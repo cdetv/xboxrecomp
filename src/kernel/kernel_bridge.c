@@ -2604,8 +2604,7 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
     if (tmr > max_tmr) max_tmr = tmr;
     if ((double)(d.QuadPart - start.QuadPart) >= 5.0 * (double)freq.QuadPart) {
         fprintf(stderr, "  [TIMERPROF] 5s: %lu passes, %lu vblanks | ms total/max:"
-                " vblank %.0f/%.1f dpc %.0f/%.1f timers %.0f/%.1f
-",
+                " vblank %.0f/%.1f dpc %.0f/%.1f timers %.0f/%.1f\n",
                 passes, g_vblanks_delivered - vb0, t_vb, max_vb, t_dpc, max_dpc,
                 t_tmr, max_tmr);
         fflush(stderr);
