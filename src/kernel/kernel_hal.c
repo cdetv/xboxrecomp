@@ -186,7 +186,9 @@ void xbox_IrqlDumpHolders(void)
  * running a DPC at DISPATCH_LEVEL, now hold it in turn. Interrupt delivery
  * (xbox_IrqlEnterInterrupt above DISPATCH_LEVEL) does not take it: on the
  * console an ISR does preempt a thread at DISPATCH_LEVEL, and device models
- * already hold off while IRQL is raised (xbox_IrqlBlocksInterrupts).
+ * already hold off while IRQL is raised (xbox_IrqlBlocksInterrupts). A device
+ * model that needs the preempted thread to stay still takes it around the
+ * whole ISR instead (xbox_IsrGateEnter, below).
  *
  * RECOMP_DPC_GATE=0 turns it off. A wait of over a second prints the threads
  * holding the boundary: a raise that is never lowered now stops every DPC,
@@ -231,6 +233,61 @@ static void gate_leave(void)
 {
     if (t_gate_held) {
         t_gate_held = 0;
+        LeaveCriticalSection(&s_gate);
+    }
+}
+
+/* The dispatch gate around a host-delivered ISR.
+ *
+ * On the console an ISR does preempt a thread at DISPATCH_LEVEL, but that
+ * thread is frozen until the ISR returns: whatever it was editing stays put
+ * mid-edit and the ISR is written not to look there. Here the ISR runs on a
+ * device thread while the guest thread keeps going, so the two interleave
+ * inside the edit. DirectSound's APU ISR caught the title thread half-way
+ * through linking a voice into a list (Flink written, Blink still 0) and
+ * walked off the null Blink. The device model's hold-off cannot close this:
+ * it checks "nobody is raised" and then calls the ISR, and a thread can raise
+ * in between -- and after enough polls it delivers anyway.
+ *
+ * Holding the gate for the ISR's whole run is as close as we get to "the CPU
+ * is in the ISR": no thread can raise IRQL (and so enter the code the ISR
+ * reads) and no DPC can run until it returns. The wait is for threads already
+ * raised to lower, which they do on their own. Call with no device lock held:
+ * a raised guest thread may be writing that device's registers.
+ *
+ * RECOMP_ISR_GATE=0 turns this off (as does RECOMP_DPC_GATE=0). */
+static XBOX_THREAD_LOCAL int t_isr_gate_held;
+static int s_isr_gate_on = -1;
+
+void xbox_IsrGateEnter(void)
+{
+    DWORD start;
+    int warned = 0;
+
+    InitOnceExecuteOnce(&s_gate_once, gate_init, NULL, NULL);
+    if (s_isr_gate_on < 0) {
+        const char *e = getenv("RECOMP_ISR_GATE");
+        s_isr_gate_on = s_gate_on && !(e && *e == '0');
+    }
+    if (!s_isr_gate_on || t_isr_gate_held || t_gate_held || t_isr_depth)
+        return;
+    start = GetTickCount();
+    while (!TryEnterCriticalSection(&s_gate)) {
+        if (!warned && GetTickCount() - start > 1000) {
+            warned = 1;
+            fprintf(stderr, "  [IRQL] ISR on tid %lu waited 1 s for the"
+                    " dispatch gate\n", (unsigned long)GetCurrentThreadId());
+            xbox_IrqlDumpHolders();
+        }
+        SwitchToThread();
+    }
+    t_isr_gate_held = 1;
+}
+
+void xbox_IsrGateLeave(void)
+{
+    if (t_isr_gate_held) {
+        t_isr_gate_held = 0;
         LeaveCriticalSection(&s_gate);
     }
 }

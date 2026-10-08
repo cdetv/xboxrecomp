@@ -180,6 +180,8 @@ extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
+extern void xbox_IsrGateEnter(void);
+extern void xbox_IsrGateLeave(void);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
 #else
@@ -230,6 +232,10 @@ static void apu_deliver_irq(MCPXAPUState *d)
         return;
 
     qemu_mutex_unlock(&d->lock);
+    /* The hold-off above only asks; the gate makes it so for the whole call
+     * (see xbox_IsrGateEnter). Taken after dropping d->lock: a raised guest
+     * thread may be in the middle of an APU register write. */
+    xbox_IsrGateEnter();
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
@@ -246,6 +252,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
             if (ms > g_apu_prof.max_isr) g_apu_prof.max_isr = ms;
         }
     }
+    xbox_IsrGateLeave();
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
