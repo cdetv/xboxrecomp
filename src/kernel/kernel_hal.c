@@ -167,6 +167,74 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* The dispatch gate: raised IRQL and DPCs exclude each other.
+ *
+ * On the console's one CPU, a thread at DISPATCH_LEVEL or above cannot be
+ * interrupted by a DPC -- DPCs run only once IRQL drops below DISPATCH -- and
+ * no other thread runs at all. The XDK is built on that. DirectSound's lock
+ * raises to DISPATCH and, when it finds itself already raised, skips its
+ * critical section, because "raised" means "nothing else is in here". Here
+ * the DPC queue is drained on the timer thread while guest threads run on
+ * other cores, so DirectSound's DPC walked into a stream the title thread was
+ * editing: both queued the same packet into the same SSL entry and each
+ * raised the segment count, leaving the voice a second segment of length 0
+ * that it then played forever. Conker's intro movie froze on it (its audio
+ * packet never completed).
+ *
+ * So every crossing to DISPATCH_LEVEL or above takes this gate, and the
+ * crossing back releases it: a guest thread raising IRQL, and the drain
+ * running a DPC at DISPATCH_LEVEL, now hold it in turn. Interrupt delivery
+ * (xbox_IrqlEnterInterrupt above DISPATCH_LEVEL) does not take it: on the
+ * console an ISR does preempt a thread at DISPATCH_LEVEL, and device models
+ * already hold off while IRQL is raised (xbox_IrqlBlocksInterrupts).
+ *
+ * RECOMP_DPC_GATE=0 turns it off. A wait of over a second prints the threads
+ * holding the boundary: a raise that is never lowered now stops every DPC,
+ * where before it only slowed device interrupts. */
+static CRITICAL_SECTION s_gate;
+static INIT_ONCE s_gate_once = INIT_ONCE_STATIC_INIT;
+static int s_gate_on = -1;
+static XBOX_THREAD_LOCAL int t_gate_held;
+static XBOX_THREAD_LOCAL int t_isr_depth;
+
+static BOOL CALLBACK gate_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    const char *e = getenv("RECOMP_DPC_GATE");
+    (void)o; (void)p; (void)c;
+    InitializeCriticalSection(&s_gate);
+    s_gate_on = !(e && *e == '0');
+    return TRUE;
+}
+
+static void gate_enter(void)
+{
+    DWORD start;
+    int warned = 0;
+
+    InitOnceExecuteOnce(&s_gate_once, gate_init, NULL, NULL);
+    if (!s_gate_on || t_gate_held || t_isr_depth)
+        return;
+    start = GetTickCount();
+    while (!TryEnterCriticalSection(&s_gate)) {
+        if (!warned && GetTickCount() - start > 1000) {
+            warned = 1;
+            fprintf(stderr, "  [IRQL] tid %lu waited 1 s for the dispatch"
+                    " gate\n", (unsigned long)GetCurrentThreadId());
+            xbox_IrqlDumpHolders();
+        }
+        SwitchToThread();
+    }
+    t_gate_held = 1;
+}
+
+static void gate_leave(void)
+{
+    if (t_gate_held) {
+        t_gate_held = 0;
+        LeaveCriticalSection(&s_gate);
+    }
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -175,6 +243,11 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 
     if (now == was)
         return;
+
+    if (now)
+        gate_enter();
+    else
+        gate_leave();
 
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
@@ -209,9 +282,18 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
  *
  * They also run the routine at the level it expects -- DISPATCH_LEVEL for a
  * DPC, the device level for an ISR -- and code checks: see irql_publish. */
+/* The returned value is opaque to callers: the low byte is the IRQL to go
+ * back to, and IRQL_SAVED_ISR says this bracket is an ISR, which does not
+ * take the dispatch gate. */
+#define IRQL_SAVED_ISR 0x100
+
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    if (level > DISPATCH_LEVEL) {
+        t_isr_depth++;
+        saved |= IRQL_SAVED_ISR;
+    }
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
@@ -222,11 +304,14 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
-    if (g_current_irql != (KIRQL)saved) {
-        irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
-        g_current_irql = (KIRQL)saved;
+    KIRQL to = (KIRQL)(saved & 0xFF);
+    if (g_current_irql != to) {
+        irql_track(g_current_irql, to, IRQL_CALLER());
+        g_current_irql = to;
         irql_publish();
     }
+    if ((saved & IRQL_SAVED_ISR) && t_isr_depth > 0)
+        t_isr_depth--;
 }
 
 /*
