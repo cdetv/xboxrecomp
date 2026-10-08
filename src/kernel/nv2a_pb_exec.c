@@ -2204,6 +2204,8 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
     return nv2a_vsh_run((const float (*)[4])in, out);
 }
 
+static void raster_xf_prims(uint32_t n);
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
@@ -2272,6 +2274,68 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    raster_xf_prims(n);
+}
+
+/* Fixed-function screen-space vertices for the combiner path.
+ *
+ * A batch drawn with the transform engine in fixed-function mode carries
+ * pixel coordinates already, and raster_triangle used to fill it with one
+ * colour or the raw stage-0 texel: no vertex colour, no combiners, no stages
+ * 1-3. That is right for a menu quad and wrong for a post-process pass.
+ * Conker's frontend glow downsamples the frame through four taps (t0..t3,
+ * one texcoord set each, averaged by the combiners), adds it back with the
+ * vertex colour's alpha (0.2) as strength, and blurs it with weighted taps;
+ * drawn as raw texels at alpha 1 every pass added the whole frame, and the
+ * intro movie went white within a few frames.
+ *
+ * So once the title has programmed the combiners, such a batch is built
+ * into the same per-vertex form a vertex program produces -- position with
+ * w = 1, colour in d0, one texcoord per stage -- and rasterised by the path
+ * that already evaluates the combiners per pixel. Which attribute feeds a
+ * stage follows the slot convention (texcoord n in slot 9+n) and, absent
+ * that, the float attributes after the position in slot order: the layouts
+ * Conker and Half-Life 2 use put colour and texcoords in low slots. */
+static int fixed_texcoord_slot(uint32_t stage, uint32_t colour_slot)
+{
+    uint32_t a, seen = 0;
+
+    if (9 + stage < NV_VERTEX_ATTRS && s_gpu.attr[9 + stage].size
+            && s_gpu.attr[9 + stage].stride)
+        return (int)(9 + stage);
+    for (a = 1; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *at = &s_gpu.attr[a];
+        if (a == colour_slot || !at->size || !at->stride || at->type != 2)
+            continue;
+        if (seen++ == stage)
+            return (int)a;
+    }
+    return -1;
+}
+
+static void fixed_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    const VertexAttr *ca = color_attr();
+    uint32_t colour_slot = (uint32_t)(ca - s_gpu.attr), st;
+    float c[4];
+
+    memset(out, 0, sizeof *out);
+    fetch_attr(&s_gpu.attr[0], index, out->pos);
+    out->pos[3] = 1.0f;
+    if (!fetch_attr(ca, index, c) && !constant_color(c))
+        c[0] = c[1] = c[2] = c[3] = 1.0f;
+    memcpy(out->d0, c, sizeof c);
+    for (st = 0; st < 4; st++) {
+        int slot = fixed_texcoord_slot(st, colour_slot);
+        if (slot >= 0)
+            fetch_attr(&s_gpu.attr[slot], index, out->tex[st]);
+    }
+}
+
+static void raster_xf_prims(uint32_t n)
+{
+    uint32_t i;
+
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -2336,7 +2400,16 @@ static void raster_batch(void)
         }
     }
 
-    switch (s_gpu.prim) {
+    /* Combiners programmed: per-pixel colour, all four stages (see
+     * fixed_vertex). RECOMP_NO_COMBINERS keeps the old flat path. */
+    static int no_rc = -1;
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    if (s_gpu.rc_seen && !no_rc) {
+        for (i = 0; i < s_gpu.idx_count; i++)
+            fixed_vertex(s_gpu.idx[i], &s_xf[i]);
+        raster_xf_prims(s_gpu.idx_count);
+    } else switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < s_gpu.idx_count; i += 3)
             raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
