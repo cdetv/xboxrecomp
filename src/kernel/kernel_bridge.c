@@ -92,8 +92,13 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
         return 0;
     if (end <= mapped)
         return 1;
-    return va >= XBOX_CONTIG_BASE
-        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    if (va >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 1;
+    /* RECOMP_EXT_VMA: committed memory above the mirrors is guest memory too.
+     * Without this a CRT heap grown up there had every file read into it
+     * refused with STATUS_ACCESS_VIOLATION. */
+    return guest_vmem_committed(va, bytes);
 }
 
 /* STATUS_ACCESS_VIOLATION is what NT answers for a user buffer it cannot

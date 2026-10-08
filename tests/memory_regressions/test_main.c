@@ -27,7 +27,8 @@
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
- *                 the memory, is told the truth when it asks, and is refused
+ *                 the memory (kernel exports accept buffers there, but not in
+ *                 reserved-only pages), is told the truth when it asks, and is refused
  *                 cleanly for an address that would alias live memory.
  *   ext-vma-128   The same switch on a 128 MB map, where the mirrors already
  *                 reach past user space. The tracker must stay out of the way
@@ -51,11 +52,12 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
 
-enum { S_ALLOC, S_FREE, S_QUERY, N_SLOTS };
+enum { S_ALLOC, S_FREE, S_QUERY, S_DPC, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
     184,   /* NtAllocateVirtualMemory */
     199,   /* NtFreeVirtualMemory */
     217,   /* NtQueryVirtualMemory */
+    107,   /* KeInitializeDpc: the simplest export that checks its buffer */
 };
 
 static uint32_t scratch;                 /* guest VA of a 64 KB block */
@@ -345,6 +347,31 @@ int main(int argc, char **argv)
             *G(hi + 0xFFFC) = 0xC0FFEE02u;
             check(*G(hi) == 0xC0FFEE01u && *G(hi + 0xFFFC) == 0xC0FFEE02u,
                   "the committed memory is real", NULL);
+
+            /* The bridge accepts a buffer there. Its buffer check only knew
+             * RAM and the contiguous range, so every NtReadFile into a CRT heap
+             * grown up here failed with STATUS_ACCESS_VIOLATION. */
+            {
+                uint32_t args[3] = { hi + 0x100, 0x00401000u, 0x1234u };
+
+                *G(hi + 0x100) = 0xFFFFFFFFu;
+                call(S_DPC, 3, args);
+                snprintf(d, sizeof d, "Type word 0x%08X, routine 0x%08X",
+                         *G(hi + 0x100), *G(hi + 0x10C));
+                check((*G(hi + 0x100) & 0xFFFF) == 0x13 && *G(hi + 0x10C) == 0x00401000u,
+                      "a kernel export accepts a buffer in committed high memory", d);
+
+                /* Reserved-only pages have no host memory: refused, not touched. */
+                args[0] = hi + 0x10000;
+                call(S_DPC, 3, args);
+                check(1, "a buffer in reserved-only high memory is refused, no fault", NULL);
+                args[0] = hi + 0xFFF0;       /* last 16 bytes committed, rest not */
+                *G(hi + 0xFFF0) = 0xFFFFFFFFu;
+                call(S_DPC, 3, args);
+                snprintf(d, sizeof d, "Type word 0x%08X", *G(hi + 0xFFF0));
+                check(*G(hi + 0xFFF0) == 0xFFFFFFFFu,
+                      "a buffer running off the committed part is refused", d);
+            }
 
             /* Ask about both halves. */
             st = nt_query(hi, mbi);

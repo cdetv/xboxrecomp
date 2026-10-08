@@ -48,3 +48,9 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
  *             State, Protect, Type } -- the 28-byte guest
  *             MEMORY_BASIC_INFORMATION layout. */
 int guest_vmem_query(uint32_t address, uint32_t info[7]);
+
+/* True when every page of [va, va + bytes) is committed here, so the host can
+ * read and write it. The kernel bridge asks this before touching a guest buffer
+ * that lies above the mirrors (a title's own high reservation, or a CRT heap
+ * grown into one). 0 when the tracker is not live. */
+int guest_vmem_committed(uint32_t va, uint32_t bytes);
