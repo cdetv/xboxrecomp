@@ -13,6 +13,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"   /* XBOX_WORKER_STACK_* + worker-stack decls */
+#include <stdio.h>
 
 /* ============================================================================
  * Thread Start Wrapper
@@ -422,9 +423,47 @@ void *xbox_thread_debug_handle(void) { return (void *)g_game_thread; }
  * a spawned worker, so the allocator itself must be thread-safe. */
 static volatile LONG g_worker_stack_used[XBOX_WORKER_STACK_COUNT];
 
+/* Where the slices live: the guest heap, claimed in one piece on first use.
+ *
+ * They used to be carved from the bottom of the stack region at a fixed
+ * 0x00780000, which is only free while the title's image ends below it --
+ * the reason xbox_AllocThreadStack moved to the heap. Conker's .data/BSS runs
+ * to 0x00881A64, so the timer thread (slice 0) and the APU ISR (slice 1) ran
+ * on the game's globals: D3DPushBuffer_Jump's fixup records landed in the
+ * timer thread's live frame and D3D's GPU DPC was handed a NOP header
+ * (0x00040100) as its device. The heap starts above the image and knows its
+ * size, so the slices are safe for any image. XBOX_WORKER_STACK_BASE is the
+ * fallback if the heap cannot spare them. */
+static uint32_t s_worker_base;
+static INIT_ONCE s_worker_base_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK worker_base_init(PINIT_ONCE o, PVOID p, PVOID *c)
+{
+    (void)o; (void)p; (void)c;
+    s_worker_base = xbox_HeapAlloc(XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT,
+                                   4096);
+    if (!s_worker_base) {
+        s_worker_base = XBOX_WORKER_STACK_BASE;
+        fprintf(stderr, "  [KERNEL] worker stacks: heap allocation failed;"
+                        " using 0x%08X (may overlap the image)\n", s_worker_base);
+    } else {
+        fprintf(stderr, "  [KERNEL] worker stacks: %u x %u KB at 0x%08X\n",
+                XBOX_WORKER_STACK_COUNT, XBOX_WORKER_STACK_SIZE / 1024,
+                s_worker_base);
+    }
+    return TRUE;
+}
+
+uint32_t xbox_worker_stack_top(int slot)
+{
+    InitOnceExecuteOnce(&s_worker_base_once, worker_base_init, NULL, NULL);
+    return s_worker_base + XBOX_WORKER_STACK_SIZE * (uint32_t)(slot + 1) - 16;
+}
+
 int xbox_worker_stack_alloc(void)
 {
     int i;
+    InitOnceExecuteOnce(&s_worker_base_once, worker_base_init, NULL, NULL);
     for (i = 0; i < XBOX_WORKER_STACK_COUNT; i++) {
         if (InterlockedCompareExchange(&g_worker_stack_used[i], 1, 0) == 0)
             return i;
