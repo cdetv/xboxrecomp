@@ -2274,14 +2274,28 @@ static int kernel_raise_interrupt(uint32_t vector)
 static unsigned long g_vblanks_delivered;   /* for RECOMP_TIMER_PROFILE */
 static void kernel_drain_dpcs(void);
 
+/* RECOMP_VBLANK_COUNTER=<va>: the guest dword the title's vblank ISR
+ * increments (D3D keeps one in its device). Delivering a vblank is only half
+ * of it -- the ISR decides from the interrupt registers whether there is one,
+ * and a vblank it does not see is delivered but never counted. With this set
+ * the timer profile says how many of the delivered ones the title counted,
+ * and how long the longest ISR call took. Read-only. */
+static uint32_t g_vblank_counter_va;
+static unsigned long g_vblanks_counted;
+static double g_vblank_isr_max_ms;
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
     static long long origin_ms = -1, delivered;
     long long now, due, owed;
 
-    if (enabled < 0)
+    if (enabled < 0) {
+        const char *c = getenv("RECOMP_VBLANK_COUNTER");
         enabled = getenv("RECOMP_VBLANK") != NULL;
+        if (c)
+            g_vblank_counter_va = (uint32_t)strtoul(c, NULL, 0);
+    }
     if (!enabled)
         return;
 
@@ -2308,7 +2322,24 @@ static void kernel_vblank_tick(void)
         g_vblanks_delivered++;
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
-        claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        {
+            uint32_t before = g_vblank_counter_va
+                            ? BRIDGE_MEM32(g_vblank_counter_va) : 0;
+            LARGE_INTEGER t0, t1, f;
+            QueryPerformanceCounter(&t0);
+            claimed = kernel_raise_interrupt(NV2A_VECTOR);
+            if (g_vblank_counter_va) {
+                double ms;
+                QueryPerformanceCounter(&t1);
+                QueryPerformanceFrequency(&f);
+                ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0
+                   / (double)f.QuadPart;
+                if (ms > g_vblank_isr_max_ms)
+                    g_vblank_isr_max_ms = ms;
+                if (BRIDGE_MEM32(g_vblank_counter_va) != before)
+                    g_vblanks_counted++;
+            }
+        }
         /* The ISR only queues D3D's DPC, and queueing a DPC that is already
          * queued does nothing: several vblanks delivered before the next
          * drain counted as one. Run it now, as the hardware would before
@@ -2589,7 +2620,7 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
     static int on = -1;
     static LARGE_INTEGER freq, start;
     static double t_vb, t_dpc, t_tmr, max_vb, max_dpc, max_tmr;
-    static unsigned long passes, vb0;
+    static unsigned long passes, vb0, vc0;
     LARGE_INTEGER d;
     double vb, dpc, tmr;
 
@@ -2613,7 +2644,14 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
                 " vblank %.0f/%.1f dpc %.0f/%.1f timers %.0f/%.1f\n",
                 passes, g_vblanks_delivered - vb0, t_vb, max_vb, t_dpc, max_dpc,
                 t_tmr, max_tmr);
+        if (g_vblank_counter_va)
+            fprintf(stderr, "  [TIMERPROF] counted by the title: %lu of %lu"
+                    " (counter 0x%08X = %u), longest ISR %.1f ms\n",
+                    g_vblanks_counted - vc0, g_vblanks_delivered - vb0,
+                    g_vblank_counter_va, BRIDGE_MEM32(g_vblank_counter_va),
+                    g_vblank_isr_max_ms);
         fflush(stderr);
+        g_vblank_isr_max_ms = 0.0; vc0 = g_vblanks_counted;
         start = d; passes = 0; vb0 = g_vblanks_delivered;
         t_vb = t_dpc = t_tmr = max_vb = max_dpc = max_tmr = 0.0;
     }
