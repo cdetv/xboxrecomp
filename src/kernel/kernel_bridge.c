@@ -2272,6 +2272,7 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_VBLANK_CATCH_UP 8
 
 static unsigned long g_vblanks_delivered;   /* for RECOMP_TIMER_PROFILE */
+static void kernel_drain_dpcs(void);
 
 static void kernel_vblank_tick(void)
 {
@@ -2308,6 +2309,11 @@ static void kernel_vblank_tick(void)
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
         claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        /* The ISR only queues D3D's DPC, and queueing a DPC that is already
+         * queued does nothing: several vblanks delivered before the next
+         * drain counted as one. Run it now, as the hardware would before
+         * the next vblank. */
+        kernel_drain_dpcs();
         if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
