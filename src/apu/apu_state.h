@@ -534,6 +534,7 @@ struct ApuProfile {
     unsigned long voices, stream_voices, stream_samples, ssl_done, ssl_empty,
                   voice_offs;
     unsigned long irq_up, irq_held, irq_delivered, irq_claimed;
+    unsigned long stream_paused, fe_traps, ists_writes, fectl_writes;
     double t_wait, t_vp, t_mon, t_isr, max_isr;
 };
 extern struct ApuProfile g_apu_prof;
