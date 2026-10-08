@@ -379,21 +379,20 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * code from the host's own message-loop thread, that thread needs a guest stack
  * (its g_esp starts at 0), which is what a worker slice provides.
  *
- * These slices carve the low end of the same 8 MB stack region xbox_AllocThreadStack
- * uses, and a title uses one model or the other -- never both -- so they do not
- * coexist at runtime. For a title that never calls xbox_worker_stack_alloc
- * (every default-model title), this is unused address space and dead code, so
- * adding it changes nothing for them.
+ * Host threads that run guest code (the kernel timer thread, device models
+ * delivering interrupts) take slices too, so they are not only for tick-driven
+ * titles. The slices come from the guest heap, claimed in one 4 MB piece on
+ * first use (see xbox_worker_stack_top): a fixed spot at the bottom of the
+ * stack region overlapped any image that ends above 0x00780000, and Conker's
+ * BSS does. XBOX_WORKER_STACK_BASE is only the fallback when the heap is full.
  */
 #define XBOX_WORKER_STACK_SIZE   (256 * 1024)
-#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* 0x00780000 */
+#define XBOX_WORKER_STACK_BASE   XBOX_STACK_BASE             /* fallback only */
 #define XBOX_WORKER_STACK_COUNT  16                          /* 4 MB total */
-#define XBOX_WORKER_STACK_END    (XBOX_WORKER_STACK_BASE + \
-                                  XBOX_WORKER_STACK_SIZE * XBOX_WORKER_STACK_COUNT)
 
 /** Top (initial esp) of worker stack slice n, 16-byte aligned, growing down. */
-#define XBOX_WORKER_STACK_TOP(n) (XBOX_WORKER_STACK_BASE + \
-                                  XBOX_WORKER_STACK_SIZE * ((n) + 1) - 16)
+uint32_t xbox_worker_stack_top(int slot);
+#define XBOX_WORKER_STACK_TOP(n) xbox_worker_stack_top(n)
 
 /* ================================================================
  * Xbox dynamic heap (for MmAllocateContiguousMemory, etc.)
