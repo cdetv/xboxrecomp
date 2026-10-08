@@ -750,7 +750,21 @@ def _make_condition(jcc, flag_setter, flag_ops):
         if jcc == "jns":
             return f"({slhs} >= 0)", desc
         # Ordered: reconstruct original a = result + b
+        #
+        # AT THE OPERAND'S WIDTH. The signed CMP_* macros recover the width
+        # from sizeof their arguments, and (uint32_t) casts tell them 32. For
+        # `sub ch, cl` with 5 - 7 the snapshot is _fa = 0xFE, _fb = 7, and the
+        # 32-bit sum 0x105 is not less than 7, so `jl` never jumped where the
+        # hardware's 5 < 7 does. A bit-buffer decoder that counts down in ch
+        # with `sub ch, cl; jl refill` then never refilled -- and never reached
+        # the output bound check that sits in the refill -- so it wrote zeros
+        # past the end of guest memory. Narrowing the sum (and _fb) to the
+        # operand's unsigned type wraps it to the original value and hands the
+        # macros a sizeof they read correctly.
         if cmp_macro and rhs:
+            if _sf_width in (1, 2):
+                return (f"{cmp_macro}(({_sf_utype})((uint32_t){lhs} + (uint32_t){rhs}),"
+                        f" ({_sf_utype}){rhs})"), desc
             return f"{cmp_macro}((uint32_t){lhs} + (uint32_t){rhs}, (uint32_t){rhs})", desc
         if jcc in ("jb", "jnae"):
             return f"((uint32_t){lhs} + (uint32_t){rhs} < (uint32_t){rhs})", desc
