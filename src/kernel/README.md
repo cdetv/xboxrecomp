@@ -37,11 +37,11 @@ Xbox VA Range          Purpose                  Size
 0x00011000-0x002BBFFF  .text (code)             2.73 MB
 0x0036B7C0-0x003B2363  .rdata (constants)       283 KB
 0x003B2360-0x0076FFFF  .data (globals + BSS)    3.8 MB
-0x00700000-0x0073FFFF  RW data copy             256 KB
 0x00740000-0x0077FFFF  Kernel data exports      256 KB
-0x00760000-0x0076FFFF  TLS area                 64 KB
 0x00780000-0x00F7FFFF  Stack (8 MB, grows down) 8 MB
 0x00F80000-0x03FFFFFF  Heap (bump allocator)    ~49 MB
+                       (also the main thread's fake Prcb, TLS and
+                       RW data blocks, so they never overlap .data)
 ```
 
 ### Why CreateFileMapping?

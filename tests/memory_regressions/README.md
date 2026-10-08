@@ -11,7 +11,15 @@ cmake --build build/memory-regressions --config Release
 ctest --test-dir build/memory-regressions -C Release --output-on-failure
 ```
 
-One test per mode, one process each, because the switches are read once and cached:
+One test per mode, one process each, because the switches are read once and cached.
+Every mode first checks that the main thread's fake KPCR/TLS structures
+(`fs:[0x20]`, `fs:[0x28]` and the area at `[fs:[0x28]+0x28]`) come from the heap.
+They used to sit at fixed addresses (`0x00700000`, `0x00760000`, `0x00761000`,
+`0x00770000`) on the assumption that this was free BSS; a title whose `.data`
+reaches past them (Conker: Live & Reloaded's runs to `0x00881A64`) keeps its own
+globals there and overwrote TLS slot 0. Without the fix the three checks report
+addresses below the heap.
+
 
 | Test | What it checks |
 |---|---|
