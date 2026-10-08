@@ -527,6 +527,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             d->regs[NV_PAPU_FECTL] &= ~NV_PAPU_FECTL_FETRAPREASON;
             d->regs[NV_PAPU_FECTL] |= NV_PAPU_FECTL_FETRAPREASON_REQUESTED;
             d->set_irq = true;
+            if (g_apu_prof_on) g_apu_prof.fe_traps++;
         }
         break;
 
@@ -1251,8 +1252,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                 if (g_apu_prof_on) {
                     g_apu_prof.voices++;
                     if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
-                                       NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
+                                       NV_PAVS_VOICE_CFG_FMT_DATA_TYPE)) {
                         g_apu_prof.stream_voices++;
+                        if (voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                           NV_PAVS_VOICE_PAR_STATE_PAUSED))
+                            g_apu_prof.stream_paused++;
+                    }
                 }
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);

@@ -94,6 +94,16 @@ static void prof_report(void)
             p->ssl_empty, p->voice_offs, p->irq_up, p->irq_held,
             p->irq_delivered, p->irq_claimed, p->t_wait, p->t_vp, p->t_mon,
             p->t_isr, p->max_isr);
+    if (g_state) {
+        const uint32_t *r = g_state->regs;
+        fprintf(stderr, "  [APUPROF] stream paused %lu, fe traps %lu, guest"
+                " writes ISTS %lu FECTL %lu | now ISTS=%08X IEN=%08X"
+                " FECTL=%08X SECTL=%08X FETFORCE0=%08X FETFORCE1=%08X\n",
+                p->stream_paused, p->fe_traps, p->ists_writes,
+                p->fectl_writes, r[NV_PAPU_ISTS], r[NV_PAPU_IEN],
+                r[NV_PAPU_FECTL], r[NV_PAPU_SECTL], r[NV_PAPU_FETFORCE0],
+                r[NV_PAPU_FETFORCE1]);
+    }
     fflush(stderr);
     memset(p, 0, sizeof(*p));
     start = now;
@@ -290,12 +300,14 @@ void mcpx_apu_write(void *opaque, hwaddr addr, uint64_t val,
 
     switch (addr) {
     case NV_PAPU_ISTS:
+        if (g_apu_prof_on) g_apu_prof.ists_writes++;
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~(uint32_t)val);
         update_irq(d);
         qemu_cond_broadcast(&d->cond);
         break;
     case NV_PAPU_FECTL:
     case NV_PAPU_SECTL:
+        if (g_apu_prof_on && addr == NV_PAPU_FECTL) g_apu_prof.fectl_writes++;
         qatomic_set(&d->regs[addr], (uint32_t)val);
         /* Starting the APU has to start the frame thread.
          *
