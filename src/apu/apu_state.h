@@ -526,6 +526,19 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 
+/* RECOMP_APU_PROFILE: what the frame thread did, summed over 5 s and printed
+ * by apu_core.c. Counted only when g_apu_prof_on, by the frame thread alone,
+ * so plain fields are enough. */
+struct ApuProfile {
+    unsigned long loops, se_frames, idle_frames;
+    unsigned long voices, stream_voices, stream_samples, ssl_done, ssl_empty,
+                  voice_offs;
+    unsigned long irq_up, irq_held, irq_delivered, irq_claimed;
+    double t_wait, t_vp, t_mon, t_isr, max_isr;
+};
+extern struct ApuProfile g_apu_prof;
+extern int g_apu_prof_on;
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;

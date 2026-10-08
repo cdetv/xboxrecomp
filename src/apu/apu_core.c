@@ -49,6 +49,57 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
 /* ============================================================
+ * RECOMP_APU_PROFILE
+ *
+ * Every 5 s: how many frames the frame thread ran (real time is 1500/s,
+ * 32 samples each), how many stream samples the voice processor consumed
+ * (48000/s per playing stream), how many segment-list completions it
+ * signalled, and how many of the resulting interrupts reached the title's
+ * service routine -- plus where the thread's time went. A title whose stream
+ * packets complete slowly stalls at one of those steps; this says which.
+ * ============================================================ */
+
+struct ApuProfile g_apu_prof;
+int g_apu_prof_on;
+
+static double prof_now_ms(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER t;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+}
+
+static void prof_report(void)
+{
+    static double start;
+    struct ApuProfile *p = &g_apu_prof;
+    double now;
+
+    if (!g_apu_prof_on)
+        return;
+    now = prof_now_ms();
+    if (start == 0.0)
+        start = now;
+    if (now - start < 5000.0)
+        return;
+    fprintf(stderr, "  [APUPROF] %.1fs: %lu loops, %lu frames, %lu idle"
+            " | voices %lu stream %lu, stream samples %lu, ssl done %lu"
+            " empty %lu, voice off %lu | irq up %lu held %lu delivered %lu"
+            " claimed %lu | ms wait %.0f vp %.0f mon %.0f isr %.0f/%.1f\n",
+            (now - start) / 1000.0, p->loops, p->se_frames, p->idle_frames,
+            p->voices, p->stream_voices, p->stream_samples, p->ssl_done,
+            p->ssl_empty, p->voice_offs, p->irq_up, p->irq_held,
+            p->irq_delivered, p->irq_claimed, p->t_wait, p->t_vp, p->t_mon,
+            p->t_isr, p->max_isr);
+    fflush(stderr);
+    memset(p, 0, sizeof(*p));
+    start = now;
+}
+
+/* ============================================================
  * Debug frame markers (minimal stubs)
  * ============================================================ */
 
@@ -143,8 +194,11 @@ static void apu_deliver_irq(MCPXAPUState *d)
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+    if (g_apu_prof_on) g_apu_prof.irq_up++;
+    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+        if (g_apu_prof_on) g_apu_prof.irq_held++;
         return;
+    }
     held_off = 0;
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
@@ -171,7 +225,17 @@ static void apu_deliver_irq(MCPXAPUState *d)
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        double t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
+        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+        if (g_apu_prof_on) {
+            double ms = prof_now_ms() - t0;
+            g_apu_prof.irq_delivered++;
+            if (g_eax & 1) g_apu_prof.irq_claimed++;
+            g_apu_prof.t_isr += ms;
+            if (ms > g_apu_prof.max_isr) g_apu_prof.max_isr = ms;
+        }
+    }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);
 
@@ -488,6 +552,7 @@ static void throttle(MCPXAPUState *d)
         d->next_frame_time_us = now_us;
     }
 
+    double t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
     while (!d->pause_requested) {
         now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
         int64_t remaining_ms = (d->next_frame_time_us - now_us) / 1000;
@@ -498,6 +563,7 @@ static void throttle(MCPXAPUState *d)
         }
     }
     d->next_frame_time_us += EP_FRAME_US;
+    if (g_apu_prof_on) g_apu_prof.t_wait += prof_now_ms() - t0;
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
 }
@@ -528,9 +594,18 @@ static void se_frame(MCPXAPUState *d)
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     memset(mixbins, 0, sizeof(mixbins));
 
-    mcpx_apu_vp_frame(d, mixbins);
-    mcpx_apu_dsp_frame(d, mixbins);
-    mcpx_apu_monitor_frame(d);
+    {
+        double t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
+        mcpx_apu_vp_frame(d, mixbins);
+        mcpx_apu_dsp_frame(d, mixbins);
+        double t1 = g_apu_prof_on ? prof_now_ms() : 0.0;
+        mcpx_apu_monitor_frame(d);
+        if (g_apu_prof_on) {
+            g_apu_prof.t_vp += t1 - t0;
+            g_apu_prof.t_mon += prof_now_ms() - t1;
+            g_apu_prof.se_frames++;
+        }
+    }
 
     d->ep_frame_div++;
 
@@ -581,6 +656,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+            if (g_apu_prof_on) g_apu_prof.idle_frames++;
         }
 
         /* What xemu's frame thread does after each frame: turn a pending
@@ -592,6 +668,8 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->set_irq = false;
         }
         apu_deliver_irq(d);
+        if (g_apu_prof_on) g_apu_prof.loops++;
+        prof_report();
 
         /* Let the guest in once per frame.
          *
@@ -665,6 +743,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
 
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
+    g_apu_prof_on = getenv("RECOMP_APU_PROFILE") != NULL;
     d->ram_ptr = ram_ptr;
 
     d->set_irq = false;
