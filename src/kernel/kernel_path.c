@@ -7,6 +7,9 @@
  *   T:\               -> <save_dir>/TitleData/
  *   U:\               -> <save_dir>/UserData/
  *   Z:\               -> <save_dir>/Cache/
+ *   \Device\Harddisk0\Partition1\TDATA -> <save_dir>/TitleData/
+ *   \Device\Harddisk0\Partition1\UDATA -> <save_dir>/UserData/
+ *   \Device\Harddisk0\Partition1\ (rest) -> <game_dir>/
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
  * emits UTF-8 paths with '/' separators (for open()).
@@ -37,6 +40,30 @@ static int match_prefix(const char* path, const char* prefix)
     return i;
 }
 
+/*
+ * match_prefix for a rule prefix. A prefix ending in a separator matches as
+ * before. One without -- "\Device\Harddisk0\Partition1\TDATA" -- matches only a
+ * whole path component, so it takes the directory itself and anything under
+ * it but not "TDATAX"; the separator after it is consumed so the remainder
+ * does not start with one.
+ */
+static int match_rule(const char* path, const char* prefix)
+{
+    int  n = match_prefix(path, prefix);
+    char last;
+
+    if (!n)
+        return 0;
+    last = prefix[n - 1];
+    if (last == '\\' || last == '/')
+        return n;
+    if (path[n] == '\0')
+        return n;
+    if (path[n] == '\\' || path[n] == '/')
+        return n + 1;
+    return 0;
+}
+
 /* A device-path translation rule, shared by both backends. */
 typedef struct {
     const char* prefix;     /* Xbox path prefix (backslash form)         */
@@ -47,6 +74,14 @@ typedef struct {
 
 static const path_rule s_rules[] = {
     { "\\Device\\CdRom0\\",                   0, NULL,         NULL          },
+    /* Title and user data on E:, the save side of Partition1. XAPI mounts T:
+     * and U: by linking them to Partition1\TDATA\<title id> and
+     * Partition1\UDATA\<title id>, and resolve_symlink follows the link before
+     * these rules run -- so without these two, every save and settings write
+     * through T:/U: fell to the Partition1 rule below and landed in the game
+     * dir, which is the extracted disc. Listed first so they win. */
+    { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TitleData", "/TitleData" },
+    { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UserData",  "/UserData"  },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
@@ -150,7 +185,7 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     out[tlen + rlen] = '\0';
 
     for (i = 0; i < PATH_RULE_COUNT; i++) {
-        if (match_prefix(out, s_rules[i].prefix))
+        if (match_rule(out, s_rules[i].prefix))
             return 1;           /* the target is somewhere we can place */
     }
     return 0;
@@ -420,7 +455,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
@@ -573,7 +608,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     for (int i = 0; i < PATH_RULE_COUNT; i++) {
-        skip = match_prefix(xbox_path, s_rules[i].prefix);
+        skip = match_rule(xbox_path, s_rules[i].prefix);
         if (skip) {
             remainder = xbox_path + skip;
             base_dir  = s_rules[i].to_save ? s_save_dir : s_game_dir;
