@@ -362,3 +362,26 @@ int guest_vmem_query(uint32_t address, uint32_t info[7])
     info[6] = first.state ? MEM_PRIVATE_TYPE : 0;           /* Type */
     return 1;
 }
+
+int guest_vmem_committed(uint32_t va, uint32_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+    uint32_t p, last;
+    int ok = 1;
+
+    if (!s_pages || !bytes || va < s_lo || end > s_top)
+        return 0;
+
+    /* Reserved-only pages have no host memory behind them; touching one would
+     * fault inside the bridge, so they do not count. */
+    AcquireSRWLockShared(&s_lock);
+    last = page_index((uint32_t)(end - 1));
+    for (p = page_index(va); p <= last; ++p) {
+        if (s_pages[p].state != MEM_COMMIT_FLAG) {
+            ok = 0;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_lock);
+    return ok;
+}

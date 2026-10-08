@@ -52,6 +52,7 @@ fails, and touching the address it asked for faults.
 |---|---|
 | Reserve at `0x76000000` returns `0x76000000` | The heap's address (`0x00F90000` in the run above). |
 | Commit inside it succeeds and the memory is usable | Access violation: nothing backs that host address. |
+| A kernel export (`KeInitializeDpc`) accepts a buffer in the committed part; one in reserved-only pages, or running off the committed part, is refused without a fault | Refused everywhere above the mirrors: the bridge's buffer check knew only RAM and the contiguous range. A title whose CRT heap grows up here (Conker: Live & Reloaded) had every `NtReadFile` into it fail with `STATUS_ACCESS_VIOLATION`. |
 | Query reports the committed part `MEM_COMMIT`, the rest `MEM_RESERVE`, one allocation base | "Everything above RAM is free", so a scanner is handed live memory. |
 | Reserving the same range again is `STATUS_CONFLICTING_ADDRESSES` | A second grant. |
 | An address inside the mirrors is refused, and queries report it reserved | It aliases low memory: a reservation there zeroed live `.rdata` on the title this came from. A scanner that is told "free" retries the same address forever. |
