@@ -2521,17 +2521,30 @@ static void draw_primitive(void)
             {
                 /* What the batch did to the picture, not just how many
                  * pixels it touched: the target's mean colour over the clip
-                 * after the batch, and vertex 0's diffuse (slot 3), which
-                 * carries a fixed-function quad's fade/strength. A
+                 * after the batch, then every attribute with an array and
+                 * its value at vertex 0, and the colour constant (slot 3's
+                 * SET_VERTEX_DATA value) an array-less colour takes. A
                  * post-process chain that ends white names its culprit as
-                 * the first batch whose mean jumps. */
+                 * the first batch whose mean jumps, and these say where
+                 * that batch's strength came from. */
                 float d[4];
-                uint32_t mr, mg, mb, mx;
+                uint32_t mr, mg, mb, mx, at;
                 surface_mean(&mr, &mg, &mb, &mx);
-                fetch_attr(&s_gpu.attr[3], s_gpu.idx[0], d);
                 fprintf(stderr, "[FTRACE]     after: mean rgb %u %u %u max %u"
-                        " | v0 diffuse %.3f %.3f %.3f a %.3f%c",
-                        mr, mg, mb, mx, d[0], d[1], d[2], d[3], 10);
+                        " | colour const %s %.3f %.3f %.3f %.3f%c",
+                        mr, mg, mb, mx,
+                        (s_gpu.imm_set & (1u << 3)) ? "set" : "unset",
+                        s_gpu.imm_attr[3][0], s_gpu.imm_attr[3][1],
+                        s_gpu.imm_attr[3][2], s_gpu.imm_attr[3][3], 10);
+                for (at = 0; at < NV_VERTEX_ATTRS; at++) {
+                    const VertexAttr *va = &s_gpu.attr[at];
+                    if (!va->size || !va->stride)
+                        continue;
+                    fetch_attr(va, s_gpu.idx[0], d);
+                    fprintf(stderr, "[FTRACE]       attr %u type %u size %u"
+                            " stride %u: v0 %g %g %g %g%c", at, va->type,
+                            va->size, va->stride, d[0], d[1], d[2], d[3], 10);
+                }
             }
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
