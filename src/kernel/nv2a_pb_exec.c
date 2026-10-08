@@ -263,6 +263,9 @@ static struct {
      * methods leave it. Writing attribute 0 (position) emits a vertex. */
     float      imm_attr[NV_VERTEX_ATTRS][4];
     uint16_t   imm_used;                /* attributes written since BEGIN */
+    uint16_t   imm_set;                 /* attributes ever written: their
+                                         * imm_attr value is the constant an
+                                         * array-less attribute takes */
     uint32_t   imm_count;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
@@ -1400,11 +1403,32 @@ static int fetch_texcoord(uint32_t index, float out[2])
     return 1;
 }
 
+/* The colour of a vertex whose batch has no colour array.
+ *
+ * On the NV2A an attribute with no array enabled takes the value last written
+ * to it with SET_VERTEX_DATA*; it is a register, not a per-draw default. A
+ * title uses that for a quad's strength or fade: Conker's frontend glow adds
+ * a downsampled copy of the frame back onto itself with blend SRC_ALPHA/ONE
+ * and the alpha set this way. Returning opaque white here added the copy at
+ * full strength, and the intro movie washed out to pure white within a few
+ * frames. White remains the answer when the title never wrote the register,
+ * which is the visible-wrong-colour choice for bring-up. */
+static int constant_color(float c[4])
+{
+    if (!(s_gpu.imm_set & (1u << 3)))
+        return 0;
+    c[0] = s_gpu.imm_attr[3][0];
+    c[1] = s_gpu.imm_attr[3][1];
+    c[2] = s_gpu.imm_attr[3][2];
+    c[3] = s_gpu.imm_attr[3][3];
+    return 1;
+}
+
 static uint32_t vertex_color(uint32_t index)
 {
     float c[4];
 
-    if (!fetch_attr(color_attr(), index, c))
+    if (!fetch_attr(color_attr(), index, c) && !constant_color(c))
         return 0xFFFFFFFFu;
     return ((uint32_t)(c[3] * 255.0f) << 24)
          | ((uint32_t)(c[0] * 255.0f) << 16)
@@ -2720,7 +2744,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
         c = (method - NV097_SET_VERTEX4F) / 4;
         s_gpu.imm_attr[0][c] = v.f;
-        s_gpu.imm_used |= 1;
+        s_gpu.imm_set |= s_gpu.imm_used |= 1;
         if (c == 3)
             imm_emit_vertex();
         return 1;
@@ -2728,7 +2752,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
         c = (method - NV097_SET_VERTEX3F) / 4;
         s_gpu.imm_attr[0][c] = v.f;
-        s_gpu.imm_used |= 1;
+        s_gpu.imm_set |= s_gpu.imm_used |= 1;
         if (c == 2) {
             s_gpu.imm_attr[0][3] = 1.0f;
             imm_emit_vertex();
@@ -2744,7 +2768,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         if (c == 1) {
             a[2] = 0.0f; a[3] = 1.0f;
         }
-        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        s_gpu.imm_set |= s_gpu.imm_used |= (uint16_t)(1u << attr);
         if (attr == 0 && c == 1)
             imm_emit_vertex();
         return 1;
@@ -2754,7 +2778,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         attr = (method - NV097_SET_VERTEX_DATA4F_M) / 16;
         c = ((method - NV097_SET_VERTEX_DATA4F_M) % 16) / 4;
         s_gpu.imm_attr[attr][c] = v.f;
-        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        s_gpu.imm_set |= s_gpu.imm_used |= (uint16_t)(1u << attr);
         if (attr == 0 && c == 3)
             imm_emit_vertex();
         return 1;
@@ -2766,7 +2790,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         a[0] = (float)(int16_t)(param & 0xFFFF);
         a[1] = (float)(int16_t)(param >> 16);
         a[2] = 0.0f; a[3] = 1.0f;
-        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        s_gpu.imm_set |= s_gpu.imm_used |= (uint16_t)(1u << attr);
         if (attr == 0)
             imm_emit_vertex();
         return 1;
@@ -2780,7 +2804,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         a[1] = (float)((param >>  8) & 0xFF) / 255.0f;
         a[2] = (float)((param >> 16) & 0xFF) / 255.0f;
         a[3] = (float)( param >> 24        ) / 255.0f;
-        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        s_gpu.imm_set |= s_gpu.imm_used |= (uint16_t)(1u << attr);
         if (attr == 0)
             imm_emit_vertex();
         return 1;
@@ -2792,7 +2816,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
         a = s_gpu.imm_attr[attr];
         a[c * 2]     = (float)(int16_t)(param & 0xFFFF);
         a[c * 2 + 1] = (float)(int16_t)(param >> 16);
-        s_gpu.imm_used |= (uint16_t)(1u << attr);
+        s_gpu.imm_set |= s_gpu.imm_used |= (uint16_t)(1u << attr);
         if (attr == 0 && c == 1)
             imm_emit_vertex();
         return 1;
