@@ -2251,11 +2251,26 @@ static int kernel_raise_interrupt(uint32_t vector)
 #define NV2A_PCRTC_INTR_VBLANK (1u << 0)
 #define NV2A_VECTOR            3u
 
+/* Catching up rather than ticking once per call.
+ *
+ * The timer thread that calls this also drains DPCs and fires timers, and a
+ * title's audio DPCs can take tens of milliseconds, so "one vblank per call
+ * once 16 ms have passed" delivered about 12 a second under Conker's intro.
+ * A title that only waits for vblanks would just run slow, but XMV compares
+ * the vblank count against QueryPerformanceCounter time: it re-syncs its
+ * clock to the wall clock and then waits for vblanks to catch up, so with the
+ * two disagreeing by 5x the movie advanced a second per minute and looked
+ * hung. The count of vblanks due is now taken from the clock (60 per second
+ * since the first call) and each call delivers what is owed, up to
+ * NV2A_VBLANK_CATCH_UP; past that the backlog is dropped rather than
+ * delivered as a burst. */
+#define NV2A_VBLANK_CATCH_UP 8
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    static long long origin_ms = -1, delivered;
+    long long now, due, owed;
 
     if (enabled < 0)
         enabled = getenv("RECOMP_VBLANK") != NULL;
@@ -2263,24 +2278,34 @@ static void kernel_vblank_tick(void)
         return;
 
     now = (long long)GetTickCount64();
-    if (now < next_ms)
+    if (origin_ms < 0)
+        origin_ms = now;
+    due = (now - origin_ms) * 60 / 1000;      /* vblanks since the first call */
+    owed = due - delivered;
+    if (owed <= 0)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    if (owed > NV2A_VBLANK_CATCH_UP) {
+        delivered = due - NV2A_VBLANK_CATCH_UP;
+        owed = NV2A_VBLANK_CATCH_UP;
+    }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
 
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
-
-    {
+    while (owed-- > 0) {
         static unsigned n;
-        int claimed = kernel_raise_interrupt(NV2A_VECTOR);
-        if (n++ < 3)
+        int claimed;
+
+        delivered++;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
+        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+        claimed = kernel_raise_interrupt(NV2A_VECTOR);
+        if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
-        fflush(stderr);
+            fflush(stderr);
+        }
     }
 }
 
