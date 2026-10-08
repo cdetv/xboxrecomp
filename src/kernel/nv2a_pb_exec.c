@@ -1336,7 +1336,11 @@ static const VertexAttr *color_attr(void)
 {
     uint32_t a;
 
-    if (s_gpu.attr[3].offset && s_gpu.attr[3].stride)
+    /* Size 0 is how the NV2A says "no array": the format register keeps
+     * whatever offset and stride the previous layout left, so testing those
+     * alone took a disabled slot 3 over Conker's colour in slot 1, and its
+     * glow quad (alpha 0.2) was drawn at full strength. */
+    if (s_gpu.attr[3].size && s_gpu.attr[3].offset && s_gpu.attr[3].stride)
         return &s_gpu.attr[3];
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
         if (s_gpu.attr[a].type == 0 && s_gpu.attr[a].size == 4
