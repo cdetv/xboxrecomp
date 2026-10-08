@@ -65,6 +65,11 @@ int main(void)
     expect("T:\\options.dat", s_save, "TitleData\\4D530051\\options.dat");
     expect("U:\\slot1\\save.bin", s_save, "UserData\\4D530051\\slot1\\save.bin");
 
+    /* XMountUtilityDrive's slot files: console state, not disc content. */
+    expect("\\Device\\Harddisk0\\partition1\\CACHE\\LocalCache00.bin",
+           s_save, "HddCache\\LocalCache00.bin");
+    expect("\\Device\\Harddisk0\\Partition1\\CACHE\\", s_save, "HddCache");
+
     /* Unchanged: the rest of Partition1, a near miss, and the disc. */
     expect("\\Device\\Harddisk0\\Partition1\\media\\level.xpr", s_game, "media\\level.xpr");
     expect("\\Device\\Harddisk0\\Partition1\\TDATAX\\a.bin", s_game, "TDATAX\\a.bin");
@@ -80,6 +85,6 @@ int main(void)
 
     if (!s_ok)
         return 1;
-    puts("PASS: Partition1 TDATA/UDATA go to the save dir, the rest of Partition1 to the game dir");
+    puts("PASS: Partition1 TDATA/UDATA/CACHE go to the save dir, the rest of Partition1 to the game dir");
     return 0;
 }

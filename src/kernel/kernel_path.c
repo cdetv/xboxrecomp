@@ -9,6 +9,7 @@
  *   Z:\               -> <save_dir>/Cache/
  *   \Device\Harddisk0\Partition1\TDATA -> <save_dir>/TitleData/
  *   \Device\Harddisk0\Partition1\UDATA -> <save_dir>/UserData/
+ *   \Device\Harddisk0\Partition1\CACHE -> <save_dir>/HddCache/
  *   \Device\Harddisk0\Partition1\ (rest) -> <game_dir>/
  *
  * The Win32 build emits UTF-16 paths (for CreateFileW); the Linux build
@@ -82,6 +83,12 @@ static const path_rule s_rules[] = {
      * dir, which is the extracted disc. Listed first so they win. */
     { "\\Device\\Harddisk0\\Partition1\\TDATA", 1, "\\TitleData", "/TitleData" },
     { "\\Device\\Harddisk0\\Partition1\\UDATA", 1, "\\UserData",  "/UserData"  },
+    /* XAPI's utility-drive bookkeeping: XMountUtilityDrive keeps one
+     * LocalCacheNN.bin per cache slot in Partition1\CACHE and creates the
+     * directory when it is missing. Console state, not disc content -- under
+     * the Partition1 rule below it was written into the game dir. Kept apart
+     * from Cache (the Z: contents) so the two cannot collide. */
+    { "\\Device\\Harddisk0\\Partition1\\CACHE", 1, "\\HddCache",  "/HddCache"  },
     { "\\Device\\Harddisk0\\Partition1\\",    0, NULL,         NULL          },
     /* The rest of the disk. Partition 0 is the whole raw device, 2 holds
      * system data, and 3-5 are the per-title caches behind X:, Y: and Z:.
