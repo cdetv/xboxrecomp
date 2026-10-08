@@ -1291,10 +1291,18 @@ static unsigned  s_watchdog_secs;
  * Every window is checked against its own pointer, because they are mapped
  * independently and any of them can be absent for this run. The 4 is the
  * width of the read below: an address one or two bytes short of the end is
- * inside the window and still faults. */
+ * inside the window and still faults.
+ *
+ * The low 64 KB below the image is mapped too, and the main thread's TIB lives
+ * there (XBOX_TIB_MAIN). Leaving it out made RECOMP_WATCH refuse fs:[4] -- the
+ * one word a stray write destroys to make SetLastError fault far from the
+ * cause (Conker: "0x00004004 is not in a mapped window; not armed"). Page
+ * zero stays out: RECOMP_TRAP_NULL may have made it PAGE_NOACCESS. */
 static int peek_readable(uint32_t va)
 {
     struct { const void *mapped; uint32_t base; uint64_t size; } win[] = {
+        { XBOX_MAP_START <= XBOX_TIB_MAIN ? g_memory_base : NULL,
+          XBOX_TIB_MAIN, XBOX_BASE_ADDRESS - XBOX_TIB_MAIN },
         { g_memory_base,   XBOX_BASE_ADDRESS, (uint64_t)g_memory_size },
         { g_contig_memory, XBOX_CONTIG_BASE,  XBOX_CONTIG_SIZE },
         { g_nv2a_memory,   XBOX_NV2A_BASE,    XBOX_NV2A_SIZE },
