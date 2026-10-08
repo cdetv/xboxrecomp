@@ -2271,6 +2271,8 @@ static int kernel_raise_interrupt(uint32_t vector)
  * delivered as a burst. */
 #define NV2A_VBLANK_CATCH_UP 8
 
+static unsigned long g_vblanks_delivered;   /* for RECOMP_TIMER_PROFILE */
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
@@ -2302,6 +2304,7 @@ static void kernel_vblank_tick(void)
         int claimed;
 
         delivered++;
+        g_vblanks_delivered++;
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
         BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
         claimed = kernel_raise_interrupt(NV2A_VECTOR);
@@ -2569,6 +2572,48 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* RECOMP_TIMER_PROFILE: every 5 s, how many passes the timer thread made and
+ * where their time went -- vblank delivery, DPCs, timers -- plus the vblanks
+ * delivered. Everything this thread does runs guest code, so one slow
+ * routine delays the GPU clock, every timer and every DPC behind it; this
+ * says which one. */
+
+static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq, start;
+    static double t_vb, t_dpc, t_tmr, max_vb, max_dpc, max_tmr;
+    static unsigned long passes, vb0;
+    LARGE_INTEGER d;
+    double vb, dpc, tmr;
+
+    if (on < 0) {
+        on = getenv("RECOMP_TIMER_PROFILE") != NULL;
+        QueryPerformanceFrequency(&freq);
+        start = a;
+    }
+    if (!on)
+        return;
+    QueryPerformanceCounter(&d);
+    vb  = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    dpc = (double)(c.QuadPart - b.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    tmr = (double)(d.QuadPart - c.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    t_vb += vb; t_dpc += dpc; t_tmr += tmr; passes++;
+    if (vb > max_vb) max_vb = vb;
+    if (dpc > max_dpc) max_dpc = dpc;
+    if (tmr > max_tmr) max_tmr = tmr;
+    if ((double)(d.QuadPart - start.QuadPart) >= 5.0 * (double)freq.QuadPart) {
+        fprintf(stderr, "  [TIMERPROF] 5s: %lu passes, %lu vblanks | ms total/max:"
+                " vblank %.0f/%.1f dpc %.0f/%.1f timers %.0f/%.1f
+",
+                passes, g_vblanks_delivered - vb0, t_vb, max_vb, t_dpc, max_dpc,
+                t_tmr, max_tmr);
+        fflush(stderr);
+        start = d; passes = 0; vb0 = g_vblanks_delivered;
+        t_vb = t_dpc = t_tmr = max_vb = max_dpc = max_tmr = 0.0;
+    }
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2599,10 +2644,14 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     for (;;) {
         long long now;
         int i;
+        LARGE_INTEGER pa, pb, pc;
 
         Sleep(10);
+        QueryPerformanceCounter(&pa);
         kernel_vblank_tick();  /* the GPU's frame clock */
+        QueryPerformanceCounter(&pb);
         kernel_drain_dpcs();   /* deferred work, before due timers */
+        QueryPerformanceCounter(&pc);
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
@@ -2635,6 +2684,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        timer_profile(pa, pb, pc);
     }
 }
 
