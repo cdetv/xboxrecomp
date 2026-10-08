@@ -6,7 +6,11 @@
  * tools/conformance, so no title and no game files are needed. The bridge is
  * called through the thunk dispatcher, the path a title's kernel calls take.
  *
- * One process per mode, because the switches are read once:
+ * One process per mode, because the switches are read once. Every mode first
+ * checks that the main thread's fake KPCR/TLS structures (fs:[0x20], fs:[0x28]
+ * and the area at [fs:[0x28]+0x28]) come from the heap. They used to sit at
+ * fixed addresses around 0x00700000-0x00770000, inside the .data of a large
+ * title, which then overwrote them with its own globals.
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
@@ -207,6 +211,25 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    printf("mode: %s\n", mode);
+
+    /* 0. The main thread's fake KPCR/TLS structures live in the heap, not at
+     * fixed addresses inside a large title's .data/BSS. Every mode. */
+    {
+        uint32_t prcb   = *G(XBOX_FS_BASE + 0x20);
+        uint32_t tls    = *G(XBOX_FS_BASE + 0x28);
+        uint32_t rwdata = tls ? *G(tls + 0x28) : 0;
+#define IN_HEAP(va) ((va) >= XBOX_HEAP_BASE && (va) < XBOX_HEAP_TOP)
+
+        snprintf(d, sizeof d, "at 0x%08X", prcb);
+        check(IN_HEAP(prcb), "fs:[0x20] Prcb stand-in is in the heap, not the image", d);
+        snprintf(d, sizeof d, "at 0x%08X", tls);
+        check(IN_HEAP(tls), "fs:[0x28] structure is in the heap, not the image", d);
+        snprintf(d, sizeof d, "at 0x%08X", rwdata);
+        check(IN_HEAP(rwdata), "[fs:[0x28]+0x28] data area is in the heap, not the image", d);
+#undef IN_HEAP
+    }
+
     scratch = xbox_HeapAlloc(0x10000, 4096);
     for (i = 0; i < N_SLOTS; i++)
         *G(THUNK_VA + 4 * i) = 0x80000000u | ORD[i];
@@ -219,7 +242,6 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    printf("mode: %s\n", mode);
 
     /* 1. A small request after a large free. */
     if (!ext) {

@@ -2140,7 +2140,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      *   fs:[0x20] = KPCR Prcb pointer (→ fake structure)
      *   fs:[0x28] = TLS / RW engine context pointer
      *
-     * We use free space in the BSS area for the fake structures.
+     * The fake structures come from the guest heap, which starts above the
+     * image. They used to sit at fixed addresses (0x00700000, 0x00760000,
+     * 0x00761000, 0x00770000) on the assumption that this was free BSS, but
+     * it is only free for small images: Conker: Live & Reloaded's .data runs
+     * to 0x00881A64 and keeps its own globals at 0x00770000, right where the
+     * main thread's TLS block was. The title then wrote its globals over TLS
+     * slot 0 (what SetLastError writes through) and started with TLS bytes in
+     * globals it expected to be zero. Nothing faults; the pages are mapped
+     * and writable. Same failure as the worker stacks in xbox_AllocThreadStack.
      */
     {
         #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
@@ -2164,19 +2172,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * only worked while page zero was mapped. Pointing at real zeroed
          * memory says the same thing to the title and survives that page being
          * unmapped, which is what makes a genuine null dereference visible. */
-        #define FAKE_PRCB_VA 0x00761000  /* zeroed KPCR Prcb stand-in */
-        memset(XBOX_VA(FAKE_PRCB_VA), 0, 0x400);
-        MEM32_INIT(XBOX_FS_BASE + 0x20, FAKE_PRCB_VA);
-        #undef FAKE_PRCB_VA
+        /* Zeroed KPCR Prcb stand-in (xbox_HeapAlloc zero-fills). */
+        uint32_t fake_prcb_va = xbox_HeapAlloc(0x400, 16);
+        MEM32_INIT(XBOX_FS_BASE + 0x20, fake_prcb_va);
 
         /*
          * fs:[0x28] - Thread local storage / RW engine context.
          * The RW engine reads [fs:[0x28] + 0x28] to get a pointer
-         * to its data area. We allocate a fake structure at 0x00760000
-         * (in the BSS area) and a data buffer at 0x00700000.
+         * to its data area. We allocate a fake structure and a 256 KB
+         * data buffer for it.
          */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        uint32_t fake_tls_va    = xbox_HeapAlloc(0x1000, 16);
+        uint32_t fake_rwdata_va = xbox_HeapAlloc(0x40000, 4096);
+        #define FAKE_TLS_VA     fake_tls_va
+        #define FAKE_RWDATA_VA  fake_rwdata_va
 
         MEM32_INIT(XBOX_FS_BASE + 0x28, FAKE_TLS_VA);
         /* TLS[0x28] = pointer to RW data area */
@@ -2210,8 +2219,6 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * Every guest thread therefore shares LastError. Give this a per-thread
          * allocation when a title is observed to care.
          */
-        #define FAKE_TLS_BLOCK_VA  0x00770000  /* image TLS data          */
-        #define FAKE_TLS_THREAD_VA 0x00770200  /* what slot 0 points at   */
         {
             DWORD tls_dir_va = *(const DWORD *)(xbe + XBE_TLS_ADDR_OFFSET);
 
@@ -2223,9 +2230,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 uint32_t init_size  = (data_end > data_start)
                                     ? data_end - data_start : 0;
                 uint32_t total      = ((init_size + zero_fill + 0xF) & ~0xFu) + 4;
+                /* Image TLS data, then what slot 0 points at (64 bytes), in
+                 * one zeroed block -- the same shape xbox_AllocThreadTib
+                 * gives worker threads. */
+                uint32_t block_va   = xbox_HeapAlloc(((total + 0xF) & ~0xFu) + 64, 16);
+                #define FAKE_TLS_BLOCK_VA  block_va
+                #define FAKE_TLS_THREAD_VA (block_va + ((total + 0xF) & ~0xFu))
 
-                memset(XBOX_VA(FAKE_TLS_BLOCK_VA), 0, total);
-                memset(XBOX_VA(FAKE_TLS_THREAD_VA), 0, 64);
                 if (init_size)
                     memcpy(XBOX_VA(FAKE_TLS_BLOCK_VA),
                            XBOX_VA(data_start), init_size);
