@@ -132,7 +132,7 @@ static void prof_event(MCPXAPUState *d, const char *what, unsigned int v,
     static int64_t t0;
     int64_t now;
 
-    if (!g_apu_prof_on || n >= 1500 || v >= MCPX_HW_MAX_VOICES)
+    if (!g_apu_prof_on || n >= 6000 || v >= MCPX_HW_MAX_VOICES)
         return;
     if (!voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
                         NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
@@ -559,6 +559,12 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             hwaddr addr = d->regs[NV_PAPU_VPSSLADDR]
                           + (d->vp.ssl_base_page * 8)
                           + (method - NV1BA0_PIO_SET_SSL_SEGMENT_OFFSET);
+            if (g_apu_prof_on) {
+                uint32_t rel = (uint32_t)(addr - d->regs[NV_PAPU_VPSSLADDR]);
+                prof_event(d, "wr.page", d->regs[NV_PAPU_FECV], rel / 8);
+                prof_event(d, (rel & 4) ? " .len" : " .addr",
+                           d->regs[NV_PAPU_FECV], argument);
+            }
             stl_le_phys(address_space_memory, addr, argument);
         } else if (method >= NV1BA0_PIO_SET_SUBMIX_HEADROOM &&
                    method <= NV1BA0_PIO_SET_SUBMIX_HEADROOM + 4 * (NUM_MIXBINS - 1)) {
@@ -849,6 +855,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] + page * 8;
         segment_offset = ldl_le_phys(address_space_memory, addr);
         segment_length = ldl_le_phys(address_space_memory, addr + 4);
+        if (g_apu_prof_on && cbo == 0) {     /* a segment starting */
+            prof_event(d, "seg", v, ((uint32_t)ssl_index << 16) | (uint32_t)page);
+            prof_event(d, " .len", v, segment_length);
+            prof_event(d, " .addr", v, (uint32_t)segment_offset);
+        }
         assert(segment_offset != 0);
         assert(segment_length != 0);
         seg_len = (segment_length >> 0) & 0xffff;
