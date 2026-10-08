@@ -8,6 +8,11 @@ checks that both (directly, as bare directories, and through a T: link) go to
 the save dir, and that the rest of Partition1, `TDATAX`-style near misses and
 D: still go to the game dir.
 
+`Partition1\CACHE` is the same kind of leak: XMountUtilityDrive keeps its
+`LocalCacheNN.bin` slot files there and creates the directory if it is
+missing. The test checks it goes to `<save>\HddCache`, apart from `Cache`
+(the Z: contents).
+
 ```powershell
 cmake -S tests/kernel_path_rules -B build/path-rules -A x64
 cmake --build build/path-rules --config Release
