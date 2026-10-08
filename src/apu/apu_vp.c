@@ -132,6 +132,7 @@ static void voice_off(MCPXAPUState *d, uint16_t v)
     bool stream = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
     int notifier = MCPX_HW_NOTIFIER_SSLA_DONE;
+    if (g_apu_prof_on) g_apu_prof.voice_offs++;
     if (stream) {
         assert(v < MCPX_HW_MAX_VOICES);
         assert(d->vp.ssl[v].ssl_index <= 1);
@@ -792,6 +793,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         count = d->vp.ssl[v].count[ssl_index];
 
         if (count == 0) {
+            if (g_apu_prof_on) g_apu_prof.ssl_empty++;
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -911,6 +913,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
+    if (stream && g_apu_prof_on) g_apu_prof.stream_samples += sample_count;
+
     if (cbo >= ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
@@ -921,6 +925,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+                if (g_apu_prof_on) g_apu_prof.ssl_done++;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
@@ -1202,6 +1207,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
                 fe_method(d, SE2FE_IDLE_VOICE, v);
             } else {
+                if (g_apu_prof_on) {
+                    g_apu_prof.voices++;
+                    if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                       NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
+                        g_apu_prof.stream_voices++;
+                }
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
             }
