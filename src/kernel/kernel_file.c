@@ -562,8 +562,15 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 
     if (!GetFileAttributesExW(win_path, GetFileExInfoStandard, &fad)) {
         DWORD err = GetLastError();
-        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+        /* Keep the two apart. A missing leaf is NAME_NOT_FOUND (error 2); a
+         * missing parent directory is PATH_NOT_FOUND (error 3). Titles build
+         * directory trees with a recursive helper that probes attributes and
+         * only creates the parent first on error 3 -- folding both into
+         * NAME_NOT_FOUND makes it create the leaf alone, which then fails. */
+        if (err == ERROR_FILE_NOT_FOUND)
             return STATUS_OBJECT_NAME_NOT_FOUND;
+        if (err == ERROR_PATH_NOT_FOUND)
+            return STATUS_OBJECT_PATH_NOT_FOUND;
         return STATUS_UNSUCCESSFUL;
     }
 
