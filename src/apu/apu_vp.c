@@ -120,6 +120,31 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
                 v | ((val << ctz32(mask)) & mask));
 }
 
+/* RECOMP_APU_PROFILE event trace: what happened to stream voices, in order,
+ * with the time since the first event. The 5 s totals say stream voices sit
+ * idle; this says who paused them and what they were waiting for. */
+static uint8_t s_prof_was_empty[MCPX_HW_MAX_VOICES];
+
+static void prof_event(MCPXAPUState *d, const char *what, unsigned int v,
+                       uint32_t arg)
+{
+    static unsigned int n;
+    static int64_t t0;
+    int64_t now;
+
+    if (!g_apu_prof_on || n >= 1500 || v >= MCPX_HW_MAX_VOICES)
+        return;
+    if (!voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
+                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
+        return;
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (!t0)
+        t0 = now;
+    n++;
+    fprintf(stderr, "  [APUEV] %8.3f %-7s v%-3u 0x%08X\n",
+            (now - t0) / 1000.0, what, v, arg);
+}
+
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
@@ -198,6 +223,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_ON: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        prof_event(d, "on", selected_handle, argument);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -283,6 +309,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_RELEASE: {
         selected_handle = argument & NV1BA0_PIO_VOICE_ON_HANDLE;
+        prof_event(d, "release", selected_handle, argument);
 
         bool locked = is_voice_locked(d, (uint16_t)selected_handle);
         if (!locked) voice_lock(d, (uint16_t)selected_handle, true);
@@ -309,10 +336,14 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     }
 
     case NV1BA0_PIO_VOICE_OFF:
+        prof_event(d, "off", argument & NV1BA0_PIO_VOICE_OFF_HANDLE, argument);
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
     case NV1BA0_PIO_VOICE_PAUSE:
+        prof_event(d, (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) ? "pause"
+                                                                   : "resume",
+                   argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE, argument);
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
@@ -452,6 +483,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 0;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        prof_event(d, "ssl_a", current_voice, argument);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -462,6 +494,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         int ssl = 1;
         int current_voice = d->regs[NV_PAPU_FECV];
         assert(current_voice < MCPX_HW_MAX_VOICES);
+        prof_event(d, "ssl_b", current_voice, argument);
         d->vp.ssl[current_voice].base[ssl] =
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
@@ -794,6 +827,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 
         if (count == 0) {
             if (g_apu_prof_on) g_apu_prof.ssl_empty++;
+            if (!s_prof_was_empty[v]) {     /* once per run of empty frames */
+                s_prof_was_empty[v] = 1;
+                prof_event(d, "empty", v, (uint32_t)ssl_index);
+            }
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -913,7 +950,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         }
     }
 
-    if (stream && g_apu_prof_on) g_apu_prof.stream_samples += sample_count;
+    if (stream && g_apu_prof_on) {
+        g_apu_prof.stream_samples += sample_count;
+        if (sample_count) s_prof_was_empty[v] = 0;
+    }
 
     if (cbo >= ebo) {
         if (stream) {
@@ -926,6 +966,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 if (g_apu_prof_on) g_apu_prof.ssl_done++;
+                prof_event(d, "done", v, (uint32_t)ssl_index);
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
                                   NV1BA0_NOTIFICATION_STATUS_DONE_SUCCESS);
             }
