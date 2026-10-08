@@ -2278,6 +2278,14 @@ static void kernel_drain_dpcs(void);
  * many the ISR declined, and the longest ISR + DPC time. Read-only. */
 static uint32_t g_vblank_counter_va;
 static unsigned long g_vblanks_counted, g_vblanks_declined;
+
+/* While a vblank is being delivered, the ack thread leaves its bits alone
+ * until D3D acknowledges (xbox_memory_layout.c, nv2a_ack_thread). The marker
+ * rides in an undefined PCRTC_INTR_0 bit so D3D's write of 1 replaces it; the
+ * deadline is only there for a title that acknowledges some other way. */
+#define NV2A_VBLANK_RAISED  0x80000000u
+#define NV2A_VBLANK_HOLD_MS 100
+volatile LONG64 g_nv2a_vblank_hold_until_ms;
 static double g_vblank_isr_max_ms;
 
 static void kernel_vblank_tick(void)
@@ -2316,8 +2324,16 @@ static void kernel_vblank_tick(void)
 
         delivered++;
         g_vblanks_delivered++;
-        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-        BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+        /* Hold first, then raise: see nv2a_ack_thread for why the bits must
+         * survive until D3D acknowledges them. */
+        InterlockedExchange64(&g_nv2a_vblank_hold_until_ms,
+                              (LONG64)GetTickCount64() + NV2A_VBLANK_HOLD_MS);
+        InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE
+                                                     + NV2A_PCRTC_INTR_0),
+                      (LONG)(NV2A_PCRTC_INTR_VBLANK | NV2A_VBLANK_RAISED));
+        InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE
+                                                     + NV2A_PMC_INTR_0),
+                      (LONG)NV2A_PMC_INTR_PCRTC);
         {
             uint32_t before = g_vblank_counter_va
                             ? BRIDGE_MEM32(g_vblank_counter_va) : 0;
@@ -2343,6 +2359,16 @@ static void kernel_vblank_tick(void)
                     g_vblanks_declined++;
             }
         }
+        /* Delivery is over: whatever D3D did with it, this vblank is done.
+         * Dropping the bits here rather than leaving them to the ack thread
+         * means the next raise always finds them clear. */
+        InterlockedExchange64(&g_nv2a_vblank_hold_until_ms, 0);
+        InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE
+                                                      + NV2A_PMC_INTR_0),
+                       (LONG)~NV2A_PMC_INTR_PCRTC);
+        InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE
+                                                      + NV2A_PCRTC_INTR_0),
+                       (LONG)~(NV2A_PCRTC_INTR_VBLANK | NV2A_VBLANK_RAISED));
         if (n++ < 3) {
             fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
                     claimed < 0 ? "not callable" :
