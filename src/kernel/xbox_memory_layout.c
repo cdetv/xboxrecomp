@@ -1593,7 +1593,7 @@ void xbox_PeekSample(const char *label)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
     const char *spec = getenv("RECOMP_PEEK");
-    char buf[256], *q, *end;
+    char buf[1024], *q, *end;
 
     if (!spec || !*spec || g_memory_base == NULL)
         return;
@@ -1624,7 +1624,23 @@ void xbox_PeekSample(const char *label)
         }
         if (*end == '+')
             a += (uint32_t)strtoul(end + 1, &end, 0);
-        if (ok && peek_readable(a))
+        if (*end == ':') {
+            /* "0x01CCC030:0x180" dumps a block, eight dwords per line: when
+             * the question is which field of a structure changed between two
+             * snapshots, naming the fields first is guessing. */
+            uint32_t len = (uint32_t)strtoul(end + 1, &end, 0), off;
+            if (len > 0x1000)
+                len = 0x1000;
+            for (off = 0; ok && off < len; off += 4) {
+                if (off % 32 == 0)
+                    fprintf(stderr, "\n    %08X:", a + off);
+                if (peek_readable(a + off))
+                    fprintf(stderr, " %08X", *(const uint32_t *)(mem + a + off));
+                else
+                    fprintf(stderr, " ????????");
+            }
+            fprintf(stderr, "\n   ");
+        } else if (ok && peek_readable(a))
             fprintf(stderr, " [%08X]=%08X", a, *(const uint32_t *)(mem + a));
         else
             fprintf(stderr, " [%08X]=??", a);
