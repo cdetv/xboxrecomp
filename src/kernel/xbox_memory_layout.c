@@ -873,6 +873,39 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* A vblank the timer thread raised (kernel_bridge.c) and the title has not
+ * acknowledged yet.
+ *
+ * Clearing the interrupt registers on sight is right for interrupts nothing
+ * raises, but the vblank is raised, and this loop runs flat out: it cleared
+ * PMC_INTR_0's PCRTC bit in the few microseconds between the timer thread
+ * setting it and D3D's DPC reading it, so the DPC found nothing and the
+ * vblank went uncounted. Conker's D3D counted about 110 of every 300.
+ *
+ * So the vblank bits are held while the timer thread is delivering, until the
+ * title acknowledges -- PCRTC_INTR_0 is write-1-to-clear, and D3D writes 1.
+ * The timer thread writes the vblank bit together with NV2A_VBLANK_RAISED; a
+ * plain write of 1 replaces that marker, which is how the acknowledgement is
+ * seen in plain memory. The hold also ends when the timer thread finishes the
+ * delivery, or at its deadline.
+ *
+ * ponytail: a title that acknowledges by writing back what it read keeps the
+ * marker and spins until the deadline on every vblank -- slow, not hung. */
+#define NV2A_PMC_INTR_0_OFS      0x000100u
+#define NV2A_PMC_INTR_PCRTC_BIT  (1u << 24)
+#define NV2A_PCRTC_INTR_0_OFS    0x600100u
+#define NV2A_VBLANK_RAISED       0x80000000u
+extern volatile LONG64 g_nv2a_vblank_hold_until_ms;
+
+static int nv2a_vblank_held(volatile uint32_t *regs)
+{
+    LONG64 until = InterlockedCompareExchange64(&g_nv2a_vblank_hold_until_ms,
+                                                0, 0);
+    uint32_t pcrtc = *(volatile uint32_t *)((char *)regs + NV2A_PCRTC_INTR_0_OFS);
+    return until && (pcrtc & NV2A_VBLANK_RAISED)
+        && (LONG64)GetTickCount64() < until;
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
@@ -880,9 +913,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            if (*r & NV2A_ACK[i].busy_mask) {
-                *r &= ~NV2A_ACK[i].busy_mask;
-            }
+            uint32_t mask = NV2A_ACK[i].busy_mask;
+            uint32_t v = *r;
+            if (!(v & mask))
+                continue;
+            /* Read, then ask about the hold, then clear only if the register
+             * still holds what was read: the timer thread sets the hold before
+             * it raises the bits, so a vblank raised after the read is either
+             * seen as held or makes the exchange fail. */
+            if (NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS
+                && nv2a_vblank_held(regs))
+                mask &= ~NV2A_PMC_INTR_PCRTC_BIT;
+            if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
+                && nv2a_vblank_held(regs))
+                mask = 0;
+            if (v & mask)
+                InterlockedCompareExchange((volatile LONG *)r,
+                                           (LONG)(v & ~mask), (LONG)v);
         }
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
