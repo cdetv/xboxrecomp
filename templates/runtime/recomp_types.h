@@ -391,6 +391,14 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* The guest's I/O ports (`in` / `out`), size 1, 2 or 4 bytes.
+ *
+ * xbox_PortIn is given the register's current value and returns it unchanged
+ * for a port the runtime does not model -- what the lifter's old no-op did --
+ * so only the ports listed in kernel_hal.c change behaviour. */
+uint32_t xbox_PortIn(uint16_t port, int size, uint32_t old);
+void xbox_PortOut(uint16_t port, int size, uint32_t value);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);

@@ -1052,3 +1052,55 @@ uint64_t xbox_ReadTimeStampCounter(void)
              + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
     }
 }
+
+/* =========================================================================
+ * Port I/O: the guest's `in` / `out`
+ *
+ * The lifter used to leave these as no-ops, so an `in` returned whatever the
+ * register held before. Ports the runtime does not model still do exactly
+ * that -- xbox_PortIn hands `old` back -- and are logged once each, so a run
+ * says which ports a title actually touches.
+ *
+ * Modelled:
+ *   0x80C0  MCPX ACPI/PM GPIO. Bit 5 is the TV encoder's field pin: the D3D
+ *           vblank handler stores ~bit5 & 1 as the current field, and
+ *           D3DDevice_GetDisplayFieldStatus reports it on an interlaced mode.
+ *           XMV will not start its playback clock on field 1, so a stale al
+ *           here kept Conker's intro movie from ever releasing a frame.
+ *           xemu reads 0x20 here every time (seen at hits 100-102 of the
+ *           read in Conker's handler), so the field is always 2; this
+ *           matches it rather than toggling per vblank.
+ * ========================================================================= */
+#define XBOX_PORT_GPIO_FIELD 0x80C0u
+
+static int port_first_use(uint16_t port, int is_out)
+{
+    /* One bit per port and direction: 2 x 64K bits. */
+    static volatile LONG seen[2][65536 / 32];
+    LONG bit = 1L << (port & 31);
+    return (InterlockedOr(&seen[is_out][port >> 5], bit) & bit) == 0;
+}
+
+uint32_t xbox_PortIn(uint16_t port, int size, uint32_t old)
+{
+    switch (port) {
+    case XBOX_PORT_GPIO_FIELD:
+        return 0x20u;
+    default:
+        if (port_first_use(port, 0)) {
+            fprintf(stderr, "  [PORT] in  0x%04X (%d bytes) not modelled; "
+                            "register left as 0x%X\n", port, size, old);
+            fflush(stderr);
+        }
+        return old;
+    }
+}
+
+void xbox_PortOut(uint16_t port, int size, uint32_t value)
+{
+    if (port_first_use(port, 1)) {
+        fprintf(stderr, "  [PORT] out 0x%04X (%d bytes) = 0x%X not modelled\n",
+                port, size, value);
+        fflush(stderr);
+    }
+}

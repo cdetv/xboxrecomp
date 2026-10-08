@@ -1698,6 +1698,44 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── Port I/O ──
+        #
+        # in/out reach the MCPX's I/O ports (SMBus, ACPI/PM, GPIO). They were
+        # RECOMP_UNIMPL, so an `in` left al/eax holding whatever was there
+        # before -- and a title that reads a status bit from a port read
+        # garbage. The D3D vblank handler takes the TV field (odd/even) from
+        # bit 5 of port 0x80C0; XMV only starts its clock on a field other
+        # than 1, so with a stale al Conker's intro movie never released a
+        # frame.
+        #
+        # The runtime decides per port. xbox_PortIn gets the old register
+        # value and hands it back for a port it does not model, so a port
+        # nobody models behaves exactly as before. The string forms
+        # (ins/outs) stay unimplemented: on the titles seen so far they are
+        # all a linear sweep over data.
+        if m in ("in", "out") and len(ops) == 2:
+            port_op, reg_op = (ops[1], ops[0]) if m == "in" else (ops[0], ops[1])
+            if port_op.type == "imm" and port_op.imm is not None:
+                port = f"0x{port_op.imm & 0xFFFF:X}u"
+            elif port_op.type == "reg" and port_op.reg == "dx":
+                port = "LO16(edx)"
+            else:
+                return self._unimplemented(insn, m)
+            if reg_op.type != "reg" or reg_op.reg not in ("al", "ax", "eax"):
+                return self._unimplemented(insn, m)
+            size = {"al": 1, "ax": 2, "eax": 4}[reg_op.reg]
+            text = f"{m} {insn.op_str}".strip()
+            if m == "in":
+                old = {"al": "LO8(eax)", "ax": "LO16(eax)", "eax": "eax"}[reg_op.reg]
+                val = f"xbox_PortIn({port}, {size}, {old})"
+                if size == 1:
+                    return [f"SET_LO8(eax, {val}); /* {text} */"]
+                if size == 2:
+                    return [f"SET_LO16(eax, {val}); /* {text} */"]
+                return [f"eax = {val}; /* {text} */"]
+            src = {"al": "LO8(eax)", "ax": "LO16(eax)", "eax": "eax"}[reg_op.reg]
+            return [f"xbox_PortOut({port}, {size}, {src}); /* {text} */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the
