@@ -542,6 +542,45 @@ static void note_drawn(void)
     s_gpu.drawn_w = s_gpu.clip_w; s_gpu.drawn_h = s_gpu.clip_h;
 }
 
+/* Mean R, G, B (0..255) of the current colour surface over its clip, from a
+ * 32 x 32 grid of samples, and the brightest channel seen. For the frame
+ * trace only: cheap enough per batch, and exact enough to say which batch
+ * turned a picture white or black. */
+static void surface_mean(uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *mx)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t bpp = surface_bpp(), sx, sy, n = 0;
+    uint64_t tr = 0, tg = 0, tb = 0;
+
+    *r = *g = *b = *mx = 0;
+    if (!s_gpu.color_offset || !s_gpu.clip_w || !s_gpu.clip_h
+        || (bpp != 2 && bpp != 4))
+        return;
+    for (sy = 0; sy < 32; sy++) {
+        uint32_t y = s_gpu.clip_y + (s_gpu.clip_h * (2 * sy + 1)) / 64;
+        const uint8_t *row = mem + dma_resolve(s_gpu.color_offset)
+                           + (size_t)y * s_gpu.pitch;
+        for (sx = 0; sx < 32; sx++) {
+            uint32_t x = s_gpu.clip_x + (s_gpu.clip_w * (2 * sx + 1)) / 64;
+            uint32_t cr, cg, cb;
+            if (bpp == 4) {
+                uint32_t v = ((const uint32_t *)row)[x];
+                cr = (v >> 16) & 0xFF; cg = (v >> 8) & 0xFF; cb = v & 0xFF;
+            } else {
+                uint16_t v = ((const uint16_t *)row)[x];
+                cr = ((v >> 11) & 0x1F) << 3;
+                cg = ((v >> 5) & 0x3F) << 2;
+                cb = (v & 0x1F) << 3;
+            }
+            tr += cr; tg += cg; tb += cb; n++;
+            if (cr > *mx) *mx = cr;
+            if (cg > *mx) *mx = cg;
+            if (cb > *mx) *mx = cb;
+        }
+    }
+    *r = (uint32_t)(tr / n); *g = (uint32_t)(tg / n); *b = (uint32_t)(tb / n);
+}
+
 static uint32_t surface_bpp(void)
 {
     /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
@@ -2455,6 +2494,21 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            {
+                /* What the batch did to the picture, not just how many
+                 * pixels it touched: the target's mean colour over the clip
+                 * after the batch, and vertex 0's diffuse (slot 3), which
+                 * carries a fixed-function quad's fade/strength. A
+                 * post-process chain that ends white names its culprit as
+                 * the first batch whose mean jumps. */
+                float d[4];
+                uint32_t mr, mg, mb, mx;
+                surface_mean(&mr, &mg, &mb, &mx);
+                fetch_attr(&s_gpu.attr[3], s_gpu.idx[0], d);
+                fprintf(stderr, "[FTRACE]     after: mean rgb %u %u %u max %u"
+                        " | v0 diffuse %.3f %.3f %.3f a %.3f%c",
+                        mr, mg, mb, mx, d[0], d[1], d[2], d[3], 10);
+            }
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
