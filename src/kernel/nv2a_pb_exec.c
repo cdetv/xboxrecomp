@@ -2052,9 +2052,73 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
 }
 #endif
 
+/* RECOMP_PIXEL_PROBE=x,y[,first_flip]: every program-path triangle that
+ * covers screen pixel (x, y) is logged with the pixel before and after it and
+ * what decided its colour. A wrong area on screen says nothing about which
+ * of a thousand draws made it; this names the draw. Up to 400 lines, from
+ * flip first_flip on. */
+static struct { int on, x, y; uint32_t from_flip, hits; } s_probe = { -1 };
+static int s_probe_clipped;             /* triangle came from near clipping */
+
+static int probe_init(void)
+{
+    if (s_probe.on < 0) {
+        const char *e = getenv("RECOMP_PIXEL_PROBE");
+        s_probe.on = 0;
+        if (e && sscanf(e, "%d,%d,%u", &s_probe.x, &s_probe.y,
+                        &s_probe.from_flip) >= 2)
+            s_probe.on = 1;
+    }
+    return s_probe.on;
+}
+
+static uint32_t probe_read(uint32_t bpp)
+{
+    const uint8_t *row = s_surface + (size_t)s_probe.y * s_gpu.pitch;
+    if (bpp == 4)
+        return ((const uint32_t *)row)[s_probe.x];
+    {
+        uint32_t t = ((const uint16_t *)row)[s_probe.x];
+        return 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+             | ((t & 0x001Fu) << 3);
+    }
+}
+
+static int probe_covers(const float *a, const float *b, const float *c)
+{
+    float px = (float)s_probe.x + 0.5f, py = (float)s_probe.y + 0.5f;
+    float w0 = (b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0]);
+    float w1 = (c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0]);
+    float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
+    return (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
+}
+
+static void probe_log(const XfTri *T, uint32_t before, uint32_t after)
+{
+    const Nv2aVshOutput *v[3];
+    int k;
+    v[0] = T->va; v[1] = T->vb; v[2] = T->vc;
+    fprintf(stderr, "[PROBE] flip %u draw %u: %08X -> %08X%s  tex0 %s fmt %02X"
+            " at %08X  rc %d prog %05X  blend %d %X/%X  depth %d %X mask %d"
+            "  alpha %d\n", s_gpu.flips, s_gpu.draws, before, after,
+            s_probe_clipped ? " (near-clipped)" : "",
+            s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].color,
+            s_gpu.texs[0].offset, T->use_rc, s_gpu.rc.stage_program,
+            s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
+            s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+            s_gpu.alpha_test);
+    for (k = 0; k < 3; k++)
+        fprintf(stderr, "[PROBE]   v%d pos %.1f %.1f %.4f w %.3f  d0 %.2f %.2f"
+                " %.2f %.2f  t0 %.3f %.3f\n", k, v[k]->pos[0], v[k]->pos[1],
+                v[k]->pos[2], v[k]->pos[3], v[k]->d0[0], v[k]->d0[1],
+                v[k]->d0[2], v[k]->d0[3], v[k]->tex[0][0], v[k]->tex[0][1]);
+}
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
+    uint32_t probe_before = 0;
+    int probe = 0;
     XfTri T;
     XfCount cnt = {0, 0, 0};
     const Nv2aVshOutput *v[3];
@@ -2137,7 +2201,17 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
 
+    if (probe_init() && s_probe.hits < 400 && s_gpu.flips >= s_probe.from_flip
+        && s_probe.x >= T.minx && s_probe.x < T.maxx
+        && s_probe.y >= T.miny && s_probe.y < T.maxy && probe_covers(a, b, c)) {
+        probe = 1;
+        probe_before = probe_read(T.bpp);
+    }
     xf_rows_parallel(&T, &cnt);
+    if (probe) {
+        s_probe.hits += 4;
+        probe_log(&T, probe_before, probe_read(T.bpp));
+    }
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
     s_gpu.zpass_count += cnt.zpass;
@@ -2227,8 +2301,10 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
             poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+    s_probe_clipped = 1;
     for (i = 1; i + 1 < n; i++)
         raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+    s_probe_clipped = 0;
 }
 
 static Nv2aVshOutput s_xf[NV_MAX_INDICES];
@@ -2313,6 +2389,31 @@ static void raster_batch_program(void)
     if (s_gpu.texs[0].valid)
         note_texture_use();
 
+    /* The probe's first frame also gets one line per batch: where its
+     * triangles went, and how many vertices came out of the program as
+     * NaN or infinity -- a triangle dropped before the rasteriser never
+     * reaches the pixel probe. */
+    if (probe_init() && s_gpu.flips == s_probe.from_flip) {
+        uint32_t drawn = s_gpu.xf_drawn, degen = s_gpu.xf_degenerate;
+        uint32_t off = s_gpu.xf_offscreen, behind = s_gpu.tris_behind;
+        uint32_t bad = 0, k;
+        for (i = 0; i < n; i++)
+            for (k = 0; k < 4; k++)
+                if (!isfinite(s_xf[i].pos[k])) {
+                    bad++;
+                    break;
+                }
+        raster_xf_prims(n);
+        fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u (%u NaN/inf):"
+                " %u drawn, %u degenerate/NaN, %u off, %u behind  tex0 %s"
+                " fmt %02X  blend %d %X/%X  depth %d mask %d\n", s_gpu.draws,
+                s_gpu.prim, n, bad, s_gpu.xf_drawn - drawn,
+                s_gpu.xf_degenerate - degen, s_gpu.xf_offscreen - off,
+                s_gpu.tris_behind - behind, s_gpu.texs[0].valid ? "on" : "off",
+                s_gpu.texs[0].color, s_gpu.blend_enable, s_gpu.blend_sfactor,
+                s_gpu.blend_dfactor, s_gpu.depth_test, s_gpu.depth_mask);
+        return;
+    }
     raster_xf_prims(n);
 }
 
