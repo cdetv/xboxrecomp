@@ -2710,10 +2710,14 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
  *
  * PGRAPH_INTR is write-1-to-clear, and D3D acknowledges by writing back what
  * it read. Against plain memory that leaves the bit set, d3d_gpu_dpc calls
- * the handler again, and the patch is applied twice. For the length of a
- * delivery the register's page is a guard page: each access to it is caught,
- * single-stepped, and a write to PGRAPH_INTR turned into a clear of the bits
- * written (pgraph_w1c_veh).
+ * the handler again, and the patch is applied twice. The handler runs on the
+ * timer thread, so that thread alone carries a hardware write breakpoint on
+ * PGRAPH_INTR (debug register 0, set when it is created): during a delivery a
+ * write there is turned into a clear of the bits written (pgraph_w1c_veh).
+ * A guard page on the register's page came first (runs 110-113) and was
+ * wrong: it traps every thread, and the main thread polls 0x400B10 on the
+ * same page in a tight loop, so each D trap took 5-10 s, and a write landing
+ * while another thread had the page unguarded went unseen.
  *
  * ponytail: one trap in flight, and the executor waits for it -- which is
  * what the hardware does too. The W1C emulation assumes dword writes, which
@@ -2735,61 +2739,59 @@ static unsigned long g_swm_unacked, g_swm_retries;
 static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
 
 static volatile LONG g_w1c_armed;
-static uintptr_t g_w1c_page;                 /* host address, PGRAPH page 0 */
-static __declspec(thread) struct {
-    int pending, write;
-    uint32_t before;
-} t_w1c;
+static uint32_t g_w1c_value;     /* what PGRAPH_INTR holds while armed */
+static DWORD g_w1c_thread;       /* the timer thread, which has the breakpoint */
 
-/* Only the faulting thread can be inside its step: a guard page fires once
- * and stays clear until that thread re-arms it, so no other thread traps in
- * between and reading the register here does not fault. */
+#define W1C_REG ((volatile uint32_t *)((uintptr_t)(XBOX_NV2A_REG_BASE \
+                    + NV2A_PGRAPH_INTR) + (uintptr_t)g_xbox_mem_offset))
+
+/* A data breakpoint traps after the write, so the value before it is the one
+ * kept in g_w1c_value; nothing else writes the register during a delivery
+ * (the ack thread leaves it alone, nv2a_handshake_pass). */
 static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
 {
-    PEXCEPTION_RECORD er = ep->ExceptionRecord;
-    volatile uint32_t *reg = (volatile uint32_t *)(g_w1c_page
-                                                   + (NV2A_PGRAPH_INTR & 0xFFFu));
+    PCONTEXT c = ep->ContextRecord;
 
-    if (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
-        uintptr_t a = (uintptr_t)er->ExceptionInformation[1];
-        if (!g_w1c_page || a - g_w1c_page >= 0x1000u)
-            return EXCEPTION_CONTINUE_SEARCH;
-        t_w1c.pending = 1;
-        t_w1c.write = er->ExceptionInformation[0] == 1
-                   && a >= (uintptr_t)reg && a < (uintptr_t)reg + 4;
-        t_w1c.before = *reg;
-        ep->ContextRecord->EFlags |= 0x100u;          /* TF: trap after it */
-        return EXCEPTION_CONTINUE_EXECUTION;
+    /* Nothing else single-steps the timer thread, so its single-step trap is
+     * this breakpoint even if the context should not report DR6. */
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP
+            || GetCurrentThreadId() != g_w1c_thread)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedCompareExchange(&g_w1c_armed, 0, 0)) {
+        g_w1c_value &= ~*W1C_REG;
+        *W1C_REG = g_w1c_value;
     }
-    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_w1c.pending) {
-        DWORD old;
-        t_w1c.pending = 0;
-        if (t_w1c.write)
-            *reg = t_w1c.before & ~*reg;
-        ep->ContextRecord->EFlags &= ~0x100u;
-        if (InterlockedCompareExchange(&g_w1c_armed, 0, 0))
-            VirtualProtect((LPVOID)g_w1c_page, 0x1000, PAGE_READWRITE | PAGE_GUARD,
-                           &old);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
+/* Called with the timer thread created suspended: DR0 = PGRAPH_INTR, 4 bytes,
+ * break on write (DR7 L0, RW0 = 01, LEN0 = 11). 0 if it could not be set, in
+ * which case deliveries go ahead and D3D's handler may run twice. */
+static int pgraph_w1c_install(HANDLE thread, DWORD tid)
+{
+    CONTEXT c;
+
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &c))
+        return 0;
+    c.Dr0 = (DWORD64)(uintptr_t)W1C_REG;
+    c.Dr7 = (c.Dr7 & ~0x000F0003ull) | 0x1ull | (0x1ull << 16) | (0x3ull << 18);
+    if (!SetThreadContext(thread, &c))
+        return 0;
+    g_w1c_thread = tid;
+    AddVectoredExceptionHandler(1, pgraph_w1c_veh);
+    return 1;
+}
+
+/* After the registers are raised, before the ISR runs; off again before
+ * they are cleared, so neither of our own writes is taken as D3D's. */
 static void pgraph_w1c_arm(int on)
 {
-    static int registered;
-    DWORD old;
-
-    if (!g_w1c_page)
-        g_w1c_page = (uintptr_t)(XBOX_NV2A_REG_BASE + (NV2A_PGRAPH_INTR & ~0xFFFu))
-                   + (uintptr_t)g_xbox_mem_offset;
-    if (on && !registered) {
-        AddVectoredExceptionHandler(1, pgraph_w1c_veh);
-        registered = 1;
-    }
+    if (on)
+        g_w1c_value = *W1C_REG;
     InterlockedExchange(&g_w1c_armed, on);
-    VirtualProtect((LPVOID)g_w1c_page, 0x1000,
-                   on ? PAGE_READWRITE | PAGE_GUARD : PAGE_READWRITE, &old);
 }
 
 static uint32_t swm_codes(void)
@@ -3006,7 +3008,23 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
         InitializeCriticalSection(&g_timer_lock);
         g_timer_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        {
+            DWORD tid;
+            HANDLE h = CreateThread(NULL, 0, kernel_timer_thread, NULL,
+                                    CREATE_SUSPENDED, &tid);
+            if (h) {
+                /* Before it runs: PGRAPH_INTR's write breakpoint is this
+                 * thread's alone (pgraph_w1c_veh). */
+                if (swm_codes() && !pgraph_w1c_install(h, tid)) {
+                    fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
+                            " on PGRAPH_INTR (error %lu); a PGRAPH trap may be"
+                            " handled twice\n", GetLastError());
+                    fflush(stderr);
+                }
+                ResumeThread(h);
+                CloseHandle(h);
+            }
+        }
     }
 
     EnterCriticalSection(&g_timer_lock);
