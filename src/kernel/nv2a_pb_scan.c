@@ -255,6 +255,17 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             if (mode == PB_RING) {
                 uint32_t back = 0, site = va - 4, want = va, code = 0;
                 if (!s_ring_hi || pb_in_ring(tva)) {
+                    /* Forward within the words still to walk: D3D jumps
+                     * over the rest of a reserved block (often just to
+                     * the next dword), and the GPU simply follows. Taking
+                     * that for the wrap ended the segment there, so
+                     * everything up to the real wrap -- fences included
+                     * -- was never run, and the title waited for good on
+                     * a fence it had submitted (runs 125-126). */
+                    if (s_ring_hi && tva >= va && tva <= end_va) {
+                        va = tva;
+                        continue;
+                    }
                     if (exit_va)              /* the ring wrapping: where to */
                         *exit_va = tva;
                     break;
