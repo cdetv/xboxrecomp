@@ -332,6 +332,10 @@ static struct {
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
     uint32_t zeta_offset, zstencil_clear;
+    /* Stencil, as the methods give it: GL enums for the function and ops,
+     * STENCIL_MASK the write mask and FUNC_MASK the read mask. */
+    uint32_t stencil_test, stencil_func, stencil_ref, stencil_rmask;
+    uint32_t stencil_wmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -1720,12 +1724,20 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
  * plane; road right under the camera is where that shows. Clip in
  * homogeneous space if it matters. */
 
-/* Depth buffers, host-side, one per zeta surface the title uses. The real one
- * lives in guest memory in a tiled format nothing here decodes, and nothing
- * the title does reads it back, so a float buffer per zeta offset is enough. */
+/* Depth and stencil buffers, host-side, one per zeta surface the title uses:
+ * float depth and a byte of stencil per pixel. The guest's own copy is only
+ * written when a texture reads the zeta surface (zeta_readback): Conker builds
+ * its glow from the stencil, sampling the Z24S8 buffer as LIN_R8G8B8A8 so the
+ * stencil byte is alpha, and alpha-testing it. With nothing in guest memory
+ * every pixel failed and the glow chain added black (run 154). */
 #define NV_ZBUF_W 1024
 #define NV_ZBUF_H 1024
-static struct { uint32_t offset; float *z; } s_zbufs[4];
+static struct {
+    uint32_t offset, zf;        /* zf: zeta format, 1 Z16, 2 Z24S8 */
+    float *z;
+    uint8_t *s;
+    int dirty;                  /* written since the guest copy was */
+} s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
 
@@ -1737,31 +1749,143 @@ static float zclear_value(void)
                    : (float)(s_gpu.zstencil_clear >> 8);
 }
 
-static float *zbuf_current(int create)
+static int zbuf_slot(int create)
 {
     int i;
-    size_t k;
+    size_t k, n = (size_t)NV_ZBUF_W * NV_ZBUF_H;
 
     for (i = 0; i < 4; i++)
         if (s_zbufs[i].z && s_zbufs[i].offset == s_gpu.zeta_offset)
-            return s_zbufs[i].z;
+            return i;
     if (!create)
-        return NULL;
+        return -1;
     i = s_zbuf_next++ & 3;
     if (!s_zbufs[i].z)
-        s_zbufs[i].z = (float *)malloc(sizeof(float) * NV_ZBUF_W * NV_ZBUF_H);
-    if (!s_zbufs[i].z)
-        return NULL;
+        s_zbufs[i].z = (float *)malloc(sizeof(float) * n);
+    if (!s_zbufs[i].s)
+        s_zbufs[i].s = (uint8_t *)malloc(n);
+    if (!s_zbufs[i].z || !s_zbufs[i].s)
+        return -1;
     s_zbufs[i].offset = s_gpu.zeta_offset;
-    for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
+    s_zbufs[i].zf = (s_gpu.format >> 4) & 0xF;
+    s_zbufs[i].dirty = 1;
+    for (k = 0; k < n; k++)
         s_zbufs[i].z[k] = 3.4e38f;
-    return s_zbufs[i].z;
+    memset(s_zbufs[i].s, 0, n);
+    return i;
+}
+
+static float *zbuf_current(int create)
+{
+    int i = zbuf_slot(create);
+    return i < 0 ? NULL : s_zbufs[i].z;
+}
+
+static uint8_t *sbuf_current(int create)
+{
+    int i = zbuf_slot(create);
+    return i < 0 ? NULL : s_zbufs[i].s;
+}
+
+/* The batch about to draw may write depth or stencil: the guest copy is
+ * stale from here on. */
+static void zbuf_touch(void)
+{
+    int i = zbuf_slot(0);
+    if (i >= 0) {
+        s_zbufs[i].dirty = 1;
+        s_zbufs[i].zf = (s_gpu.format >> 4) & 0xF;
+    }
+}
+
+static void sbuf_clear(void)
+{
+    uint8_t *s = sbuf_current(1);
+    if (s)
+        memset(s, (int)(s_gpu.zstencil_clear & 0xFF),
+               (size_t)NV_ZBUF_W * NV_ZBUF_H);
+    zbuf_touch();
+}
+
+/* Write a zeta surface the title is about to sample into guest memory, in
+ * the surface's own format, over the rectangle the texture reads. Linear
+ * textures only (a depth texture made from a render target is); the depth is
+ * already in Z24 or Z16 units, as the clear value is.
+ * ponytail: a float zeta format (SET_CONTROL0) is written as fixed. */
+static void zeta_readback(const Texture *t)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t w, h, x, y;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        if (s_zbufs[i].z && s_zbufs[i].dirty
+            && (s_zbufs[i].offset & 0x0FFFFFFFu) == (t->offset & 0x0FFFFFFFu))
+            break;
+    if (i == 4 || tex_size_from_format(t->color) || !t->pitch)
+        return;
+    w = t->width < NV_ZBUF_W ? t->width : NV_ZBUF_W;
+    h = t->height < NV_ZBUF_H ? t->height : NV_ZBUF_H;
+    for (y = 0; y < h; y++) {
+        const float *zr = s_zbufs[i].z + (size_t)y * NV_ZBUF_W;
+        const uint8_t *sr = s_zbufs[i].s + (size_t)y * NV_ZBUF_W;
+        uint8_t *row = mem + t->offset + (size_t)y * t->pitch;
+        for (x = 0; x < w; x++) {
+            float z = zr[x];
+            if (s_zbufs[i].zf == 1) {
+                uint16_t v = (uint16_t)(z <= 0.0f ? 0.0f
+                                      : z >= 65535.0f ? 65535.0f : z);
+                if ((x + 1) * 2 <= t->pitch)
+                    memcpy(row + x * 2, &v, 2);
+            } else {
+                uint32_t v = (uint32_t)(z <= 0.0f ? 0.0f
+                                      : z >= 16777215.0f ? 16777215.0f : z);
+                v = v << 8 | sr[x];
+                if ((x + 1) * 4 <= t->pitch)
+                    memcpy(row + x * 4, &v, 4);
+            }
+        }
+    }
+    s_zbufs[i].dirty = 0;
+}
+
+static int stencil_pass(uint8_t stored)
+{
+    uint32_t m = s_gpu.stencil_rmask & 0xFFu;
+    uint32_t r = s_gpu.stencil_ref & m, v = stored & m;
+    switch (s_gpu.stencil_func) {                 /* ref OP stored, as GL */
+    case 0x200: return 0;
+    case 0x201: return r <  v;
+    case 0x202: return r == v;
+    case 0x203: return r <= v;
+    case 0x204: return r >  v;
+    case 0x205: return r != v;
+    case 0x206: return r >= v;
+    default:    return 1;
+    }
+}
+
+static void stencil_apply(uint8_t *sp, uint32_t op)
+{
+    uint32_t v = *sp, n, wm = s_gpu.stencil_wmask & 0xFFu;
+    switch (op) {                                 /* GL enums */
+    case 0x0000: n = 0; break;                    /* ZERO      */
+    case 0x1E01: n = s_gpu.stencil_ref & 0xFFu; break; /* REPLACE */
+    case 0x1E02: n = v < 255 ? v + 1 : 255; break;/* INCR (sat) */
+    case 0x1E03: n = v ? v - 1 : 0; break;        /* DECR (sat) */
+    case 0x150A: n = ~v & 0xFFu; break;           /* INVERT    */
+    case 0x8507: n = (v + 1) & 0xFFu; break;      /* INCR_WRAP */
+    case 0x8508: n = (v - 1) & 0xFFu; break;      /* DECR_WRAP */
+    default:     return;                          /* KEEP      */
+    }
+    *sp = (uint8_t)((v & ~wm) | (n & wm));
 }
 
 static void zbuf_clear(void)
 {
     float *z = zbuf_current(1), v = zclear_value();
     size_t k;
+    zbuf_touch();
     if (z)
         for (k = 0; k < (size_t)NV_ZBUF_W * NV_ZBUF_H; k++)
             z[k] = v;
@@ -1981,6 +2105,8 @@ typedef struct {
     const float *a, *b, *c;
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float *zb;
+    uint8_t *sb;                        /* stencil, when the test is on */
+    int stencil_early_z;                /* depth failures leave it unchanged */
     int minx, maxx, miny, maxy, use_rc, textured;
     int probe_x, probe_y;               /* RECOMP_PIXEL_PROBE pixel, or -1 */
 } XfTri;
@@ -2013,11 +2139,18 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
             {
                 float *zp = T->zb ? &T->zb[(size_t)y * NV_ZBUF_W + x] : NULL;
+                uint8_t *sp = T->sb ? &T->sb[(size_t)y * NV_ZBUF_W + x] : NULL;
                 int shade = (s_gpu.color_mask & 0x01010101u) || s_gpu.alpha_test;
                 /* Depth test, then shade, then alpha test, and only then the
                  * depth write: an alpha-tested texel that is cut away must
-                 * not leave its depth behind (foliage, fences). */
-                if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                 * not leave its depth behind (foliage, fences). With stencil
+                 * on, the depth test waits until after the alpha test too:
+                 * the stencil op depends on it, and a cut-away texel must
+                 * not change the stencil either -- unless both ops a depth
+                 * failure can lead to are KEEP (Conker's tagging passes),
+                 * when it changes nothing and can be dropped early. */
+                if ((!sp || T->stencil_early_z) && zp && s_gpu.depth_test
+                    && !depth_pass(z, *zp)) {
                     cnt->depth_fail++;
                     continue;
                 }
@@ -2075,6 +2208,18 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             && !alpha_test_pass((float)(argb >> 24) / 255.0f))
                             continue;
                     }
+                }
+                if (sp) {
+                    if (!stencil_pass(*sp)) {
+                        stencil_apply(sp, s_gpu.stencil_op_fail);
+                        continue;
+                    }
+                    if (zp && s_gpu.depth_test && !depth_pass(z, *zp)) {
+                        stencil_apply(sp, s_gpu.stencil_op_zfail);
+                        cnt->depth_fail++;
+                        continue;
+                    }
+                    stencil_apply(sp, s_gpu.stencil_op_zpass);
                 }
                 if (zp && s_gpu.depth_mask)
                     *zp = z;
@@ -2431,8 +2576,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_seeded = 1;
     if (!surface_begin_batch(T.mem))
         return;
-    if (s_gpu.depth_test || s_gpu.depth_mask)
+    if (s_gpu.depth_test || s_gpu.depth_mask || s_gpu.stencil_test)
         T.zb = zbuf_current(1);
+    if (s_gpu.stencil_test)
+        T.sb = sbuf_current(1);
+    T.stencil_early_z = s_gpu.stencil_op_fail == 0x1E00
+                     && s_gpu.stencil_op_zfail == 0x1E00;
     if (tex_size_from_format(s_gpu.texs[0].color)) {
         su = (float)s_gpu.texs[0].width;
         sv = (float)s_gpu.texs[0].height;
@@ -2939,6 +3088,14 @@ static void raster_batch(void)
 
     if (s_gpu.idx_count < 3)
         return;
+    /* The queue of the batch before has been drawn by now, so a zeta
+     * surface sampled here is complete; and from here on this batch's own
+     * depth and stencil writes make the guest copy stale. */
+    for (i = 0; i < 4; i++)
+        if (s_gpu.texs[i].valid)
+            zeta_readback(&s_gpu.texs[i]);
+    if (s_gpu.depth_mask || s_gpu.stencil_test)
+        zbuf_touch();
     static int no_vsh = -1;
     if (no_vsh < 0)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
@@ -3126,6 +3283,15 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            if (s_gpu.stencil_test || s_gpu.alpha_test)
+                fprintf(stderr, "[FTRACE]     stencil %u func %X ref %02X"
+                        " mask r %02X w %02X op %X/%X/%X | alpha test %u"
+                        " func %X ref %02X\n", s_gpu.stencil_test,
+                        s_gpu.stencil_func, s_gpu.stencil_ref & 0xFF,
+                        s_gpu.stencil_rmask & 0xFF, s_gpu.stencil_wmask & 0xFF,
+                        s_gpu.stencil_op_fail, s_gpu.stencil_op_zfail,
+                        s_gpu.stencil_op_zpass, s_gpu.alpha_test,
+                        s_gpu.alpha_func, s_gpu.alpha_ref & 0xFF);
             {
                 /* What the batch did to the picture, not just how many
                  * pixels it touched: the target's mean colour over the clip
@@ -3748,6 +3914,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         clear_surface(param);
         if (param & 0x01)                         /* Z */
             zbuf_clear();
+        if (param & 0x02)                         /* stencil */
+            sbuf_clear();
         break;
 
     case NV097_SET_BEGIN_END:
@@ -3937,6 +4105,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0214: s_gpu.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: s_gpu.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
+
+    /* Stencil. */
+    case 0x032C: s_gpu.stencil_test = param; break;     /* _TEST_ENABLE */
+    case 0x0360: s_gpu.stencil_wmask = param; break;    /* STENCIL_MASK */
+    case 0x0364: s_gpu.stencil_func = param; break;
+    case 0x0368: s_gpu.stencil_ref = param; break;
+    case 0x036C: s_gpu.stencil_rmask = param; break;    /* _FUNC_MASK */
+    case 0x0370: s_gpu.stencil_op_fail = param; break;
+    case 0x0374: s_gpu.stencil_op_zfail = param; break;
+    case 0x0378: s_gpu.stencil_op_zpass = param; break;
 
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
