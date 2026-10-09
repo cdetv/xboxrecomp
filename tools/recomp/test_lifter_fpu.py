@@ -178,6 +178,21 @@ class FpuLifterTest(unittest.TestCase):
         self.assertIn("fp_st1()", lifted)
         self.assertNotIn("fp_top() = fp_top()", lifted)
 
+    def test_fincstp_and_fdecstp_move_top_without_touching_values(self):
+        """They used to fall through to a comment, so every st(i) after one
+        named the wrong register."""
+        inc = Instruction(0, 2, "fincstp", "", "d9f7")
+        dec = Instruction(0, 2, "fdecstp", "", "d9f6")
+
+        self.assertEqual(
+            Lifter().lift_instruction(inc),
+            ["g_fp_top = (g_fp_top + 1u) & 7u; /* fincstp */"],
+        )
+        self.assertEqual(
+            Lifter().lift_instruction(dec),
+            ["g_fp_top = (g_fp_top + 7u) & 7u; /* fdecstp */"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

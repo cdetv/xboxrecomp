@@ -3846,6 +3846,16 @@ class Lifter:
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
+        if m in ("fincstp", "fdecstp"):
+            # TOP moves without a push or pop: the registers keep their values
+            # and every st(i) after it names a different one. Dropping it
+            # (it used to fall through to the comment below) shifted every
+            # later stack access by one -- Conker's Euler-angle matrix builder
+            # rotates past a sine with fincstp, and came out with the wrong
+            # sines and cosines, putting the whole 3D scene behind the camera.
+            # Tags are not modelled, so this is all the instruction does here.
+            step = "1u" if m == "fincstp" else "7u"
+            return [f"g_fp_top = (g_fp_top + {step}) & 7u; /* {m} */"]
 
         return [f"/* FPU: {m} {insn.op_str} */"]
 
