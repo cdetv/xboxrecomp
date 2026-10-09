@@ -1420,6 +1420,33 @@ static int watch_is_code(uint32_t va)
     return va >= g_xbox_code_lo && va < g_xbox_code_hi;
 }
 
+static RECOMP_TLS uintptr_t s_watch_rip;    /* host instruction that wrote */
+
+/* The guest function whose lifted body holds a host address: the one whose
+ * entry is the nearest at or below it. The return addresses on the guest
+ * stack are only a lead -- stale slots from earlier calls look the same --
+ * while the faulting instruction is the writer itself. Linear in the code
+ * range, which is fine once per reported write. Lifted functions are laid out
+ * by the linker, not by guest address, so near folded or reordered code this
+ * is a strong guess, not a proof. */
+typedef void (*watch_fn_t)(void);
+extern watch_fn_t recomp_lookup(uint32_t xbox_va);
+
+static uint32_t watch_host_owner(uintptr_t rip)
+{
+    uintptr_t best = 0;
+    uint32_t va, best_va = 0;
+
+    for (va = g_xbox_code_lo; va < g_xbox_code_hi; va++) {
+        uintptr_t f = (uintptr_t)recomp_lookup(va);
+        if (f && f <= rip && f > best) {
+            best = f;
+            best_va = va;
+        }
+    }
+    return best_va;
+}
+
 static void watch_report(void)
 {
     const uint8_t *mem = (const uint8_t *)g_memory_offset;
@@ -1431,6 +1458,9 @@ static void watch_report(void)
     fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
             g_watch_va, g_watch_last, now, esp);
     g_watch_last = now;
+    if (s_watch_rip)
+        fprintf(stderr, "         written in sub_%08X (host %p)\n",
+                watch_host_owner(s_watch_rip), (void *)s_watch_rip);
 
     /* Return addresses the recompiled code pushed, innermost first. Values
      * that merely look like code get printed too -- the chain is a lead, not
@@ -1489,6 +1519,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
             if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
             s_watch_stepping = 1;
+            s_watch_rip = (uintptr_t)ep->ExceptionRecord->ExceptionAddress;
             ep->ContextRecord->EFlags |= 0x100u;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
