@@ -31,6 +31,7 @@
 #endif
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern size_t g_xbox_total_ram;
 
 #define PB_MAX_METHODS 4096
 
@@ -44,6 +45,8 @@ static int s_seen_count;
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
 static uint32_t s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost;
+static uint32_t s_tot_jumped_stale;   /* buffer's return was another run's */
+static uint32_t s_tot_jumped_open;    /* buffer ran off with no jump back */
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -138,8 +141,10 @@ void nv2a_pb_scan_report(void)
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed; %u jumps to recorded"
-                        " pushbuffers: %u came back, %u lost\n", s_tot_calls,
-                s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost);
+                        " pushbuffers: %u came back, %u lost (%u held another"
+                        " run's return, %u had none)\n", s_tot_calls,
+                s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost,
+                s_tot_jumped_stale, s_tot_jumped_open);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -175,10 +180,22 @@ void nv2a_pb_scan_report(void)
  * scene, leaving most frames with a clear and nothing else. So a jump to
  * somewhere outside the ring is followed (jumps between recorded buffers
  * too) until a jump lands back in the ring, and the walk resumes there if
- * that is still ahead in this segment. A jump back that is not -- D3D defers
- * the patch to a GPU interrupt when the buffer may still be in use, and an
- * unpatched slot holds an old return -- is counted as lost and ends the
- * walk as before. */
+ * that is still ahead in this segment.
+ *
+ * Where it resumes is not taken from the buffer's last dword, though. That
+ * dword holds the return of whichever run D3D patched last, and the walk
+ * runs after the title moved PUT -- by then a buffer run twice holds the
+ * second run's return, or one D3D patched late. When the buffer may still be
+ * in use, RunPushBuffer puts NO_OPERATION before the JUMP with a software
+ * method parameter, and on hardware the GPU stops there while an interrupt
+ * patches the return for this run; the toolkit raises no such interrupt.
+ * So the return this run wants is worked out from the ring, as D3D wrote it:
+ *   NOP param (rec << 5) | 0xC or 0xE: rec is a record in the ring, just
+ *       after the JUMP, whose first dword is the return (past the record);
+ *   otherwise (param 0xD with the record in the device, or no NOP): the
+ *       word after the JUMP.
+ * A return that is not ahead in this segment is counted as lost and ends
+ * the walk as before. */
 #define PB_RING   0
 #define PB_CALL   1
 #define PB_JUMPED 2
@@ -203,7 +220,15 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
+    uint32_t nop_param = 0, nop_end = 0;  /* last NO_OPERATION, and where it ended */
+    /* A buffer with no jump back -- one being recorded again, say -- reads on
+     * through whatever follows it; past the end of RAM that is a host fault. */
+    uint32_t ram_end = XBOX_CONTIG_BASE + (uint32_t)g_xbox_total_ram;
 
+    if (va < XBOX_CONTIG_BASE || va >= ram_end)
+        return 0;
+    if (end_va > ram_end)
+        end_va = ram_end;
     while (va < end_va && words < 0x100000u) {
         uint32_t w = *(const uint32_t *)(mem + va);
         va += 4;
@@ -215,25 +240,48 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             uint32_t tva = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             (*jumps)++;
             if (mode == PB_RING) {
-                uint32_t back = 0, site = va - 4;
+                uint32_t back = 0, site = va - 4, want = va, code = 0;
                 if (!s_ring_hi || pb_in_ring(tva)) {
                     if (exit_va)              /* the ring wrapping: where to */
                         *exit_va = tva;
                     break;
                 }
+                if (nop_end == site) {
+                    code = nop_param & 0x1Fu;
+                    uint32_t rec = XBOX_CONTIG_BASE
+                                 | ((nop_param >> 5) & 0x0FFFFFFFu);
+                    /* D3D writes the record straight after the JUMP;
+                     * anything else is not one of its NOPs. */
+                    if ((code == 0xCu || code == 0xEu) && rec == va) {
+                        want = XBOX_CONTIG_BASE
+                             | (*(const uint32_t *)(mem + rec) & 0x0FFFFFFFu);
+                    }
+                }
                 s_tot_jumped++;
                 words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
                                  jumps, unknown, &back);
-                if (back >= va && back <= end_va) {
+                if (!back) {
+                    s_tot_jumped_open++;
+                    if (s_tot_jumped_open <= 8)
+                        fprintf(stderr, "[PB] jump at %08X to %08X: buffer"
+                                " has no jump back\n", site, tva);
+                } else if (back != want) {
+                    s_tot_jumped_stale++;
+                    if (s_tot_jumped_stale <= 8)
+                        fprintf(stderr, "[PB] jump at %08X to %08X (NOP code"
+                                " %X): buffer returns to %08X, this run to"
+                                " %08X\n", site, tva, code, back, want);
+                }
+                if (want >= va && want <= end_va) {
                     s_tot_jumped_back++;
-                    va = back;
+                    va = want;
                     continue;
                 }
                 s_tot_jumped_lost++;
                 if (s_tot_jumped_lost <= 8)
-                    fprintf(stderr, "[PB] jump at %08X to %08X: no jump back"
-                            " into this segment (exit %08X, segment ends"
-                            " %08X)\n", site, tva, back, end_va);
+                    fprintf(stderr, "[PB] jump at %08X to %08X: return %08X"
+                            " not in this segment (segment ends %08X)\n",
+                            site, tva, want, end_va);
                 break;
             }
             if (mode == PB_JUMPED && pb_in_ring(tva)) {
@@ -242,6 +290,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             }
             va = tva;
             end_va = va + 0x400000u;
+            if (va < XBOX_CONTIG_BASE || va >= ram_end)
+                break;
+            if (end_va > ram_end)
+                end_va = ram_end;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
@@ -267,6 +319,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
+                if (m == 0x0100u) {
+                    nop_param = *(const uint32_t *)(mem + va);
+                    nop_end = va + 4;
+                }
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
