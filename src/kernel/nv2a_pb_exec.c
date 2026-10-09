@@ -2112,7 +2112,7 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
  * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
  * may undercount; nothing depends on them. */
 #define NV_RASTER_MAX_THREADS 16
-#define NV_RASTER_MT_MIN_PIXELS 4096
+#define NV_RASTER_MT_MIN_PIXELS 1024
 #define NV_TRIQ_MAX 2048
 
 typedef struct {
@@ -2664,7 +2664,7 @@ static void raster_xf_prims(uint32_t n);
  * on one thread is right. Also one thread under RECOMP_VSH_DUMP/_STEP, whose
  * logging is not thread-safe. */
 #define NV_VCACHE_SIZE 65536u
-#define NV_VSH_MT_MIN  256          /* program runs worth waking the pool */
+#define NV_VSH_MT_MIN  64           /* program runs worth waking the pool */
 static uint32_t s_vc_stamp[NV_VCACHE_SIZE], s_vc_index[NV_VCACHE_SIZE];
 static uint32_t s_vc_slot[NV_VCACHE_SIZE], s_vc_now;
 static uint32_t s_xf_from[NV_MAX_INDICES];  /* slot to copy, or itself */
@@ -2693,8 +2693,14 @@ static int transform_batch(uint32_t n)
     int cache = !nv2a_vsh_cxt_write();
     uint32_t i;
 
+    static long mt_min = -1;
     if (vsh_debug < 0)
         vsh_debug = getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_STEP");
+    if (mt_min < 0) {                       /* RECOMP_VSH_MT_MIN=<runs> */
+        const char *e = getenv("RECOMP_VSH_MT_MIN");
+        mt_min = e ? atol(e) : NV_VSH_MT_MIN;
+        if (mt_min < 2) mt_min = 2;
+    }
     if (!cache) {
         for (i = 0; i < n; i++)
             if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
@@ -2721,7 +2727,7 @@ static int transform_batch(uint32_t n)
     if (!transform_vertex(s_gpu.idx[s_xf_run[0]], &s_xf[s_xf_run[0]]))
         return 0;
     s_xf_failed = 0;
-    if (s_xf_nrun >= NV_VSH_MT_MIN && raster_pool_size() > 1 && !vsh_debug)
+    if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1 && !vsh_debug)
         pool_run(xf_job);
     else
         xf_job(0, 1);
