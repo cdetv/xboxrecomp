@@ -225,7 +225,11 @@ typedef struct {
 } VertexAttr;
 
 #define NV_VERTEX_ATTRS 16
-#define NV_MAX_INDICES  4096
+/* One BEGIN/END batch. 4096 used to be the cap and indices past it were
+ * dropped in silence: Conker draws its front-end bar floor as one strip of
+ * more than 4096, whose cut-off end was the floor in front of the camera --
+ * black wedges where only the lighting pass over it reached the screen. */
+#define NV_MAX_INDICES  65536
 #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
 /* Texture stage 0, decoded from what the title programmed.
@@ -250,8 +254,9 @@ typedef struct {
 static struct {
     VertexAttr attr[NV_VERTEX_ATTRS];
     uint32_t   prim;                    /* SET_BEGIN_END parameter, 0 = ended */
-    uint16_t   idx[NV_MAX_INDICES];
+    uint32_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
+    uint32_t   idx_dropped;             /* indices past NV_MAX_INDICES */
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
      * different place to read them from. */
@@ -2886,6 +2891,8 @@ static void draw_inline_array(void)
         goto out;
 
     count = (s_gpu.inline_count * 4) / vsize;
+    if (count > NV_MAX_INDICES)
+        s_gpu.idx_dropped += count;
     if (count < 3 || count > NV_MAX_INDICES)
         goto out;
     for (a = 0; a < NV_VERTEX_ATTRS; a++)
@@ -2893,7 +2900,7 @@ static void draw_inline_array(void)
             s_gpu.attr[a].stride = vsize;
 
     for (i = 0; i < count; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = count;
 
     s_gpu.inline_active = 1;
@@ -2942,7 +2949,7 @@ static void draw_immediate(void)
     }
 
     for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
-        s_gpu.idx[i] = (uint16_t)i;
+        s_gpu.idx[i] = i;
     s_gpu.idx_count = i;
 
     /* fetch_attr bounds-checks against inline_count dwords. */
@@ -3322,15 +3329,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (!s_gpu.prim)
             break;
         for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+            s_gpu.idx[s_gpu.idx_count++] = start + i;
+        s_gpu.idx_dropped += count - i;
         break;
     }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
         if (s_gpu.prim && s_gpu.idx_count + 2 <= NV_MAX_INDICES) {
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param & 0xFFFF);
-            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(param >> 16);
+            s_gpu.idx[s_gpu.idx_count++] = param & 0xFFFFu;
+            s_gpu.idx[s_gpu.idx_count++] = param >> 16;
+        } else if (s_gpu.prim) {
+            s_gpu.idx_dropped += 2;
         }
         break;
 
@@ -3725,9 +3735,11 @@ void nv2a_pb_exec_report(void)
             dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
             dma_resolve(s_gpu.color_offset));
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
-                    " screen-space, %u triangles fully off-surface\n",
+                    " screen-space, %u triangles fully off-surface; %u indices"
+                    " dropped past %u per batch\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
-            s_gpu.tris_skipped_offscreen);
+            s_gpu.tris_skipped_offscreen, s_gpu.idx_dropped,
+            (unsigned)NV_MAX_INDICES);
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
