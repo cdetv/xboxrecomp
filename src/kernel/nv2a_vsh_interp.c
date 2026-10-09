@@ -305,28 +305,40 @@ static vec4 run_ilu(uint32_t op, vec4 c)
     return r;
 }
 
+/* By content: titles reload different programs into the same slot. */
+static uint32_t program_hash(void)
+{
+    uint32_t h = 2166136261u, t;
+    int i;
+    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+        for (i = 0; i < 4; i++)
+            h = (h ^ s_program[t][i]) * 16777619u;
+        if (field(s_program[t], 3, 0, 1))
+            break;
+    }
+    return h;
+}
+
+static void step_print(const char *what, const vec4 *v)
+{
+    fprintf(stderr, " %s(%g %g %g %g)", what, v->v[0], v->v[1], v->v[2], v->v[3]);
+}
+
+static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
+                       int step);
+
 int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 {
-    static int dump = -1;
-    static uint32_t dumped[16];
-    static int ndumped;
-    vec4 temp[12], opos;
-    float outregs[13][4];
-    int a0 = 0;
-    uint32_t s;
+    static int dump = -1, step_left = -1;
+    static uint32_t dumped[16], stepped[64];
+    static int ndumped, nstepped;
+    int r;
 
     if (dump < 0)
         dump = getenv("RECOMP_VSH_DUMP") != NULL;
     if (dump && ndumped < 16) {
-        /* By content: titles reload different programs into the same slot. */
-        uint32_t h = 2166136261u, t;
+        uint32_t h = program_hash();
         int i, seen = 0;
-        for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
-            for (i = 0; i < 4; i++)
-                h = (h ^ s_program[t][i]) * 16777619u;
-            if (field(s_program[t], 3, 0, 1))
-                break;
-        }
         for (i = 0; i < ndumped; i++)
             if (dumped[i] == h) seen = 1;
         if (!seen) {
@@ -334,6 +346,45 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             dump_program(s_start_slot);
         }
     }
+
+    r = run_program(in, out, 0);
+
+    /* RECOMP_VSH_STEP=<n>: the first vertex of each program (up to n
+     * programs) that comes out with w <= 0 -- behind the eye -- is run again
+     * instruction by instruction, printing what each one read and wrote. */
+    if (step_left < 0) {
+        const char *t = getenv("RECOMP_VSH_STEP");
+        step_left = t ? atoi(t) : 0;
+        if (step_left > 64) step_left = 64;
+    }
+    if (r && step_left > 0 && out->pos[3] <= 0.0f) {
+        uint32_t h = program_hash();
+        int i, seen = 0;
+        for (i = 0; i < nstepped; i++)
+            if (stepped[i] == h) seen = 1;
+        if (!seen) {
+            Nv2aVshOutput tmp;
+            stepped[nstepped++] = h;
+            step_left--;
+            fprintf(stderr, "[VSTEP] program %08X at slot %u, inputs:\n", h,
+                    s_start_slot);
+            for (i = 0; i < NV2A_VSH_INPUTS; i++)
+                fprintf(stderr, "[VSTEP]   v%d %g %g %g %g\n", i, in[i][0],
+                        in[i][1], in[i][2], in[i][3]);
+            run_program(in, &tmp, 1);
+            fflush(stderr);
+        }
+    }
+    return r;
+}
+
+static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
+                       int step)
+{
+    vec4 temp[12], opos;
+    float outregs[13][4];
+    int a0 = 0;
+    uint32_t s;
 
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
@@ -359,6 +410,21 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             mres = run_mac(mac, a, b, c, &a0);
         if (ilu)
             ires = run_ilu(ilu, c);
+        if (step) {
+            char da[40], db[40], dc[40];
+            dis_src(da, sizeof da, ins, 0);
+            dis_src(db, sizeof db, ins, 1);
+            dis_src(dc, sizeof dc, ins, 2);
+            fprintf(stderr, "[VSTEP] %3u %s %s A=%s B=%s C=%s R%u mac%X ilu%X"
+                    " out%s%u m%X%s a0=%d\n[VSTEP]     ", s, k_mac[mac],
+                    k_ilu[ilu], da, db, dc, tdst, mac_mask, ilu_mask,
+                    field(ins, 3, 11, 1) ? "o" : "c", oaddr, omask,
+                    field(ins, 3, 2, 1) ? " ilu" : " mac", a0);
+            step_print("A", &a); step_print("B", &b); step_print("C", &c);
+            if (mac) step_print("mac", &mres);
+            if (ilu) step_print("ilu", &ires);
+            fputc('\n', stderr);
+        }
 
         if (mac && mac != 13 && mac_mask) {
             float *d = tdst == 12 ? opos.v : (tdst < 12 ? temp[tdst].v : NULL);
@@ -386,6 +452,9 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             }
         }
         if (field(ins, 3, 0, 1)) {
+            if (step)
+                fprintf(stderr, "[VSTEP] FINAL oPos %g %g %g %g\n", opos.v[0],
+                        opos.v[1], opos.v[2], opos.v[3]);
             memcpy(out->pos, opos.v, sizeof out->pos);
             memcpy(out->d0, outregs[3], sizeof out->d0);
             memcpy(out->d1, outregs[4], sizeof out->d1);
