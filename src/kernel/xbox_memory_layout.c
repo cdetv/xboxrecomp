@@ -1024,11 +1024,25 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                     } else if (last_put && put < last_put) {
-                        if (put_hi > last_put)
-                            nv2a_pb_scan(
-                                XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                        if (put > put_lo)
+                        /* The lowest PUT is not the ring's start when D3D
+                         * began on a different buffer. Conker's boot
+                         * pushbuffer sits at 0x3000, far below the ring at
+                         * 0xA03000, so every wrap re-ran the stale boot
+                         * commands -- which end by switching the GPU to
+                         * fixed-function, leaving the whole front end's
+                         * vertex-program draws untransformed. The JUMP
+                         * that wraps the ring names the true start. */
+                        extern uint32_t nv2a_pb_scan_wrap(uint32_t);
+                        uint32_t start = nv2a_pb_scan_wrap(
+                            XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu));
+                        if (start && (start & 0x0FFFFFFFu) <= put) {
+                            extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
+                            put_lo = start & 0x0FFFFFFFu;
+                            nv2a_pb_scan_ring(start,
+                                XBOX_CONTIG_BASE | (put_hi & 0x0FFFFFFFu));
+                            nv2a_pb_scan(start,
+                                XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                        } else if (put > put_lo)
                             nv2a_pb_scan(
                                 XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
                                 XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
@@ -1036,7 +1050,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             static unsigned wraps;
                             if (wraps++ < 8)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
-                                        "(0x%08X -> 0x%08X)\n", last_put, put);
+                                        "(0x%08X -> 0x%08X, ring starts"
+                                        " 0x%08X)\n", last_put, put, start);
                         }
                     }
                     /* Periodic, because what the title submits at init is not
