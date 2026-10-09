@@ -369,6 +369,51 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
     return words;
 }
 
+/* RECOMP_PB_IDLE_DUMP: decode up to 64 KB past an idle PUT -- commands the
+ * title wrote but has not kicked, then stale ones from the ring's last lap --
+ * and list the fences (0x1D70) and NOPs with a parameter found there, so a
+ * wait on a fence the GPU was never given shows as such. Read-only. */
+void nv2a_pb_peek_ahead(uint32_t va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t start = va, end = va + 0x10000u, methods = 0, shown = 0;
+    uint32_t ram_end = XBOX_CONTIG_BASE + (uint32_t)g_xbox_total_ram;
+
+    if (va < XBOX_CONTIG_BASE || va >= ram_end)
+        return;
+    if (end > ram_end)
+        end = ram_end;
+    fprintf(stderr, "[PB] PUT idle at %08X; past it:\n", va);
+    while (va < end && shown < 40) {
+        uint32_t w = *(const uint32_t *)(mem + va);
+        if (w && (w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            for (uint32_t i = 0; i < count && va + 4 + i * 4 < end; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                uint32_t p = *(const uint32_t *)(mem + va + 4 + i * 4);
+                methods++;
+                if (m == 0x1D70u || (m == 0x0100u && p)) {
+                    fprintf(stderr, "[PB]   +%05X %u:%04X = %08X\n",
+                            va + 4 + i * 4 - start, subch, m, p);
+                    shown++;
+                }
+            }
+            va += 4 + count * 4;
+            continue;
+        }
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            fprintf(stderr, "[PB]   +%05X jump %08X\n", va - start, w);
+            shown++;
+        }
+        va += 4;
+    }
+    fprintf(stderr, "[PB]   %u methods in %u bytes\n", methods, va - start);
+    fflush(stderr);
+}
+
 /* Walks one ring segment; returns where the ring-wrap jump ending it goes,
  * or 0 if it did not end on one. */
 static uint32_t pb_scan_segment(uint32_t start_va, uint32_t end_va)

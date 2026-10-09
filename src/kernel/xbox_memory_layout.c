@@ -1046,6 +1046,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            {
+                /* RECOMP_PB_IDLE_DUMP: PUT has not moved for 5 s -- what has
+                 * the title written past it without kicking? */
+                static int idle_dump = -1;
+                static uint32_t idle_put, dumped_put;
+                static DWORD idle_since;
+                if (idle_dump < 0)
+                    idle_dump = getenv("RECOMP_PB_IDLE_DUMP") != NULL;
+                if (put != idle_put) {
+                    idle_put = put;
+                    idle_since = now_ms;
+                } else if (idle_dump && put != dumped_put
+                           && now_ms - idle_since > 5000) {
+                    extern void nv2a_pb_peek_ahead(uint32_t va);
+                    dumped_put = put;
+                    nv2a_pb_peek_ahead(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                }
+            }
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
