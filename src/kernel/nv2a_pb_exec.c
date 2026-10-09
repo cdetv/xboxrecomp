@@ -706,6 +706,10 @@ static void dump_surface_bmp(void)
 static void raster_triangle(const float a[2], const float b[2],
                             const float c[2], uint32_t argb,
                             const float uv[3][2]);
+static void surface_swizzle_setup(void);
+static uint8_t *surface_pixel(uint8_t *base, uint32_t bpp, int x, int y);
+/* The current surface's swizzle layout; see surface_swizzle_setup. */
+static struct { int on; uint32_t w, h, mask_x, mask_y; } s_swz;
 
 static void clear_surface(uint32_t param)
 {
@@ -726,10 +730,26 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
+    surface_swizzle_setup();
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
-        if (bpp == 4) {
+        if (s_swz.on) {
+            /* Swizzled: pixel by pixel, each to its Morton address. */
+            for (x = 0; x < s_gpu.clip_w; x++) {
+                uint8_t *p = surface_pixel(mem + s_gpu.color_base, bpp,
+                                           (int)(s_gpu.clip_x + x),
+                                           (int)(s_gpu.clip_y + y));
+                if (!p)
+                    continue;
+                if (bpp == 4)
+                    *(uint32_t *)p = s_gpu.clear_color;
+                else if (bpp == 2)
+                    *(uint16_t *)p = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
+                                              | ((s_gpu.clear_color >> 5) & 0x07E0)
+                                              | ((s_gpu.clear_color >> 3) & 0x001F));
+            }
+        } else if (bpp == 4) {
             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
@@ -1174,6 +1194,34 @@ static void dump_texture_bmp(uint32_t seq)
  * playback rate. */
 static uint8_t *s_surface;          /* host address of surface row 0 */
 
+/* Swizzled surfaces (SET_SURFACE_FORMAT type 2): render targets a title
+ * draws into and then samples as a swizzled texture. Their pixels are in
+ * Morton order, not rows, with the size in the format's log2 fields, so
+ * a pixel written row-major is read back from somewhere else. Conker draws
+ * its floor lighting into 128x128 R5G6B5 ones every frame; written as rows,
+ * the floor sampled them scrambled. */
+static void surface_swizzle_setup(void)
+{
+    s_swz.on = ((s_gpu.format >> 8) & 0xF) == 2;
+    if (!s_swz.on)
+        return;
+    s_swz.w = 1u << ((s_gpu.format >> 16) & 0xF);
+    s_swz.h = 1u << ((s_gpu.format >> 24) & 0xF);
+    xbox_swizzle_masks(s_swz.w, s_swz.h, &s_swz.mask_x, &s_swz.mask_y);
+}
+
+/* Host address of pixel (x, y) of the surface at `base`, or NULL when a
+ * swizzled surface does not have that pixel. */
+static uint8_t *surface_pixel(uint8_t *base, uint32_t bpp, int x, int y)
+{
+    if (!s_swz.on)
+        return base + (size_t)y * s_gpu.pitch + (size_t)x * bpp;
+    if ((uint32_t)x >= s_swz.w || (uint32_t)y >= s_swz.h)
+        return NULL;
+    return base + (size_t)(swizzle_deposit((uint32_t)x, s_swz.mask_x)
+                         | swizzle_deposit((uint32_t)y, s_swz.mask_y)) * bpp;
+}
+
 static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
@@ -1181,6 +1229,7 @@ static int surface_begin_batch(const uint8_t *mem)
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
     s_surface = (uint8_t *)mem + base;
+    surface_swizzle_setup();
     return 1;
 }
 
@@ -1217,17 +1266,19 @@ static void blend_factor(uint32_t f, const float s[4], const float d[4],
 
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
-    uint8_t *row;
+    uint8_t *px;
 
     (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
+    px = surface_pixel(s_surface, bpp, x, y);
+    if (!px)
+        return;
     s_gpu.pixels++;
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
-    row = s_surface + (size_t)y * s_gpu.pitch;
 
     /* Blending, with the GL factor set and equations the NV2A takes.
      *
@@ -1241,9 +1292,9 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         float sc[4], dc[4], sf[4], df[4], out[4];
         int k;
         if (bpp == 4) {
-            dst = ((const uint32_t *)row)[x];
+            dst = *(const uint32_t *)px;
         } else if (bpp == 2) {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = *(const uint16_t *)px;
             dst = 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
                 | ((t & 0x001Fu) << 3);
         }
@@ -1276,19 +1327,19 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
         if (keep == 0xFFFFFFFFu)
             return;
         if (bpp == 4) {
-            old = ((const uint32_t *)row)[x];
+            old = *(const uint32_t *)px;
         } else {
-            uint32_t t = ((const uint16_t *)row)[x];
+            uint32_t t = *(const uint16_t *)px;
             old = ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5) | ((t & 0x001Fu) << 3);
         }
         argb = (argb & ~keep) | (old & keep);
     }
     if (bpp == 4) {
-        ((uint32_t *)row)[x] = argb;
+        *(uint32_t *)px = argb;
     } else if (bpp == 2) {
-        ((uint16_t *)row)[x] = (uint16_t)(((argb >> 8) & 0xF800)
-                                        | ((argb >> 5) & 0x07E0)
-                                        | ((argb >> 3) & 0x001F));
+        *(uint16_t *)px = (uint16_t)(((argb >> 8) & 0xF800)
+                                   | ((argb >> 5) & 0x07E0)
+                                   | ((argb >> 3) & 0x001F));
     }
 }
 
@@ -2079,11 +2130,13 @@ static int probe_init(void)
 
 static uint32_t probe_read(uint32_t bpp)
 {
-    const uint8_t *row = s_surface + (size_t)s_probe.y * s_gpu.pitch;
+    const uint8_t *px = surface_pixel(s_surface, bpp, s_probe.x, s_probe.y);
+    if (!px)
+        return 0;
     if (bpp == 4)
-        return ((const uint32_t *)row)[s_probe.x];
+        return *(const uint32_t *)px;
     {
-        uint32_t t = ((const uint16_t *)row)[s_probe.x];
+        uint32_t t = *(const uint16_t *)px;
         return 0xFF000000u | ((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
              | ((t & 0x001Fu) << 3);
     }
