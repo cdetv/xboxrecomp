@@ -716,6 +716,7 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+    uint16_t v16;
 
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;                            /* depth/stencil only */
@@ -730,6 +731,13 @@ static void clear_surface(uint32_t param)
         s_gpu.color_base = base;
     }
 
+    /* The clear value is in the surface's own pixel format, not A8R8G8B8
+     * (xemu pgraph_get_clear_color): a 16-bit surface takes its low half
+     * as is. Conker clears its R5G6B5 lighting targets with 0x0000FFFF,
+     * which is white; read as A8R8G8B8 it was cyan, and the floor they
+     * light kept only its red channel's shading -- the whole front end
+     * came out green. */
+    v16 = (uint16_t)s_gpu.clear_color;
     surface_swizzle_setup();
     for (y = 0; y < s_gpu.clip_h; y++) {
         uint8_t *row = mem + s_gpu.color_base
@@ -745,23 +753,16 @@ static void clear_surface(uint32_t param)
                 if (bpp == 4)
                     *(uint32_t *)p = s_gpu.clear_color;
                 else if (bpp == 2)
-                    *(uint16_t *)p = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                              | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                              | ((s_gpu.clear_color >> 3) & 0x001F));
+                    *(uint16_t *)p = v16;
             }
         } else if (bpp == 4) {
             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
-                p[x] = v;
+                p[x] = v16;
         }
     }
     s_gpu.clears++;
