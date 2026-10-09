@@ -130,6 +130,33 @@ int main(void)
         ok &= expect("NOP 0xC record", w, 3);
     }
 
+    /* NOP 0: a run chained onto an earlier deferred one. The record after
+     * the JUMP is not named by the NOP, and walked as commands its buffer
+     * address reads as a method header (0x80040000 here: one parameter,
+     * eating the next command; Conker's 0x81F82708: 126). Skip the record
+     * by its contents. */
+    put(CONTIG + 0x1300, M(0x100)); put(CONTIG + 0x1304, 0);
+    put(CONTIG + 0x1308, JMP(0x40000));
+    put(CONTIG + 0x130C, 0x1320); put(CONTIG + 0x1310, 0);
+    put(CONTIG + 0x1314, M(0x3FC)); put(CONTIG + 0x1318, 0);
+    put(CONTIG + 0x131C, buf);
+    put(CONTIG + 0x1320, M(0x318)); put(CONTIG + 0x1324, 7);
+    nv2a_pb_scan(CONTIG + 0x1300, CONTIG + 0x1328);
+    {
+        static const uint32_t w[] = { 0x100, 0x30C, 0x318 };
+        ok &= expect("NOP 0 chained record", w, 3);
+    }
+
+    /* No NOP and no record (idle buffer): the walk resumes straight after
+     * the JUMP, even when the next words happen to be a method. */
+    put(CONTIG + 0x1400, JMP(0x40000));
+    put(CONTIG + 0x1404, M(0x31C)); put(CONTIG + 0x1408, 8);
+    nv2a_pb_scan(CONTIG + 0x1400, CONTIG + 0x140C);
+    {
+        static const uint32_t w[] = { 0x30C, 0x31C };
+        ok &= expect("idle buffer, no record", w, 2);
+    }
+
     /* A buffer at the very end of RAM with no jump back. */
     put(CONTIG + RAM - 8, M(0x314)); put(CONTIG + RAM - 4, 5);
     put(CONTIG + 0x1200, JMP(RAM - 8));
