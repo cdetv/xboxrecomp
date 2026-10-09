@@ -787,6 +787,17 @@ static void frame_counters_tick(void)
 
 static void fence_mirrors_tick(void)
 {
+    /* Once the pushbuffer executor runs fences itself, the GPU time is the
+     * last fence it actually reached, not the last one submitted: copying
+     * the submitted time told the title the GPU was done with commands still
+     * waiting in the ring, and it rewrote memory they read (Conker's fur
+     * shells patch one recorded pushbuffer in place per shell, so most of
+     * them drew with another shell's texture). Without the executor the
+     * submitted time is all there is. */
+    extern int nv2a_pb_exec_semaphore(uint32_t *value);
+    uint32_t executed;
+    int from_exec = nv2a_pb_exec_semaphore(&executed);
+
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -804,7 +815,7 @@ static void fence_mirrors_tick(void)
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t put =
+            uint32_t put = from_exec ? executed :
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
             if (*fence != put)
@@ -906,38 +917,95 @@ static int nv2a_vblank_held(volatile uint32_t *regs)
         && (LONG64)GetTickCount64() < until;
 }
 
+/* One pass over the handshake tables. intr_regs = 0 leaves PGRAPH's
+ * interrupt bits alone -- PGRAPH_INTR and its bit in PMC_INTR_0 -- because a
+ * software-method trap is being delivered and they are its. Everything else
+ * still has to be acknowledged meanwhile: D3D's DPC spins until a vblank's
+ * PMC_INTR_0 bit clears, and holding all of PMC_INTR_0 left the timer thread
+ * stuck in that DPC, never getting to the trap (run 109). */
+static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        uint32_t v = *r;
+        if (!(v & mask))
+            continue;
+        if (!intr_regs && NV2A_ACK[i].offset == 0x400100u)   /* PGRAPH_INTR */
+            continue;
+        if (!intr_regs && NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS)
+            mask &= ~(1u << 12);                             /* PGRAPH */
+        /* Read, then ask about the hold, then clear only if the register
+         * still holds what was read: the timer thread sets the hold before
+         * it raises the bits, so a vblank raised after the read is either
+         * seen as held or makes the exchange fail. */
+        if (NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS
+            && nv2a_vblank_held(regs))
+            mask &= ~NV2A_PMC_INTR_PCRTC_BIT;
+        if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
+            && nv2a_vblank_held(regs))
+            mask = 0;
+        if (v & mask)
+            InterlockedCompareExchange((volatile LONG *)r,
+                                       (LONG)(v & ~mask), (LONG)v);
+    }
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+            *r |= NV2A_IDLE[i].idle_mask;
+        }
+    }
+}
+
+static volatile uint32_t *s_ack_regs;
+
+/* The pushbuffer executor reached a NOP with a parameter: a PGRAPH
+ * software-method trap (kernel_bridge.c, kernel_pgraph_swm_tick). Like the
+ * GPU, it stops until the driver has handled it. It runs on this thread, so
+ * the handshakes have to go on while it waits -- D3D's handler ends in a
+ * PFB flush that spins until bit 16 of 0x100410 is cleared, which is this
+ * thread's job. A trap the timer thread has not taken up within two seconds
+ * is withdrawn, so a stalled timer thread slows the executor instead of
+ * hanging it. */
+void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
+{
+    extern int kernel_pgraph_swm_post(uint32_t subch, uint32_t param);
+    extern int kernel_pgraph_swm_done(void);
+    extern int kernel_pgraph_swm_cancel(void);
+    ULONGLONG t0, warned = 0;
+
+    if (!s_ack_regs || !kernel_pgraph_swm_post(subch, param))
+        return;
+    t0 = GetTickCount64();
+    while (!kernel_pgraph_swm_done()) {
+        ULONGLONG waited;
+        nv2a_handshake_pass(s_ack_regs, 0);
+        waited = GetTickCount64() - t0;
+        if (waited > 2000 && kernel_pgraph_swm_cancel()) {
+            fprintf(stderr, "  [NV2A] software method %X (param %08X) not taken"
+                    " up in 2 s; skipped\n", param & 0x1Fu, param);
+            fflush(stderr);
+            return;
+        }
+        if (waited > 5000 && waited - warned > 5000) {
+            warned = waited;
+            fprintf(stderr, "  [NV2A] software method %X (param %08X): ISR/DPC"
+                    " still running after %llu ms\n", param & 0x1Fu, param,
+                    (unsigned long long)waited);
+            fflush(stderr);
+        }
+        SwitchToThread();
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    s_ack_regs = regs;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            uint32_t mask = NV2A_ACK[i].busy_mask;
-            uint32_t v = *r;
-            if (!(v & mask))
-                continue;
-            /* Read, then ask about the hold, then clear only if the register
-             * still holds what was read: the timer thread sets the hold before
-             * it raises the bits, so a vblank raised after the read is either
-             * seen as held or makes the exchange fail. */
-            if (NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS
-                && nv2a_vblank_held(regs))
-                mask &= ~NV2A_PMC_INTR_PCRTC_BIT;
-            if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
-                && nv2a_vblank_held(regs))
-                mask = 0;
-            if (v & mask)
-                InterlockedCompareExchange((volatile LONG *)r,
-                                           (LONG)(v & ~mask), (LONG)v);
-        }
-        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
-            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-                *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
+        nv2a_handshake_pass(regs, 1);
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
          *
@@ -978,6 +1046,24 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             static uint32_t last_put;
             DWORD now_ms = GetTickCount();
             uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            {
+                /* RECOMP_PB_IDLE_DUMP: PUT has not moved for 5 s -- what has
+                 * the title written past it without kicking? */
+                static int idle_dump = -1;
+                static uint32_t idle_put, dumped_put;
+                static DWORD idle_since;
+                if (idle_dump < 0)
+                    idle_dump = getenv("RECOMP_PB_IDLE_DUMP") != NULL;
+                if (put != idle_put) {
+                    idle_put = put;
+                    idle_since = now_ms;
+                } else if (idle_dump && put != dumped_put
+                           && now_ms - idle_since > 5000) {
+                    extern void nv2a_pb_peek_ahead(uint32_t va);
+                    dumped_put = put;
+                    nv2a_pb_peek_ahead(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                }
+            }
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
                 /* Survey the segment the title just submitted, once. */
                 {
@@ -1046,9 +1132,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             nv2a_pb_scan(
                                 XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
                                 XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                        /* RECOMP_PB_WRAP_TRACE=all: every wrap, not the
+                         * first eight. A wrap whose start was not found
+                         * or lies past PUT is always shown: the segment
+                         * after it was walked from a guess. */
+                        if (getenv("RECOMP_PB_WRAP_TRACE")
+                                || !start || (start & 0x0FFFFFFFu) > put) {
                             static unsigned wraps;
-                            if (wraps++ < 8)
+                            const char *wt = getenv("RECOMP_PB_WRAP_TRACE");
+                            if (wraps++ < 8 || (wt && !strcmp(wt, "all"))
+                                    || !start || (start & 0x0FFFFFFFu) > put)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
                                         "(0x%08X -> 0x%08X, ring starts"
                                         " 0x%08X)\n", last_put, put, start);

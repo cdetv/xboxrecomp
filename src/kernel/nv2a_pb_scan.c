@@ -52,6 +52,7 @@ static uint32_t s_tot_jumped_open;    /* buffer ran off with no jump back */
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
 static int s_exec_enabled = -1;
 
 static void note(uint32_t subch, uint32_t method)
@@ -231,7 +232,18 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
     if (end_va > ram_end)
         end_va = ram_end;
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w;
+        /* DMA_GET follows the walk through the ring, as the GPU's does.
+         * Moving it only after the whole segment left it far behind while
+         * the executor was in fact part-way through, and D3D_BlockOnTime
+         * picks the place for its NOP 5 by that distance: it wrote the NOP
+         * into words already walked, and waited for good on an event that
+         * NOP would have set (run 115). Inside a recorded pushbuffer GET
+         * stays at the jump, which is where D3D looks for it. */
+        if (mode == PB_RING && s_exec_enabled)
+            *(volatile uint32_t *)((uint8_t *)mem + 0xFD800044u) =
+                va & 0x0FFFFFFFu;
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
@@ -243,6 +255,17 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             if (mode == PB_RING) {
                 uint32_t back = 0, site = va - 4, want = va, code = 0;
                 if (!s_ring_hi || pb_in_ring(tva)) {
+                    /* Forward within the words still to walk: D3D jumps
+                     * over the rest of a reserved block (often just to
+                     * the next dword), and the GPU simply follows. Taking
+                     * that for the wrap ended the segment there, so
+                     * everything up to the real wrap -- fences included
+                     * -- was never run, and the title waited for good on
+                     * a fence it had submitted (runs 125-126). */
+                    if (s_ring_hi && tva >= va && tva <= end_va) {
+                        va = tva;
+                        continue;
+                    }
                     if (exit_va)              /* the ring wrapping: where to */
                         *exit_va = tva;
                     break;
@@ -330,6 +353,23 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
+                /* A NOP with a parameter traps to the driver, and the GPU
+                 * waits for it (xbox_Nv2aSoftwareMethod). What the driver
+                 * does there -- patch the jump back out of a recorded
+                 * pushbuffer, say -- is read by the words after this, so
+                 * the walk reads on from memory only once it returns. */
+                if (s_exec_enabled && m == 0x0100u && nop_param)
+                    xbox_Nv2aSoftwareMethod(subch, nop_param);
+                /* D3D's fence block opens with method 0x0310 on subchannel
+                 * 5, the fence time in bits 2-6, which PGRAPH keeps at
+                 * 0x400B10. Before waiting on the event a NOP 5 sets,
+                 * D3D_BlockOnTime spins until those bits match the GPU-time
+                 * word (0x0053C130 in Conker); with the register never
+                 * written it spun for good once the time's low bits were
+                 * not 0 (run 112). */
+                if (s_exec_enabled && subch == 5u && m == 0x0310u)
+                    *(volatile uint32_t *)((uint8_t *)mem + 0xFD400B10u) =
+                        *(const uint32_t *)(mem + va);
                 va += 4;
                 words++;
             }
@@ -338,6 +378,51 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
         (*unknown)++;
     }
     return words;
+}
+
+/* RECOMP_PB_IDLE_DUMP: decode up to 64 KB past an idle PUT -- commands the
+ * title wrote but has not kicked, then stale ones from the ring's last lap --
+ * and list the fences (0x1D70) and NOPs with a parameter found there, so a
+ * wait on a fence the GPU was never given shows as such. Read-only. */
+void nv2a_pb_peek_ahead(uint32_t va)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t start = va, end = va + 0x10000u, methods = 0, shown = 0;
+    uint32_t ram_end = XBOX_CONTIG_BASE + (uint32_t)g_xbox_total_ram;
+
+    if (va < XBOX_CONTIG_BASE || va >= ram_end)
+        return;
+    if (end > ram_end)
+        end = ram_end;
+    fprintf(stderr, "[PB] PUT idle at %08X; past it:\n", va);
+    while (va < end && shown < 40) {
+        uint32_t w = *(const uint32_t *)(mem + va);
+        if (w && (w & 0x00030003u) == 0u) {
+            uint32_t count  = (w >> 18) & 0x7FFu;
+            uint32_t subch  = (w >> 13) & 7u;
+            uint32_t method =  w & 0x1FFCu;
+            int noninc = (w & 0xE0000000u) == 0x40000000u;
+            for (uint32_t i = 0; i < count && va + 4 + i * 4 < end; i++) {
+                uint32_t m = noninc ? method : method + i * 4;
+                uint32_t p = *(const uint32_t *)(mem + va + 4 + i * 4);
+                methods++;
+                if (m == 0x1D70u || (m == 0x0100u && p)) {
+                    fprintf(stderr, "[PB]   +%05X %u:%04X = %08X\n",
+                            va + 4 + i * 4 - start, subch, m, p);
+                    shown++;
+                }
+            }
+            va += 4 + count * 4;
+            continue;
+        }
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            fprintf(stderr, "[PB]   +%05X jump %08X\n", va - start, w);
+            shown++;
+        }
+        va += 4;
+    }
+    fprintf(stderr, "[PB]   %u methods in %u bytes\n", methods, va - start);
+    fflush(stderr);
 }
 
 /* Walks one ring segment; returns where the ring-wrap jump ending it goes,

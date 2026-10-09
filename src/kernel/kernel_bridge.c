@@ -2689,6 +2689,240 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
     }
 }
 
+/* PGRAPH software methods: a NOP (0x0100) with a nonzero parameter.
+ *
+ * The NV2A treats such a NOP as a call to the driver: PGRAPH stops, records
+ * the method and parameter in its trap registers and raises its interrupt,
+ * and carries on only once the ISR has acknowledged it (xemu: pgraph
+ * NV097_NO_OPERATION, "waiting_for_nop"). D3D builds on it: the low five bits
+ * of the parameter pick a job for d3d_gpu_nop_software_method, the rest are
+ * its argument. RunPushBuffer, finding a recorded pushbuffer still busy,
+ * queues NOP 0xC/0xD/0xE in front of its JUMP and leaves the jump back to be
+ * patched in when the GPU gets there; D3D_BlockOnTime waits on code 5's
+ * KeSetEvent. Nothing raised them, so those patches never happened.
+ *
+ * The pushbuffer executor runs on the ack thread, which has no guest stack.
+ * It posts the trap here and waits; the timer thread, which has one, sets the
+ * registers the way D3D's handler reads them, calls the ISR, drains the DPC
+ * it queues, and reports back. RECOMP_PGRAPH_SWM=* delivers every code, or a
+ * list of hex codes (C,D,E) delivers only those; the rest are skipped and
+ * counted, as before.
+ *
+ * PGRAPH_INTR is write-1-to-clear, and D3D acknowledges by writing back what
+ * it read. Against plain memory that leaves the bit set, d3d_gpu_dpc calls
+ * the handler again, and the patch is applied twice. The handler runs on the
+ * timer thread, so that thread alone carries a hardware write breakpoint on
+ * PGRAPH_INTR (debug register 0, set when it is created): during a delivery a
+ * write there is turned into a clear of the bits written (pgraph_w1c_veh).
+ * A guard page on the register's page came first (runs 110-113) and was
+ * wrong: it traps every thread, and the main thread polls 0x400B10 on the
+ * same page in a tight loop, so each D trap took 5-10 s, and a write landing
+ * while another thread had the page unguarded went unseen.
+ *
+ * ponytail: one trap in flight, and the executor waits for it -- which is
+ * what the hardware does too. The W1C emulation assumes dword writes, which
+ * is what D3D does. */
+#define NV2A_PMC_INTR_PGRAPH          (1u << 12)
+#define NV2A_PGRAPH_INTR              0x00400100u
+#define NV2A_PGRAPH_INTR_ERROR        (1u << 20)
+#define NV2A_PGRAPH_NSOURCE           0x00400108u
+#define NV2A_PGRAPH_NSOURCE_NOTIFY    1u
+#define NV2A_PGRAPH_TRAPPED_ADDR      0x00400704u
+#define NV2A_PGRAPH_TRAPPED_DATA_LOW  0x00400708u
+
+enum { SWM_IDLE, SWM_POSTED, SWM_DELIVERING, SWM_DONE };
+static volatile LONG g_swm_state;
+static uint32_t g_swm_subch, g_swm_param;
+static uint32_t g_swm_codes = (uint32_t)-1;  /* bit per code; -1: not read yet */
+static unsigned long g_swm_delivered[32], g_swm_skipped[32];
+static unsigned long g_swm_unacked, g_swm_retries;
+static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
+
+static volatile LONG g_w1c_armed;
+static uint32_t g_w1c_value;     /* what PGRAPH_INTR holds while armed */
+static DWORD g_w1c_thread;       /* the timer thread, which has the breakpoint */
+static volatile int g_w1c_inside;  /* only that thread ever sets it */
+
+#define W1C_REG ((volatile uint32_t *)((uintptr_t)(XBOX_NV2A_REG_BASE \
+                    + NV2A_PGRAPH_INTR) + (uintptr_t)g_xbox_mem_offset))
+
+/* A data breakpoint traps after the write, so the value before it is the one
+ * kept in g_w1c_value; nothing else writes the register during a delivery
+ * (the ack thread leaves it alone, nv2a_handshake_pass). */
+static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
+{
+    PCONTEXT c = ep->ContextRecord;
+
+    /* Nothing else single-steps the timer thread, so its single-step trap is
+     * this breakpoint even if the context should not report DR6. */
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP
+            || GetCurrentThreadId() != g_w1c_thread)
+        return EXCEPTION_CONTINUE_SEARCH;
+    /* The write below trips the same breakpoint, and the handler re-entered
+     * itself until the stack ran out (run 114); the nested trap is ours. */
+    if (InterlockedCompareExchange(&g_w1c_armed, 0, 0) && !g_w1c_inside) {
+        g_w1c_inside = 1;
+        g_w1c_value &= ~*W1C_REG;
+        *W1C_REG = g_w1c_value;
+        g_w1c_inside = 0;
+    }
+    c->Dr6 = 0;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/* Called with the timer thread created suspended: DR0 = PGRAPH_INTR, 4 bytes,
+ * break on write (DR7 L0, RW0 = 01, LEN0 = 11). 0 if it could not be set, in
+ * which case deliveries go ahead and D3D's handler may run twice. */
+static int pgraph_w1c_install(HANDLE thread, DWORD tid)
+{
+    CONTEXT c;
+
+    memset(&c, 0, sizeof c);
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    if (!GetThreadContext(thread, &c))
+        return 0;
+    c.Dr0 = (DWORD64)(uintptr_t)W1C_REG;
+    c.Dr7 = (c.Dr7 & ~0x000F0003ull) | 0x1ull | (0x1ull << 16) | (0x3ull << 18);
+    if (!SetThreadContext(thread, &c))
+        return 0;
+    g_w1c_thread = tid;
+    AddVectoredExceptionHandler(1, pgraph_w1c_veh);
+    return 1;
+}
+
+/* After the registers are raised, before the ISR runs; off again before
+ * they are cleared, so neither of our own writes is taken as D3D's. */
+static void pgraph_w1c_arm(int on)
+{
+    if (on)
+        g_w1c_value = *W1C_REG;
+    InterlockedExchange(&g_w1c_armed, on);
+}
+
+static uint32_t swm_codes(void)
+{
+    if (g_swm_codes == (uint32_t)-1) {
+        const char *e = getenv("RECOMP_PGRAPH_SWM");
+        g_swm_codes = 0;
+        if (e && (!strcmp(e, "*") || !_stricmp(e, "all")))
+            g_swm_codes = 0xFFFFFFFEu;      /* -1 is "not read"; code 0 is not one */
+        else if (e)
+            for (const char *p = e; *p; ) {
+                char *q;
+                unsigned long c = strtoul(p, &q, 16);
+                if (q == p) { p++; continue; }
+                if (c < 32) g_swm_codes |= 1u << c;
+                p = q;
+            }
+    }
+    return g_swm_codes;
+}
+
+/* Executor side (xbox_memory_layout.c): post a trap; 1 if it will be
+ * delivered, 0 if it is skipped and the executor should just go on. */
+int kernel_pgraph_swm_post(uint32_t subch, uint32_t param)
+{
+    uint32_t code = param & 0x1Fu;
+
+    if (!(swm_codes() & (1u << code)) || !g_timer_started || !g_timer_wake
+            || !xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
+        if (++g_swm_skipped[code] <= 4) {
+            fprintf(stderr, "  [NV2A] software method %X (param %08X) skipped%s\n",
+                    code, param, swm_codes() & (1u << code) ? " (no timer"
+                    " thread or no GPU interrupt yet)" : "");
+            fflush(stderr);
+        }
+        return 0;
+    }
+    g_swm_subch = subch;
+    g_swm_param = param;
+    InterlockedExchange(&g_swm_state, SWM_POSTED);
+    SetEvent(g_timer_wake);
+    return 1;
+}
+
+/* 1 once the trap has been delivered (or given up on); the state is idle
+ * again after this says so. */
+int kernel_pgraph_swm_done(void)
+{
+    return InterlockedCompareExchange(&g_swm_state, SWM_IDLE, SWM_DONE) == SWM_DONE;
+}
+
+/* Withdraw a trap the timer thread has not started on; 1 if withdrawn. */
+int kernel_pgraph_swm_cancel(void)
+{
+    return InterlockedCompareExchange(&g_swm_state, SWM_IDLE, SWM_POSTED)
+        == SWM_POSTED;
+}
+
+/* Timer-thread side. */
+static void kernel_pgraph_swm_tick(void)
+{
+    uint32_t code, left;
+    int claimed;
+    LARGE_INTEGER t0, t1, f;
+
+    if (InterlockedCompareExchange(&g_swm_state, SWM_DELIVERING, SWM_POSTED)
+            != SWM_POSTED)
+        return;
+    code = g_swm_param & 0x1Fu;
+    QueryPerformanceCounter(&t0);
+
+    /* The registers first, then the guard: a write of ours to PGRAPH_INTR
+     * under the guard would be taken as an acknowledgement. */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_ADDR) =
+        ((g_swm_subch & 7u) << 16) | 0x0100u;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_DATA_LOW) = g_swm_param;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = NV2A_PGRAPH_NSOURCE_NOTIFY;
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                  (LONG)NV2A_PGRAPH_INTR_ERROR);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                  (LONG)NV2A_PMC_INTR_PGRAPH);
+    pgraph_w1c_arm(1);
+    claimed = kernel_raise_interrupt(NV2A_VECTOR);
+    if (claimed > 0)
+        kernel_drain_dpcs();
+    pgraph_w1c_arm(0);
+    left = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) & NV2A_PGRAPH_INTR_ERROR;
+    InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                   (LONG)~NV2A_PGRAPH_INTR_ERROR);
+    InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                   (LONG)~NV2A_PMC_INTR_PGRAPH);
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
+
+    if (claimed == 0) {
+        /* The ISR declined: D3D has the GPU's interrupts masked just now. On
+         * hardware the interrupt stays pending until they are unmasked, so
+         * try again on the next pass rather than dropping it. */
+        g_swm_retries++;
+        InterlockedExchange(&g_swm_state, SWM_POSTED);
+        return;
+    }
+    if (claimed > 0) {
+        g_swm_delivered[code]++;
+        if (left)
+            g_swm_unacked++;
+    } else {
+        g_swm_skipped[code]++;
+    }
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    /* The first few of each code, then every 1024th. */
+    if (claimed < 0 || left || g_swm_delivered[code] <= 8
+            || !(g_swm_delivered[code] & 1023)) {
+        fprintf(stderr, "  [NV2A] software method %X (param %08X, subch %u): ISR"
+                " %s%s, %.2f ms | delivered C/D/E/5 %lu/%lu/%lu/%lu, unacked %lu,"
+                " retries %lu\n", code, g_swm_param, g_swm_subch,
+                claimed < 0 ? "not callable" : "claimed it",
+                left ? ", NOT acknowledged" : "",
+                (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart,
+                g_swm_delivered[0xC], g_swm_delivered[0xD], g_swm_delivered[0xE],
+                g_swm_delivered[5], g_swm_unacked, g_swm_retries);
+        fflush(stderr);
+    }
+    InterlockedExchange(&g_swm_state, SWM_DONE);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2721,8 +2955,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
         LARGE_INTEGER pa, pb, pc;
 
-        Sleep(10);
+        /* Sleeps the same 10 ms, but a posted PGRAPH trap wakes it: the
+         * pushbuffer executor is stopped until the trap is delivered. */
+        if (!g_timer_wake || WaitForSingleObject(g_timer_wake, 10) == WAIT_FAILED)
+            Sleep(10);
         QueryPerformanceCounter(&pa);
+        kernel_pgraph_swm_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         QueryPerformanceCounter(&pb);
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2773,8 +3011,25 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
 
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
+        g_timer_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_timer_started = 1;
-        CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
+        {
+            DWORD tid;
+            HANDLE h = CreateThread(NULL, 0, kernel_timer_thread, NULL,
+                                    CREATE_SUSPENDED, &tid);
+            if (h) {
+                /* Before it runs: PGRAPH_INTR's write breakpoint is this
+                 * thread's alone (pgraph_w1c_veh). */
+                if (swm_codes() && !pgraph_w1c_install(h, tid)) {
+                    fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
+                            " on PGRAPH_INTR (error %lu); a PGRAPH trap may be"
+                            " handled twice\n", GetLastError());
+                    fflush(stderr);
+                }
+                ResumeThread(h);
+                CloseHandle(h);
+            }
+        }
     }
 
     EnterCriticalSection(&g_timer_lock);
