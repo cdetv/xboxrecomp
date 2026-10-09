@@ -232,7 +232,18 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
     if (end_va > ram_end)
         end_va = ram_end;
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w;
+        /* DMA_GET follows the walk through the ring, as the GPU's does.
+         * Moving it only after the whole segment left it far behind while
+         * the executor was in fact part-way through, and D3D_BlockOnTime
+         * picks the place for its NOP 5 by that distance: it wrote the NOP
+         * into words already walked, and waited for good on an event that
+         * NOP would have set (run 115). Inside a recorded pushbuffer GET
+         * stays at the jump, which is where D3D looks for it. */
+        if (mode == PB_RING && s_exec_enabled)
+            *(volatile uint32_t *)((uint8_t *)mem + 0xFD800044u) =
+                va & 0x0FFFFFFFu;
+        w = *(const uint32_t *)(mem + va);
         va += 4;
         words++;
 
