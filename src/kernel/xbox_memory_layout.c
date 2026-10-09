@@ -1132,9 +1132,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             nv2a_pb_scan(
                                 XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
                                 XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
-                        if (getenv("RECOMP_PB_WRAP_TRACE")) {
+                        /* RECOMP_PB_WRAP_TRACE=all: every wrap, not the
+                         * first eight. A wrap whose start was not found
+                         * or lies past PUT is always shown: the segment
+                         * after it was walked from a guess. */
+                        if (getenv("RECOMP_PB_WRAP_TRACE")
+                                || !start || (start & 0x0FFFFFFFu) > put) {
                             static unsigned wraps;
-                            if (wraps++ < 8)
+                            const char *wt = getenv("RECOMP_PB_WRAP_TRACE");
+                            if (wraps++ < 8 || (wt && !strcmp(wt, "all"))
+                                    || !start || (start & 0x0FFFFFFFu) > put)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
                                         "(0x%08X -> 0x%08X, ring starts"
                                         " 0x%08X)\n", last_put, put, start);
