@@ -55,13 +55,19 @@ extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
 static int s_exec_enabled = -1;
 
+/* s_seen slot + 1 of each (subch, method), 0 = not seen yet. note() runs for
+ * every method word the walk decodes, and searching s_seen for it made the
+ * walk a tenth of the GPU thread's time in Conker. */
+/* An incrementing run starting near 0x1FFC reaches 0x3FF4. */
+static uint16_t s_seen_slot[8][0x4000 / 4];
+
 static void note(uint32_t subch, uint32_t method)
 {
-    for (int i = 0; i < s_seen_count; i++) {
-        if (s_seen[i].method == method && s_seen[i].subch == subch) {
-            s_seen[i].count++;
-            return;
-        }
+    uint16_t *slot = &s_seen_slot[subch & 7u][(method >> 2) & 0xFFFu];
+
+    if (*slot) {
+        s_seen[*slot - 1].count++;
+        return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
         /* Silently dropping past the cap is how a truncated inventory reads as
@@ -79,6 +85,7 @@ static void note(uint32_t subch, uint32_t method)
         s_seen[s_seen_count].subch  = subch;
         s_seen[s_seen_count].count  = 1;
         s_seen_count++;
+        *slot = (uint16_t)s_seen_count;
     }
 }
 
