@@ -188,6 +188,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+#define NV097_ARRAY_ELEMENT32             0x1808
 /* Draw a run of vertices straight out of the arrays, with no index list:
  * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
  * appear several times inside one BEGIN_END to draw a longer run. */
@@ -3376,6 +3377,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         } else if (s_gpu.prim) {
             s_gpu.idx_dropped += 2;
         }
+        break;
+
+    case NV097_ARRAY_ELEMENT32:
+        /* One 32-bit index. Xbox D3D sends 16-bit index lists two per word
+         * and the odd last one this way, so without it every odd-length
+         * draw lost its last index -- a lone triangle (one pair + one) all
+         * of it, since two indices draw nothing. */
+        if (s_gpu.prim && s_gpu.idx_count < NV_MAX_INDICES)
+            s_gpu.idx[s_gpu.idx_count++] = param;
+        else if (s_gpu.prim)
+            s_gpu.idx_dropped++;
         break;
 
     case NV097_SET_FLIP_READ:
