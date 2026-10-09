@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_pb_scan_regression C)
+enable_testing()
+add_executable(nv2a-pb-scan-test nv2a_pb_scan_test.c ../../src/kernel/nv2a_pb_scan.c)
+add_test(NAME nv2a-pb-scan-returns COMMAND nv2a-pb-scan-test)
