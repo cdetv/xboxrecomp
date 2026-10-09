@@ -12,12 +12,36 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 #define RAM      0x100000u
 #define CONTIG   0x80000000u
+#define SPAN     0x7E000000u                /* CONTIG up to the end of PGRAPH */
 
-static uint8_t s_ram[RAM];
+/* Guest VAs from CONTIG on. The walk also writes two GPU registers through
+ * the same memory offset (PFIFO DMA_GET at 0xFD800044, PGRAPH 0xFD400B10),
+ * so their pages are backed too, not just the RAM. */
+static uint8_t *s_ram;
 size_t g_xbox_total_ram = RAM;
+
+static void map_guest(void)
+{
+#ifdef _WIN32
+    s_ram = (uint8_t *)VirtualAlloc(NULL, SPAN, MEM_RESERVE, PAGE_NOACCESS);
+    VirtualAlloc(s_ram, RAM, MEM_COMMIT, PAGE_READWRITE);
+    VirtualAlloc(s_ram + (0xFD400000u - CONTIG), 0x1000, MEM_COMMIT,
+                 PAGE_READWRITE);
+    VirtualAlloc(s_ram + (0xFD800000u - CONTIG), 0x1000, MEM_COMMIT,
+                 PAGE_READWRITE);
+#else
+    s_ram = (uint8_t *)mmap(NULL, SPAN, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#endif
+}
 
 ptrdiff_t xbox_GetMemoryOffset(void)
 {
@@ -35,6 +59,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 }
 
 void nv2a_pb_exec_report(void) {}
+void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
+{
+    (void)subch; (void)param;
+}
 
 extern void nv2a_pb_scan(uint32_t start_va, uint32_t end_va);
 extern void nv2a_pb_scan_ring(uint32_t lo_va, uint32_t hi_va);
@@ -65,6 +93,7 @@ int main(void)
     const uint32_t buf = CONTIG + 0x40000;  /* the recorded pushbuffer */
     int ok = 1;
 
+    map_guest();
 #ifdef _WIN32
     _putenv("RECOMP_PB_EXEC=1");
 #else
