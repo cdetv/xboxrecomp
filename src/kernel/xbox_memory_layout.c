@@ -917,9 +917,12 @@ static int nv2a_vblank_held(volatile uint32_t *regs)
         && (LONG64)GetTickCount64() < until;
 }
 
-/* One pass over the handshake tables. intr_regs = 0 leaves the interrupt
- * status registers (every NV2A block keeps its own at +0x100) alone: a
- * PGRAPH software-method trap is being delivered and they are its. */
+/* One pass over the handshake tables. intr_regs = 0 leaves PGRAPH's
+ * interrupt bits alone -- PGRAPH_INTR and its bit in PMC_INTR_0 -- because a
+ * software-method trap is being delivered and they are its. Everything else
+ * still has to be acknowledged meanwhile: D3D's DPC spins until a vblank's
+ * PMC_INTR_0 bit clears, and holding all of PMC_INTR_0 left the timer thread
+ * stuck in that DPC, never getting to the trap (run 109). */
 static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
 {
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
@@ -929,8 +932,10 @@ static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
         uint32_t v = *r;
         if (!(v & mask))
             continue;
-        if (!intr_regs && (NV2A_ACK[i].offset & 0xFFFu) == 0x100u)
+        if (!intr_regs && NV2A_ACK[i].offset == 0x400100u)   /* PGRAPH_INTR */
             continue;
+        if (!intr_regs && NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS)
+            mask &= ~(1u << 12);                             /* PGRAPH */
         /* Read, then ask about the hold, then clear only if the register
          * still holds what was read: the timer thread sets the hold before
          * it raises the bits, so a vblank raised after the read is either
