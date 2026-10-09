@@ -2239,9 +2239,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * space first: clip = (screen - offset) / scale * w. Everything else the
  * vertex carries -- colours, fog, texture coordinates -- is linear in clip
  * space and is interpolated directly. The polygon is clipped against
- * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
- * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
- * check, which is correct, just slower for huge off-screen triangles. */
+ * w = NV_CLIP_W and the near plane, re-projected, and fanned.
+ * ponytail: x/y/far fall to the rasteriser's bounds check, which is
+ * correct, just slower for huge off-screen triangles. */
 #define NV_CLIP_W 1e-3f
 
 static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
@@ -2262,53 +2262,78 @@ static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
         po[i] = pa[i] + (pb[i] - pa[i]) * t;
 }
 
+/* Which side of clip plane p a clip-space vertex is on (>= 0: kept).
+ * Plane 0 is w = NV_CLIP_W, plane 1 the near plane z = 0.
+ *
+ * w alone was not enough. A vertex between the eye and the near plane has a
+ * small positive w, so it passed, and projected to coordinates in the
+ * millions or billions: the bounding box overflowed int and the triangle
+ * counted as off-surface, or its area overflowed and it counted as
+ * degenerate -- dropped either way, without a trace. The NV2A never draws
+ * that part (depth below 0), so it is clipped away like the part behind the
+ * eye. */
+static float xf_plane_dist(const Nv2aVshOutput *v, int p)
+{
+    return p == 0 ? v->pos[3] - NV_CLIP_W : v->pos[2];
+}
+
 static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
                               const Nv2aVshOutput *c)
 {
     const Nv2aVshOutput *in[3];
-    Nv2aVshOutput poly[4], va, vb;
-    float k[3], o[3], ca[3], cb[3];
-    int n = 0, i, j;
+    Nv2aVshOutput poly[2][8];
+    float k[3], o[3], cc[3];
+    int n = 3, cur = 0, i, j, p;
 
-    if (a->pos[3] > NV_CLIP_W && b->pos[3] > NV_CLIP_W && c->pos[3] > NV_CLIP_W) {
-        raster_xf_triangle(a, b, c);
-        return;
-    }
-    if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
-        && c->pos[3] <= NV_CLIP_W) {
-        s_gpu.tris_behind++;                  /* wholly behind: nothing */
-        return;
-    }
     {
         const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
         for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
     }
     in[0] = a; in[1] = b; in[2] = c;
+    /* In front of the eye and past the near plane: as it is. For w > 0 the
+     * clip-space z has the sign of (screen z - offset) / scale. */
+    for (i = 0; i < 3; i++)
+        if (in[i]->pos[3] <= NV_CLIP_W
+            || (k[2] != 0.0f && (in[i]->pos[2] - o[2]) / k[2] < 0.0f))
+            break;
+    if (i == 3) {
+        raster_xf_triangle(a, b, c);
+        return;
+    }
     for (i = 0; i < 3; i++) {
-        const Nv2aVshOutput *p = in[i], *q = in[(i + 1) % 3];
-        int pin = p->pos[3] > NV_CLIP_W, qin = q->pos[3] > NV_CLIP_W;
-        if (pin) {
-            va = *p;
-            xf_to_clip(p, k, o, ca);
-            for (j = 0; j < 3; j++) va.pos[j] = ca[j];
-            poly[n++] = va;
+        poly[0][i] = *in[i];
+        xf_to_clip(in[i], k, o, cc);
+        for (j = 0; j < 3; j++)
+            poly[0][i].pos[j] = cc[j];
+    }
+    /* Sutherland-Hodgman, one plane at a time; 3 -> at most 5 vertices. */
+    for (p = 0; p < 2; p++) {
+        const Nv2aVshOutput *src = poly[cur];
+        Nv2aVshOutput *dst = poly[cur ^ 1];
+        int m = 0;
+        for (i = 0; i < n; i++) {
+            const Nv2aVshOutput *P = &src[i], *Q = &src[(i + 1) % n];
+            float dp = xf_plane_dist(P, p), dq = xf_plane_dist(Q, p);
+            if (dp >= 0.0f)
+                dst[m++] = *P;
+            if ((dp >= 0.0f) != (dq >= 0.0f))
+                xf_lerp(P, Q, dp / (dp - dq), &dst[m++]);
         }
-        if (pin != qin) {
-            float t = (NV_CLIP_W - p->pos[3]) / (q->pos[3] - p->pos[3]);
-            va = *p; vb = *q;
-            xf_to_clip(p, k, o, ca);
-            xf_to_clip(q, k, o, cb);
-            for (j = 0; j < 3; j++) { va.pos[j] = ca[j]; vb.pos[j] = cb[j]; }
-            xf_lerp(&va, &vb, t, &poly[n++]);
+        n = m;
+        cur ^= 1;
+        if (n < 3) {
+            s_gpu.tris_behind++;              /* nothing left in front */
+            return;
         }
     }
     /* Back to screen space: divide by the (now positive) w, viewport. */
     for (i = 0; i < n; i++)
         for (j = 0; j < 3; j++)
-            poly[i].pos[j] = poly[i].pos[j] / poly[i].pos[3] * k[j] + o[j];
+            poly[cur][i].pos[j] = poly[cur][i].pos[j] / poly[cur][i].pos[3]
+                                * k[j] + o[j];
     s_probe_clipped = 1;
     for (i = 1; i + 1 < n; i++)
-        raster_xf_triangle(&poly[0], &poly[i], &poly[i + 1]);
+        raster_xf_triangle(&poly[cur][0], &poly[cur][i], &poly[cur][i + 1]);
     s_probe_clipped = 0;
 }
 
