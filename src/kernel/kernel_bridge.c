@@ -2741,6 +2741,7 @@ static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
 static volatile LONG g_w1c_armed;
 static uint32_t g_w1c_value;     /* what PGRAPH_INTR holds while armed */
 static DWORD g_w1c_thread;       /* the timer thread, which has the breakpoint */
+static volatile int g_w1c_inside;  /* only that thread ever sets it */
 
 #define W1C_REG ((volatile uint32_t *)((uintptr_t)(XBOX_NV2A_REG_BASE \
                     + NV2A_PGRAPH_INTR) + (uintptr_t)g_xbox_mem_offset))
@@ -2757,9 +2758,13 @@ static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP
             || GetCurrentThreadId() != g_w1c_thread)
         return EXCEPTION_CONTINUE_SEARCH;
-    if (InterlockedCompareExchange(&g_w1c_armed, 0, 0)) {
+    /* The write below trips the same breakpoint, and the handler re-entered
+     * itself until the stack ran out (run 114); the nested trap is ours. */
+    if (InterlockedCompareExchange(&g_w1c_armed, 0, 0) && !g_w1c_inside) {
+        g_w1c_inside = 1;
         g_w1c_value &= ~*W1C_REG;
         *W1C_REG = g_w1c_value;
+        g_w1c_inside = 0;
     }
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
