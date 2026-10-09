@@ -323,6 +323,7 @@ static struct {
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
+    uint32_t verts_cached;                  /* program runs saved, vertex cache */
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -2558,12 +2559,53 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
 static void raster_xf_prims(uint32_t n);
 
+/* Post-transform vertex cache, one batch deep.
+ *
+ * An indexed triangle list names each vertex about six times (once per
+ * triangle around it), and every one of those ran the vertex program again:
+ * same index, same attributes, same program and constants, same result. The
+ * NV2A keeps a small cache of transformed vertices for exactly this. Here a
+ * vertex index maps to the first s_xf slot that holds it in this batch, and a
+ * repeat copies that slot instead of running the program. The interpreter was
+ * the largest single cost of the GPU thread (run_program, 30% of it).
+ *
+ * Direct-mapped on the low 16 bits; the index is kept to tell 32-bit indices
+ * that share them apart. A new batch bumps the stamp instead of clearing.
+ * Off while the program may write constants (CXT_WRITE_EN): then one vertex
+ * can change what the next computes, and only running it again is right. */
+#define NV_VCACHE_SIZE 65536u
+static uint32_t s_vc_stamp[NV_VCACHE_SIZE], s_vc_index[NV_VCACHE_SIZE];
+static uint32_t s_vc_slot[NV_VCACHE_SIZE], s_vc_now;
+
+static int transform_cached(uint32_t i)
+{
+    uint32_t index = s_gpu.idx[i], h = index & (NV_VCACHE_SIZE - 1);
+
+    if (s_vc_stamp[h] == s_vc_now && s_vc_index[h] == index) {
+        s_xf[i] = s_xf[s_vc_slot[h]];
+        s_gpu.verts_cached++;
+        return 1;
+    }
+    if (!transform_vertex(index, &s_xf[i]))
+        return 0;
+    s_vc_stamp[h] = s_vc_now;
+    s_vc_index[h] = index;
+    s_vc_slot[h] = i;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
+    int cache = !nv2a_vsh_cxt_write();
 
+    if (cache && ++s_vc_now == 0) {         /* stamp wrapped: forget all */
+        memset(s_vc_stamp, 0, sizeof s_vc_stamp);
+        s_vc_now = 1;
+    }
     for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
+        if (!(cache ? transform_cached(i)
+                    : transform_vertex(s_gpu.idx[i], &s_xf[i]))) {
             if (probe_init() && s_gpu.flips == s_probe.from_flip)
                 fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
                         " program did not run (no END), batch dropped\n",
@@ -4034,9 +4076,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen, s_gpu.idx_dropped,
             (unsigned)NV_MAX_INDICES);
-    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
-                    " %u triangles dropped behind the eye\n",
-            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices (%u from"
+                    " the vertex cache); %u triangles dropped behind the eye\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.verts_cached,
+            s_gpu.tris_behind);
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
