@@ -52,6 +52,7 @@ static uint32_t s_tot_jumped_open;    /* buffer ran off with no jump back */
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
+extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
 static int s_exec_enabled = -1;
 
 static void note(uint32_t subch, uint32_t method)
@@ -330,6 +331,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
+                /* A NOP with a parameter traps to the driver, and the GPU
+                 * waits for it (xbox_Nv2aSoftwareMethod). What the driver
+                 * does there -- patch the jump back out of a recorded
+                 * pushbuffer, say -- is read by the words after this, so
+                 * the walk reads on from memory only once it returns. */
+                if (s_exec_enabled && m == 0x0100u && nop_param)
+                    xbox_Nv2aSoftwareMethod(subch, nop_param);
                 va += 4;
                 words++;
             }

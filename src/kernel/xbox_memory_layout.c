@@ -917,38 +917,90 @@ static int nv2a_vblank_held(volatile uint32_t *regs)
         && (LONG64)GetTickCount64() < until;
 }
 
+/* One pass over the handshake tables. intr_regs = 0 leaves the interrupt
+ * status registers (every NV2A block keeps its own at +0x100) alone: a
+ * PGRAPH software-method trap is being delivered and they are its. */
+static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
+{
+    for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
+        uint32_t mask = NV2A_ACK[i].busy_mask;
+        uint32_t v = *r;
+        if (!(v & mask))
+            continue;
+        if (!intr_regs && (NV2A_ACK[i].offset & 0xFFFu) == 0x100u)
+            continue;
+        /* Read, then ask about the hold, then clear only if the register
+         * still holds what was read: the timer thread sets the hold before
+         * it raises the bits, so a vblank raised after the read is either
+         * seen as held or makes the exchange fail. */
+        if (NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS
+            && nv2a_vblank_held(regs))
+            mask &= ~NV2A_PMC_INTR_PCRTC_BIT;
+        if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
+            && nv2a_vblank_held(regs))
+            mask = 0;
+        if (v & mask)
+            InterlockedCompareExchange((volatile LONG *)r,
+                                       (LONG)(v & ~mask), (LONG)v);
+    }
+    for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
+        volatile uint32_t *r =
+            (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
+        if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
+            *r |= NV2A_IDLE[i].idle_mask;
+        }
+    }
+}
+
+static volatile uint32_t *s_ack_regs;
+
+/* The pushbuffer executor reached a NOP with a parameter: a PGRAPH
+ * software-method trap (kernel_bridge.c, kernel_pgraph_swm_tick). Like the
+ * GPU, it stops until the driver has handled it. It runs on this thread, so
+ * the handshakes have to go on while it waits -- D3D's handler ends in a
+ * PFB flush that spins until bit 16 of 0x100410 is cleared, which is this
+ * thread's job. A trap the timer thread has not taken up within two seconds
+ * is withdrawn, so a stalled timer thread slows the executor instead of
+ * hanging it. */
+void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
+{
+    extern int kernel_pgraph_swm_post(uint32_t subch, uint32_t param);
+    extern int kernel_pgraph_swm_done(void);
+    extern int kernel_pgraph_swm_cancel(void);
+    ULONGLONG t0, warned = 0;
+
+    if (!s_ack_regs || !kernel_pgraph_swm_post(subch, param))
+        return;
+    t0 = GetTickCount64();
+    while (!kernel_pgraph_swm_done()) {
+        ULONGLONG waited;
+        nv2a_handshake_pass(s_ack_regs, 0);
+        waited = GetTickCount64() - t0;
+        if (waited > 2000 && kernel_pgraph_swm_cancel()) {
+            fprintf(stderr, "  [NV2A] software method %X (param %08X) not taken"
+                    " up in 2 s; skipped\n", param & 0x1Fu, param);
+            fflush(stderr);
+            return;
+        }
+        if (waited > 5000 && waited - warned > 5000) {
+            warned = waited;
+            fprintf(stderr, "  [NV2A] software method %X (param %08X): ISR/DPC"
+                    " still running after %llu ms\n", param & 0x1Fu, param,
+                    (unsigned long long)waited);
+            fflush(stderr);
+        }
+        SwitchToThread();
+    }
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    s_ack_regs = regs;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
-        for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
-            uint32_t mask = NV2A_ACK[i].busy_mask;
-            uint32_t v = *r;
-            if (!(v & mask))
-                continue;
-            /* Read, then ask about the hold, then clear only if the register
-             * still holds what was read: the timer thread sets the hold before
-             * it raises the bits, so a vblank raised after the read is either
-             * seen as held or makes the exchange fail. */
-            if (NV2A_ACK[i].offset == NV2A_PMC_INTR_0_OFS
-                && nv2a_vblank_held(regs))
-                mask &= ~NV2A_PMC_INTR_PCRTC_BIT;
-            if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
-                && nv2a_vblank_held(regs))
-                mask = 0;
-            if (v & mask)
-                InterlockedCompareExchange((volatile LONG *)r,
-                                           (LONG)(v & ~mask), (LONG)v);
-        }
-        for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
-            volatile uint32_t *r =
-                (volatile uint32_t *)((char *)regs + NV2A_IDLE[i].offset);
-            if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
-                *r |= NV2A_IDLE[i].idle_mask;
-            }
-        }
+        nv2a_handshake_pass(regs, 1);
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
          *

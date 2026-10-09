@@ -2689,6 +2689,227 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
     }
 }
 
+/* PGRAPH software methods: a NOP (0x0100) with a nonzero parameter.
+ *
+ * The NV2A treats such a NOP as a call to the driver: PGRAPH stops, records
+ * the method and parameter in its trap registers and raises its interrupt,
+ * and carries on only once the ISR has acknowledged it (xemu: pgraph
+ * NV097_NO_OPERATION, "waiting_for_nop"). D3D builds on it: the low five bits
+ * of the parameter pick a job for d3d_gpu_nop_software_method, the rest are
+ * its argument. RunPushBuffer, finding a recorded pushbuffer still busy,
+ * queues NOP 0xC/0xD/0xE in front of its JUMP and leaves the jump back to be
+ * patched in when the GPU gets there; D3D_BlockOnTime waits on code 5's
+ * KeSetEvent. Nothing raised them, so those patches never happened.
+ *
+ * The pushbuffer executor runs on the ack thread, which has no guest stack.
+ * It posts the trap here and waits; the timer thread, which has one, sets the
+ * registers the way D3D's handler reads them, calls the ISR, drains the DPC
+ * it queues, and reports back. RECOMP_PGRAPH_SWM=* delivers every code, or a
+ * list of hex codes (C,D,E) delivers only those; the rest are skipped and
+ * counted, as before.
+ *
+ * PGRAPH_INTR is write-1-to-clear, and D3D acknowledges by writing back what
+ * it read. Against plain memory that leaves the bit set, d3d_gpu_dpc calls
+ * the handler again, and the patch is applied twice. For the length of a
+ * delivery the register's page is a guard page: each access to it is caught,
+ * single-stepped, and a write to PGRAPH_INTR turned into a clear of the bits
+ * written (pgraph_w1c_veh).
+ *
+ * ponytail: one trap in flight, and the executor waits for it -- which is
+ * what the hardware does too. The W1C emulation assumes dword writes, which
+ * is what D3D does. */
+#define NV2A_PMC_INTR_PGRAPH          (1u << 12)
+#define NV2A_PGRAPH_INTR              0x00400100u
+#define NV2A_PGRAPH_INTR_ERROR        (1u << 20)
+#define NV2A_PGRAPH_NSOURCE           0x00400108u
+#define NV2A_PGRAPH_NSOURCE_NOTIFY    1u
+#define NV2A_PGRAPH_TRAPPED_ADDR      0x00400704u
+#define NV2A_PGRAPH_TRAPPED_DATA_LOW  0x00400708u
+
+enum { SWM_IDLE, SWM_POSTED, SWM_DELIVERING, SWM_DONE };
+static volatile LONG g_swm_state;
+static uint32_t g_swm_subch, g_swm_param;
+static uint32_t g_swm_codes = (uint32_t)-1;  /* bit per code; -1: not read yet */
+static unsigned long g_swm_delivered[32], g_swm_skipped[32];
+static unsigned long g_swm_unacked, g_swm_retries;
+static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
+
+static volatile LONG g_w1c_armed;
+static uintptr_t g_w1c_page;                 /* host address, PGRAPH page 0 */
+static __declspec(thread) struct {
+    int pending, write;
+    uint32_t before;
+} t_w1c;
+
+/* Only the faulting thread can be inside its step: a guard page fires once
+ * and stays clear until that thread re-arms it, so no other thread traps in
+ * between and reading the register here does not fault. */
+static LONG CALLBACK pgraph_w1c_veh(PEXCEPTION_POINTERS ep)
+{
+    PEXCEPTION_RECORD er = ep->ExceptionRecord;
+    volatile uint32_t *reg = (volatile uint32_t *)(g_w1c_page
+                                                   + (NV2A_PGRAPH_INTR & 0xFFFu));
+
+    if (er->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+        uintptr_t a = (uintptr_t)er->ExceptionInformation[1];
+        if (!g_w1c_page || a - g_w1c_page >= 0x1000u)
+            return EXCEPTION_CONTINUE_SEARCH;
+        t_w1c.pending = 1;
+        t_w1c.write = er->ExceptionInformation[0] == 1
+                   && a >= (uintptr_t)reg && a < (uintptr_t)reg + 4;
+        t_w1c.before = *reg;
+        ep->ContextRecord->EFlags |= 0x100u;          /* TF: trap after it */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_w1c.pending) {
+        DWORD old;
+        t_w1c.pending = 0;
+        if (t_w1c.write)
+            *reg = t_w1c.before & ~*reg;
+        ep->ContextRecord->EFlags &= ~0x100u;
+        if (InterlockedCompareExchange(&g_w1c_armed, 0, 0))
+            VirtualProtect((LPVOID)g_w1c_page, 0x1000, PAGE_READWRITE | PAGE_GUARD,
+                           &old);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void pgraph_w1c_arm(int on)
+{
+    static int registered;
+    DWORD old;
+
+    if (!g_w1c_page)
+        g_w1c_page = (uintptr_t)(XBOX_NV2A_REG_BASE + (NV2A_PGRAPH_INTR & ~0xFFFu))
+                   + (uintptr_t)g_xbox_mem_offset;
+    if (on && !registered) {
+        AddVectoredExceptionHandler(1, pgraph_w1c_veh);
+        registered = 1;
+    }
+    InterlockedExchange(&g_w1c_armed, on);
+    VirtualProtect((LPVOID)g_w1c_page, 0x1000,
+                   on ? PAGE_READWRITE | PAGE_GUARD : PAGE_READWRITE, &old);
+}
+
+static uint32_t swm_codes(void)
+{
+    if (g_swm_codes == (uint32_t)-1) {
+        const char *e = getenv("RECOMP_PGRAPH_SWM");
+        g_swm_codes = 0;
+        if (e && (!strcmp(e, "*") || !_stricmp(e, "all")))
+            g_swm_codes = 0xFFFFFFFEu;      /* -1 is "not read"; code 0 is not one */
+        else if (e)
+            for (const char *p = e; *p; ) {
+                char *q;
+                unsigned long c = strtoul(p, &q, 16);
+                if (q == p) { p++; continue; }
+                if (c < 32) g_swm_codes |= 1u << c;
+                p = q;
+            }
+    }
+    return g_swm_codes;
+}
+
+/* Executor side (xbox_memory_layout.c): post a trap; 1 if it will be
+ * delivered, 0 if it is skipped and the executor should just go on. */
+int kernel_pgraph_swm_post(uint32_t subch, uint32_t param)
+{
+    uint32_t code = param & 0x1Fu;
+
+    if (!(swm_codes() & (1u << code)) || !g_timer_started || !g_timer_wake
+            || !xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
+        g_swm_skipped[code]++;
+        return 0;
+    }
+    g_swm_subch = subch;
+    g_swm_param = param;
+    InterlockedExchange(&g_swm_state, SWM_POSTED);
+    SetEvent(g_timer_wake);
+    return 1;
+}
+
+/* 1 once the trap has been delivered (or given up on); the state is idle
+ * again after this says so. */
+int kernel_pgraph_swm_done(void)
+{
+    return InterlockedCompareExchange(&g_swm_state, SWM_IDLE, SWM_DONE) == SWM_DONE;
+}
+
+/* Withdraw a trap the timer thread has not started on; 1 if withdrawn. */
+int kernel_pgraph_swm_cancel(void)
+{
+    return InterlockedCompareExchange(&g_swm_state, SWM_IDLE, SWM_POSTED)
+        == SWM_POSTED;
+}
+
+/* Timer-thread side. */
+static void kernel_pgraph_swm_tick(void)
+{
+    static unsigned long total;
+    uint32_t code, left;
+    int claimed;
+    LARGE_INTEGER t0, t1, f;
+
+    if (InterlockedCompareExchange(&g_swm_state, SWM_DELIVERING, SWM_POSTED)
+            != SWM_POSTED)
+        return;
+    code = g_swm_param & 0x1Fu;
+    QueryPerformanceCounter(&t0);
+
+    /* The registers first, then the guard: a write of ours to PGRAPH_INTR
+     * under the guard would be taken as an acknowledgement. */
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_ADDR) =
+        ((g_swm_subch & 7u) << 16) | 0x0100u;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_TRAPPED_DATA_LOW) = g_swm_param;
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = NV2A_PGRAPH_NSOURCE_NOTIFY;
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                  (LONG)NV2A_PGRAPH_INTR_ERROR);
+    InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                  (LONG)NV2A_PMC_INTR_PGRAPH);
+    pgraph_w1c_arm(1);
+    claimed = kernel_raise_interrupt(NV2A_VECTOR);
+    if (claimed > 0)
+        kernel_drain_dpcs();
+    pgraph_w1c_arm(0);
+    left = BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR) & NV2A_PGRAPH_INTR_ERROR;
+    InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_INTR),
+                   (LONG)~NV2A_PGRAPH_INTR_ERROR);
+    InterlockedAnd((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0),
+                   (LONG)~NV2A_PMC_INTR_PGRAPH);
+    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PGRAPH_NSOURCE) = 0;
+
+    if (claimed == 0) {
+        /* The ISR declined: D3D has the GPU's interrupts masked just now. On
+         * hardware the interrupt stays pending until they are unmasked, so
+         * try again on the next pass rather than dropping it. */
+        g_swm_retries++;
+        InterlockedExchange(&g_swm_state, SWM_POSTED);
+        return;
+    }
+    if (claimed > 0) {
+        g_swm_delivered[code]++;
+        if (left)
+            g_swm_unacked++;
+    } else {
+        g_swm_skipped[code]++;
+    }
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    if (++total <= 16 || !(total & 1023)) {
+        fprintf(stderr, "  [NV2A] software method %X (param %08X, subch %u): ISR"
+                " %s%s, %.2f ms | delivered C/D/E/5 %lu/%lu/%lu/%lu, unacked %lu,"
+                " retries %lu\n", code, g_swm_param, g_swm_subch,
+                claimed < 0 ? "not callable" : "claimed it",
+                left ? ", NOT acknowledged" : "",
+                (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart,
+                g_swm_delivered[0xC], g_swm_delivered[0xD], g_swm_delivered[0xE],
+                g_swm_delivered[5], g_swm_unacked, g_swm_retries);
+        fflush(stderr);
+    }
+    InterlockedExchange(&g_swm_state, SWM_DONE);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2721,8 +2942,12 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
         LARGE_INTEGER pa, pb, pc;
 
-        Sleep(10);
+        /* Sleeps the same 10 ms, but a posted PGRAPH trap wakes it: the
+         * pushbuffer executor is stopped until the trap is delivered. */
+        if (!g_timer_wake || WaitForSingleObject(g_timer_wake, 10) == WAIT_FAILED)
+            Sleep(10);
         QueryPerformanceCounter(&pa);
+        kernel_pgraph_swm_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
         QueryPerformanceCounter(&pb);
         kernel_drain_dpcs();   /* deferred work, before due timers */
@@ -2773,6 +2998,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
 
     if (!g_timer_started) {
         InitializeCriticalSection(&g_timer_lock);
+        g_timer_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_timer_started = 1;
         CloseHandle(CreateThread(NULL, 0, kernel_timer_thread, NULL, 0, NULL));
     }
