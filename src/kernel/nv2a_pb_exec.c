@@ -226,9 +226,8 @@ typedef struct {
 
 #define NV_VERTEX_ATTRS 16
 /* One BEGIN/END batch. 4096 used to be the cap and indices past it were
- * dropped in silence: Conker draws its front-end bar floor as one strip of
- * more than 4096, whose cut-off end was the floor in front of the camera --
- * black wedges where only the lighting pass over it reached the screen. */
+ * dropped in silence: Conker's front-end bar scene draws a triangle strip
+ * of 8540 in one batch, and lost more than half of it. */
 #define NV_MAX_INDICES  65536
 #define NV_MAX_INLINE   65536           /* dwords of INLINE_ARRAY per batch */
 
