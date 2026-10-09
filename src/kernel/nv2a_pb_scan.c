@@ -216,8 +216,11 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             (*jumps)++;
             if (mode == PB_RING) {
                 uint32_t back = 0, site = va - 4;
-                if (!s_ring_hi || pb_in_ring(tva))
-                    break;                    /* the ring wrapping */
+                if (!s_ring_hi || pb_in_ring(tva)) {
+                    if (exit_va)              /* the ring wrapping: where to */
+                        *exit_va = tva;
+                    break;
+                }
                 s_tot_jumped++;
                 words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
                                  jumps, unknown, &back);
@@ -280,9 +283,11 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
     return words;
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Walks one ring segment; returns where the ring-wrap jump ending it goes,
+ * or 0 if it did not end on one. */
+static uint32_t pb_scan_segment(uint32_t start_va, uint32_t end_va)
 {
-    uint32_t words, jumps = 0, unknown = 0;
+    uint32_t words, jumps = 0, unknown = 0, wrap_to = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
@@ -290,14 +295,30 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (scan < 0)
         scan = getenv("RECOMP_PB_SCAN") != NULL;
     if (!(scan || s_exec_enabled) || end_va <= start_va)
-        return;
+        return 0;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
-    words = pb_walk(start_va, end_va, PB_RING, &jumps, &unknown, NULL);
+    words = pb_walk(start_va, end_va, PB_RING, &jumps, &unknown, &wrap_to);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    return wrap_to;
+}
+
+void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+{
+    (void)pb_scan_segment(start_va, end_va);
+}
+
+/* PUT came back round: walk on from where the last segment ended up to the
+ * JUMP D3D wrote to wrap the ring, and return that jump's target -- the
+ * ring's true start, where the new segment begins. 0 if no wrap jump was
+ * found. See the caller in xbox_memory_layout.c for why the learned lowest
+ * PUT is not good enough. */
+uint32_t nv2a_pb_scan_wrap(uint32_t from_va)
+{
+    return pb_scan_segment(from_va, from_va + 0x400000u);
 }
