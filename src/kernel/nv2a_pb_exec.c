@@ -2326,8 +2326,13 @@ static void raster_batch_program(void)
     uint32_t i, n = s_gpu.idx_count;
 
     for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
+            if (probe_init() && s_gpu.flips == s_probe.from_flip)
+                fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
+                        " program did not run (no END), batch dropped\n",
+                        s_gpu.draws, s_gpu.prim, n);
             return;                                    /* no program loaded */
+        }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -2521,6 +2526,11 @@ static void raster_batch(void)
         raster_batch_program();
         return;
     }
+    if (probe_init() && s_gpu.flips == s_probe.from_flip)
+        fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: fixed-function"
+                " (mode %u), %s\n", s_gpu.draws, s_gpu.prim, s_gpu.idx_count,
+                s_gpu.xf_mode, batch_is_screen_space() ? "screen-space"
+                : "not screen-space, dropped");
     if (!batch_is_screen_space()) {
         s_gpu.batches_untransformed++;
         return;
