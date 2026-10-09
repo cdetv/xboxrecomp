@@ -2309,6 +2309,19 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
         raster_xf_triangle(a, b, c);
         return;
     }
+    /* The same triangle arrives in another vertex order in another pass (a
+     * strip for the base layer, a list for the lighting over it), and a
+     * different order clips into a differently fanned polygon whose depth
+     * differs in the last bits -- so the later pass's EQUAL/LEQUAL test
+     * failed and its pixels vanished. Put the corners in one order first;
+     * the rasteriser takes either winding. */
+    for (i = 0; i < 2; i++)
+        for (j = 0; j < 2 - i; j++)
+            if (memcmp(in[j]->pos, in[j + 1]->pos, sizeof in[j]->pos) > 0) {
+                const Nv2aVshOutput *t = in[j];
+                in[j] = in[j + 1];
+                in[j + 1] = t;
+            }
     for (i = 0; i < 3; i++) {
         poly[0][i] = *in[i];
         xf_to_clip(in[i], k, o, cc);
