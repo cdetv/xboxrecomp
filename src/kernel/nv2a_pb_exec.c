@@ -1918,7 +1918,11 @@ typedef struct {
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
+    int probe_x, probe_y;               /* RECOMP_PIXEL_PROBE pixel, or -1 */
 } XfTri;
+
+/* What the combiners saw and made at the probe pixel, for probe_log. */
+static struct { int hit; float d0[4], d1[4], t[4][4], out[4]; } s_probe_px;
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
 
@@ -1980,6 +1984,13 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             continue;
                         nv2a_rc_eval(&s_gpu.rc, col, d1, fog,
                                      (const float (*)[4])t, out);
+                        if (x == T->probe_x && y == T->probe_y) {
+                            s_probe_px.hit = 1;
+                            memcpy(s_probe_px.d0, col, sizeof col);
+                            memcpy(s_probe_px.d1, d1, sizeof d1);
+                            memcpy(s_probe_px.t, t, sizeof t);
+                            memcpy(s_probe_px.out, out, sizeof out);
+                        }
                         if (s_gpu.alpha_test && !alpha_test_pass(out[3]))
                             continue;
                         argb = pack_color(out);
@@ -2174,9 +2185,41 @@ static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
             s_gpu.alpha_test);
     for (k = 0; k < 3; k++)
         fprintf(stderr, "[PROBE]   v%d pos %.1f %.1f %.4f w %.3f  d0 %.2f %.2f"
-                " %.2f %.2f  t0 %.3f %.3f\n", k, v[k]->pos[0], v[k]->pos[1],
-                v[k]->pos[2], v[k]->pos[3], v[k]->d0[0], v[k]->d0[1],
-                v[k]->d0[2], v[k]->d0[3], v[k]->tex[0][0], v[k]->tex[0][1]);
+                " %.2f %.2f  t0 %.3f %.3f %.3f %.3f\n", k, v[k]->pos[0],
+                v[k]->pos[1], v[k]->pos[2], v[k]->pos[3], v[k]->d0[0],
+                v[k]->d0[1], v[k]->d0[2], v[k]->d0[3], v[k]->tex[0][0],
+                v[k]->tex[0][1], v[k]->tex[0][2], v[k]->tex[0][3]);
+    /* The combiner program and what it made of this pixel. */
+    fprintf(stderr, "[PROBE]   cmask %08X  rc ctl %08X fin %08X %08X fc %08X %08X\n",
+            s_gpu.color_mask, s_gpu.rc.control, s_gpu.rc.final0,
+            s_gpu.rc.final1, s_gpu.rc.final_c0, s_gpu.rc.final_c1);
+    for (k = 0; k < (int)(s_gpu.rc.control & 0xFF) && k < 8; k++)
+        fprintf(stderr, "[PROBE]   s%d icw %08X %08X ocw %08X %08X c %08X %08X\n",
+                k, s_gpu.rc.color_icw[k], s_gpu.rc.alpha_icw[k],
+                s_gpu.rc.color_ocw[k], s_gpu.rc.alpha_ocw[k],
+                s_gpu.rc.factor0[k], s_gpu.rc.factor1[k]);
+    for (k = 0; k < 4; k++)
+        if ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F)
+            fprintf(stderr, "[PROBE]   t%d %08X %ux%u fmt %02X%s pitch %u\n", k,
+                    s_gpu.texs[k].offset, s_gpu.texs[k].width,
+                    s_gpu.texs[k].height, s_gpu.texs[k].color,
+                    s_gpu.texs[k].valid ? "" : " (invalid)", s_gpu.texs[k].pitch);
+    if (s_probe_px.hit) {
+        const float *q;
+        q = s_probe_px.d0;
+        fprintf(stderr, "[PROBE]   px d0 %.3f %.3f %.3f %.3f", q[0], q[1], q[2], q[3]);
+        q = s_probe_px.d1;
+        fprintf(stderr, "  d1 %.3f %.3f %.3f %.3f\n", q[0], q[1], q[2], q[3]);
+        for (k = 0; k < 4; k++) {
+            q = s_probe_px.t[k];
+            fprintf(stderr, "[PROBE]   px t%d %.3f %.3f %.3f %.3f\n", k,
+                    q[0], q[1], q[2], q[3]);
+        }
+        q = s_probe_px.out;
+        fprintf(stderr, "[PROBE]   px out %.3f %.3f %.3f %.3f\n", q[0], q[1], q[2], q[3]);
+    } else {
+        fprintf(stderr, "[PROBE]   px not shaded (depth, clip or flat path)\n");
+    }
 }
 
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
@@ -2196,6 +2239,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (no_rc < 0)
         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     memset(&T, 0, sizeof T);
+    T.probe_x = T.probe_y = -1;
     T.mem = (uint8_t *)xbox_GetMemoryOffset();
     T.bpp = surface_bpp();
     T.textured = s_gpu.texs[0].valid;
@@ -2271,6 +2315,9 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         && s_probe.x >= T.minx && s_probe.x < T.maxx
         && s_probe.y >= T.miny && s_probe.y < T.maxy && probe_covers(a, b, c)) {
         probe = 1;
+        T.probe_x = s_probe.x;
+        T.probe_y = s_probe.y;
+        s_probe_px.hit = 0;
         probe_before = probe_read(T.bpp);
         probe_z = T.zb ? T.zb[(size_t)s_probe.y * NV_ZBUF_W + s_probe.x] : -1.0f;
     }
@@ -3309,6 +3356,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.clip_h = (param >> 16) & 0xFFFF;
         break;
     case NV097_SET_SURFACE_FORMAT:
+        if (probe_init() && s_gpu.flips == s_probe.from_flip
+            && param != s_gpu.format)
+            fprintf(stderr, "[PROBE] flip %u draw %u: surface format %08X%c",
+                    s_gpu.flips, s_gpu.draws, param, 10);
         s_gpu.format = param;
         break;
     case NV097_SET_SURFACE_PITCH:
@@ -3317,6 +3368,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_COLOR_OFFSET:
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
+        /* Render targets of the probed frame: a texture the title draws
+         * into itself is only right if this surface is. */
+        if (probe_init() && s_gpu.flips == s_probe.from_flip)
+            fprintf(stderr, "[PROBE] flip %u draw %u: surface %08X (was %08X)"
+                    " format %08X pitch %08X clip %u,%u %ux%u%c", s_gpu.flips,
+                    s_gpu.draws, param, s_gpu.color_offset, s_gpu.format,
+                    s_gpu.pitch, s_gpu.clip_x, s_gpu.clip_y, s_gpu.clip_w,
+                    s_gpu.clip_h, 10);
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
