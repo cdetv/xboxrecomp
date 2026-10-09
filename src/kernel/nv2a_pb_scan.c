@@ -47,6 +47,7 @@ static uint32_t s_tot_calls;
 static uint32_t s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost;
 static uint32_t s_tot_jumped_stale;   /* buffer's return was another run's */
 static uint32_t s_tot_jumped_open;    /* buffer ran off with no jump back */
+static uint32_t s_tot_jumped_chained; /* record found with no NOP code */
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -151,9 +152,10 @@ void nv2a_pb_scan_report(void)
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed; %u jumps to recorded"
                         " pushbuffers: %u came back, %u lost (%u held another"
-                        " run's return, %u had none)\n", s_tot_calls,
-                s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost,
-                s_tot_jumped_stale, s_tot_jumped_open);
+                        " run's return, %u had none, %u chained records)\n",
+                s_tot_calls, s_tot_jumped, s_tot_jumped_back,
+                s_tot_jumped_lost, s_tot_jumped_stale, s_tot_jumped_open,
+                s_tot_jumped_chained);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -201,6 +203,10 @@ void nv2a_pb_scan_report(void)
  * So the return this run wants is worked out from the ring, as D3D wrote it:
  *   NOP param (rec << 5) | 0xC or 0xE: rec is a record in the ring, just
  *       after the JUMP, whose first dword is the return (past the record);
+ *   NOP param 0 (a run chained onto an earlier deferred one; the earlier
+ *       one's interrupt patches both): the record after the JUMP is still
+ *       there, found by its contents (pb_is_return_record); the return is
+ *       past it;
  *   otherwise (param 0xD with the record in the device, or no NOP): the
  *       word after the JUMP.
  * A return that is not ahead in this segment is counted as lost and ends
@@ -222,6 +228,24 @@ void nv2a_pb_scan_ring(uint32_t lo_va, uint32_t hi_va)
 static int pb_in_ring(uint32_t va)
 {
     return va + 0x10000u >= s_ring_lo && va <= s_ring_hi + 0x10000u;
+}
+
+/* RunPushBuffer's return record, as it writes it after the JUMP:
+ * { return phys | flags, next, last-dword VA, fixups, data VA }. The return
+ * is the word past the record and the data is where the JUMP goes, so a
+ * record for this jump is recognised by those two, not by the NOP before it
+ * (whose parameter is 0 when the run is chained onto another). */
+#define PB_RECORD_BYTES 20u
+
+static int pb_is_return_record(const uint8_t *mem, uint32_t va, uint32_t tva,
+                               uint32_t ram_end)
+{
+    const uint32_t *r;
+    if (va + PB_RECORD_BYTES > ram_end)
+        return 0;
+    r = (const uint32_t *)(mem + va);
+    return (r[0] & 0x0FFFFFFFu) == ((va + PB_RECORD_BYTES) & 0x0FFFFFFFu)
+        && (r[4] & 0x0FFFFFFFu) == (tva & 0x0FFFFFFFu);
 }
 
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
@@ -287,6 +311,17 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                         want = XBOX_CONTIG_BASE
                              | (*(const uint32_t *)(mem + rec) & 0x0FFFFFFFu);
                     }
+                }
+                /* A record after the JUMP with no code naming it: D3D
+                 * chains a run onto the previous deferred one and leaves
+                 * the NOP's parameter 0. Walked as commands, the record's
+                 * buffer address read as a method header with ~126
+                 * parameters, swallowing the real commands after it --
+                 * the walk then took vertex floats for jumps (run 147). */
+                if (want == va && pb_is_return_record(mem, va, tva,
+                                                      ram_end)) {
+                    want = va + PB_RECORD_BYTES;
+                    s_tot_jumped_chained++;
                 }
                 s_tot_jumped++;
                 words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
