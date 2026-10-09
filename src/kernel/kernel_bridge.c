@@ -2819,7 +2819,12 @@ int kernel_pgraph_swm_post(uint32_t subch, uint32_t param)
 
     if (!(swm_codes() & (1u << code)) || !g_timer_started || !g_timer_wake
             || !xbox_GetConnectedInterrupt(NV2A_VECTOR)) {
-        g_swm_skipped[code]++;
+        if (++g_swm_skipped[code] <= 4) {
+            fprintf(stderr, "  [NV2A] software method %X (param %08X) skipped%s\n",
+                    code, param, swm_codes() & (1u << code) ? " (no timer"
+                    " thread or no GPU interrupt yet)" : "");
+            fflush(stderr);
+        }
         return 0;
     }
     g_swm_subch = subch;
@@ -2846,7 +2851,6 @@ int kernel_pgraph_swm_cancel(void)
 /* Timer-thread side. */
 static void kernel_pgraph_swm_tick(void)
 {
-    static unsigned long total;
     uint32_t code, left;
     int claimed;
     LARGE_INTEGER t0, t1, f;
@@ -2896,7 +2900,9 @@ static void kernel_pgraph_swm_tick(void)
     }
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
-    if (++total <= 16 || !(total & 1023)) {
+    /* The first few of each code, then every 1024th. */
+    if (claimed < 0 || left || g_swm_delivered[code] <= 8
+            || !(g_swm_delivered[code] & 1023)) {
         fprintf(stderr, "  [NV2A] software method %X (param %08X, subch %u): ISR"
                 " %s%s, %.2f ms | delivered C/D/E/5 %lu/%lu/%lu/%lu, unacked %lu,"
                 " retries %lu\n", code, g_swm_param, g_swm_subch,
