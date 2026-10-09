@@ -1310,7 +1310,9 @@ static int peek_readable(uint32_t va)
                 && (uint64_t)va + 4 <= (uint64_t)win[i].base + win[i].size)
             return 1;
     }
-    return 0;
+    /* RECOMP_EXT_VMA pages above the mirrors, where committed. Conker keeps
+     * its camera object there (0x7403CB40), and peeking it printed "??". */
+    return guest_vmem_committed(va, 4);
 }
 
 /* ---- RECOMP_WATCH: name the guest code that changes a guest dword -------
