@@ -2098,19 +2098,26 @@ static int probe_covers(const float *a, const float *b, const float *c)
     return (w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0);
 }
 
-static void probe_log(const XfTri *T, uint32_t before, uint32_t after)
+static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
+                      float zbuf)
 {
     const Nv2aVshOutput *v[3];
+    const float *a = T->a, *b = T->b, *c = T->c;
+    float px = (float)s_probe.x + 0.5f, py = (float)s_probe.y + 0.5f, z;
     int k;
     v[0] = T->va; v[1] = T->vb; v[2] = T->vc;
+    /* The triangle's depth at the pixel, as xf_rows computes it. */
+    z = ((c[0] - b[0]) * (py - b[1]) - (c[1] - b[1]) * (px - b[0])) * T->inv_area * a[2]
+      + ((a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0])) * T->inv_area * b[2]
+      + ((b[0] - a[0]) * (py - a[1]) - (b[1] - a[1]) * (px - a[0])) * T->inv_area * c[2];
     fprintf(stderr, "[PROBE] flip %u draw %u: %08X -> %08X%s  tex0 %s fmt %02X"
             " at %08X  rc %d prog %05X  blend %d %X/%X  depth %d %X mask %d"
-            "  alpha %d\n", s_gpu.flips, s_gpu.draws, before, after,
-            s_probe_clipped ? " (near-clipped)" : "",
+            " z %.9g vs %.9g  alpha %d\n", s_gpu.flips, s_gpu.draws, before,
+            after, s_probe_clipped ? " (near-clipped)" : "",
             s_gpu.texs[0].valid ? "on" : "off", s_gpu.texs[0].color,
             s_gpu.texs[0].offset, T->use_rc, s_gpu.rc.stage_program,
             s_gpu.blend_enable, s_gpu.blend_sfactor, s_gpu.blend_dfactor,
-            s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
+            s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask, z, zbuf,
             s_gpu.alpha_test);
     for (k = 0; k < 3; k++)
         fprintf(stderr, "[PROBE]   v%d pos %.1f %.1f %.4f w %.3f  d0 %.2f %.2f"
@@ -2123,6 +2130,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
     uint32_t probe_before = 0;
+    float probe_z = -1.0f;              /* depth buffer at the pixel, before */
     int probe = 0;
     XfTri T;
     XfCount cnt = {0, 0, 0};
@@ -2211,11 +2219,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         && s_probe.y >= T.miny && s_probe.y < T.maxy && probe_covers(a, b, c)) {
         probe = 1;
         probe_before = probe_read(T.bpp);
+        probe_z = T.zb ? T.zb[(size_t)s_probe.y * NV_ZBUF_W + s_probe.x] : -1.0f;
     }
     xf_rows_parallel(&T, &cnt);
     if (probe) {
         s_probe.hits += 4;
-        probe_log(&T, probe_before, probe_read(T.bpp));
+        probe_log(&T, probe_before, probe_read(T.bpp), probe_z);
     }
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
