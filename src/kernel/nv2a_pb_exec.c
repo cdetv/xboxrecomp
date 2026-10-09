@@ -204,6 +204,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_VERTEX3F                0x1500   /* +0..0x08, 3 floats */
 #define NV097_SET_VERTEX4F                0x1518   /* +0..0x0C, 4 floats */
 #define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
+#define NV097_BACK_END_WRITE_SEMAPHORE_RELEASE 0x1D70
 #define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
 #define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  4 x u8 */
 #define NV097_SET_VERTEX_DATA2S           0x1900   /* + attr*4,  2 x s16 */
@@ -3289,6 +3290,18 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+static volatile uint32_t s_sem_release;
+static volatile int s_sem_seen;
+
+/* Last BACK_END_WRITE_SEMAPHORE_RELEASE the executor ran; 0 until one ran. */
+int nv2a_pb_exec_semaphore(uint32_t *value)
+{
+    if (!s_sem_seen)
+        return 0;
+    *value = s_sem_release;
+    return 1;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -3348,6 +3361,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     switch (method) {
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        /* D3D's fence: the GPU writes this value (the fence time) to the
+         * GPU-time word when it gets here. The fence mirror reports it from
+         * now on instead of the time D3D last *submitted*, so a title that
+         * waits for the GPU before rewriting memory the GPU still has to
+         * read (a recorded pushbuffer patched in place, Conker's fur shells)
+         * really waits until the executor has drawn from it. */
+        s_sem_release = param;
+        s_sem_seen = 1;
+        break;
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;
         s_gpu.clip_w = (param >> 16) & 0xFFFF;

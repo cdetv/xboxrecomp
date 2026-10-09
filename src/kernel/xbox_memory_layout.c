@@ -787,6 +787,17 @@ static void frame_counters_tick(void)
 
 static void fence_mirrors_tick(void)
 {
+    /* Once the pushbuffer executor runs fences itself, the GPU time is the
+     * last fence it actually reached, not the last one submitted: copying
+     * the submitted time told the title the GPU was done with commands still
+     * waiting in the ring, and it rewrote memory they read (Conker's fur
+     * shells patch one recorded pushbuffer in place per shell, so most of
+     * them drew with another shell's texture). Without the executor the
+     * submitted time is all there is. */
+    extern int nv2a_pb_exec_semaphore(uint32_t *value);
+    uint32_t executed;
+    int from_exec = nv2a_pb_exec_semaphore(&executed);
+
     for (int i = 0; i < g_fence_mirror_count; i++) {
         uint32_t dev, get_ptr;
 
@@ -804,7 +815,7 @@ static void fence_mirrors_tick(void)
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t put =
+            uint32_t put = from_exec ? executed :
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
             if (*fence != put)
