@@ -1182,6 +1182,67 @@ static void dump_texture_bmp(uint32_t seq)
     fflush(stderr);
 }
 
+/* RECOMP_PROBE_TEXDUMP=<prefix>: level 0 of a probed draw's stage texture,
+ * colour on the left and alpha as grey on the right, through sample_tex like
+ * the rasteriser reads it. Once per address and format. */
+static void probe_dump_stage_tex(const Texture *t, int st)
+{
+    static struct { uint32_t offset, color; } seen[64];
+    static int nseen;
+    const char *prefix = getenv("RECOMP_PROBE_TEXDUMP");
+    uint32_t w = t->width, h = t->height, x, y, ow, row_bytes, pad, filesz, i;
+    uint8_t hdr[54];
+    char path[512];
+    FILE *f;
+
+    if (!prefix || !t->valid || !w || !h || w > 2048 || h > 2048 || nseen >= 64)
+        return;
+    for (i = 0; i < (uint32_t)nseen; i++)
+        if (seen[i].offset == t->offset && seen[i].color == t->color)
+            return;
+    seen[nseen].offset = t->offset;
+    seen[nseen++].color = t->color;
+    ow = w * 2;
+    row_bytes = ow * 3;
+    pad = (4 - (row_bytes & 3)) & 3;
+    filesz = 54 + (row_bytes + pad) * h;
+    snprintf(path, sizeof path, "%st%d_%08X_fmt%02X.bmp", prefix, st,
+             t->offset, t->color);
+    f = fopen(path, "wb");
+    if (!f)
+        return;
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &filesz, 4);
+    hdr[10] = 54; hdr[14] = 40;
+    memcpy(hdr + 18, &ow, 4);
+    memcpy(hdr + 22, &h, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    fwrite(hdr, 1, sizeof hdr, f);
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < ow; x++) {
+            uint32_t argb = 0;
+            uint8_t px[3];
+            if (!sample_tex(t, 0, x % w, h - 1 - y, &argb))
+                argb = 0;
+            if (x < w) {
+                px[0] = (uint8_t)argb;
+                px[1] = (uint8_t)(argb >> 8);
+                px[2] = (uint8_t)(argb >> 16);
+            } else {
+                px[0] = px[1] = px[2] = (uint8_t)(argb >> 24);
+            }
+            fwrite(px, 1, 3, f);
+        }
+        if (pad) {
+            static const uint8_t zero[3] = {0, 0, 0};
+            fwrite(zero, 1, pad, f);
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[PROBE]   texdump %s\n", path);
+}
+
 /* The surface, resolved once per batch.
  *
  * dma_resolve consults the contiguous arena's high-water mark and
@@ -1923,7 +1984,7 @@ typedef struct {
 } XfTri;
 
 /* What the combiners saw and made at the probe pixel, for probe_log. */
-static struct { int hit; float d0[4], d1[4], t[4][4], out[4]; } s_probe_px;
+static struct { int hit; float d0[4], d1[4], t[4][4], tc[4][4], out[4]; } s_probe_px;
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
 
@@ -1979,6 +2040,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             for (j = 0; j < 4; j++)
                                 tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
                                        + l2 * T->stc[2][st][j]) / pw;
+                            if (x == T->probe_x && y == T->probe_y)
+                                memcpy(s_probe_px.tc[st], tc, sizeof tc);
                             keep = rc_stage_fetch(st, tc, t[st]);
                         }
                         if (!keep)
@@ -2199,12 +2262,31 @@ static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
                 k, s_gpu.rc.color_icw[k], s_gpu.rc.alpha_icw[k],
                 s_gpu.rc.color_ocw[k], s_gpu.rc.alpha_ocw[k],
                 s_gpu.rc.factor0[k], s_gpu.rc.factor1[k]);
+    fprintf(stderr, "[PROBE]   alpha func %X ref %02X\n", s_gpu.alpha_func,
+            s_gpu.alpha_ref & 0xFF);
     for (k = 0; k < 4; k++)
-        if ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F)
-            fprintf(stderr, "[PROBE]   t%d %08X %ux%u fmt %02X%s pitch %u\n", k,
-                    s_gpu.texs[k].offset, s_gpu.texs[k].width,
-                    s_gpu.texs[k].height, s_gpu.texs[k].color,
-                    s_gpu.texs[k].valid ? "" : " (invalid)", s_gpu.texs[k].pitch);
+        if ((s_gpu.rc.stage_program >> (k * 5)) & 0x1F) {
+            /* How much of level 0 has alpha >= 0.5, and its mean alpha: says
+             * whether an all-transparent sample is the texture or where we
+             * read it. */
+            const Texture *tx = &s_gpu.texs[k];
+            uint32_t u, vv, texel, solid = 0, n = 0;
+            uint64_t asum = 0;
+            for (vv = 0; vv < tx->height && vv < 1024; vv++)
+                for (u = 0; u < tx->width && u < 1024; u++)
+                    if (sample_tex(tx, 0, u, vv, &texel)) {
+                        n++;
+                        asum += texel >> 24;
+                        solid += (texel >> 24) >= 0x80;
+                    }
+            fprintf(stderr, "[PROBE]   t%d %08X %ux%u fmt %02X%s pitch %u levels %u"
+                    " addr %X/%X filter %08X cube %d  alpha>=.5 %u/%u mean %.3f\n",
+                    k, tx->offset, tx->width, tx->height, tx->color,
+                    tx->valid ? "" : " (invalid)", tx->pitch, tx->levels,
+                    tx->addr_u, tx->addr_v, tx->filter, tx->cube, solid, n,
+                    n ? (double)asum / n / 255.0 : 0.0);
+            probe_dump_stage_tex(tx, k);
+        }
     if (s_probe_px.hit) {
         const float *q;
         q = s_probe_px.d0;
@@ -2213,8 +2295,9 @@ static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
         fprintf(stderr, "  d1 %.3f %.3f %.3f %.3f\n", q[0], q[1], q[2], q[3]);
         for (k = 0; k < 4; k++) {
             q = s_probe_px.t[k];
-            fprintf(stderr, "[PROBE]   px t%d %.3f %.3f %.3f %.3f\n", k,
-                    q[0], q[1], q[2], q[3]);
+            fprintf(stderr, "[PROBE]   px t%d %.3f %.3f %.3f %.3f  at %.4f %.4f %.4f"
+                    " %.4f\n", k, q[0], q[1], q[2], q[3], s_probe_px.tc[k][0],
+                    s_probe_px.tc[k][1], s_probe_px.tc[k][2], s_probe_px.tc[k][3]);
         }
         q = s_probe_px.out;
         fprintf(stderr, "[PROBE]   px out %.3f %.3f %.3f %.3f\n", q[0], q[1], q[2], q[3]);
