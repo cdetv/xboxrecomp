@@ -323,6 +323,7 @@ static struct {
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
+    uint32_t verts_cached;                  /* program runs saved, vertex cache */
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -2088,28 +2089,63 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
     }
 }
 
-/* Worker threads for big triangles.
+/* Triangle queue and worker threads.
  *
- * The rasteriser is a software GPU, and a Burnout 3 frame is dominated by a
- * handful of full-screen passes -- composites, blurs, the menu backdrops --
- * each two triangles of 300,000 pixels through the register combiners. Those
- * split cleanly by row: every pixel reads only its own depth and colour, so
- * interleaved rows on N threads need no locking. Small triangles stay on the
- * executor thread, where waking workers would cost more than it saves.
+ * The rasteriser is a software GPU. Pixels split cleanly by row: every pixel
+ * reads only its own depth and colour, so N threads that each own every Nth
+ * row of the screen need no locking -- and because each thread draws the
+ * queued triangles in order, overlapping triangles still blend and
+ * depth-test in submission order.
+ *
+ * The pool used to be woken per triangle, for big triangles only (Burnout
+ * 3's full-screen passes). A Conker frame is ~10,000 small triangles, so the
+ * executor thread drew nearly all of them alone while the workers slept, and
+ * waking them per triangle cost more than it saved. Triangles are now set up
+ * on the executor thread and queued; the queue is drawn when the batch ends
+ * (raster_xf_prims) or fills, with one wake-up for all of it. Draw state
+ * (s_gpu, s_surface, the combiners) cannot change inside a batch, so the
+ * workers can read it directly.
+ *
  * RECOMP_RASTER_THREADS=<n> sets the count (1 = off); the default leaves a
- * few cores for the title and the host.
+ * few cores for the title and the host. RECOMP_RASTER_MT_MIN=<pixels>: a
+ * queue whose bounding boxes add up to less is drawn on the executor thread.
  * ponytail: s_gpu.pixels/pixel_max in put_pixel are unsynchronised stats and
  * may undercount; nothing depends on them. */
 #define NV_RASTER_MAX_THREADS 16
-#define NV_RASTER_MT_MIN_PIXELS 8192
+#define NV_RASTER_MT_MIN_PIXELS 1024
+#define NV_TRIQ_MAX 2048
+
+typedef struct {
+    XfTri T;
+    Nv2aVshOutput v[3];          /* the vertices T points at: clipped ones
+                                  * live on raster_xf_clipped's stack */
+} XfQueued;
+
+static XfQueued s_triq[NV_TRIQ_MAX];
+static int s_triq_n;
+static long s_triq_px;
+
+/* The rows of every queued triangle that thread k of n owns. */
+static void triq_rows(int k, int n, XfCount *cnt)
+{
+    int i;
+    for (i = 0; i < s_triq_n; i++) {
+        const XfTri *T = &s_triq[i].T;
+        int y0 = T->miny + ((k - T->miny % n) % n + n) % n;
+        xf_rows(T, y0, n, cnt);
+    }
+}
+
+/* The pool runs one job at a time on all its threads: job(k, n) for k in
+ * 0..n-1, the caller taking k = n-1, and returns when every part is done. */
+typedef void (*PoolJob)(int k, int n);
 
 #if defined(_WIN32)
 static struct {
     int n;                                  /* threads incl. the caller */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
     volatile LONG pending;
-    const XfTri *tri;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
+    PoolJob job;
 } s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
@@ -2117,8 +2153,7 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     int k = (int)(intptr_t)arg;
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        xf_rows(s_pool.tri, s_pool.tri->miny + k, s_pool.n, &s_pool.cnt[k]);
+        s_pool.job(k, s_pool.n);
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -2150,39 +2185,81 @@ static int raster_pool_size(void)
     return s_pool.n;
 }
 
-static void xf_rows_parallel(const XfTri *T, XfCount *total)
+static void pool_run(PoolJob job)
 {
-    int n = raster_pool_size(), k;
-    long px = (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+    int n = s_pool.n, k;
 
-    if (n <= 1 || px < NV_RASTER_MT_MIN_PIXELS || T->maxy - T->miny < n) {
-        xf_rows(T, T->miny, 1, total);
-        return;
-    }
-    s_pool.tri = T;
+    s_pool.job = job;
     s_pool.pending = n - 1;
     for (k = 0; k < n - 1; k++)
         SetEvent(s_pool.start[k]);
-    {
-        XfCount mine = {0, 0, 0};
-        xf_rows(T, T->miny + (n - 1), n, &mine);
-        WaitForSingleObject(s_pool.done, INFINITE);
-        total->depth_fail += mine.depth_fail;
-        total->pixels += mine.pixels;
-        total->zpass += mine.zpass;
-    }
-    for (k = 0; k < n - 1; k++) {
-        total->depth_fail += s_pool.cnt[k].depth_fail;
-        total->pixels += s_pool.cnt[k].pixels;
-        total->zpass += s_pool.cnt[k].zpass;
-    }
+    job(n - 1, n);
+    WaitForSingleObject(s_pool.done, INFINITE);
 }
 #else
-static void xf_rows_parallel(const XfTri *T, XfCount *total)
-{
-    xf_rows(T, T->miny, 1, total);
-}
+static int raster_pool_size(void) { return 1; }
+static void pool_run(PoolJob job) { job(0, 1); }
 #endif
+
+static XfCount s_triq_cnt[NV_RASTER_MAX_THREADS];
+
+static void triq_job(int k, int n)
+{
+    memset(&s_triq_cnt[k], 0, sizeof s_triq_cnt[k]);
+    triq_rows(k, n, &s_triq_cnt[k]);
+}
+
+static long raster_mt_min(void)
+{
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_RASTER_MT_MIN");
+        v = e ? atol(e) : NV_RASTER_MT_MIN_PIXELS;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+
+/* Draw everything queued, then empty the queue. */
+static void triq_flush(void)
+{
+    XfCount total = {0, 0, 0};
+    int n, k;
+
+    if (!s_triq_n)
+        return;
+    n = raster_pool_size();
+    if (n <= 1 || s_triq_px < raster_mt_min()) {
+        triq_rows(0, 1, &total);
+    } else {
+        pool_run(triq_job);
+        for (k = 0; k < n; k++) {
+            total.depth_fail += s_triq_cnt[k].depth_fail;
+            total.pixels += s_triq_cnt[k].pixels;
+            total.zpass += s_triq_cnt[k].zpass;
+        }
+    }
+    s_gpu.xf_depth_fail += total.depth_fail;
+    s_gpu.xf_pixels += total.pixels;
+    s_gpu.zpass_count += total.zpass;
+    s_triq_n = 0;
+    s_triq_px = 0;
+}
+
+/* Queue triangle T, with copies of its vertices. */
+static void triq_push(const XfTri *T)
+{
+    XfQueued *q;
+
+    if (s_triq_n == NV_TRIQ_MAX)
+        triq_flush();
+    q = &s_triq[s_triq_n++];
+    q->T = *T;
+    q->v[0] = *T->va; q->v[1] = *T->vb; q->v[2] = *T->vc;
+    q->T.va = &q->v[0]; q->T.vb = &q->v[1]; q->T.vc = &q->v[2];
+    q->T.a = q->v[0].pos; q->T.b = q->v[1].pos; q->T.c = q->v[2].pos;
+    s_triq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+}
 
 /* RECOMP_PIXEL_PROBE=x,y[,first_flip]: every program-path triangle that
  * covers screen pixel (x, y) is logged with the pixel before and after it and
@@ -2402,18 +2479,24 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         probe = 1;
         T.probe_x = s_probe.x;
         T.probe_y = s_probe.y;
+    }
+    if (probe) {
+        /* The probe logs the pixel before and after this one triangle, so
+         * everything queued ahead of it has to be on the surface first, and
+         * it is drawn right here on this thread. */
+        triq_flush();
         s_probe_px.hit = 0;
         probe_before = probe_read(T.bpp);
         probe_z = T.zb ? T.zb[(size_t)s_probe.y * NV_ZBUF_W + s_probe.x] : -1.0f;
-    }
-    xf_rows_parallel(&T, &cnt);
-    if (probe) {
+        xf_rows(&T, T.miny, 1, &cnt);
         s_probe.hits += 4;
         probe_log(&T, probe_before, probe_read(T.bpp), probe_z);
+        s_gpu.xf_depth_fail += cnt.depth_fail;
+        s_gpu.xf_pixels += cnt.pixels;
+        s_gpu.zpass_count += cnt.zpass;
+    } else {
+        triq_push(&T);
     }
-    s_gpu.xf_depth_fail += cnt.depth_fail;
-    s_gpu.xf_pixels += cnt.pixels;
-    s_gpu.zpass_count += cnt.zpass;
     s_gpu.tris_drawn++;
     note_drawn();
 }
@@ -2558,18 +2641,117 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
 static void raster_xf_prims(uint32_t n);
 
+/* Post-transform vertex cache, one batch deep, and transforms on the pool.
+ *
+ * An indexed triangle list names each vertex about six times (once per
+ * triangle around it), and every one of those ran the vertex program again:
+ * same index, same attributes, same program and constants, same result. The
+ * NV2A keeps a small cache of transformed vertices for exactly this. Here a
+ * vertex index maps to the first s_xf slot that holds it in this batch; only
+ * those first slots run the program, and repeats are copied from them
+ * afterwards. The interpreter was the largest single cost of the GPU thread
+ * (run_program, 30% of it).
+ *
+ * The program runs are independent, so a big batch spreads them over the
+ * raster pool. The first one always runs here, alone: it decodes the
+ * program and sets the interpreter's one-time switches before any worker
+ * reads them.
+ *
+ * Direct-mapped on the low 16 bits; the index is kept to tell 32-bit indices
+ * that share them apart. A new batch bumps the stamp instead of clearing.
+ * Off while the program may write constants (CXT_WRITE_EN): then one vertex
+ * can change what the next computes, and only running them all, in order,
+ * on one thread is right. Also one thread under RECOMP_VSH_DUMP/_STEP, whose
+ * logging is not thread-safe. */
+#define NV_VCACHE_SIZE 65536u
+#define NV_VSH_MT_MIN  64           /* program runs worth waking the pool */
+static uint32_t s_vc_stamp[NV_VCACHE_SIZE], s_vc_index[NV_VCACHE_SIZE];
+static uint32_t s_vc_slot[NV_VCACHE_SIZE], s_vc_now;
+static uint32_t s_xf_from[NV_MAX_INDICES];  /* slot to copy, or itself */
+static uint32_t s_xf_run[NV_MAX_INDICES], s_xf_nrun;   /* slots to run */
+static volatile int s_xf_failed;
+
+static void xf_job(int k, int n)
+{
+    /* Contiguous shares: neighbouring vertices share cache lines. Slot 0 of
+     * s_xf_run already ran. */
+    uint32_t m = s_xf_nrun - 1, j;
+    uint32_t lo = 1 + (uint32_t)((uint64_t)m * k / n);
+    uint32_t hi = 1 + (uint32_t)((uint64_t)m * (k + 1) / n);
+
+    for (j = lo; j < hi; j++) {
+        uint32_t i = s_xf_run[j];
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+            s_xf_failed = 1;
+    }
+}
+
+/* Every vertex of the batch into s_xf. 0: the program did not run. */
+static int transform_batch(uint32_t n)
+{
+    static int vsh_debug = -1;
+    int cache = !nv2a_vsh_cxt_write();
+    uint32_t i;
+
+    static long mt_min = -1;
+    if (vsh_debug < 0)
+        vsh_debug = getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_STEP");
+    if (mt_min < 0) {                       /* RECOMP_VSH_MT_MIN=<runs> */
+        const char *e = getenv("RECOMP_VSH_MT_MIN");
+        mt_min = e ? atol(e) : NV_VSH_MT_MIN;
+        if (mt_min < 2) mt_min = 2;
+    }
+    if (!cache) {
+        for (i = 0; i < n; i++)
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                return 0;
+        return 1;
+    }
+    if (++s_vc_now == 0) {                  /* stamp wrapped: forget all */
+        memset(s_vc_stamp, 0, sizeof s_vc_stamp);
+        s_vc_now = 1;
+    }
+    s_xf_nrun = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t index = s_gpu.idx[i], h = index & (NV_VCACHE_SIZE - 1);
+        if (s_vc_stamp[h] == s_vc_now && s_vc_index[h] == index) {
+            s_xf_from[i] = s_vc_slot[h];
+            continue;
+        }
+        s_vc_stamp[h] = s_vc_now;
+        s_vc_index[h] = index;
+        s_vc_slot[h] = i;
+        s_xf_from[i] = i;
+        s_xf_run[s_xf_nrun++] = i;
+    }
+    if (!transform_vertex(s_gpu.idx[s_xf_run[0]], &s_xf[s_xf_run[0]]))
+        return 0;
+    s_xf_failed = 0;
+    if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1 && !vsh_debug)
+        pool_run(xf_job);
+    else
+        xf_job(0, 1);
+    if (s_xf_failed)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (s_xf_from[i] != i) {
+            s_xf[i] = s_xf[s_xf_from[i]];
+            s_gpu.verts_cached++;
+        }
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
-    for (i = 0; i < n; i++)
-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
-            if (probe_init() && s_gpu.flips == s_probe.from_flip)
-                fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
-                        " program did not run (no END), batch dropped\n",
-                        s_gpu.draws, s_gpu.prim, n);
-            return;                                    /* no program loaded */
-        }
+    if (!transform_batch(n)) {
+        if (probe_init() && s_gpu.flips == s_probe.from_flip)
+            fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
+                    " program did not run (no END), batch dropped\n",
+                    s_gpu.draws, s_gpu.prim, n);
+        return;                                        /* no program loaded */
+    }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -2747,6 +2929,7 @@ static void raster_xf_prims(uint32_t n)
     default:
         break;
     }
+    triq_flush();       /* draw state may change after the batch */
 }
 
 static void raster_batch(void)
@@ -4034,9 +4217,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
             s_gpu.tris_skipped_offscreen, s_gpu.idx_dropped,
             (unsigned)NV_MAX_INDICES);
-    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
-                    " %u triangles dropped behind the eye\n",
-            s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices (%u from"
+                    " the vertex cache); %u triangles dropped behind the eye\n",
+            s_gpu.batches_program, s_gpu.verts_program, s_gpu.verts_cached,
+            s_gpu.tris_behind);
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",
