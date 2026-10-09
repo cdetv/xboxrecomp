@@ -1489,7 +1489,9 @@ void xbox_WatchInit(void)
     if (*endp == '+')
         g_watch_off = (uint32_t)strtoul(endp + 1, NULL, 0);
 
-    if (g_watch_derefs) {
+    /* A plain address that is not mapped yet -- RECOMP_EXT_VMA memory the
+     * title commits later -- is waited for the same way as a chain. */
+    if (g_watch_derefs || !peek_readable(g_watch_root + g_watch_off)) {
         fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
                         "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
         CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
