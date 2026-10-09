@@ -3368,6 +3368,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * waits for the GPU before rewriting memory the GPU still has to
          * read (a recorded pushbuffer patched in place, Conker's fur shells)
          * really waits until the executor has drawn from it. */
+        if (s_sem_seen && (int32_t)(param - s_sem_release) <= 0) {
+            static unsigned back;
+            if (back++ < 16)
+                fprintf(stderr, "[GPU] fence went back: %08X after %08X"
+                        " (flip %u draw %u)\n", param, s_sem_release,
+                        s_gpu.flips, s_gpu.draws);
+        }
         s_sem_release = param;
         s_sem_seen = 1;
         break;
@@ -3909,9 +3916,9 @@ void nv2a_pb_exec_report(void)
         static unsigned long last_ms;
         unsigned long now = (unsigned long)(clock() * 1000.0 / CLOCKS_PER_SEC);
         if (last_ms && now > last_ms)
-            fprintf(stderr, "[GPU] %.2f fps (%u flips)%c",
+            fprintf(stderr, "[GPU] %.2f fps (%u flips), last fence run %08X%c",
                     (s_gpu.flips - last_flips) * 1000.0 / (now - last_ms),
-                    s_gpu.flips, 10);
+                    s_gpu.flips, s_sem_release, 10);
         last_flips = s_gpu.flips;
         last_ms = now;
     }
