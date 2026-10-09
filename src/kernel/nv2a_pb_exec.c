@@ -2136,12 +2136,16 @@ static void triq_rows(int k, int n, XfCount *cnt)
     }
 }
 
+/* The pool runs one job at a time on all its threads: job(k, n) for k in
+ * 0..n-1, the caller taking k = n-1, and returns when every part is done. */
+typedef void (*PoolJob)(int k, int n);
+
 #if defined(_WIN32)
 static struct {
     int n;                                  /* threads incl. the caller */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
     volatile LONG pending;
-    XfCount cnt[NV_RASTER_MAX_THREADS];
+    PoolJob job;
 } s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
@@ -2149,8 +2153,7 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     int k = (int)(intptr_t)arg;
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
-        triq_rows(k, s_pool.n, &s_pool.cnt[k]);
+        s_pool.job(k, s_pool.n);
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -2182,9 +2185,29 @@ static int raster_pool_size(void)
     return s_pool.n;
 }
 
+static void pool_run(PoolJob job)
+{
+    int n = s_pool.n, k;
+
+    s_pool.job = job;
+    s_pool.pending = n - 1;
+    for (k = 0; k < n - 1; k++)
+        SetEvent(s_pool.start[k]);
+    job(n - 1, n);
+    WaitForSingleObject(s_pool.done, INFINITE);
+}
 #else
 static int raster_pool_size(void) { return 1; }
+static void pool_run(PoolJob job) { job(0, 1); }
 #endif
+
+static XfCount s_triq_cnt[NV_RASTER_MAX_THREADS];
+
+static void triq_job(int k, int n)
+{
+    memset(&s_triq_cnt[k], 0, sizeof s_triq_cnt[k]);
+    triq_rows(k, n, &s_triq_cnt[k]);
+}
 
 static long raster_mt_min(void)
 {
@@ -2209,22 +2232,13 @@ static void triq_flush(void)
     if (n <= 1 || s_triq_px < raster_mt_min()) {
         triq_rows(0, 1, &total);
     } else {
-#if defined(_WIN32)
-        XfCount mine = {0, 0, 0};
-        s_pool.pending = n - 1;
-        for (k = 0; k < n - 1; k++)
-            SetEvent(s_pool.start[k]);
-        triq_rows(n - 1, n, &mine);
-        WaitForSingleObject(s_pool.done, INFINITE);
-        total = mine;
-        for (k = 0; k < n - 1; k++) {
-            total.depth_fail += s_pool.cnt[k].depth_fail;
-            total.pixels += s_pool.cnt[k].pixels;
-            total.zpass += s_pool.cnt[k].zpass;
+        pool_run(triq_job);
+        for (k = 0; k < n; k++) {
+            total.depth_fail += s_triq_cnt[k].depth_fail;
+            total.pixels += s_triq_cnt[k].pixels;
+            total.zpass += s_triq_cnt[k].zpass;
         }
-#endif
     }
-    (void)k;
     s_gpu.xf_depth_fail += total.depth_fail;
     s_gpu.xf_pixels += total.pixels;
     s_gpu.zpass_count += total.zpass;
@@ -2627,59 +2641,111 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
 static void raster_xf_prims(uint32_t n);
 
-/* Post-transform vertex cache, one batch deep.
+/* Post-transform vertex cache, one batch deep, and transforms on the pool.
  *
  * An indexed triangle list names each vertex about six times (once per
  * triangle around it), and every one of those ran the vertex program again:
  * same index, same attributes, same program and constants, same result. The
  * NV2A keeps a small cache of transformed vertices for exactly this. Here a
- * vertex index maps to the first s_xf slot that holds it in this batch, and a
- * repeat copies that slot instead of running the program. The interpreter was
- * the largest single cost of the GPU thread (run_program, 30% of it).
+ * vertex index maps to the first s_xf slot that holds it in this batch; only
+ * those first slots run the program, and repeats are copied from them
+ * afterwards. The interpreter was the largest single cost of the GPU thread
+ * (run_program, 30% of it).
+ *
+ * The program runs are independent, so a big batch spreads them over the
+ * raster pool. The first one always runs here, alone: it decodes the
+ * program and sets the interpreter's one-time switches before any worker
+ * reads them.
  *
  * Direct-mapped on the low 16 bits; the index is kept to tell 32-bit indices
  * that share them apart. A new batch bumps the stamp instead of clearing.
  * Off while the program may write constants (CXT_WRITE_EN): then one vertex
- * can change what the next computes, and only running it again is right. */
+ * can change what the next computes, and only running them all, in order,
+ * on one thread is right. Also one thread under RECOMP_VSH_DUMP/_STEP, whose
+ * logging is not thread-safe. */
 #define NV_VCACHE_SIZE 65536u
+#define NV_VSH_MT_MIN  256          /* program runs worth waking the pool */
 static uint32_t s_vc_stamp[NV_VCACHE_SIZE], s_vc_index[NV_VCACHE_SIZE];
 static uint32_t s_vc_slot[NV_VCACHE_SIZE], s_vc_now;
+static uint32_t s_xf_from[NV_MAX_INDICES];  /* slot to copy, or itself */
+static uint32_t s_xf_run[NV_MAX_INDICES], s_xf_nrun;   /* slots to run */
+static volatile int s_xf_failed;
 
-static int transform_cached(uint32_t i)
+static void xf_job(int k, int n)
 {
-    uint32_t index = s_gpu.idx[i], h = index & (NV_VCACHE_SIZE - 1);
+    /* Contiguous shares: neighbouring vertices share cache lines. Slot 0 of
+     * s_xf_run already ran. */
+    uint32_t m = s_xf_nrun - 1, j;
+    uint32_t lo = 1 + (uint32_t)((uint64_t)m * k / n);
+    uint32_t hi = 1 + (uint32_t)((uint64_t)m * (k + 1) / n);
 
-    if (s_vc_stamp[h] == s_vc_now && s_vc_index[h] == index) {
-        s_xf[i] = s_xf[s_vc_slot[h]];
-        s_gpu.verts_cached++;
+    for (j = lo; j < hi; j++) {
+        uint32_t i = s_xf_run[j];
+        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+            s_xf_failed = 1;
+    }
+}
+
+/* Every vertex of the batch into s_xf. 0: the program did not run. */
+static int transform_batch(uint32_t n)
+{
+    static int vsh_debug = -1;
+    int cache = !nv2a_vsh_cxt_write();
+    uint32_t i;
+
+    if (vsh_debug < 0)
+        vsh_debug = getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_STEP");
+    if (!cache) {
+        for (i = 0; i < n; i++)
+            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+                return 0;
         return 1;
     }
-    if (!transform_vertex(index, &s_xf[i]))
+    if (++s_vc_now == 0) {                  /* stamp wrapped: forget all */
+        memset(s_vc_stamp, 0, sizeof s_vc_stamp);
+        s_vc_now = 1;
+    }
+    s_xf_nrun = 0;
+    for (i = 0; i < n; i++) {
+        uint32_t index = s_gpu.idx[i], h = index & (NV_VCACHE_SIZE - 1);
+        if (s_vc_stamp[h] == s_vc_now && s_vc_index[h] == index) {
+            s_xf_from[i] = s_vc_slot[h];
+            continue;
+        }
+        s_vc_stamp[h] = s_vc_now;
+        s_vc_index[h] = index;
+        s_vc_slot[h] = i;
+        s_xf_from[i] = i;
+        s_xf_run[s_xf_nrun++] = i;
+    }
+    if (!transform_vertex(s_gpu.idx[s_xf_run[0]], &s_xf[s_xf_run[0]]))
         return 0;
-    s_vc_stamp[h] = s_vc_now;
-    s_vc_index[h] = index;
-    s_vc_slot[h] = i;
+    s_xf_failed = 0;
+    if (s_xf_nrun >= NV_VSH_MT_MIN && raster_pool_size() > 1 && !vsh_debug)
+        pool_run(xf_job);
+    else
+        xf_job(0, 1);
+    if (s_xf_failed)
+        return 0;
+    for (i = 0; i < n; i++)
+        if (s_xf_from[i] != i) {
+            s_xf[i] = s_xf[s_xf_from[i]];
+            s_gpu.verts_cached++;
+        }
     return 1;
 }
 
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
-    int cache = !nv2a_vsh_cxt_write();
 
-    if (cache && ++s_vc_now == 0) {         /* stamp wrapped: forget all */
-        memset(s_vc_stamp, 0, sizeof s_vc_stamp);
-        s_vc_now = 1;
+    if (!transform_batch(n)) {
+        if (probe_init() && s_gpu.flips == s_probe.from_flip)
+            fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
+                    " program did not run (no END), batch dropped\n",
+                    s_gpu.draws, s_gpu.prim, n);
+        return;                                        /* no program loaded */
     }
-    for (i = 0; i < n; i++)
-        if (!(cache ? transform_cached(i)
-                    : transform_vertex(s_gpu.idx[i], &s_xf[i]))) {
-            if (probe_init() && s_gpu.flips == s_probe.from_flip)
-                fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
-                        " program did not run (no END), batch dropped\n",
-                        s_gpu.draws, s_gpu.prim, n);
-            return;                                    /* no program loaded */
-        }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
