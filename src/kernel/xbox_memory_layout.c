@@ -966,6 +966,13 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     static uint32_t put_lo, put_hi;
                     if (!put_lo || put < put_lo) put_lo = put;
                     if (put > put_hi) put_hi = put;
+                    {
+                        /* The walker needs the same bounds to tell the ring
+                         * wrapping from a jump out to a recorded pushbuffer. */
+                        extern void nv2a_pb_scan_ring(uint32_t, uint32_t);
+                        nv2a_pb_scan_ring(XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
+                                          XBOX_CONTIG_BASE | (put_hi & 0x0FFFFFFFu));
+                    }
                     if (last_put && put > last_put) {
                         nv2a_pb_scan(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                      XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));

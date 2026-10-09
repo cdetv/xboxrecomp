@@ -43,6 +43,7 @@ static int s_seen_count;
  * nothing. Unrecognised words are the tell. */
 static uint32_t s_tot_words, s_tot_unknown, s_tot_jumps, s_tot_segments;
 static uint32_t s_tot_calls;
+static uint32_t s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost;
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -136,7 +137,9 @@ void nv2a_pb_scan_report(void)
 
     if (s_exec_enabled > 0) {
         nv2a_pb_exec_report();
-        fprintf(stderr, "[PB] %u pushbuffer calls followed\n", s_tot_calls);
+        fprintf(stderr, "[PB] %u pushbuffer calls followed; %u jumps to recorded"
+                        " pushbuffers: %u came back, %u lost\n", s_tot_calls,
+                s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -162,9 +165,41 @@ void nv2a_pb_scan_report(void)
  * geometry it submits inline (environment maps, the HUD) drew fine.
  * The NV2A has one level of subroutine, so a CALL inside a call is not
  * followed. Addresses are physical, like PUT's, and reach guest memory the
- * same way: through the contiguous window. */
-static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
-                        uint32_t *jumps, uint32_t *unknown)
+ * same way: through the contiguous window.
+ *
+ * A JUMP in the ring used to end the walk, on the theory that the only jump
+ * there is the one back to the ring's start. Xbox D3D also jumps OUT:
+ * RunPushBuffer writes a JUMP to the recorded pushbuffer, whose last dword
+ * D3D patches into a JUMP back to the word after it. Stopping there lost the
+ * recorded buffer and the rest of the segment -- Conker's whole front-end
+ * scene, leaving most frames with a clear and nothing else. So a jump to
+ * somewhere outside the ring is followed (jumps between recorded buffers
+ * too) until a jump lands back in the ring, and the walk resumes there if
+ * that is still ahead in this segment. A jump back that is not -- D3D defers
+ * the patch to a GPU interrupt when the buffer may still be in use, and an
+ * unpatched slot holds an old return -- is counted as lost and ends the
+ * walk as before. */
+#define PB_RING   0
+#define PB_CALL   1
+#define PB_JUMPED 2
+
+static uint32_t s_ring_lo, s_ring_hi;          /* learned ring bounds (VAs) */
+
+void nv2a_pb_scan_ring(uint32_t lo_va, uint32_t hi_va)
+{
+    s_ring_lo = lo_va;
+    s_ring_hi = hi_va;
+}
+
+/* Learned bounds trail the true ones (the base sits at or below the lowest
+ * PUT, the end above the highest), hence the slack. */
+static int pb_in_ring(uint32_t va)
+{
+    return va + 0x10000u >= s_ring_lo && va <= s_ring_hi + 0x10000u;
+}
+
+static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
+                        uint32_t *jumps, uint32_t *unknown, uint32_t *exit_va)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
@@ -177,23 +212,46 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
         if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
+            uint32_t tva = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             (*jumps)++;
-            if (!in_call)
-                break;                        /* the ring: a jump ends it */
-            va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            if (mode == PB_RING) {
+                uint32_t back = 0, site = va - 4;
+                if (!s_ring_hi || pb_in_ring(tva))
+                    break;                    /* the ring wrapping */
+                s_tot_jumped++;
+                words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
+                                 jumps, unknown, &back);
+                if (back >= va && back <= end_va) {
+                    s_tot_jumped_back++;
+                    va = back;
+                    continue;
+                }
+                s_tot_jumped_lost++;
+                if (s_tot_jumped_lost <= 8)
+                    fprintf(stderr, "[PB] jump at %08X to %08X: no jump back"
+                            " into this segment (exit %08X, segment ends"
+                            " %08X)\n", site, tva, back, end_va);
+                break;
+            }
+            if (mode == PB_JUMPED && pb_in_ring(tva)) {
+                *exit_va = tva;               /* back to the ring */
+                break;
+            }
+            va = tva;
             end_va = va + 0x400000u;
             continue;
         }
         if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
-            if (in_call)
+            if (mode == PB_CALL)
                 break;
             continue;
         }
         if ((w & 3u) == 2u) {                    /* CALL */
-            if (!in_call) {
+            if (mode != PB_CALL) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
-                words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown);
+                words += pb_walk(sub, sub + 0x400000u, PB_CALL,
+                                 jumps, unknown, NULL);
             }
             continue;
         }
@@ -236,7 +294,7 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
-    words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
+    words = pb_walk(start_va, end_va, PB_RING, &jumps, &unknown, NULL);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
