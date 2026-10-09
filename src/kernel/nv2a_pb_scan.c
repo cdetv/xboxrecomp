@@ -338,6 +338,16 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                  * the walk reads on from memory only once it returns. */
                 if (s_exec_enabled && m == 0x0100u && nop_param)
                     xbox_Nv2aSoftwareMethod(subch, nop_param);
+                /* D3D's fence block opens with method 0x0310 on subchannel
+                 * 5, the fence time in bits 2-6, which PGRAPH keeps at
+                 * 0x400B10. Before waiting on the event a NOP 5 sets,
+                 * D3D_BlockOnTime spins until those bits match the GPU-time
+                 * word (0x0053C130 in Conker); with the register never
+                 * written it spun for good once the time's low bits were
+                 * not 0 (run 112). */
+                if (s_exec_enabled && subch == 5u && m == 0x0310u)
+                    *(volatile uint32_t *)((uint8_t *)mem + 0xFD400B10u) =
+                        *(const uint32_t *)(mem + va);
                 va += 4;
                 words++;
             }
