@@ -179,8 +179,6 @@ int pb_fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
-static uint32_t surface_bpp(void);
-
 static void note_drawn(void)
 {
     if (!g_pb.drawn_stale && g_pb.drawn_offset
@@ -189,7 +187,7 @@ static void note_drawn(void)
     g_pb.drawn_stale = 0;
     g_pb.drawn_offset = g_pb.color_offset;
     g_pb.drawn_pitch = g_pb.pitch;
-    g_pb.drawn_bpp = surface_bpp();
+    g_pb.drawn_bpp = pb_surface_bpp();
     g_pb.drawn_x = g_pb.clip_x; g_pb.drawn_y = g_pb.clip_y;
     g_pb.drawn_w = g_pb.clip_w; g_pb.drawn_h = g_pb.clip_h;
 }
@@ -201,7 +199,7 @@ static void note_drawn(void)
 static void surface_mean(uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *mx)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp(), sx, sy, n = 0;
+    uint32_t bpp = pb_surface_bpp(), sx, sy, n = 0;
     uint64_t tr = 0, tg = 0, tb = 0;
 
     *r = *g = *b = *mx = 0;
@@ -233,32 +231,6 @@ static void surface_mean(uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *mx)
     *r = (uint32_t)(tr / n); *g = (uint32_t)(tg / n); *b = (uint32_t)(tb / n);
 }
 
-static uint32_t surface_bpp(void)
-{
-    /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
-     * Deriving it from pitch / clip width -- the only way before -- is right
-     * only while the clip spans the whole surface: Burnout 3 narrows the clip
-     * to a 250-pixel window to draw its option values, 2560 / 250 came out as
-     * 10 bytes a pixel, and every such text quad was refused. */
-    switch (g_pb.format & 0xF) {
-    case 0x1: case 0x2: case 0x3: case 0xA:
-        return 2;
-    case 0x4: case 0x5: case 0x6: case 0x7: case 0x8:
-        return 4;
-    case 0x9:
-        return 1;
-    default:
-        break;
-    }
-    /* The pitch and the clip width together give the pixel size, which is more
-     * reliable than decoding the format field: the format's colour code is
-     * only meaningful alongside a type the title also sets, while the pitch is
-     * always exactly how many bytes a row occupies. */
-    if (!g_pb.clip_w)
-        return 0;
-    return g_pb.pitch / g_pb.clip_w;
-}
-
 
 /* Write the current surface out as a 24-bit BMP.
  *
@@ -287,7 +259,7 @@ static void dump_surface_bmp(void)
     char path[512];
     uint32_t w = drawn ? g_pb.drawn_w : g_pb.clip_w;
     uint32_t h = drawn ? g_pb.drawn_h : g_pb.clip_h, y, x;
-    uint32_t bpp = drawn ? g_pb.drawn_bpp : surface_bpp();
+    uint32_t bpp = drawn ? g_pb.drawn_bpp : pb_surface_bpp();
     uint32_t row_bytes, pad, filesz;
     uint8_t hdr[54];
     FILE *f;
@@ -358,7 +330,7 @@ static struct { int on; uint32_t w, h, mask_x, mask_y; } s_swz;
 static void clear_surface(uint32_t param)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    uint32_t bpp = pb_surface_bpp();
     uint32_t y, x;
     uint16_t v16;
 
@@ -428,7 +400,7 @@ static void clear_surface(uint32_t param)
             seen[n++] = g_pb.clear_color;
             fprintf(stderr, "  [GPU] clear colour 0x%08X -> surface 0x%08X"
                             " (%ubpp)\n",
-                    g_pb.clear_color, g_pb.color_offset, surface_bpp());
+                    g_pb.clear_color, g_pb.color_offset, pb_surface_bpp());
         }
     }
 
@@ -462,7 +434,7 @@ static void clear_surface(uint32_t param)
             fprintf(stderr, "  [GPU] raster self-test: triangle (%.0f,%.0f)"
                             " (%.0f,%.0f) (%.0f,%.0f) into 0x%08X %ubpp\n",
                     a[0], a[1], b[0], b[1], c[0], c[1],
-                    g_pb.color_offset, surface_bpp());
+                    g_pb.color_offset, pb_surface_bpp());
         }
     }
 
@@ -1057,7 +1029,7 @@ static void raster_triangle(const float a[2], const float b[2],
                             const float uv[3][2])
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
-    uint32_t bpp = surface_bpp();
+    uint32_t bpp = pb_surface_bpp();
     float area;
     int minx, maxx, miny, maxy, x, y;
     int textured = uv && g_pb.texs[0].valid;
@@ -2185,7 +2157,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     memset(&T, 0, sizeof T);
     T.probe_x = T.probe_y = -1;
     T.mem = (uint8_t *)xbox_GetMemoryOffset();
-    T.bpp = surface_bpp();
+    T.bpp = pb_surface_bpp();
     T.textured = g_pb.texs[0].valid;
     T.use_rc = g_pb.rc_seen && !no_rc;
     T.va = va; T.vb = vb; T.vc = vc;

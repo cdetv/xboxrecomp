@@ -158,6 +158,33 @@ static inline int tex_size_from_format(uint32_t fmt)
     return d3d8_format_is_swizzled(fmt) || d3d8_format_dxt_block_bytes(fmt);
 }
 
+/* Bytes per pixel of the current colour surface. */
+static inline uint32_t pb_surface_bpp(void)
+{
+    /* The surface format says it outright (NV097_SET_SURFACE_FORMAT_COLOR).
+     * Deriving it from pitch / clip width -- the only way before -- is right
+     * only while the clip spans the whole surface: Burnout 3 narrows the clip
+     * to a 250-pixel window to draw its option values, 2560 / 250 came out as
+     * 10 bytes a pixel, and every such text quad was refused. */
+    switch (g_pb.format & 0xF) {
+    case 0x1: case 0x2: case 0x3: case 0xA:
+        return 2;
+    case 0x4: case 0x5: case 0x6: case 0x7: case 0x8:
+        return 4;
+    case 0x9:
+        return 1;
+    default:
+        break;
+    }
+    /* The pitch and the clip width together give the pixel size, which is more
+     * reliable than decoding the format field: the format's colour code is
+     * only meaningful alongside a type the title also sets, while the pitch is
+     * always exactly how many bytes a row occupies. */
+    if (!g_pb.clip_w)
+        return 0;
+    return g_pb.pitch / g_pb.clip_w;
+}
+
 /* nv2a_pb_exec.c: where a DMA-object offset lives, and the guard that keeps
  * surface writes off the title's own image. */
 uint32_t pb_dma_resolve(uint32_t offset);
@@ -188,5 +215,8 @@ typedef struct {
 } Nv2aPbBackend;
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
+
+/* nv2a_draw_d3d11.c: the D3D11 back end, or NULL when it cannot start. */
+const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(void);
 
 #endif /* NV2A_PB_STATE_H */

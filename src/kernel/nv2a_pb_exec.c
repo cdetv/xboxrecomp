@@ -731,12 +731,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (!inited) {
         inited = 1;
         {
-            /* RECOMP_GPU picks the back end; unset or "sw" is the software
-             * rasteriser. */
+            /* RECOMP_GPU picks the back end: unset or "sw" is the software
+             * rasteriser, "d3d11" the GPU. */
             const char *gpu = getenv("RECOMP_GPU");
-            if (gpu && strcmp(gpu, "sw") != 0)
+            if (gpu && strcmp(gpu, "d3d11") == 0) {
+                const Nv2aPbBackend *b = nv2a_pb_backend_d3d11_open();
+                if (b)
+                    s_be = b;
+                else
+                    fprintf(stderr, "[GPU] d3d11 back end did not start,"
+                            " using %s%c", s_be->name, 10);
+            } else if (gpu && strcmp(gpu, "sw") != 0) {
                 fprintf(stderr, "[GPU] RECOMP_GPU=%s: unknown back end,"
                         " using %s%c", gpu, s_be->name, 10);
+            }
             fprintf(stderr, "[GPU] back end: %s%c", s_be->name, 10);
         }
         g_pb.color_mask = 0x01010101u;           /* all channels, as reset */
