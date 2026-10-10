@@ -1475,6 +1475,7 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+static const char *s_watchdog_file;   /* RECOMP_WATCHDOG_FILE */
 
 /* Can RECOMP_PEEK dereference this guest address?
  *
@@ -1842,7 +1843,19 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
     uint32_t esp, i;
 
     (void)unused;
-    Sleep(s_watchdog_secs * 1000u);
+    if (s_watchdog_file) {
+        /* RECOMP_WATCHDOG_FILE: dump when the file appears, not after a
+         * fixed time. A hang that comes at an unpredictable point -- while a
+         * level loads, minutes in, with someone at the pad -- is caught when
+         * it is seen, which a timer set at launch cannot do. */
+        ULONGLONG t0 = GetTickCount64();
+        while (GetFileAttributesA(s_watchdog_file) == INVALID_FILE_ATTRIBUTES)
+            Sleep(500);
+        s_watchdog_secs = (unsigned)((GetTickCount64() - t0) / 1000u);
+        fprintf(stderr, "[WATCHDOG] %s appeared\n", s_watchdog_file);
+    } else {
+        Sleep(s_watchdog_secs * 1000u);
+    }
 
     mem = (const uint8_t *)g_memory_offset;
     esp = s_watchdog_esp ? *s_watchdog_esp : 0;
@@ -1918,13 +1931,18 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 void xbox_WatchdogStart(void)
 {
     const char *secs = getenv("RECOMP_WATCHDOG_SECS");
+    const char *file = getenv("RECOMP_WATCHDOG_FILE");
     HANDLE h;
 
-    if (!secs || !*secs)
-        return;
-    s_watchdog_secs = (unsigned)atoi(secs);
-    if (!s_watchdog_secs)
-        return;
+    if (file && *file) {
+        s_watchdog_file = file;
+    } else {
+        if (!secs || !*secs)
+            return;
+        s_watchdog_secs = (unsigned)atoi(secs);
+        if (!s_watchdog_secs)
+            return;
+    }
 
     /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
      * be handed the address of the one that matters rather than reading its
