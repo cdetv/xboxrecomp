@@ -15,7 +15,7 @@
  * that reads them from a constant buffer), alpha test, fog, blend and colour
  * mask. Step 3: a texture that is a GPU surface is sampled from the GPU
  * (render to texture); depth and stencil buffers on the GPU, read back as
- * textures there too. Not yet: near-plane clipping, mip levels.
+ * textures there too; near-plane clipping on the CPU. Not yet: mip levels.
  *
  * Guest surfaces live on the GPU only. Nothing is written back to guest
  * memory, so a title that reads its own pixels back sees whatever was there
@@ -100,7 +100,7 @@ static struct {
     uint32_t shadow_dumps, shadow_no_surface;
     /* Batches: drawn, and the reasons the rest were not. */
     uint32_t drawn, tris, skip_program, skip_not_screen, skip_surface;
-    uint32_t verts_need_clip, combined;
+    uint32_t verts_need_clip, tris_clipped, tris_behind, combined;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
@@ -499,17 +499,20 @@ static void d3d_clear(uint32_t param)
  * the flat-path fetches without). Either way each vertex ends up as an
  * Nv2aVshOutput, which is also the GPU vertex: the batch goes up as it is,
  * with an index list that cuts its primitive into triangles the way
- * raster_batch cuts it. The shaders are in nv2a_draw_d3d11_hlsl.h.
- * ponytail: a triangle reaching behind the eye or the near plane is left
- * out rather than clipped (raster_xf_clipped). */
+ * raster_batch cuts it. The shaders are in nv2a_draw_d3d11_hlsl.h. A
+ * triangle reaching behind the eye or the near plane is clipped on the CPU
+ * (clip_triangle, as raster_xf_clipped does). */
 
 #include "nv2a_draw_d3d11_hlsl.h"
 
 #define NV_CLIP_W 1e-3f                 /* as in nv2a_draw_sw.c */
+enum { BV_OK = 1, BV_CLIP = 2 };        /* s_bv_ok; 0: not usable */
 
 static Nv2aVshOutput s_bv[NV_MAX_INDICES];          /* fixed-function batches */
 static uint8_t       s_bv_ok[NV_MAX_INDICES];       /* vertex usable */
-static uint32_t      s_ib[3 * NV_MAX_INDICES];      /* the triangle list */
+/* The triangle list: at most one triangle per vertex, and a clipped one
+ * fans into at most three. */
+static uint32_t      s_ib[9 * NV_MAX_INDICES];
 
 static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
@@ -670,6 +673,21 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
                                        D3D11_MAP_WRITE_DISCARD, 0, &m)))
         return 0;
     memcpy(m.pData, src, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    return 1;
+}
+
+/* buf_fill with two pieces back to back (a batch and its clipped vertices). */
+static int buf_fill2(ID3D11Buffer *b, const void *a, size_t na,
+                     const void *c, size_t nc)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, a, na);
+    if (nc)
+        memcpy((uint8_t *)m.pData + na, c, nc);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
     return 1;
 }
@@ -1275,17 +1293,137 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     return s_samp[k];
 }
 
-/* The triangle list for the batch's primitive, as raster_batch cuts it, as
- * indices into the batch's vertices. Returns the index count; triangles with
- * an unusable vertex are left out, as raster_indexed and the near-plane
- * check leave them out. */
-static uint32_t build_triangles(void)
-{
-    uint32_t n = g_pb.idx_count, i, out = 0;
+/* Near-plane clipping, a port of raster_xf_clipped (nv2a_draw_sw.c): a
+ * triangle with a corner behind the eye (w <= NV_CLIP_W) or in front of the
+ * near plane (depth below 0) is taken back to clip space, clipped against
+ * both planes, re-projected and fanned. The pieces are appended to the
+ * batch's vertices (s_cv, after the batch's own n) and indexed like any
+ * other triangle. Keep this in step with the C version: the same arithmetic
+ * in the same order gives the same vertices, and the same corner sort keeps
+ * depth bit-identical between passes that send the triangle in another
+ * vertex order (the lighting layers test LEQUAL against the base layer). */
+static Nv2aVshOutput *s_cv;             /* clipped vertices, grown */
+static uint32_t       s_cv_cap, s_cv_n;
 
+static Nv2aVshOutput *clip_vertex(void)
+{
+    if (s_cv_n == s_cv_cap) {
+        uint32_t cap = s_cv_cap ? s_cv_cap * 2 : 1024;
+        Nv2aVshOutput *p = (Nv2aVshOutput *)realloc(s_cv, cap * sizeof *p);
+        if (!p)
+            return NULL;
+        s_cv = p;
+        s_cv_cap = cap;
+    }
+    return &s_cv[s_cv_n++];
+}
+
+static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
+                       const float o[3], float c[3])
+{
+    int i;
+    for (i = 0; i < 3; i++)
+        c[i] = k[i] != 0.0f ? (v->pos[i] - o[i]) / k[i] * v->pos[3] : 0.0f;
+}
+
+static void xf_lerp(const Nv2aVshOutput *a, const Nv2aVshOutput *b, float t,
+                    Nv2aVshOutput *out)
+{
+    const float *pa = (const float *)a, *pb = (const float *)b;
+    float *po = (float *)out;
+    size_t i, n = sizeof(Nv2aVshOutput) / sizeof(float);
+    for (i = 0; i < n; i++)
+        po[i] = pa[i] + (pb[i] - pa[i]) * t;
+}
+
+static float xf_plane_dist(const Nv2aVshOutput *v, int p)
+{
+    return p == 0 ? v->pos[3] - NV_CLIP_W : v->pos[2];
+}
+
+/* Clip triangle a b c of batch v (n vertices); writes the fan's indices at
+ * ib and returns how many. */
+static uint32_t clip_triangle(const Nv2aVshOutput *v, uint32_t n,
+                              uint32_t a, uint32_t b, uint32_t c, uint32_t *ib)
+{
+    const Nv2aVshOutput *in[3];
+    Nv2aVshOutput poly[2][8];
+    const float *sc = nv2a_vsh_constant(58), *of = nv2a_vsh_constant(59);
+    float k[3], o[3], cc[3];
+    int m = 3, cur = 0, i, j, p;
+    uint32_t base, out = 0;
+
+    for (i = 0; i < 3; i++) { k[i] = sc[i]; o[i] = of[i]; }
+    in[0] = &v[a]; in[1] = &v[b]; in[2] = &v[c];
+    for (i = 0; i < 2; i++)
+        for (j = 0; j < 2 - i; j++)
+            if (memcmp(in[j]->pos, in[j + 1]->pos, sizeof in[j]->pos) > 0) {
+                const Nv2aVshOutput *t = in[j];
+                in[j] = in[j + 1];
+                in[j + 1] = t;
+            }
+    for (i = 0; i < 3; i++) {
+        poly[0][i] = *in[i];
+        xf_to_clip(in[i], k, o, cc);
+        for (j = 0; j < 3; j++)
+            poly[0][i].pos[j] = cc[j];
+    }
+    /* Sutherland-Hodgman, one plane at a time; 3 -> at most 5 vertices. */
+    for (p = 0; p < 2; p++) {
+        const Nv2aVshOutput *src = poly[cur];
+        Nv2aVshOutput *dst = poly[cur ^ 1];
+        int q = 0;
+        for (i = 0; i < m; i++) {
+            const Nv2aVshOutput *P = &src[i], *Q = &src[(i + 1) % m];
+            float dp = xf_plane_dist(P, p), dq = xf_plane_dist(Q, p);
+            if (dp >= 0.0f)
+                dst[q++] = *P;
+            if ((dp >= 0.0f) != (dq >= 0.0f))
+                xf_lerp(P, Q, dp / (dp - dq), &dst[q++]);
+        }
+        m = q;
+        cur ^= 1;
+        if (m < 3) {
+            s_stat.tris_behind++;               /* nothing left in front */
+            return 0;
+        }
+    }
+    base = n + s_cv_n;
+    for (i = 0; i < m; i++) {
+        Nv2aVshOutput *d = clip_vertex();
+        if (!d) {
+            s_cv_n -= (uint32_t)i;
+            return 0;
+        }
+        *d = poly[cur][i];
+        for (j = 0; j < 3; j++)
+            d->pos[j] = d->pos[j] / d->pos[3] * k[j] + o[j];
+    }
+    for (i = 1; i + 1 < m; i++) {
+        ib[out++] = base;
+        ib[out++] = base + (uint32_t)i;
+        ib[out++] = base + (uint32_t)i + 1;
+    }
+    s_stat.tris_clipped++;
+    return out;
+}
+
+/* The triangle list for the batch's primitive, as raster_batch cuts it, as
+ * indices into the batch's vertices v (n of them). Returns the index count.
+ * Triangles with an unusable vertex are left out, as raster_indexed and
+ * raster_xf_triangle leave them out; triangles crossing the near plane are
+ * clipped into s_cv. */
+static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
+{
+    uint32_t i, out = 0;
+
+    s_cv_n = 0;
 #define TRI(a, b, c) do {                                               \
-        if (s_bv_ok[a] && s_bv_ok[b] && s_bv_ok[c]) {                   \
+        uint8_t ka = s_bv_ok[a], kb = s_bv_ok[b], kc = s_bv_ok[c];      \
+        if (ka == BV_OK && kb == BV_OK && kc == BV_OK) {                \
             s_ib[out++] = (a); s_ib[out++] = (b); s_ib[out++] = (c);    \
+        } else if (ka && kb && kc) {                                    \
+            out += clip_triangle(v, n, (a), (b), (c), &s_ib[out]);      \
         } } while (0)
 
     switch (g_pb.prim) {
@@ -1318,8 +1456,10 @@ static uint32_t build_triangles(void)
     return out;
 }
 
-/* Which vertices of an Nv2aVshOutput batch can be drawn unclipped: in front
- * of the eye and past the near plane (raster_xf_clipped's test), finite. */
+/* Which vertices of an Nv2aVshOutput batch can be drawn as they are (BV_OK:
+ * in front of the eye and past the near plane, raster_xf_clipped's test),
+ * need their triangles clipped (BV_CLIP), or can't be used (0: not
+ * finite). */
 static void mark_unclipped(const Nv2aVshOutput *v, uint32_t n)
 {
     const float *zs = nv2a_vsh_constant(58), *zo = nv2a_vsh_constant(59);
@@ -1327,12 +1467,16 @@ static void mark_unclipped(const Nv2aVshOutput *v, uint32_t n)
 
     for (i = 0; i < n; i++) {
         const float *p = v[i].pos;
-        s_bv_ok[i] = p[3] > NV_CLIP_W
-            && !(zs[2] != 0.0f && (p[2] - zo[2]) / zs[2] < 0.0f)
-            && isfinite(p[0]) && isfinite(p[1])
-            && isfinite(p[2]) && isfinite(p[3]);
-        if (!s_bv_ok[i])
+        if (!(isfinite(p[0]) && isfinite(p[1])
+              && isfinite(p[2]) && isfinite(p[3])))
+            s_bv_ok[i] = 0;
+        else if (p[3] > NV_CLIP_W
+                 && !(zs[2] != 0.0f && (p[2] - zo[2]) / zs[2] < 0.0f))
+            s_bv_ok[i] = BV_OK;
+        else {
+            s_bv_ok[i] = BV_CLIP;
             s_stat.verts_need_clip++;
+        }
     }
 }
 
@@ -1454,8 +1598,8 @@ static void d3d_draw(void)
             float c[4], uv[2];
             Nv2aVshOutput *v = &s_bv[i];
             memset(v, 0, sizeof *v);
-            s_bv_ok[i] = (uint8_t)pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i],
-                                                v->pos);
+            s_bv_ok[i] = pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i], v->pos)
+                         ? BV_OK : 0;
             v->pos[2] = 0.0f;
             v->pos[3] = 1.0f;
             if (!pb_fetch_color(g_pb.idx[i], c))
@@ -1484,13 +1628,14 @@ static void d3d_draw(void)
         }
     }
 
-    nidx = build_triangles();
+    nidx = build_triangles(verts, n);
     if (!nidx
-        || !buf_reserve(&s_vb, &s_vb_verts, n, sizeof(Nv2aVshOutput),
-                        D3D11_BIND_VERTEX_BUFFER)
+        || !buf_reserve(&s_vb, &s_vb_verts, n + s_cv_n,
+                        sizeof(Nv2aVshOutput), D3D11_BIND_VERTEX_BUFFER)
         || !buf_reserve(&s_ib_buf, &s_ib_count, nidx, 4,
                         D3D11_BIND_INDEX_BUFFER)
-        || !buf_fill(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput))
+        || !buf_fill2(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput),
+                      s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput))
         || !buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4))
         return;
 
@@ -1783,11 +1928,12 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: %u batches: %u drawn (%u textured, %u"
             " through the combiners, %u triangles); not drawn: %u program"
             " did not run, %u not screen-space, %u no surface; %u vertices"
-            " needing a near clip (their triangles left out)%c",
+            " needing a near clip: %u triangles clipped, %u wholly behind%c",
             s_stat.batches, s_stat.drawn, s_stat.textured, s_stat.combined,
             s_stat.tris, s_stat.skip_program,
             s_stat.skip_not_screen, s_stat.skip_surface,
-            s_stat.verts_need_clip, 10);
+            s_stat.verts_need_clip, s_stat.tris_clipped, s_stat.tris_behind,
+            10);
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads, %u binds"
             " unchanged, %u binds of a format the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_reused,
