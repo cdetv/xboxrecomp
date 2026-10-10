@@ -42,6 +42,22 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
 
+/* The window itself, for a GPU back end that presents into it with a swap
+ * chain (nv2a_draw_d3d11.c). Once one has, GDI stops drawing: two presenters
+ * on one window fight over every frame. */
+static HWND          s_hwnd;
+static volatile LONG s_gpu_owned;
+
+void *xbox_FramebufferWindowHandle(void)
+{
+    return s_fb_running ? (void *)s_hwnd : NULL;
+}
+
+void xbox_FramebufferWindowGpuOwned(int on)
+{
+    InterlockedExchange(&s_gpu_owned, on ? 1 : 0);
+}
+
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
     /* RECOMP_FB_VA pins the window to one guest address instead of following
@@ -286,6 +302,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    s_hwnd = hwnd;
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -306,7 +323,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
-        if (s_present_idx >= 0 && s_rgb) {
+        if (s_gpu_owned) {
+            /* The GPU back end presents; this thread only pumps messages
+             * and keeps the title bar. */
+        } else if (s_present_idx >= 0 && s_rgb) {
             /* A finished frame, published by the flip. Copied into s_rgb so
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
@@ -368,6 +388,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         Sleep(16);
     }
 
+    s_hwnd = NULL;
     ReleaseDC(hwnd, hdc);
     DestroyWindow(hwnd);
     free(s_rgb);
@@ -397,4 +418,6 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+void *xbox_FramebufferWindowHandle(void) { return NULL; }
+void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
 #endif

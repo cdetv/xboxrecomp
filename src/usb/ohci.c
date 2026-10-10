@@ -485,7 +485,7 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * accepts, so it never needed this.)
  *
  * Resolved the way the pushbuffer executor resolves surface offsets
- * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
+ * (pb_dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
  * high-water mark an address is memory some MmAllocateContiguousMemory call
  * returned, and its bytes live in the window.
  *
