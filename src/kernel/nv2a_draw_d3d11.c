@@ -13,7 +13,9 @@
  * transformed on the CPU by the software path's interpreter, pixels on the
  * GPU with four texture stages, the register combiners (one general shader
  * that reads them from a constant buffer), alpha test, fog, blend and colour
- * mask. Not yet: depth and stencil, near-plane clipping, mip levels.
+ * mask. Step 3: a texture that is a GPU surface is sampled from the GPU
+ * (render to texture). Not yet: depth and stencil, near-plane clipping, mip
+ * levels.
  *
  * Guest surfaces live on the GPU only. Nothing is written back to guest
  * memory, so a title that reads its own pixels back sees whatever was there
@@ -70,6 +72,7 @@ static int                   s_shadow;  /* RECOMP_GPU=both: no window */
 typedef struct {
     uint32_t addr, pitch;
     uint32_t w, h;
+    uint32_t bpp, swz;                  /* guest pixel size, swizzled */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
 } GpuSurface;
@@ -91,6 +94,7 @@ static struct {
     uint32_t drawn, tris, skip_program, skip_not_screen, skip_surface;
     uint32_t verts_need_clip, combined;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
+    uint32_t rtt_binds, rtt_unhandled;
 } s_stat;
 
 static void fail(const char *what, HRESULT hr)
@@ -179,8 +183,11 @@ static int surface_current(void)
         if (s_surf[i].tex && s_surf[i].addr == addr
             && s_surf[i].pitch == g_pb.pitch)
             break;
-    if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h)
+    if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h) {
+        s_surf[i].bpp = pb_surface_bpp();
+        s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
         return i;
+    }
     if (i == GPU_SURFACES) {
         /* Round robin over a table that, in practice, never fills. */
         i = s_surf_next++ % GPU_SURFACES;
@@ -237,6 +244,8 @@ static int surface_current(void)
     s_surf[i].pitch = g_pb.pitch;
     s_surf[i].w = w;
     s_surf[i].h = h;
+    s_surf[i].bpp = pb_surface_bpp();
+    s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
     return i;
 }
 
@@ -621,21 +630,146 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     return h;
 }
 
+/* ── Render to texture ─────────────────────────────────────────────────────
+ *
+ * A title draws into a surface and then samples it: Conker's bloom
+ * downsamples the frame into small targets and blurs them back. On this back
+ * end those pixels exist only on the GPU, so a stage whose texture starts
+ * where a GPU surface does takes that surface instead of guest memory.
+ *
+ * The surface is copied into a texture of the stage's own size, one per
+ * stage, at every bind: the current render target cannot be sampled while
+ * it is drawn into, and a copy the texture's size keeps clamp and wrap at the
+ * texture's edges rather than the (often larger) surface's. A copy is a
+ * GPU-side blit, cheap next to hashing the guest bytes, which this path skips.
+ *
+ * The surface texture holds B8G8R8A8, i.e. A8R8G8B8 as the guest stores it;
+ * other readings of the same pixels are shader flags (tscale[st].z: alpha
+ * reads 1; .w: red and blue swap). A reading not handled here (e.g. a
+ * surface read as R8G8B8A8) falls back to guest memory and is counted.
+ * ponytail: matched by address alone (pitch too when linear), however old
+ * the surface: memory a title frees and refills with a CPU-made texture
+ * would still read the old surface. Not seen in Conker yet. */
+
+#define RTT_ALPHA_ONE 1u
+#define RTT_SWAP_RB   2u
+
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+} s_rtt[4];
+
+/* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
+ * or -1 when that reading is not handled. */
+static int rtt_reading(uint32_t fmt, uint32_t bpp)
+{
+    if (bpp == 4)
+        switch (fmt) {
+        case 0x06: case 0x12: return 0;                     /* A8R8G8B8 */
+        case 0x07: case 0x1E: return RTT_ALPHA_ONE;         /* X8R8G8B8 */
+        case 0x3F:            return RTT_SWAP_RB;           /* LIN_A8B8G8R8 */
+        default:              return -1;
+        }
+    if (bpp == 2)
+        switch (fmt) {
+        /* The GPU keeps a 16-bit surface at 8 bits a channel; its alpha is
+         * never written (blend_state), so it reads 1 anyway. */
+        case 0x05: case 0x11: return RTT_ALPHA_ONE;         /* R5G6B5 */
+        default:              return -1;
+        }
+    return -1;
+}
+
+/* Stage st's texture as a copy of the GPU surface it starts at, with its
+ * reading in *flags; NULL when no GPU surface is there (or one is, read in a
+ * way not handled: counted, and guest memory is used as before). */
+static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
+{
+    const Texture *t = &g_pb.texs[st];
+    uint32_t swz = d3d8_format_is_swizzled(t->color) ? 1u : 0u;
+    D3D11_BOX box;
+    int i, r;
+
+    if (d3d8_format_dxt_block_bytes(t->color))
+        return NULL;
+    for (i = 0; i < GPU_SURFACES; i++)
+        if (s_surf[i].tex
+            && (s_surf[i].addr & 0x0FFFFFFFu) == (t->offset & 0x0FFFFFFFu)
+            && s_surf[i].swz == swz
+            && (swz || s_surf[i].pitch == t->pitch))
+            break;
+    if (i == GPU_SURFACES)
+        return NULL;
+    r = rtt_reading(t->color, s_surf[i].bpp);
+    if (r < 0) {
+        if (s_stat.rtt_unhandled++ < 8)
+            fprintf(stderr, "[GPU] d3d11: texture 0x%08X fmt 0x%02X %ux%u"
+                    " is a GPU surface (%u bpp) read in a way not handled;"
+                    " read from guest memory%c", t->offset, t->color,
+                    t->width, t->height, s_surf[i].bpp, 10);
+        return NULL;
+    }
+
+    if (!s_rtt[st].tex || s_rtt[st].w != t->width || s_rtt[st].h != t->height) {
+        D3D11_TEXTURE2D_DESC d;
+        if (s_rtt[st].srv) ID3D11ShaderResourceView_Release(s_rtt[st].srv);
+        if (s_rtt[st].tex) ID3D11Texture2D_Release(s_rtt[st].tex);
+        memset(&s_rtt[st], 0, sizeof s_rtt[st]);
+        memset(&d, 0, sizeof d);
+        d.Width = t->width;
+        d.Height = t->height;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                &s_rtt[st].tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_rtt[st].tex, NULL, &s_rtt[st].srv))) {
+            if (s_rtt[st].tex) ID3D11Texture2D_Release(s_rtt[st].tex);
+            memset(&s_rtt[st], 0, sizeof s_rtt[st]);
+            return NULL;
+        }
+        s_rtt[st].w = t->width;
+        s_rtt[st].h = t->height;
+    }
+    /* What the surface has of the texture's rectangle; past its edge the
+     * copy keeps whatever it held. */
+    box.left = 0; box.top = 0; box.front = 0;
+    box.right = t->width < s_surf[i].w ? t->width : s_surf[i].w;
+    box.bottom = t->height < s_surf[i].h ? t->height : s_surf[i].h;
+    box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+            (ID3D11Resource *)s_rtt[st].tex, 0, 0, 0, 0,
+            (ID3D11Resource *)s_surf[i].tex, 0, &box);
+    *flags = (uint32_t)r;
+    s_stat.rtt_binds++;
+    return s_rtt[st].srv;
+}
+
 /* A shader view of stage st's texture as it is now, or NULL when it cannot
- * be read. */
-static ID3D11ShaderResourceView *texture_stage(int st)
+ * be read; RTT_* flags in *flags. */
+static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
 {
     const Texture *t = &g_pb.texs[st];
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes, x, y, palette;
     uint64_t hash;
     GpuTexture *e = NULL;
+    ID3D11ShaderResourceView *rtt;
     int i, lru = 0;
 
+    *flags = 0;
     if (!t->valid || t->cube || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return NULL;
+    rtt = texture_from_surface(st, flags);
+    if (rtt)
+        return rtt;
     bytes = pb_tex_bytes(t);
     if (!bytes)
         return NULL;
@@ -850,7 +984,7 @@ static void d3d_draw(void)
     const Nv2aVshOutput *verts = s_bv;
     float bf[4];
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
-    uint32_t offset = 0, path;
+    uint32_t offset = 0, path, rtt;
     int si, st, combiners, program;
 
     s_stat.batches++;
@@ -900,7 +1034,7 @@ static void d3d_draw(void)
             /* Without combiners only stage 0 is sampled (xf_rows). */
             if (combiners ? !(m >= 1 && m <= 3) : st != 0)
                 continue;
-            srv[st] = texture_stage(st);
+            srv[st] = texture_stage(st, &rtt);
             samp[st] = srv[st] ? sampler_stage(st, combiners) : NULL;
             if (!samp[st]) {
                 srv[st] = NULL;
@@ -911,6 +1045,8 @@ static void d3d_draw(void)
                               ? 1.0f : 1.0f / (float)t->width;
             k.tscale[st][1] = tex_size_from_format(t->color)
                               ? 1.0f : 1.0f / (float)t->height;
+            k.tscale[st][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;
+            k.tscale[st][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
         }
         if (g_pb.alpha_test) {
             k.mode[2] = g_pb.alpha_func;
@@ -942,12 +1078,14 @@ static void d3d_draw(void)
         }
         path = PATH_FLAT;
         if (textured) {
-            srv[0] = texture_stage(0);
+            srv[0] = texture_stage(0, &rtt);
             samp[0] = srv[0] ? sampler_stage(0, 0) : NULL;
             if (samp[0]) {
                 bound = 1;
                 k.tscale[0][0] = 1.0f / (float)g_pb.texs[0].width;
                 k.tscale[0][1] = 1.0f / (float)g_pb.texs[0].height;
+                k.tscale[0][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;
+                k.tscale[0][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
             } else {
                 srv[0] = NULL;
             }
@@ -1242,6 +1380,9 @@ static void d3d_report(void)
             " unchanged, %u binds of a format the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_reused,
             s_stat.tex_unreadable, 10);
+    fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
+            " surface, %u of a surface in a reading not handled (guest"
+            " memory used)%c", s_stat.rtt_binds, s_stat.rtt_unhandled, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
