@@ -525,6 +525,10 @@ void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
+/* GP (APU offset 0x30000) and EP (0x50000) MMIO regions, offset relative to
+ * the APU base. Plain memory plus the boot ROM's program load; see apu_dsp.c. */
+uint32_t mcpx_apu_gp_ep_read(MCPXAPUState *d, hwaddr addr);
+void mcpx_apu_gp_ep_write(MCPXAPUState *d, hwaddr addr, uint32_t val);
 
 /* RECOMP_APU_PROFILE: what the frame thread did, summed over 5 s and printed
  * by apu_core.c. Counted only when g_apu_prof_on, by the frame thread alone,

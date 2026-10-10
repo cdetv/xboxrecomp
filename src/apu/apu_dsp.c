@@ -131,6 +131,101 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     fprintf(stderr, "[APU] DSP GP/EP initialized (STUBBED - passthrough mode)\n");
 }
 
+/* ── GP / EP memory and the boot ROM ────────────────────────────────────
+ *
+ * The GP (APU +0x30000) and EP (+0x50000) regions used to be ignored: reads
+ * returned 0 and writes vanished. DirectSound reads one of them back.
+ * CMcpxAPU::ServiceDeferredCommandsLow, run from every DirectSoundDoWork,
+ * checks that EP program memory word 6 (APU +0x5A018) holds 0xCCCCCC and
+ * otherwise resets both DSPs: XCNTMODE off (SECTL), GPRST/EPRST 1 then 3, a
+ * 10 ms KeStallExecutionProcessor, XCNTMODE back on. Reading 0, it reset them
+ * on every call, so the sample counter was off ~10 ms of every ~16 ms and
+ * the frame thread skipped about two se_frames in three -- silence between
+ * the slices that did play (Conker: Live & Reloaded, crackling audio).
+ *
+ * The X/Y/P memories stay plain guest memory (xbox_memory_layout.c leaves
+ * them untrapped: Burnout 3 bulk-copies them with rep movsd). Only each
+ * window's last page, the control registers (GPRST/EPRST at +0xFFFC), is
+ * trapped and lands here, stored in gp.regs / ep.regs by byte offset like
+ * xemu. A DSPRST 0->1 edge on GPRST/EPRST does what xemu's dsp_bootstrap
+ * does: the boot ROM copies the first 0x800 words of the DSP's scratch
+ * memory (the GPSADDR/EPSADDR page list) into program memory. No DSP code
+ * runs; this only puts what the guest loaded where it reads it back. */
+#define DSP_BOOT_WORDS 0x800
+#define APU_VA         0xFE800000u
+
+extern ptrdiff_t g_xbox_mem_offset;
+
+static void dsp_bootstrap(MCPXAPUState *d, uint32_t *regs, uint32_t window,
+                          uint32_t pmem, hwaddr sge_base, uint32_t max_sge,
+                          const char *name)
+{
+    static int reported[2];
+    int which = (regs == d->ep.regs);
+    volatile uint32_t *p = (volatile uint32_t *)
+        ((uintptr_t)g_xbox_mem_offset + APU_VA + window + pmem);
+
+    if (!sge_base) {
+        if (!reported[which]++)
+            fprintf(stderr, "[APU] %s boot: no scratch page list yet\n", name);
+        return;
+    }
+    for (uint32_t i = 0; i < DSP_BOOT_WORDS; i++) {
+        uint32_t byte = i * 4;
+        uint32_t entry = byte / TARGET_PAGE_SIZE;
+        if (entry > max_sge)
+            break;
+        uint32_t page = ldl_le_phys(address_space_memory, sge_base + entry * 8);
+        p[i] = ldl_le_phys(address_space_memory, page + byte % TARGET_PAGE_SIZE)
+               & 0x00FFFFFF;
+    }
+    reported[which]++;
+    if (reported[which] <= 3 || reported[which] % 1000 == 0)
+        fprintf(stderr, "[APU] %s boot #%d: scratch SGE 0x%08X (max %u) -> P:0..7FF,"
+                " P:6=%06X\n", name, reported[which], (uint32_t)sge_base, max_sge,
+                p[6]);
+}
+
+static void dsp_rst_write(MCPXAPUState *d, uint32_t *regs, uint32_t rst,
+                          uint32_t val, uint32_t window, uint32_t pmem,
+                          hwaddr sge_base, uint32_t max_sge, const char *name)
+{
+    /* xemu gp_write/ep_write: RST or DSPRST low holds the core in reset; a
+     * DSPRST rising edge with RST high runs the boot ROM. */
+    if ((val & NV_PAPU_GPRST_GPRST) && (val & NV_PAPU_GPRST_GPDSPRST) &&
+        !(regs[rst] & NV_PAPU_GPRST_GPDSPRST))
+        dsp_bootstrap(d, regs, window, pmem, sge_base, max_sge, name);
+    regs[rst] = val;
+}
+
+uint32_t mcpx_apu_gp_ep_read(MCPXAPUState *d, hwaddr addr)
+{
+    if (addr >= 0x30000 && addr < 0x40000)
+        return d->gp.regs[(addr - 0x30000) & ~3u];
+    if (addr >= 0x50000 && addr < 0x60000)
+        return d->ep.regs[(addr - 0x50000) & ~3u];
+    return 0;
+}
+
+void mcpx_apu_gp_ep_write(MCPXAPUState *d, hwaddr addr, uint32_t val)
+{
+    if (addr >= 0x30000 && addr < 0x40000) {
+        uint32_t off = (uint32_t)(addr - 0x30000) & ~3u;
+        if (off == NV_PAPU_GPRST)
+            dsp_rst_write(d, d->gp.regs, off, val, 0x30000, NV_PAPU_GPPMEM,
+                          d->regs[NV_PAPU_GPSADDR], d->regs[NV_PAPU_GPSMAXSGE], "GP");
+        else
+            d->gp.regs[off] = val;
+    } else if (addr >= 0x50000 && addr < 0x60000) {
+        uint32_t off = (uint32_t)(addr - 0x50000) & ~3u;
+        if (off == NV_PAPU_EPRST)
+            dsp_rst_write(d, d->ep.regs, off, val, 0x50000, NV_PAPU_EPPMEM,
+                          d->regs[NV_PAPU_EPSADDR], d->regs[NV_PAPU_EPSMAXSGE], "EP");
+        else
+            d->ep.regs[off] = val;
+    }
+}
+
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     /* In the real xemu, this reads settings to decide whether
