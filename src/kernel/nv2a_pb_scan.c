@@ -413,7 +413,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 if (s_exec_enabled && subch == 5u && m == 0x0310u)
                     *(volatile uint32_t *)((uint8_t *)mem + 0xFD400B10u) =
                         *(const uint32_t *)(mem + va);
-                /* Answer the title's PFB flush now, not after the segment. */
+                /* Answer the title's PFB flush and publish the GPU time
+                 * now, not after the segment. */
                 if (s_exec_enabled)
                     xbox_Nv2aExecProgress();
                 va += 4;
