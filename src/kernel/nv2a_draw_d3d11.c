@@ -897,6 +897,7 @@ typedef struct {
     uint32_t addr, fmt, w, h, pitch, palette;
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
+    uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
@@ -1183,9 +1184,6 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     if (!bytes)
         return NULL;
     palette = t->color == 0x0B ? t->palette : 0;
-    hash = hash_bytes(mem + t->offset, bytes, 0xCBF29CE484222325ull);
-    if (palette)
-        hash = hash_bytes(mem + palette, 256 * 4, hash);
 
     s_tex_tick++;
     for (i = 0; i < GPU_TEXTURES; i++) {
@@ -1199,7 +1197,21 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         if (!c->tex || (s_tex[lru].tex && c->used < s_tex[lru].used))
             lru = i;
     }
+    /* Hashed once a frame, not once a bind. A busy scene binds the same few
+     * hundred textures thousands of times a frame, and hashing every byte of
+     * each one each time was a quarter of the executor's time (Conker's first
+     * field). ponytail: a texture the title rewrites between two binds in
+     * the same frame keeps the first bind's contents until the next flip. */
+    if (e && e->hashed_flip == g_pb.flips) {
+        e->used = s_tex_tick;
+        s_stat.tex_reused++;
+        return e->srv;
+    }
+    hash = hash_bytes(mem + t->offset, bytes, 0xCBF29CE484222325ull);
+    if (palette)
+        hash = hash_bytes(mem + palette, 256 * 4, hash);
     if (e && e->hash == hash) {
+        e->hashed_flip = g_pb.flips;
         e->used = s_tex_tick;
         s_stat.tex_reused++;
         return e->srv;
@@ -1258,6 +1270,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
                                           NULL, s_texels, t->width * 4, 0);
     e->hash = hash;
+    e->hashed_flip = g_pb.flips;
     e->used = s_tex_tick;
     s_stat.tex_uploads++;
     return e->srv;
