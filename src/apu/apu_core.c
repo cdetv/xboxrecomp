@@ -116,6 +116,9 @@ static void prof_report(void)
             if (len >= sizeof(bins))
                 break;
         }
+        fprintf(stderr, "  [APUPROF] out: xa2 starved %lu dropped %lu | throttle"
+                " resets %lu, %.0f ms given up\n", p->xa2_starved,
+                p->xa2_dropped, p->throttle_resets, p->throttle_lost_ms);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
                 " | bins (frames/peak):%s\n", p->mix_clipped, p->mix_samples,
                 p->mix_peak, bins[0] ? bins : " none");
@@ -535,7 +538,11 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                n * 2 * sizeof(int16_t));
         g_xa2_stage_fill += n;
         if (g_xa2_stage_fill >= buf_size) {
-            xa2_submit_samples((const int16_t *)g_xa2_stage, buf_size);
+            if (g_apu_prof_on && xa2_queued_buffers() == 0)
+                g_apu_prof.xa2_starved++;
+            if (!xa2_submit_samples((const int16_t *)g_xa2_stage, buf_size)
+                && g_apu_prof_on)
+                g_apu_prof.xa2_dropped++;
             g_xa2_stage_fill = 0;
         }
     } else if (g_waveout.initialized) {
@@ -580,8 +587,25 @@ static void throttle(MCPXAPUState *d)
 
     int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
 
-    if (d->next_frame_time_us == 0 ||
-        now_us - d->next_frame_time_us > EP_FRAME_US) {
+    /* A late wakeup is caught up: the next frames run back to back until the
+     * clock is reached. This used to give the time up as soon as the thread
+     * was one frame (5.3 ms) late, so every late wakeup -- frequent while the
+     * title's 3D scenes load the CPU -- produced 256 samples fewer than real
+     * time. The output queue lost that much for good, ran dry, and from then
+     * on every late wakeup was a gap (Conker: Live & Reloaded, crackling in
+     * menus and in game, 6200-7400 frames per 5 s instead of 7504; its movie
+     * audio, played while the CPU is idle, was clean). Up to APU_MAX_LAG_US
+     * behind -- about what the XAudio2 queue holds -- is made up; beyond
+     * that the gap is already audible and the clock restarts. */
+    const int64_t APU_MAX_LAG_US = 8 * EP_FRAME_US;
+    if (d->next_frame_time_us == 0) {
+        d->next_frame_time_us = now_us;
+    } else if (now_us - d->next_frame_time_us > APU_MAX_LAG_US) {
+        if (g_apu_prof_on) {
+            g_apu_prof.throttle_resets++;
+            g_apu_prof.throttle_lost_ms +=
+                (now_us - d->next_frame_time_us) / 1000.0;
+        }
         d->next_frame_time_us = now_us;
     }
 

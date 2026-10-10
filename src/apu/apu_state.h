@@ -546,6 +546,10 @@ struct ApuProfile {
     float mix_peak;
     unsigned long bin_frames[NUM_MIXBINS];
     float bin_peak[NUM_MIXBINS];
+    /* Output pacing: XAudio2 found empty / full at a submit, and how often
+     * the frame thread woke too late to catch up and gave the time up. */
+    unsigned long xa2_starved, xa2_dropped, throttle_resets;
+    double throttle_lost_ms;
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;
