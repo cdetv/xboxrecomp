@@ -892,7 +892,12 @@ static ID3D11DepthStencilState *ds_state(void)
  * ponytail: the bytes are hashed at every bind, which is a full read of the
  * texture per batch; a dirty-page scheme would avoid it. */
 
-#define GPU_TEXTURES 128
+/* Enough for a whole scene. With 128, Conker's first field evicted textures
+ * it bound again the same frame and re-decoded ~30 a second while standing
+ * still. Found through s_tex_head (by address); a full scan only picks the
+ * entry to evict, on a miss. */
+#define GPU_TEXTURES 1024
+#define TEX_BUCKETS  1024
 typedef struct {
     uint32_t addr, fmt, w, h, pitch, palette;
     uint64_t hash;
@@ -902,7 +907,24 @@ typedef struct {
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
 static GpuTexture s_tex[GPU_TEXTURES];
+static uint16_t   s_tex_head[TEX_BUCKETS];  /* entry index + 1, 0 = none */
+static uint16_t   s_tex_next[GPU_TEXTURES]; /* same, next in the bucket */
 static uint32_t   s_tex_tick;
+
+static uint32_t tex_bucket(uint32_t addr)
+{
+    return (addr * 2654435761u) >> 22;      /* top 10 bits: TEX_BUCKETS */
+}
+
+static void tex_unlink(int i)
+{
+    uint16_t *p = &s_tex_head[tex_bucket(s_tex[i].addr)];
+    while (*p && *p != i + 1)
+        p = &s_tex_next[*p - 1];
+    if (*p)
+        *p = s_tex_next[i];
+    s_tex_next[i] = 0;
+}
 static uint32_t  *s_texels;             /* decode scratch */
 static size_t     s_texels_cap;
 
@@ -1186,16 +1208,14 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     palette = t->color == 0x0B ? t->palette : 0;
 
     s_tex_tick++;
-    for (i = 0; i < GPU_TEXTURES; i++) {
-        GpuTexture *c = &s_tex[i];
-        if (c->tex && c->addr == t->offset && c->fmt == t->color
+    for (i = s_tex_head[tex_bucket(t->offset)]; i; i = s_tex_next[i - 1]) {
+        GpuTexture *c = &s_tex[i - 1];
+        if (c->addr == t->offset && c->fmt == t->color
             && c->w == t->width && c->h == t->height && c->pitch == t->pitch
             && c->palette == palette) {
             e = c;
             break;
         }
-        if (!c->tex || (s_tex[lru].tex && c->used < s_tex[lru].used))
-            lru = i;
     }
     /* Hashed once a frame, not once a bind. A busy scene binds the same few
      * hundred textures thousands of times a frame, and hashing every byte of
@@ -1239,7 +1259,13 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
 
     if (!e) {
         D3D11_TEXTURE2D_DESC d;
+        for (i = 0; i < GPU_TEXTURES; i++)
+            if (!s_tex[i].tex
+                || (s_tex[lru].tex && s_tex[i].used < s_tex[lru].used))
+                lru = i;
         e = &s_tex[lru];
+        if (e->tex)
+            tex_unlink(lru);
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         if (e->tex) ID3D11Texture2D_Release(e->tex);
         memset(e, 0, sizeof *e);
@@ -1265,6 +1291,8 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         e->h = t->height;
         e->pitch = t->pitch;
         e->palette = palette;
+        s_tex_next[lru] = s_tex_head[tex_bucket(e->addr)];
+        s_tex_head[tex_bucket(e->addr)] = (uint16_t)(lru + 1);
         s_stat.tex_made++;
     }
     ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
