@@ -488,6 +488,60 @@ static inline void monitor_add(int16_t *slot, int32_t s)
     *slot = (int16_t)v;
 }
 
+/* RECOMP_APU_WAV=<file>: every sample the monitor hands to the output, as a
+ * 48 kHz 16-bit stereo WAV. Tells a defect in the mix (it is in the file)
+ * from one in the delivery (the file is clean, the speakers are not). The
+ * header's sizes are rewritten every second, so a run killed by closing the
+ * window still leaves a readable file. */
+static FILE    *g_wav;
+static uint32_t g_wav_frames;
+
+static void wav_write_header(void)
+{
+    uint32_t data = g_wav_frames * 4;
+    uint8_t h[44];
+    memcpy(h, "RIFF", 4);
+    uint32_t v = 36 + data;            memcpy(h + 4, &v, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    v = 16;                            memcpy(h + 16, &v, 4);
+    uint16_t w = 1;                    memcpy(h + 20, &w, 2);  /* PCM */
+    w = 2;                             memcpy(h + 22, &w, 2);  /* stereo */
+    v = 48000;                         memcpy(h + 24, &v, 4);
+    v = 48000 * 4;                     memcpy(h + 28, &v, 4);
+    w = 4;                             memcpy(h + 32, &w, 2);
+    w = 16;                            memcpy(h + 34, &w, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &data, 4);
+    fseek(g_wav, 0, SEEK_SET);
+    fwrite(h, 1, sizeof h, g_wav);
+    fseek(g_wav, 0, SEEK_END);
+}
+
+static void wav_append(const int16_t (*buf)[2], int frames)
+{
+    static int checked;
+    if (!checked) {
+        const char *path = getenv("RECOMP_APU_WAV");
+        checked = 1;
+        if (path && *path) {
+            g_wav = fopen(path, "wb");
+            if (g_wav) {
+                wav_write_header();
+                fprintf(stderr, "[APU] writing output to %s\n", path);
+            }
+        }
+    }
+    if (!g_wav)
+        return;
+    fwrite(buf, 4, (size_t)frames, g_wav);
+    uint32_t before = g_wav_frames / 48000;
+    g_wav_frames += (uint32_t)frames;
+    if (g_wav_frames / 48000 != before) {
+        wav_write_header();
+        fflush(g_wav);
+    }
+}
+
 /* Samples produced but not yet handed to the output: XAudio2 and waveOut
  * take bigger buffers than the 256 samples one monitor frame makes. */
 static int16_t g_xa2_stage[1024][2];  /* matches XA2_BUF_SAMPLES max */
@@ -530,6 +584,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(d->monitor.frame_buf, n);
     }
+    wav_append((const int16_t (*)[2])d->monitor.frame_buf, n);
 
     if (xa2_is_active()) {
         int buf_size = xa2_get_buffer_size();
