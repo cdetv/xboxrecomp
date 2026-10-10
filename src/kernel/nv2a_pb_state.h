@@ -236,6 +236,10 @@ int pb_batch_screen_space(void);
  * once per batch whichever back end asks first. Screen-space x, y, z with
  * the clip-space w kept in pos[3], as raster_xf_triangle takes them. */
 const Nv2aVshOutput *pb_transform_batch(void);
+/* pb_fixed_vertex: a fixed-function screen-space vertex in the form the
+ * combiner path takes (fixed_vertex): position with w = 1, colour in d0,
+ * one texcoord set per stage. */
+void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out);
 int pb_fetch_color(uint32_t index, float c[4]);
 int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
 uint32_t pb_tex_bytes(const Texture *t);

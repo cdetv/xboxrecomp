@@ -9,11 +9,11 @@
  * Built up in steps, each checked against the software path at the same flip
  * (docs: GPU plan in the game repo's architecture notes). Step 1: the device,
  * a swap chain on the framebuffer window, and colour clears into one GPU
- * texture per guest colour surface. Step 2: fixed-function screen-space
- * batches -- menus, logos, movie frames, full-screen passes -- with texture
- * stage 0, blend and colour mask. Batches that run a vertex program are
- * counted, not drawn (step 3), and the register combiners are stood in for by
- * "stage 0 times diffuse" until step 4.
+ * texture per guest colour surface. Step 2: batches -- vertices still
+ * transformed on the CPU by the software path's interpreter, pixels on the
+ * GPU with four texture stages, the register combiners (one general shader
+ * that reads them from a constant buffer), alpha test, fog, blend and colour
+ * mask. Not yet: depth and stencil, near-plane clipping, mip levels.
  *
  * Guest surfaces live on the GPU only. Nothing is written back to guest
  * memory, so a title that reads its own pixels back sees whatever was there
@@ -89,7 +89,7 @@ static struct {
     uint32_t shadow_dumps, shadow_no_surface;
     /* Batches: drawn, and the reasons the rest were not. */
     uint32_t drawn, tris, skip_program, skip_not_screen, skip_surface;
-    uint32_t verts_need_clip;
+    uint32_t verts_need_clip, combined;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
 } s_stat;
 
@@ -332,64 +332,41 @@ static void d3d_clear(uint32_t param)
  * D3D puts even pre-transformed vertices through a pass-through program --
  * is transformed by the software path's interpreter (pb_transform_batch);
  * a fixed-function batch whose positions are already pixels is read through
- * the same helpers raster_batch uses. Either way the primitive is cut into a
- * triangle list the way raster_batch cuts it, and the list goes up in one
- * dynamic buffer. The vertex shader only maps pixels back to clip space,
- * keeping w so textures stay perspective-correct.
+ * the same helpers raster_batch uses (pb_fixed_vertex with the combiners,
+ * the flat-path fetches without). Either way each vertex ends up as an
+ * Nv2aVshOutput, which is also the GPU vertex: the batch goes up as it is,
+ * with an index list that cuts its primitive into triangles the way
+ * raster_batch cuts it. The shaders are in nv2a_draw_d3d11_hlsl.h.
  * ponytail: no depth buffer yet, and a triangle reaching behind the eye or
  * the near plane is left out rather than clipped (raster_xf_clipped). */
 
+#include "nv2a_draw_d3d11_hlsl.h"
+
 #define NV_CLIP_W 1e-3f                 /* as in nv2a_draw_sw.c */
 
-typedef struct {
-    float x, y, z, w;                   /* screen pixels; clip-space w */
-    float r, g, b, a;
-    float u, v;                         /* texels; the shader normalises */
-} GpuVertex;
-
-static GpuVertex  s_bv[NV_MAX_INDICES];             /* one per index */
-static uint8_t    s_bv_ok[NV_MAX_INDICES];
-static GpuVertex  s_tri[3 * NV_MAX_INDICES];        /* the triangle list */
+static Nv2aVshOutput s_bv[NV_MAX_INDICES];          /* fixed-function batches */
+static uint8_t       s_bv_ok[NV_MAX_INDICES];       /* vertex usable */
+static uint32_t      s_ib[3 * NV_MAX_INDICES];      /* the triangle list */
 
 static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
 static ID3D11InputLayout  *s_layout;
-static ID3D11Buffer       *s_vb, *s_cb;
-static uint32_t            s_vb_verts;
+static ID3D11Buffer       *s_vb, *s_ib_buf, *s_cb;
+static uint32_t            s_vb_verts, s_ib_count;
 static ID3D11RasterizerState *s_rs;
 
-/* Per batch: where the surface is, how to read texcoords, what to do. */
+/* The shader's constant buffer; see the cbuffer in nv2a_draw_d3d11_hlsl.h. */
+enum { PATH_FLAT = 0, PATH_MODULATE = 1, PATH_COMBINERS = 2 };
 typedef struct {
-    float rt[4];                        /* x*rt.x+rt.z, y*rt.y+rt.w -> clip */
-    float tx[4];                        /* 1/width, 1/height of stage 0 */
-    uint32_t mode[4];                   /* textured, modulate */
+    float    rt[4];
+    float    tscale[4][4];
+    uint32_t mode[4];                   /* path, bound stages, alpha func, ref */
+    uint32_t stage[4];                  /* stage program, clip planes, control, fog */
+    uint32_t icw[8][4];
+    float    cf0[8][4], cf1[8][4];
+    uint32_t fin[4];
+    float    fc0[4], fc1[4], fogc[4], fogp[4];
 } GpuConsts;
-
-/* mode.y 0: flat colour from a triangle's first vertex, or the texel alone
- * (raster_indexed). mode.y 1: texel times the interpolated colour -- the
- * program path without combiners (xf_rows), and the stand-in for them until
- * step 4. The provoking vertex in D3D is the first one, which the triangle
- * list keeps. Colour interpolates across the screen without perspective, as
- * xf_rows does it; texture coordinates with it. */
-static const char s_hlsl[] =
-    "Texture2D t0 : register(t0);\n"
-    "SamplerState s0 : register(s0);\n"
-    "cbuffer C : register(b0) { float4 rt; float4 tx; uint4 mode; };\n"
-    "struct V { float4 p : SV_Position;\n"
-    "           nointerpolation float4 cf : COLOR0;\n"
-    "           noperspective float4 cs : COLOR1; float2 uv : TEXCOORD0; };\n"
-    "V vs(float4 p : POSITION, float4 c : COLOR, float2 uv : TEXCOORD) {\n"
-    "  V o;\n"
-    "  o.p = float4((p.x * rt.x + rt.z) * p.w, (p.y * rt.y + rt.w) * p.w,\n"
-    "               0.5 * p.w, p.w);\n"
-    "  o.cf = c; o.cs = c; o.uv = uv * tx.xy;\n"
-    "  return o;\n"
-    "}\n"
-    "float4 ps(V i) : SV_Target {\n"
-    "  float4 t = mode.x ? t0.Sample(s0, i.uv) : float4(1, 1, 1, 1);\n"
-    "  if (mode.y) return t * i.cs;\n"
-    "  return mode.x ? t : i.cf;\n"
-    "}\n";
 
 static ID3DBlob *compile(const char *entry, const char *target)
 {
@@ -412,14 +389,14 @@ static ID3DBlob *compile(const char *entry, const char *target)
  * counted and skipped as before. */
 static int draw_setup(void)
 {
-    static const D3D11_INPUT_ELEMENT_DESC el[] = {
-        { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-          D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16,
-          D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 32,
-          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+#define EL(name, idx, off) { name, idx, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, \
+                             off, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+    static const D3D11_INPUT_ELEMENT_DESC el[] = {   /* Nv2aVshOutput */
+        EL("POSITION", 0, 0), EL("COLOR", 0, 16), EL("COLOR", 1, 32),
+        EL("TEXCOORD", 4, 48), EL("TEXCOORD", 0, 64), EL("TEXCOORD", 1, 80),
+        EL("TEXCOORD", 2, 96), EL("TEXCOORD", 3, 112),
     };
+#undef EL
     ID3DBlob *vs = compile("vs", "vs_4_0"), *ps = compile("ps", "ps_4_0");
     D3D11_BUFFER_DESC bd;
     D3D11_RASTERIZER_DESC rd;
@@ -464,30 +441,43 @@ static int draw_setup(void)
     return 1;
 }
 
-/* The vertex buffer, grown to hold n vertices. */
-static int vb_reserve(uint32_t n)
+/* A dynamic buffer grown to hold n elements of `size` bytes. */
+static int buf_reserve(ID3D11Buffer **b, uint32_t *have, uint32_t n,
+                       uint32_t size, UINT bind)
 {
     D3D11_BUFFER_DESC bd;
-    uint32_t want = s_vb_verts ? s_vb_verts : 4096;
+    uint32_t want = *have ? *have : 4096;
 
-    if (s_vb && n <= s_vb_verts)
+    if (*b && n <= *have)
         return 1;
     while (want < n)
         want *= 2;
-    if (s_vb) {
-        ID3D11Buffer_Release(s_vb);
-        s_vb = NULL;
+    if (*b) {
+        ID3D11Buffer_Release(*b);
+        *b = NULL;
     }
     memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = want * (UINT)sizeof(GpuVertex);
+    bd.ByteWidth = want * size;
     bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    bd.BindFlags = bind;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_vb))) {
-        s_vb_verts = 0;
+    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, b))) {
+        *have = 0;
         return 0;
     }
-    s_vb_verts = want;
+    *have = want;
+    return 1;
+}
+
+/* Copy `bytes` into dynamic buffer b, discarding what it held. */
+static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, src, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
     return 1;
 }
 
@@ -593,13 +583,14 @@ static void blend_constant(float f[4])
 
 /* ── Textures ──────────────────────────────────────────────────────────────
  *
- * Stage 0's level 0, decoded on the CPU through the software sampler
+ * A stage's level 0, decoded on the CPU through the software sampler
  * (pb_tex_texel: swizzled, DXT, palette, YUV all read one way) into a
  * B8G8R8A8 texture, which is 0xAARRGGBB in memory. Cached by address,
  * format, size, pitch and palette, and re-decoded when the guest bytes
  * change: a movie keeps one address and rewrites it every frame, and a
  * render target sampled later is rewritten in place.
- * ponytail: no mip levels and no cube maps, so a minified texture shimmers.
+ * ponytail: no mip levels, so a minified texture shimmers; a cube map is
+ * not bound (its stage reads white).
  * ponytail: the bytes are hashed at every bind, which is a full read of the
  * texture per batch; a dirty-page scheme would avoid it. */
 
@@ -630,17 +621,18 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     return h;
 }
 
-/* A shader view of stage 0 as it is now, or NULL when it cannot be read. */
-static ID3D11ShaderResourceView *texture_stage0(void)
+/* A shader view of stage st's texture as it is now, or NULL when it cannot
+ * be read. */
+static ID3D11ShaderResourceView *texture_stage(int st)
 {
-    const Texture *t = &g_pb.texs[0];
+    const Texture *t = &g_pb.texs[st];
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t bytes, x, y, palette;
     uint64_t hash;
     GpuTexture *e = NULL;
     int i, lru = 0;
 
-    if (!t->valid || !t->offset || !t->width || !t->height
+    if (!t->valid || t->cube || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return NULL;
@@ -671,8 +663,7 @@ static ID3D11ShaderResourceView *texture_stage0(void)
     }
 
     /* New or changed: decode level 0. A format the sampler cannot read
-     * comes out NULL, and the batch draws in its vertex colour as it does
-     * in the software path. */
+     * comes out NULL, as the software sampler's fallback. */
     if ((size_t)t->width * t->height > s_texels_cap) {
         free(s_texels);
         s_texels_cap = (size_t)t->width * t->height;
@@ -732,13 +723,13 @@ static ID3D11ShaderResourceView *texture_stage0(void)
 /* Sampler states: point or bilinear, wrap or clamp per axis. */
 static ID3D11SamplerState *s_samp[8];
 
-static ID3D11SamplerState *sampler_stage0(int combiners)
+static ID3D11SamplerState *sampler_stage(int st, int combiners)
 {
-    const Texture *t = &g_pb.texs[0];
+    const Texture *t = &g_pb.texs[st];
     uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
     /* Bilinear only where the software path filters: in the combiner path,
-     * when the title asks for a tent (rc_texel); raster_triangle always
-     * takes the nearest texel. */
+     * when the title asks for a tent (rc_texel); the other paths always
+     * take the nearest texel. */
     int lin = combiners && (mag == 2 || min == 2 || min == 4 || min == 6);
     int k = lin | (t->addr_u == 1) << 1 | (t->addr_v == 1) << 2;
 
@@ -759,18 +750,17 @@ static ID3D11SamplerState *sampler_stage0(int combiners)
     return s_samp[k];
 }
 
-/* The triangle list for the batch's primitive, as raster_batch cuts it.
- * Returns the vertex count; triangles with an unreadable vertex are left
- * out, as raster_indexed leaves them out. */
+/* The triangle list for the batch's primitive, as raster_batch cuts it, as
+ * indices into the batch's vertices. Returns the index count; triangles with
+ * an unusable vertex are left out, as raster_indexed and the near-plane
+ * check leave them out. */
 static uint32_t build_triangles(void)
 {
     uint32_t n = g_pb.idx_count, i, out = 0;
 
 #define TRI(a, b, c) do {                                               \
         if (s_bv_ok[a] && s_bv_ok[b] && s_bv_ok[c]) {                   \
-            s_tri[out++] = s_bv[a];                                     \
-            s_tri[out++] = s_bv[b];                                     \
-            s_tri[out++] = s_bv[c];                                     \
+            s_ib[out++] = (a); s_ib[out++] = (b); s_ib[out++] = (c);    \
         } } while (0)
 
     switch (g_pb.prim) {
@@ -803,18 +793,65 @@ static uint32_t build_triangles(void)
     return out;
 }
 
+/* Which vertices of an Nv2aVshOutput batch can be drawn unclipped: in front
+ * of the eye and past the near plane (raster_xf_clipped's test), finite. */
+static void mark_unclipped(const Nv2aVshOutput *v, uint32_t n)
+{
+    const float *zs = nv2a_vsh_constant(58), *zo = nv2a_vsh_constant(59);
+    uint32_t i;
+
+    for (i = 0; i < n; i++) {
+        const float *p = v[i].pos;
+        s_bv_ok[i] = p[3] > NV_CLIP_W
+            && !(zs[2] != 0.0f && (p[2] - zo[2]) / zs[2] < 0.0f)
+            && isfinite(p[0]) && isfinite(p[1])
+            && isfinite(p[2]) && isfinite(p[3]);
+        if (!s_bv_ok[i])
+            s_stat.verts_need_clip++;
+    }
+}
+
+/* The combiner registers and the per-pixel state around them. */
+static void consts_combiners(GpuConsts *k)
+{
+    uint32_t s;
+
+    k->stage[0] = g_pb.rc.stage_program;
+    k->stage[1] = g_pb.clip_plane_mode;
+    k->stage[2] = g_pb.rc.control;
+    k->stage[3] = g_pb.fog_enable ? 0x10000u | (g_pb.fog_mode & 0xFFFF) : 0;
+    for (s = 0; s < 8; s++) {
+        k->icw[s][0] = g_pb.rc.color_icw[s];
+        k->icw[s][1] = g_pb.rc.alpha_icw[s];
+        k->icw[s][2] = g_pb.rc.color_ocw[s];
+        k->icw[s][3] = g_pb.rc.alpha_ocw[s];
+        nv2a_rc_unpack(g_pb.rc.factor0[s], k->cf0[s]);
+        nv2a_rc_unpack(g_pb.rc.factor1[s], k->cf1[s]);
+    }
+    k->fin[0] = g_pb.rc.final0;
+    k->fin[1] = g_pb.rc.final1;
+    nv2a_rc_unpack(g_pb.rc.final_c0, k->fc0);
+    nv2a_rc_unpack(g_pb.rc.final_c1, k->fc1);
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    nv2a_rc_unpack(g_pb.fog_color, k->fogc);
+    { float r = k->fogc[2]; k->fogc[2] = k->fogc[0]; k->fogc[0] = r; }
+    k->fogp[0] = g_pb.fog_param[0];
+    k->fogp[1] = g_pb.fog_param[1];
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
-    D3D11_MAPPED_SUBRESOURCE m;
+    static GpuConsts k;
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
-    ID3D11ShaderResourceView *srv = NULL;
-    ID3D11SamplerState *samp = NULL;
-    GpuConsts k;
+    ID3D11ShaderResourceView *srv[4] = {NULL, NULL, NULL, NULL};
+    ID3D11SamplerState *samp[4] = {NULL, NULL, NULL, NULL};
+    const Nv2aVshOutput *verts = s_bv;
     float bf[4];
-    uint32_t n, i, verts, bpp, stride = sizeof(GpuVertex), offset = 0;
-    int si, textured, combiners, program, modulate;
+    uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
+    uint32_t offset = 0, path;
+    int si, st, combiners, program;
 
     s_stat.batches++;
     if (ready < 0)
@@ -838,91 +875,103 @@ static void d3d_draw(void)
     }
     combiners = g_pb.rc_seen && !no_rc;
     n = g_pb.idx_count;
+    memset(&k, 0, sizeof k);
 
-    if (program) {
-        /* Through the title's own program. Stage 0 is sampled whenever it
-         * is valid (raster_xf_triangle); its coordinates are normalised for
-         * swizzled and DXT formats and texels otherwise, so scale to texels
-         * as the software path does. A vertex at or behind the eye, or in
-         * front of the near plane, marks its triangles as needing a clip. */
-        const Nv2aVshOutput *xf = pb_transform_batch();
-        const float *zs = nv2a_vsh_constant(58), *zo = nv2a_vsh_constant(59);
-        float su = 1.0f, sv = 1.0f;
-        if (!xf) {
-            s_stat.skip_program++;
-            return;
+    if (program || combiners) {
+        /* Through the title's own program, or the fixed-function vertex
+         * built the way the combiner path takes it. Every stage the program
+         * samples is bound; coordinates are normalised for swizzled and DXT
+         * formats and texels otherwise (rc_texel). */
+        if (program) {
+            verts = pb_transform_batch();
+            if (!verts) {
+                s_stat.skip_program++;
+                return;
+            }
+        } else {
+            for (i = 0; i < n; i++)
+                pb_fixed_vertex(g_pb.idx[i], &s_bv[i]);
         }
-        if (tex_size_from_format(g_pb.texs[0].color)) {
-            su = (float)g_pb.texs[0].width;
-            sv = (float)g_pb.texs[0].height;
+        mark_unclipped(verts, n);
+        path = combiners ? PATH_COMBINERS : PATH_MODULATE;
+        for (st = 0; st < 4; st++) {
+            uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
+            const Texture *t = &g_pb.texs[st];
+            /* Without combiners only stage 0 is sampled (xf_rows). */
+            if (combiners ? !(m >= 1 && m <= 3) : st != 0)
+                continue;
+            srv[st] = texture_stage(st);
+            samp[st] = srv[st] ? sampler_stage(st, combiners) : NULL;
+            if (!samp[st]) {
+                srv[st] = NULL;
+                continue;
+            }
+            bound |= 1u << st;
+            k.tscale[st][0] = tex_size_from_format(t->color)
+                              ? 1.0f : 1.0f / (float)t->width;
+            k.tscale[st][1] = tex_size_from_format(t->color)
+                              ? 1.0f : 1.0f / (float)t->height;
         }
-        for (i = 0; i < n; i++) {
-            const Nv2aVshOutput *x = &xf[i];
-            GpuVertex *v = &s_bv[i];
-            s_bv_ok[i] = x->pos[3] > NV_CLIP_W
-                && !(zs[2] != 0.0f && (x->pos[2] - zo[2]) / zs[2] < 0.0f)
-                && isfinite(x->pos[0]) && isfinite(x->pos[1])
-                && isfinite(x->pos[2]) && isfinite(x->pos[3]);
-            if (!s_bv_ok[i])
-                s_stat.verts_need_clip++;
-            v->x = x->pos[0]; v->y = x->pos[1];
-            v->z = x->pos[2]; v->w = x->pos[3];
-            v->r = x->d0[0]; v->g = x->d0[1]; v->b = x->d0[2]; v->a = x->d0[3];
-            v->u = x->tex[0][0] * su; v->v = x->tex[0][1] * sv;
+        if (g_pb.alpha_test) {
+            k.mode[2] = g_pb.alpha_func;
+            k.mode[3] = g_pb.alpha_ref & 0xFF;
         }
-        textured = g_pb.texs[0].valid;
-        modulate = 1;
+        if (combiners)
+            consts_combiners(&k);
     } else {
-        /* Stage 0, when the batch carries texcoords for it. */
-        textured = 1;
+        /* raster_indexed: stage 0 when every vertex carries texcoords for
+         * it, in texels; flat colour otherwise. */
+        int textured = 1;
         for (i = 0; i < n; i++) {
-            float p[4], c[4], uv[2];
-            GpuVertex *v = &s_bv[i];
-            s_bv_ok[i] = (uint8_t)pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i], p);
+            float c[4], uv[2];
+            Nv2aVshOutput *v = &s_bv[i];
+            memset(v, 0, sizeof *v);
+            s_bv_ok[i] = (uint8_t)pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i],
+                                                v->pos);
+            v->pos[2] = 0.0f;
+            v->pos[3] = 1.0f;
             if (!pb_fetch_color(g_pb.idx[i], c))
                 c[0] = c[1] = c[2] = c[3] = 1.0f;
-            if (!pb_fetch_texcoord(g_pb.idx[i], uv)) {
+            memcpy(v->d0, c, sizeof c);
+            if (pb_fetch_texcoord(g_pb.idx[i], uv)) {
+                v->tex[0][0] = uv[0];
+                v->tex[0][1] = uv[1];
+            } else {
                 textured = 0;
-                uv[0] = uv[1] = 0.0f;
             }
-            v->x = p[0]; v->y = p[1]; v->z = 0.0f; v->w = 1.0f;
-            v->r = c[0]; v->g = c[1]; v->b = c[2]; v->a = c[3];
-            v->u = uv[0]; v->v = uv[1];
         }
-        modulate = combiners;
+        path = PATH_FLAT;
+        if (textured) {
+            srv[0] = texture_stage(0);
+            samp[0] = srv[0] ? sampler_stage(0, 0) : NULL;
+            if (samp[0]) {
+                bound = 1;
+                k.tscale[0][0] = 1.0f / (float)g_pb.texs[0].width;
+                k.tscale[0][1] = 1.0f / (float)g_pb.texs[0].height;
+            } else {
+                srv[0] = NULL;
+            }
+        }
     }
-    if (textured) {
-        srv = texture_stage0();
-        samp = srv ? sampler_stage0(combiners) : NULL;
-        if (!samp)
-            srv = NULL;
-    }
-    verts = build_triangles();
-    if (!verts || !vb_reserve(verts))
+
+    nidx = build_triangles();
+    if (!nidx
+        || !buf_reserve(&s_vb, &s_vb_verts, n, sizeof(Nv2aVshOutput),
+                        D3D11_BIND_VERTEX_BUFFER)
+        || !buf_reserve(&s_ib_buf, &s_ib_count, nidx, 4,
+                        D3D11_BIND_INDEX_BUFFER)
+        || !buf_fill(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput))
+        || !buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4))
         return;
 
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
-        return;
-    memcpy(m.pData, s_tri, (size_t)verts * sizeof(GpuVertex));
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
-
-    memset(&k, 0, sizeof k);
     k.rt[0] = 2.0f / (float)s_surf[si].w;
     k.rt[1] = -2.0f / (float)s_surf[si].h;
     k.rt[2] = -1.0f;
     k.rt[3] = 1.0f;
-    if (srv) {
-        k.tx[0] = 1.0f / (float)g_pb.texs[0].width;
-        k.tx[1] = 1.0f / (float)g_pb.texs[0].height;
-    }
-    k.mode[0] = srv != NULL;
-    k.mode[1] = (uint32_t)modulate;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+    k.mode[0] = path;
+    k.mode[1] = bound;
+    if (!buf_fill(s_cb, &k, sizeof k))
         return;
-    memcpy(m.pData, &k, sizeof k);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
 
     vp.TopLeftX = 0.0f;
     vp.TopLeftY = 0.0f;
@@ -941,12 +990,14 @@ static void d3d_draw(void)
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride,
                                            &offset);
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_buf,
+                                         DXGI_FORMAT_R32_UINT, 0);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
-    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &samp);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
@@ -954,16 +1005,18 @@ static void d3d_draw(void)
                                         0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv, NULL);
-    ID3D11DeviceContext_Draw(s_ctx, verts, 0);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     /* Unbound again, so a later batch may draw into a texture this one
      * sampled without D3D refusing the overlap. */
-    srv = NULL;
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &srv);
+    memset(srv, 0, sizeof srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
 
     s_stat.drawn++;
-    s_stat.tris += verts / 3;
-    if (k.mode[0])
+    s_stat.tris += nidx / 3;
+    if (bound)
         s_stat.textured++;
+    if (path == PATH_COMBINERS)
+        s_stat.combined++;
     note_shown(si);
 }
 
@@ -1178,10 +1231,11 @@ static void d3d_report(void)
             s_stat.clears, s_stat.clears_skipped, s_stat.presents,
             s_stat.surfaces, 10);
     fprintf(stderr, "[GPU] d3d11: %u batches: %u drawn (%u textured, %u"
-            " triangles); not drawn: %u program did not run, %u not"
-            " screen-space, %u no surface; %u vertices needing a near clip"
-            " (their triangles left out)%c", s_stat.batches, s_stat.drawn,
-            s_stat.textured, s_stat.tris, s_stat.skip_program,
+            " through the combiners, %u triangles); not drawn: %u program"
+            " did not run, %u not screen-space, %u no surface; %u vertices"
+            " needing a near clip (their triangles left out)%c",
+            s_stat.batches, s_stat.drawn, s_stat.textured, s_stat.combined,
+            s_stat.tris, s_stat.skip_program,
             s_stat.skip_not_screen, s_stat.skip_surface,
             s_stat.verts_need_clip, 10);
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads, %u binds"

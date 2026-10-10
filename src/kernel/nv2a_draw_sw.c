@@ -3037,6 +3037,11 @@ int pb_fetch_color(uint32_t index, float c[4])
     return pb_fetch_attr(color_attr(), index, c) || constant_color(c);
 }
 
+void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    fixed_vertex(index, out);
+}
+
 int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     return sample_tex(t, 0, u, v, argb);
