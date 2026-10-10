@@ -252,6 +252,20 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    if (g_apu_prof_on) {
+        for (int b = 0; b < NUM_MIXBINS; ++b) {
+            float peak = 0.0f;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float a = fabsf(mixbins[b][i]);
+                if (a > peak) peak = a;
+            }
+            if (peak > 0.0f) {
+                g_apu_prof.bin_frames[b]++;
+                if (peak > g_apu_prof.bin_peak[b]) g_apu_prof.bin_peak[b] = peak;
+            }
+        }
+    }
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
@@ -292,6 +306,13 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
+            }
+            if (g_apu_prof_on) {
+                float al = fabsf(left), ar = fabsf(right);
+                float m = al > ar ? al : ar;
+                g_apu_prof.mix_samples++;
+                if (m > 1.0f) g_apu_prof.mix_clipped++;
+                if (m > g_apu_prof.mix_peak) g_apu_prof.mix_peak = m;
             }
             /* Clamp to [-1, 1] range */
             if (left > 1.0f) left = 1.0f;

@@ -104,6 +104,22 @@ static void prof_report(void)
                 r[NV_PAPU_FECTL], r[NV_PAPU_SECTL], r[NV_PAPU_FETFORCE0],
                 r[NV_PAPU_FETFORCE1]);
     }
+    {
+        char bins[NUM_MIXBINS * 24] = "";
+        size_t len = 0;
+        for (int b = 0; b < NUM_MIXBINS; b++) {
+            if (!p->bin_frames[b])
+                continue;
+            len += (size_t)snprintf(bins + len, sizeof(bins) - len,
+                                    " %d:%lu/%.2f", b, p->bin_frames[b],
+                                    p->bin_peak[b]);
+            if (len >= sizeof(bins))
+                break;
+        }
+        fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
+                " | bins (frames/peak):%s\n", p->mix_clipped, p->mix_samples,
+                p->mix_peak, bins[0] ? bins : " none");
+    }
     fflush(stderr);
     memset(p, 0, sizeof(*p));
     start = now;

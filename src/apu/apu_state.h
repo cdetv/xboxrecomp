@@ -540,6 +540,12 @@ struct ApuProfile {
     unsigned long irq_up, irq_held, irq_delivered, irq_claimed;
     unsigned long stream_paused, fe_traps, ists_writes, fectl_writes;
     double t_wait, t_vp, t_mon, t_isr, max_isr;
+    /* The DSP stub's mixdown: samples clamped, peak |L|/|R| before the
+     * clamp, and per mixbin how many frames carried sound and its peak. */
+    unsigned long mix_samples, mix_clipped;
+    float mix_peak;
+    unsigned long bin_frames[NUM_MIXBINS];
+    float bin_peak[NUM_MIXBINS];
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;
