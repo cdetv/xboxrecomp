@@ -1280,28 +1280,6 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types.
- *
- * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
- * at 1. They were each one too low, so every title's geometry was decomposed
- * as the primitive below the one it asked for -- a strip as a fan, a fan as
- * quads, and TRIANGLES, the one case whose vertex count must be a multiple
- * of three, as a strip.
- *
- * The vertex order says which numbering is right without taking a table on
- * trust: a strip arrives in Z order and a fan in cyclic order, and they only
- * line up with the primitive under this one. */
-#define NV_PRIM_POINTS         1
-#define NV_PRIM_LINES          2
-#define NV_PRIM_LINE_LOOP      3
-#define NV_PRIM_LINE_STRIP     4
-#define NV_PRIM_TRIANGLES      5
-#define NV_PRIM_TRIANGLE_STRIP 6
-#define NV_PRIM_TRIANGLE_FAN   7
-#define NV_PRIM_QUADS          8
-#define NV_PRIM_QUAD_STRIP     9
-#define NV_PRIM_POLYGON        10
-
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
 #define FB_DUMP_AFTER_DRAW 8
@@ -2511,11 +2489,27 @@ static int transform_batch(uint32_t n)
     return 1;
 }
 
+/* transform_batch for the current batch, once: a second back end asking for
+ * the same batch (RECOMP_GPU=both) gets these results rather than running
+ * the program again, which a program that writes constants would not
+ * survive. Keyed on the front end's batch number. */
+static uint32_t s_xf_draw;
+static int      s_xf_ok;
+
+const Nv2aVshOutput *pb_transform_batch(void)
+{
+    if (s_xf_draw != g_pb.draws) {
+        s_xf_ok = transform_batch(g_pb.idx_count);
+        s_xf_draw = g_pb.draws;
+    }
+    return s_xf_ok ? s_xf : NULL;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = g_pb.idx_count;
 
-    if (!transform_batch(n)) {
+    if (!pb_transform_batch()) {
         if (probe_init() && g_pb.flips == s_probe.from_flip)
             fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
                     " program did not run (no END), batch dropped\n",
@@ -3031,6 +3025,32 @@ static void sw_report(void)
 int pb_probe_frame(void)
 {
     return probe_init() && g_pb.flips == s_probe.from_flip;
+}
+
+int pb_batch_screen_space(void)
+{
+    return batch_is_screen_space();
+}
+
+int pb_fetch_color(uint32_t index, float c[4])
+{
+    return pb_fetch_attr(color_attr(), index, c) || constant_color(c);
+}
+
+int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex(t, 0, u, v, argb);
+}
+
+uint32_t pb_tex_bytes(const Texture *t)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+
+    if (block)
+        return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
+    if (d3d8_format_is_swizzled(t->color))
+        return t->width * t->height * tex_texel_bytes(t->color);
+    return t->pitch * t->height;
 }
 
 const Nv2aPbDump *pb_sw_flip_dump(void)

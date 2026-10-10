@@ -19,10 +19,33 @@
 
 #include <stdint.h>
 #include "nv2a_combiner.h"
+#include "nv2a_vsh_interp.h"
 /* tex_size_from_format below needs the format tables. */
 #include "../d3d/d3d8_swizzle.h"
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
+
+/* NV097 primitive types.
+ *
+ * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
+ * at 1. They were each one too low, so every title's geometry was decomposed
+ * as the primitive below the one it asked for -- a strip as a fan, a fan as
+ * quads, and TRIANGLES, the one case whose vertex count must be a multiple
+ * of three, as a strip.
+ *
+ * The vertex order says which numbering is right without taking a table on
+ * trust: a strip arrives in Z order and a fan in cyclic order, and they only
+ * line up with the primitive under this one. */
+#define NV_PRIM_POINTS         1
+#define NV_PRIM_LINES          2
+#define NV_PRIM_LINE_LOOP      3
+#define NV_PRIM_LINE_STRIP     4
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* One vertex attribute stream, as the title describes it. Attribute 0 is
  * position; the rest are colours, texture coordinates and so on. */
@@ -197,6 +220,25 @@ int pb_surface_write_refused(uint32_t base, uint32_t bytes, const char *what);
 int pb_fetch_attr(const VertexAttr *a, uint32_t index, float out[4]);
 int pb_fetch_texcoord(uint32_t index, float out[2]);
 int pb_probe_frame(void);
+
+/* nv2a_draw_sw.c: the rules the software back end draws a fixed-function
+ * batch by, shared so another back end reads a batch the same way rather
+ * than by a second set of heuristics that can disagree with the first.
+ * pb_batch_screen_space: the batch carries pixel coordinates (see
+ * batch_is_screen_space). pb_fetch_color: a vertex's diffuse colour, from its
+ * array or the SET_VERTEX_DATA constant; 0 when there is neither (white).
+ * pb_tex_texel: texel (u, v) of level 0 of t as 0xAARRGGBB, through the
+ * software sampler's own decoder; 0 for a format it cannot read.
+ * pb_tex_bytes: how many guest bytes level 0 of t covers, palette aside. */
+int pb_batch_screen_space(void);
+/* pb_transform_batch: every vertex of the current batch through the title's
+ * vertex program, one output per index, or NULL when no program ran. Run
+ * once per batch whichever back end asks first. Screen-space x, y, z with
+ * the clip-space w kept in pos[3], as raster_xf_triangle takes them. */
+const Nv2aVshOutput *pb_transform_batch(void);
+int pb_fetch_color(uint32_t index, float c[4]);
+int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
+uint32_t pb_tex_bytes(const Texture *t);
 
 /* nv2a_draw_sw.c: the frame dump the last software present wrote, or NULL
  * when it wrote none. RECOMP_GPU=both dumps the GPU's copy of the same
