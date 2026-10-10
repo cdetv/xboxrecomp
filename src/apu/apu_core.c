@@ -116,6 +116,7 @@ static void prof_report(void)
             if (len >= sizeof(bins))
                 break;
         }
+        mcpx_apu_vp_prof_voices();
         fprintf(stderr, "  [APUPROF] out: xa2 starved %lu dropped %lu | throttle"
                 " resets %lu, %.0f ms given up\n", p->xa2_starved,
                 p->xa2_dropped, p->throttle_resets, p->throttle_lost_ms);

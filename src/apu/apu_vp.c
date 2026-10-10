@@ -68,6 +68,66 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
 
 static void voice_resample_reset(uint16_t v);
 
+/* RECOMP_APU_PROFILE: clicks per voice. A click is a jump in the voice's own
+ * resampled output (second difference > 0.18 of full scale) -- what made
+ * Conker's menu music crackle while its movie audio was clean. Kept with the
+ * voice's format so the guilty decode path can be named. */
+static float         s_clk_hist[MCPX_HW_MAX_VOICES][2];
+static unsigned long s_clk_count[MCPX_HW_MAX_VOICES];
+static unsigned long s_clk_frames[MCPX_HW_MAX_VOICES];
+static uint32_t      s_clk_fmt[MCPX_HW_MAX_VOICES];
+static float         s_clk_rate[MCPX_HW_MAX_VOICES];
+static int           s_clk_segcs[MCPX_HW_MAX_VOICES];   /* stream: SSL segment's */
+
+static void prof_voice_clicks(uint16_t v, float samples[][2], uint32_t fmt,
+                              float rate)
+{
+    float *h = s_clk_hist[v];
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float x = samples[i][0];
+        float d2 = x - 2.0f * h[1] + h[0];
+        if (fabsf(d2) > 0.18f && s_clk_frames[v]) s_clk_count[v]++;
+        h[0] = h[1];
+        h[1] = x;
+    }
+    s_clk_frames[v]++;
+    s_clk_fmt[v] = fmt;
+    s_clk_rate[v] = rate;
+}
+
+/* Printed by prof_report every 5 s: the voices that clicked most. */
+void mcpx_apu_vp_prof_voices(void)
+{
+    char line[1024];
+    size_t len = 0;
+    line[0] = 0;
+    for (int k = 0; k < 6; k++) {
+        int best = -1;
+        for (int v = 0; v < MCPX_HW_MAX_VOICES; v++)
+            if (s_clk_frames[v] && (best < 0 || s_clk_count[v] > s_clk_count[best]))
+                best = v;
+        if (best < 0 || !s_clk_frames[best])
+            break;
+        uint32_t f = s_clk_fmt[best];
+        bool stream = (f & NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) != 0;
+        int cs = stream ? s_clk_segcs[best] : (int)GET_MASK(f, NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE);
+        len += (size_t)snprintf(line + len, sizeof(line) - len,
+            " v%d:%lu clicks/%lu fr [%s%s cs%d ss%d spb%d%s rate %.3f fmt %08X]",
+            best, s_clk_count[best], s_clk_frames[best],
+            stream ? "stream" : "buffer",
+            (f & NV_PAVS_VOICE_CFG_FMT_STEREO) ? " stereo" : " mono", cs,
+            (int)GET_MASK(f, NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE),
+            (int)GET_MASK(f, NV_PAVS_VOICE_CFG_FMT_SAMPLES_PER_BLOCK) + 1,
+            (f & NV_PAVS_VOICE_CFG_FMT_LOOP) ? " loop" : "",
+            s_clk_rate[best], f);
+        s_clk_frames[best] = 0;   /* taken; cleared below with the rest */
+        if (len >= sizeof(line)) break;
+    }
+    fprintf(stderr, "  [APUPROF] voices by clicks:%s\n", line[0] ? line : " none");
+    memset(s_clk_count, 0, sizeof(s_clk_count));
+    memset(s_clk_frames, 0, sizeof(s_clk_frames));
+}
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -869,6 +929,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         seg_cs = (segment_length >> 16) & 3;
         seg_spb = (segment_length >> 18) & 0x1f;
         seg_s = (segment_length >> 23) & 1;
+        s_clk_segcs[v] = seg_cs;
         container_size_index = seg_cs;
         if (seg_cs == NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_ADPCM) {
             sample_size = NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24;
@@ -1170,6 +1231,11 @@ static void voice_process(MCPXAPUState *d,
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
     if (!active) return;
+
+    if (g_apu_prof_on && !multipass)
+        prof_voice_clicks(v, samples,
+                          voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT, 0xFFFFFFFFu),
+                          rate);
 
     /* Get volume bins */
     int bin[8];
