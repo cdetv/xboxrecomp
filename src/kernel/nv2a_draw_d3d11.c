@@ -107,6 +107,59 @@ static struct {
     uint32_t zeta_reads, zeta_unhandled;
 } s_stat;
 
+/* RECOMP_GPU_CALL_TIMES=1: wall time spent in each group of D3D11 calls,
+ * reported with the [GPU] lines. A sampling profile shows the executor
+ * sleeping and reading the clock inside the driver, called from d3d_draw
+ * (run 205); this says which call the driver is making it wait in. */
+enum { CT_TEXTURES, CT_VB, CT_IB, CT_CB, CT_DRAW, CT_PRESENT, CT_N };
+static const char *const CT_NAME[CT_N] = {
+    "textures+samplers", "vertex Map", "index Map", "constants Map",
+    "state+DrawIndexed", "Present"
+};
+static int s_ct_on = -1;
+static uint64_t s_ct_ticks[CT_N], s_ct_count[CT_N];
+
+static uint64_t ct_now(void)
+{
+    LARGE_INTEGER t;
+    if (s_ct_on < 0)
+        s_ct_on = getenv("RECOMP_GPU_CALL_TIMES") != NULL;
+    if (!s_ct_on)
+        return 0;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+}
+
+static void ct_add(int which, uint64_t t0)
+{
+    if (s_ct_on > 0) {
+        s_ct_ticks[which] += ct_now() - t0;
+        s_ct_count[which]++;
+    }
+}
+
+static void ct_report(void)
+{
+    static uint64_t last_ticks[CT_N], last_count[CT_N];
+    LARGE_INTEGER f;
+    int i;
+
+    if (s_ct_on <= 0)
+        return;
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "[GPU] d3d11 call times since last report:");
+    for (i = 0; i < CT_N; i++) {
+        uint64_t n = s_ct_count[i] - last_count[i];
+        double ms = (double)(s_ct_ticks[i] - last_ticks[i]) * 1000.0
+                  / (double)f.QuadPart;
+        fprintf(stderr, " %s %.0f ms (%llu x %.1f us);", CT_NAME[i], ms,
+                (unsigned long long)n, n ? ms * 1000.0 / (double)n : 0.0);
+        last_ticks[i] = s_ct_ticks[i];
+        last_count[i] = s_ct_count[i];
+    }
+    fprintf(stderr, "%c", 10);
+}
+
 static void fail(const char *what, HRESULT hr)
 {
     fprintf(stderr, "[GPU] d3d11: %s failed (hr 0x%08lX)%c", what,
@@ -1563,6 +1616,7 @@ static void d3d_draw(void)
     uint32_t offset = 0, path, rtt;
     int si, st, combiners, program, zi;
     ID3D11DepthStencilState *ds;
+    uint64_t ct_draw0;
 
     s_stat.batches++;
     if (ready < 0)
@@ -1603,8 +1657,10 @@ static void d3d_draw(void)
             for (i = 0; i < n; i++)
                 pb_fixed_vertex(g_pb.idx[i], &s_bv[i]);
         }
+        uint64_t ct0;
         mark_unclipped(verts, n);
         path = combiners ? PATH_COMBINERS : PATH_MODULATE;
+        ct0 = ct_now();
         for (st = 0; st < 4; st++) {
             uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
             const Texture *t = &g_pb.texs[st];
@@ -1625,6 +1681,7 @@ static void d3d_draw(void)
             k.tscale[st][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;
             k.tscale[st][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
         }
+        ct_add(CT_TEXTURES, ct0);
         if (g_pb.alpha_test) {
             k.mode[2] = g_pb.alpha_func;
             k.mode[3] = g_pb.alpha_ref & 0xFF;
@@ -1674,11 +1731,21 @@ static void d3d_draw(void)
         || !buf_reserve(&s_vb, &s_vb_verts, n + s_cv_n,
                         sizeof(Nv2aVshOutput), D3D11_BIND_VERTEX_BUFFER)
         || !buf_reserve(&s_ib_buf, &s_ib_count, nidx, 4,
-                        D3D11_BIND_INDEX_BUFFER)
-        || !buf_fill2(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput),
-                      s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput))
-        || !buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4))
+                        D3D11_BIND_INDEX_BUFFER))
         return;
+    {
+        uint64_t ct0 = ct_now();
+        int ok = buf_fill2(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput),
+                           s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput));
+        ct_add(CT_VB, ct0);
+        if (!ok)
+            return;
+        ct0 = ct_now();
+        ok = buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4);
+        ct_add(CT_IB, ct0);
+        if (!ok)
+            return;
+    }
 
     /* Depth and stencil where raster_xf_triangle has them: on the program
      * and combiner paths, when the batch tests or writes either (the flat
@@ -1702,8 +1769,13 @@ static void d3d_draw(void)
     k.mode[0] = path;
     k.mode[1] = bound;
     k.zsc[0] = zeta_scale();
-    if (!buf_fill(s_cb, &k, sizeof k))
-        return;
+    {
+        uint64_t ct0 = ct_now();
+        int ok = buf_fill(s_cb, &k, sizeof k);
+        ct_add(CT_CB, ct0);
+        if (!ok)
+            return;
+    }
 
     vp.TopLeftX = 0.0f;
     vp.TopLeftY = 0.0f;
@@ -1717,6 +1789,7 @@ static void d3d_draw(void)
     sc.bottom = (LONG)(g_pb.clip_y + g_pb.clip_h);
     blend_constant(bf);
 
+    ct_draw0 = ct_now();
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -1746,6 +1819,7 @@ static void d3d_draw(void)
      * sampled without D3D refusing the overlap. */
     memset(srv, 0, sizeof srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ct_add(CT_DRAW, ct_draw0);
 
     s_stat.drawn++;
     s_stat.tris += nidx / 3;
@@ -1954,7 +2028,9 @@ static void d3d_present(void)
         }
         /* No vsync: the title paces itself on the vblank the kernel
          * emulates, as it does with the software path. */
+        uint64_t ct0 = ct_now();
         IDXGISwapChain1_Present(s_swap, 0, 0);
+        ct_add(CT_PRESENT, ct0);
         s_stat.presents++;
     }
     s_shown_stale = 1;
@@ -1992,6 +2068,7 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
                 s_stat.shadow_dumps, s_stat.shadow_no_surface, 10);
+    ct_report();
 }
 
 static const Nv2aPbBackend s_backend = {

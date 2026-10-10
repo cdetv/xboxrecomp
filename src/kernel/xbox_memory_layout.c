@@ -959,6 +959,169 @@ static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
     }
 }
 
+/*
+ * RECOMP_TURN_PROFILE=<seconds>: who waits on whom, game or executor.
+ *
+ * A sampling profile shows each thread on its own: the game in D3D's PFB
+ * flush 83% of the time and this thread idle a third of the time. Taken
+ * together those say both wait at once for at least a fifth of it, but not
+ * when or why. This says it directly. The ack thread publishes what it is
+ * doing (a phase) and times its executed segments; a sampler thread reads that
+ * phase together with the handshake bits the other side is spinning on, once
+ * a millisecond, so every sample is one moment seen from both sides.
+ *
+ * Read-only: nothing here changes what any thread does. Off unless set.
+ */
+enum { TURN_TOP, TURN_EXEC, TURN_IDLE, TURN_YIELD, TURN_SWM, TURN_PHASES };
+static const char *const TURN_PHASE_NAME[TURN_PHASES] = {
+    "handshakes", "executing", "idle (no new PUT)", "yield after exec",
+    "waiting on a trap"
+};
+static int s_turn_on;
+static volatile LONG s_turn_phase;
+static LARGE_INTEGER s_turn_freq;
+
+/* Written by the ack thread only, read by the sampler as running totals. */
+static struct {
+    uint64_t exec_n, exec_ticks, exec_bytes;
+    uint64_t exec_hist[6];            /* <0.25, <1, <4, <16, <50, >=50 ms */
+    uint64_t idle_n;
+    uint64_t flush_after_exec, flush_after_idle, flush_in_swm;
+    uint64_t kick_n, kick_ticks;      /* flush answered -> PUT seen moved */
+    uint64_t swm_n, swm_ticks;
+} s_turn;
+
+static uint64_t turn_now(void)
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (uint64_t)t.QuadPart;
+}
+
+static double turn_ms(uint64_t ticks)
+{
+    return (double)ticks * 1000.0 / (double)s_turn_freq.QuadPart;
+}
+
+static DWORD WINAPI turn_sampler_thread(LPVOID param)
+{
+    volatile uint32_t *regs = (volatile uint32_t *)param;
+    double every = atof(getenv("RECOMP_TURN_PROFILE"));
+    /* [phase][game in flush][vblank DPC waiting][PUT ahead of GET] */
+    static uint32_t joint[TURN_PHASES][2][2][2];
+    uint64_t t0 = turn_now(), prev_hist[6] = {0};
+    uint64_t prev_exec_n = 0, prev_exec_ticks = 0, prev_exec_bytes = 0;
+    uint64_t prev_idle_n = 0, prev_fe = 0, prev_fi = 0, prev_fs = 0;
+    uint64_t prev_kick_n = 0, prev_kick_ticks = 0, prev_swm_n = 0;
+    uint64_t prev_swm_ticks = 0;
+
+    if (every < 1.0)
+        every = 20.0;
+    for (;;) {
+        uint32_t flush = *(volatile uint32_t *)((char *)regs + 0x100410);
+        uint32_t pmc   = *(volatile uint32_t *)((char *)regs + 0x000100);
+        uint32_t put   = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+        uint32_t get   = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+        LONG ph = s_turn_phase;
+        uint64_t now;
+        double secs;
+
+        if (ph < 0 || ph >= TURN_PHASES)
+            ph = TURN_TOP;
+        joint[ph][(flush >> 16) & 1][(pmc >> 24) & 1][put != get]++;
+        Sleep(1);
+        now = turn_now();
+        secs = turn_ms(now - t0) / 1000.0;
+        if (secs < every)
+            continue;
+
+        {
+            uint32_t total = 0, by_phase[TURN_PHASES] = {0};
+            uint32_t flush_by[TURN_PHASES] = {0}, vbl_by[TURN_PHASES] = {0};
+            uint32_t ahead_by[TURN_PHASES] = {0};
+            uint32_t flush_all = 0, vbl_all = 0;
+            uint64_t en = s_turn.exec_n - prev_exec_n;
+            uint64_t kn = s_turn.kick_n - prev_kick_n;
+            uint64_t sn = s_turn.swm_n - prev_swm_n;
+            int p, f, v, a;
+
+            for (p = 0; p < TURN_PHASES; p++)
+                for (f = 0; f < 2; f++)
+                    for (v = 0; v < 2; v++)
+                        for (a = 0; a < 2; a++) {
+                            uint32_t c = joint[p][f][v][a];
+                            total += c;
+                            by_phase[p] += c;
+                            if (f) { flush_by[p] += c; flush_all += c; }
+                            if (v) { vbl_by[p] += c; vbl_all += c; }
+                            if (a) ahead_by[p] += c;
+                        }
+            if (!total)
+                total = 1;
+            fprintf(stderr, "[TURN] %.1f s window, %u samples\n", secs, total);
+            fprintf(stderr, "[TURN] executor phase     share  | game in flush"
+                    " | vblank DPC waiting | PUT ahead of GET\n");
+            for (p = 0; p < TURN_PHASES; p++)
+                fprintf(stderr, "[TURN]   %-20s %5.1f%% | %5.1f%%        |"
+                        " %5.1f%%             | %5.1f%%\n",
+                        TURN_PHASE_NAME[p], 100.0 * by_phase[p] / total,
+                        100.0 * flush_by[p] / total, 100.0 * vbl_by[p] / total,
+                        100.0 * ahead_by[p] / total);
+            fprintf(stderr, "[TURN]   %-20s %5.1f%% | %5.1f%%        |"
+                    " %5.1f%%\n", "all", 100.0, 100.0 * flush_all / total,
+                    100.0 * vbl_all / total);
+            fprintf(stderr, "[TURN] segments: %llu (%.1f/s), mean %.2f ms,"
+                    " %.1f KB each; ms <0.25:%llu <1:%llu <4:%llu <16:%llu"
+                    " <50:%llu >=50:%llu\n",
+                    (unsigned long long)en, en / secs,
+                    en ? turn_ms(s_turn.exec_ticks - prev_exec_ticks) / en : 0.0,
+                    en ? (s_turn.exec_bytes - prev_exec_bytes) / 1024.0 / en : 0.0,
+                    (unsigned long long)(s_turn.exec_hist[0] - prev_hist[0]),
+                    (unsigned long long)(s_turn.exec_hist[1] - prev_hist[1]),
+                    (unsigned long long)(s_turn.exec_hist[2] - prev_hist[2]),
+                    (unsigned long long)(s_turn.exec_hist[3] - prev_hist[3]),
+                    (unsigned long long)(s_turn.exec_hist[4] - prev_hist[4]),
+                    (unsigned long long)(s_turn.exec_hist[5] - prev_hist[5]));
+            fprintf(stderr, "[TURN] idle passes %llu; flushes answered: after"
+                    " exec %llu, after idle %llu, in trap wait %llu; flush ->"
+                    " new PUT %llu x mean %.3f ms; trap waits %llu, %.1f ms"
+                    " total\n",
+                    (unsigned long long)(s_turn.idle_n - prev_idle_n),
+                    (unsigned long long)(s_turn.flush_after_exec - prev_fe),
+                    (unsigned long long)(s_turn.flush_after_idle - prev_fi),
+                    (unsigned long long)(s_turn.flush_in_swm - prev_fs),
+                    (unsigned long long)kn,
+                    kn ? turn_ms(s_turn.kick_ticks - prev_kick_ticks) / kn : 0.0,
+                    (unsigned long long)sn,
+                    turn_ms(s_turn.swm_ticks - prev_swm_ticks));
+            fflush(stderr);
+
+            memset(joint, 0, sizeof joint);
+            memcpy(prev_hist, s_turn.exec_hist, sizeof prev_hist);
+            prev_exec_n = s_turn.exec_n; prev_exec_ticks = s_turn.exec_ticks;
+            prev_exec_bytes = s_turn.exec_bytes; prev_idle_n = s_turn.idle_n;
+            prev_fe = s_turn.flush_after_exec; prev_fi = s_turn.flush_after_idle;
+            prev_fs = s_turn.flush_in_swm;
+            prev_kick_n = s_turn.kick_n; prev_kick_ticks = s_turn.kick_ticks;
+            prev_swm_n = s_turn.swm_n; prev_swm_ticks = s_turn.swm_ticks;
+            t0 = turn_now();
+        }
+    }
+    return 0;
+}
+
+static void turn_exec_done(uint64_t t0, uint32_t bytes)
+{
+    uint64_t d = turn_now() - t0;
+    double ms = turn_ms(d);
+    int b = ms < 0.25 ? 0 : ms < 1 ? 1 : ms < 4 ? 2 : ms < 16 ? 3
+          : ms < 50 ? 4 : 5;
+    s_turn.exec_n++;
+    s_turn.exec_ticks += d;
+    s_turn.exec_bytes += bytes;
+    s_turn.exec_hist[b]++;
+}
+
 static volatile uint32_t *s_ack_regs;
 
 /* The pushbuffer executor reached a NOP with a parameter: a PGRAPH
@@ -975,19 +1138,28 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
     extern int kernel_pgraph_swm_done(void);
     extern int kernel_pgraph_swm_cancel(void);
     ULONGLONG t0, warned = 0;
+    uint64_t turn_t0 = 0;
+    LONG turn_prev = TURN_EXEC;
 
     if (!s_ack_regs || !kernel_pgraph_swm_post(subch, param))
         return;
+    if (s_turn_on) {
+        turn_t0 = turn_now();
+        turn_prev = InterlockedExchange(&s_turn_phase, TURN_SWM);
+    }
     t0 = GetTickCount64();
     while (!kernel_pgraph_swm_done()) {
         ULONGLONG waited;
+        if (s_turn_on && (*(volatile uint32_t *)((char *)s_ack_regs + 0x100410)
+                          & 0x10000u))
+            s_turn.flush_in_swm++;
         nv2a_handshake_pass(s_ack_regs, 0);
         waited = GetTickCount64() - t0;
         if (waited > 2000 && kernel_pgraph_swm_cancel()) {
             fprintf(stderr, "  [NV2A] software method %X (param %08X) not taken"
                     " up in 2 s; skipped\n", param & 0x1Fu, param);
             fflush(stderr);
-            return;
+            break;
         }
         if (waited > 5000 && waited - warned > 5000) {
             warned = waited;
@@ -998,13 +1170,28 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
         }
         SwitchToThread();
     }
+    if (s_turn_on) {
+        s_turn.swm_n++;
+        s_turn.swm_ticks += turn_now() - turn_t0;
+        InterlockedExchange(&s_turn_phase, turn_prev);
+    }
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    int turn_ran = 0;                 /* last pass executed a segment */
+    uint64_t turn_flush_at = 0;       /* when a flush was last answered */
     s_ack_regs = regs;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (s_turn_on) {
+            InterlockedExchange(&s_turn_phase, TURN_TOP);
+            if (*(volatile uint32_t *)((char *)regs + 0x100410) & 0x10000u) {
+                if (turn_ran) s_turn.flush_after_exec++;
+                else          s_turn.flush_after_idle++;
+                turn_flush_at = turn_now();
+            }
+        }
         nv2a_handshake_pass(regs, 1);
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
@@ -1062,6 +1249,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     extern void nv2a_pb_peek_ahead(uint32_t va);
                     dumped_put = put;
                     nv2a_pb_peek_ahead(XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
+                }
+            }
+            uint64_t turn_t0 = 0;
+            turn_ran = 0;
+            if (s_turn_on && put != last_put) {
+                turn_t0 = turn_now();
+                turn_ran = 1;
+                InterlockedExchange(&s_turn_phase, TURN_EXEC);
+                if (turn_flush_at) {
+                    s_turn.kick_n++;
+                    s_turn.kick_ticks += turn_t0 - turn_flush_at;
+                    turn_flush_at = 0;
                 }
             }
             if (put != last_put || (now_ms - last_put_ms) > 2000) {
@@ -1172,6 +1371,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                                               + NV2A_USER_DMA_GET);
                     *get = put;
                 }
+                if (turn_ran)   /* bytes: a ring wrap counts as 0 */
+                    turn_exec_done(turn_t0, put > last_put ? put - last_put : 0);
                 last_put = put; last_put_ms = now_ms;
                 /* GET as well as PUT. A title that stops submitting has either
                  * finished or is spinning on the GPU catching up, and only GET
@@ -1219,6 +1420,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
 
+        if (s_turn_on) {
+            if (!turn_ran) s_turn.idle_n++;
+            InterlockedExchange(&s_turn_phase,
+                                turn_ran ? TURN_YIELD : TURN_IDLE);
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -1231,6 +1437,14 @@ static void xbox_Nv2aAckStart(void)
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
+    if (g_nv2a_ack_thread && getenv("RECOMP_TURN_PROFILE")) {
+        QueryPerformanceFrequency(&s_turn_freq);
+        s_turn_on = 1;
+        CloseHandle(CreateThread(NULL, 0, turn_sampler_thread,
+                                 g_nv2a_memory, 0, NULL));
+        fprintf(stderr, "  [TURN] game/executor turn profile on, report every"
+                " %s s\n", getenv("RECOMP_TURN_PROFILE"));
+    }
     if (g_nv2a_ack_thread) {
         fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
                 sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
