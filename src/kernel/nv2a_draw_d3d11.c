@@ -255,14 +255,15 @@ static void d3d_clear(uint32_t param)
     clear_rgba(c);
     {
         /* RECOMP_GPU_CLEAR_TEST: every colour clear is red, then green,
-         * then blue, a second each (by flip count). A title that clears to
-         * black shows nothing either way; this proves the clear reaches the
-         * window and the dumps, in the right channel order. */
+         * then blue, a second each. A title that clears to black shows
+         * nothing either way; this proves the clear reaches the window and
+         * the dumps, in the right channel order. By the clock, not the flip
+         * count: with nothing drawn a title's flips come in bursts. */
         static int test = -1;
         if (test < 0)
             test = getenv("RECOMP_GPU_CLEAR_TEST") != NULL;
         if (test) {
-            uint32_t phase = (g_pb.flips / 60) % 3;
+            uint32_t phase = (uint32_t)((GetTickCount64() / 1000) % 3);
             c[0] = phase == 0 ? 1.0f : 0.0f;
             c[1] = phase == 1 ? 1.0f : 0.0f;
             c[2] = phase == 2 ? 1.0f : 0.0f;
@@ -385,6 +386,34 @@ static void dump_shown(void)
 static void d3d_present(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+
+    {
+        /* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a
+         * line -- how evenly the title paces its frames once drawing costs
+         * nothing. */
+        static int on = -1;
+        static ULONGLONG second;
+        static uint32_t n, line[10], nline;
+        ULONGLONG now;
+        if (on < 0)
+            on = getenv("RECOMP_GPU_PACING") != NULL;
+        if (on) {
+            now = GetTickCount64() / 1000;
+            if (second && now != second) {
+                line[nline++] = n;
+                n = 0;
+                if (nline == 10) {
+                    fprintf(stderr, "[PACE] presents/s: %u %u %u %u %u %u %u"
+                            " %u %u %u (flip %u)%c", line[0], line[1], line[2],
+                            line[3], line[4], line[5], line[6], line[7],
+                            line[8], line[9], g_pb.flips, 10);
+                    nline = 0;
+                }
+            }
+            second = now;
+            n++;
+        }
+    }
 
     if (flip_dump_on())
         dump_shown();
