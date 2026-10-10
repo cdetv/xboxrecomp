@@ -20,5 +20,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
+/* Buffers XAudio2 still has queued (0 = it ran dry), or -1 if inactive. */
+int xa2_queued_buffers(void);
 
 #endif /* APU_XAUDIO2_H */
