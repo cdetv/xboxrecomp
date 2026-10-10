@@ -570,8 +570,7 @@ static uint32_t      s_ib[9 * NV_MAX_INDICES];
 static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
 static ID3D11InputLayout  *s_layout;
-static ID3D11Buffer       *s_vb, *s_ib_buf, *s_cb;
-static uint32_t            s_vb_verts, s_ib_count;
+static ID3D11Buffer       *s_cb;
 static ID3D11RasterizerState *s_rs;
 
 /* The shader's constant buffer; see the cbuffer in nv2a_draw_d3d11_hlsl.h. */
@@ -690,34 +689,6 @@ static int draw_setup(void)
     return 1;
 }
 
-/* A dynamic buffer grown to hold n elements of `size` bytes. */
-static int buf_reserve(ID3D11Buffer **b, uint32_t *have, uint32_t n,
-                       uint32_t size, UINT bind)
-{
-    D3D11_BUFFER_DESC bd;
-    uint32_t want = *have ? *have : 4096;
-
-    if (*b && n <= *have)
-        return 1;
-    while (want < n)
-        want *= 2;
-    if (*b) {
-        ID3D11Buffer_Release(*b);
-        *b = NULL;
-    }
-    memset(&bd, 0, sizeof bd);
-    bd.ByteWidth = want * size;
-    bd.Usage = D3D11_USAGE_DYNAMIC;
-    bd.BindFlags = bind;
-    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, b))) {
-        *have = 0;
-        return 0;
-    }
-    *have = want;
-    return 1;
-}
-
 /* Copy `bytes` into dynamic buffer b, discarding what it held. */
 static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
 {
@@ -730,18 +701,61 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
     return 1;
 }
 
-/* buf_fill with two pieces back to back (a batch and its clipped vertices). */
-static int buf_fill2(ID3D11Buffer *b, const void *a, size_t na,
-                     const void *c, size_t nc)
+/* A dynamic buffer filled as a ring: each batch is appended after the last
+ * with MAP_WRITE_NO_OVERWRITE and drawn from its own offset; only a wrap
+ * discards. A discard per batch made the driver hand out a fresh copy of the
+ * whole buffer every draw (60-130 us each on AMD, ~60% of the executor). */
+typedef struct {
+    ID3D11Buffer *b;
+    uint32_t      bytes, pos, wraps;
+} Ring;
+
+#define RING_MIN_BYTES (16u << 20)
+
+static Ring s_vb, s_ib_ring;            /* the batches' vertices, indices */
+
+/* Append pieces a and c back to back; *at gets their byte offset. */
+static int ring_put(Ring *r, UINT bind, const void *a, size_t na,
+                    const void *c, size_t nc, uint32_t *at)
 {
     D3D11_MAPPED_SUBRESOURCE m;
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)b, 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+    D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    uint32_t need = (uint32_t)(na + nc);
+    uint32_t pos = (r->pos + 15u) & ~15u;
+
+    if (!r->b || need > r->bytes / 2) {         /* (re)made big enough */
+        D3D11_BUFFER_DESC bd;
+        uint32_t want = r->bytes ? r->bytes : RING_MIN_BYTES;
+        while (want < need * 2)
+            want *= 2;
+        if (r->b)
+            ID3D11Buffer_Release(r->b);
+        r->b = NULL;
+        r->bytes = 0;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = want;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = bind;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &r->b)))
+            return 0;
+        r->bytes = want;
+        how = D3D11_MAP_WRITE_DISCARD;
+        pos = 0;
+    } else if (pos + need > r->bytes) {
+        how = D3D11_MAP_WRITE_DISCARD;
+        pos = 0;
+        r->wraps++;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->b, 0,
+                                       how, 0, &m)))
         return 0;
-    memcpy(m.pData, a, na);
+    memcpy((uint8_t *)m.pData + pos, a, na);
     if (nc)
-        memcpy((uint8_t *)m.pData + na, c, nc);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+        memcpy((uint8_t *)m.pData + pos + na, c, nc);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)r->b, 0);
+    *at = pos;
+    r->pos = pos + need;
     return 1;
 }
 
@@ -1613,7 +1627,7 @@ static void d3d_draw(void)
     const Nv2aVshOutput *verts = s_bv;
     float bf[4];
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
-    uint32_t offset = 0, path, rtt;
+    uint32_t offset = 0, ib_offset = 0, path, rtt;
     int si, st, combiners, program, zi;
     ID3D11DepthStencilState *ds;
     uint64_t ct_draw0;
@@ -1727,21 +1741,20 @@ static void d3d_draw(void)
     }
 
     nidx = build_triangles(verts, n);
-    if (!nidx
-        || !buf_reserve(&s_vb, &s_vb_verts, n + s_cv_n,
-                        sizeof(Nv2aVshOutput), D3D11_BIND_VERTEX_BUFFER)
-        || !buf_reserve(&s_ib_buf, &s_ib_count, nidx, 4,
-                        D3D11_BIND_INDEX_BUFFER))
+    if (!nidx)
         return;
     {
         uint64_t ct0 = ct_now();
-        int ok = buf_fill2(s_vb, verts, (size_t)n * sizeof(Nv2aVshOutput),
-                           s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput));
+        int ok = ring_put(&s_vb, D3D11_BIND_VERTEX_BUFFER,
+                          verts, (size_t)n * sizeof(Nv2aVshOutput),
+                          s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput),
+                          &offset);
         ct_add(CT_VB, ct0);
         if (!ok)
             return;
         ct0 = ct_now();
-        ok = buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4);
+        ok = ring_put(&s_ib_ring, D3D11_BIND_INDEX_BUFFER,
+                      s_ib, (size_t)nidx * 4, NULL, 0, &ib_offset);
         ct_add(CT_IB, ct0);
         if (!ok)
             return;
@@ -1793,10 +1806,10 @@ static void d3d_draw(void)
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride,
+    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb.b, &stride,
                                            &offset);
-    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_buf,
-                                         DXGI_FORMAT_R32_UINT, 0);
+    ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
+                                         DXGI_FORMAT_R32_UINT, ib_offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
@@ -2064,6 +2077,9 @@ static void d3d_report(void)
             " handled (guest memory used)%c", s_stat.zeta_made,
             s_stat.zeta_clears, s_stat.zeta_draws, s_stat.zeta_too_big,
             s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
+    fprintf(stderr, "[GPU] d3d11: rings: vertices %u wraps (%u MB), indices"
+            " %u wraps (%u MB)%c", s_vb.wraps, s_vb.bytes >> 20,
+            s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
