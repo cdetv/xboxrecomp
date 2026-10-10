@@ -54,6 +54,7 @@ static uint32_t s_tot_jumped_chained; /* record found with no NOP code */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
+extern void xbox_Nv2aExecProgress(void);
 static int s_exec_enabled = -1;
 
 /* s_seen slot + 1 of each (subch, method), 0 = not seen yet. note() runs for
@@ -412,6 +413,9 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 if (s_exec_enabled && subch == 5u && m == 0x0310u)
                     *(volatile uint32_t *)((uint8_t *)mem + 0xFD400B10u) =
                         *(const uint32_t *)(mem + va);
+                /* Answer the title's PFB flush now, not after the segment. */
+                if (s_exec_enabled)
+                    xbox_Nv2aExecProgress();
                 va += 4;
                 words++;
             }

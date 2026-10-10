@@ -1000,6 +1000,27 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
     }
 }
 
+/* Called by the executor between methods. The PFB flush is otherwise answered
+ * once per ack-thread loop, after the whole submitted segment has run, and D3D
+ * flushes before every kick (CDevice_KickOff): the title waited out each
+ * segment before it could submit the next, so title and executor took turns
+ * instead of overlapping (Conker's field: main thread 60% in the flush, the
+ * executor idle a quarter of the time). On hardware the flush only drains
+ * the write-combine buffer and is answered at once, not when the GPU is done. */
+void xbox_Nv2aExecProgress(void)
+{
+    volatile uint32_t *flush;
+    uint32_t v;
+
+    if (!s_ack_regs)
+        return;
+    flush = (volatile uint32_t *)((char *)s_ack_regs + 0x100410u);
+    v = *flush;
+    if (v & 0x00010000u)
+        InterlockedCompareExchange((volatile LONG *)flush,
+                                   (LONG)(v & ~0x00010000u), (LONG)v);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;

@@ -63,6 +63,7 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
 {
     (void)subch; (void)param;
 }
+void xbox_Nv2aExecProgress(void) {}
 
 extern void nv2a_pb_scan(uint32_t start_va, uint32_t end_va);
 extern void nv2a_pb_scan_ring(uint32_t lo_va, uint32_t hi_va);
