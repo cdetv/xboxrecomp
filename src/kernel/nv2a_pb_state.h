@@ -198,6 +198,17 @@ int pb_fetch_attr(const VertexAttr *a, uint32_t index, float out[4]);
 int pb_fetch_texcoord(uint32_t index, float out[2]);
 int pb_probe_frame(void);
 
+/* nv2a_draw_sw.c: the frame dump the last software present wrote, or NULL
+ * when it wrote none. RECOMP_GPU=both dumps the GPU's copy of the same
+ * rectangle of the same surface under the same number, so the two sequences
+ * pair up frame for frame however far the run goes. */
+typedef struct {
+    int      seq;                       /* <prefix>NNNNN.bmp */
+    uint32_t addr, pitch;               /* resolved surface address, pitch */
+    uint32_t x, y, w, h;                /* rectangle dumped */
+} Nv2aPbDump;
+const Nv2aPbDump *pb_sw_flip_dump(void);
+
 /* What a back end does. The front end has already updated g_pb when each of
  * these is called, and g_pb is all a back end reads. */
 typedef struct {
@@ -216,7 +227,10 @@ typedef struct {
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 
-/* nv2a_draw_d3d11.c: the D3D11 back end, or NULL when it cannot start. */
-const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(void);
+/* nv2a_draw_d3d11.c: the D3D11 back end, or NULL when it cannot start.
+ * shadow: it runs beside the software back end (RECOMP_GPU=both), which
+ * keeps the window; this one draws only into its own textures and dumps
+ * them next to the software dumps (pb_sw_flip_dump). */
+const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow);
 
 #endif /* NV2A_PB_STATE_H */

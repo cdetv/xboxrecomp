@@ -19,6 +19,12 @@
  * RECOMP_FB_DUMP + RECOMP_FB_DUMP_FLIPS dump presented frames exactly as the
  * software path does (24-bit BMPs, same numbering), read back from the GPU, so
  * scripts/compare_frames.py can put the two back ends side by side.
+ *
+ * RECOMP_GPU=both opens this as a shadow: the software back end keeps the
+ * window and its dumps, and this one draws into its own textures only. At
+ * every flip the software path dumps, this dumps the same rectangle of the
+ * same surface as <RECOMP_FB_DUMP>gpu_NNNNN.bmp with the software dump's
+ * number, so any frame of a run -- in-game too -- can be compared.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +55,7 @@ static IDXGIFactory2        *s_factory;
 static IDXGISwapChain1      *s_swap;
 static ID3D11RenderTargetView *s_back_rtv;
 static int                   s_swap_failed;
+static int                   s_shadow;  /* RECOMP_GPU=both: no window */
 
 /* One GPU texture per guest colour surface, found by its resolved address
  * and pitch. ponytail: always B8G8R8A8 whatever the guest format, and a
@@ -73,6 +80,7 @@ static uint32_t s_shown_x, s_shown_y, s_shown_w, s_shown_h;
 
 static struct {
     uint32_t clears, clears_skipped, batches, presents, surfaces;
+    uint32_t shadow_dumps, shadow_no_surface;
 } s_stat;
 
 static void fail(const char *what, HRESULT hr)
@@ -312,47 +320,55 @@ static int flip_dump_on(void)
     return 1;
 }
 
-/* The presented rectangle, read back and written as <prefix>NNNNN.bmp. */
-static void dump_shown(void)
+/* Rectangle x,y,w,h of surface i (or of nothing, i < 0), read back from the
+ * GPU and written as a 24-bit BMP. What lies outside the surface's texture
+ * comes out black. 1 when the file was written. */
+static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
+                     uint32_t w, uint32_t h)
 {
-    static int seq;
-    const char *prefix = getenv("RECOMP_FB_DUMP");
-    D3D11_TEXTURE2D_DESC d;
-    D3D11_BOX box;
+    static const uint8_t black[4] = {0, 0, 0, 0};
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11Texture2D *staging = NULL;
-    uint32_t w = s_shown_w, h = s_shown_h, row_bytes, pad, filesz, y, x;
+    uint32_t cw = 0, ch = 0, row_bytes, pad, filesz, r, c;
     uint8_t hdr[54];
-    char path[512];
     FILE *f;
 
-    if (s_shown < 0 || !w || !h)
-        return;
-    memset(&d, 0, sizeof d);
-    d.Width = w;
-    d.Height = h;
-    d.MipLevels = 1;
-    d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    d.SampleDesc.Count = 1;
-    d.Usage = D3D11_USAGE_STAGING;
-    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &staging)))
-        return;
-    box.left = s_shown_x; box.top = s_shown_y; box.front = 0;
-    box.right = s_shown_x + w; box.bottom = s_shown_y + h; box.back = 1;
-    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)staging,
-            0, 0, 0, 0, (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
-    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging, 0,
-                                       D3D11_MAP_READ, 0, &m))) {
-        ID3D11Texture2D_Release(staging);
-        return;
+    if (!w || !h)
+        return 0;
+    if (i >= 0 && x < s_surf[i].w && y < s_surf[i].h) {
+        cw = s_surf[i].w - x < w ? s_surf[i].w - x : w;
+        ch = s_surf[i].h - y < h ? s_surf[i].h - y : h;
+    }
+    memset(&m, 0, sizeof m);
+    if (cw && ch) {
+        D3D11_TEXTURE2D_DESC d;
+        D3D11_BOX box;
+        memset(&d, 0, sizeof d);
+        d.Width = cw;
+        d.Height = ch;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_STAGING;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &staging)))
+            return 0;
+        box.left = x; box.top = y; box.front = 0;
+        box.right = x + cw; box.bottom = y + ch; box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                (ID3D11Resource *)staging, 0, 0, 0, 0,
+                (ID3D11Resource *)s_surf[i].tex, 0, &box);
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging,
+                                           0, D3D11_MAP_READ, 0, &m))) {
+            ID3D11Texture2D_Release(staging);
+            return 0;
+        }
     }
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
-    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
     f = fopen(path, "wb");
     if (f) {
         memset(hdr, 0, sizeof hdr);
@@ -365,22 +381,60 @@ static void dump_shown(void)
         hdr[26] = 1;
         hdr[28] = 24;
         fwrite(hdr, 1, sizeof hdr, f);
-        for (y = h; y-- > 0; ) {             /* BMP rows run bottom-up */
-            const uint8_t *row = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
-            for (x = 0; x < w; x++)
-                fwrite(row + x * 4, 1, 3, f);    /* B, G, R */
-            if (pad) {
-                static const uint8_t zero[3] = {0, 0, 0};
-                fwrite(zero, 1, pad, f);
-            }
+        for (r = h; r-- > 0; ) {             /* BMP rows run bottom-up */
+            const uint8_t *row = r < ch
+                ? (const uint8_t *)m.pData + (size_t)r * m.RowPitch : NULL;
+            for (c = 0; c < w; c++)                  /* B, G, R */
+                fwrite(row && c < cw ? row + c * 4 : black, 1, 3, f);
+            if (pad)
+                fwrite(black, 1, pad, f);
         }
         fclose(f);
-        if (seq == 1)
-            fprintf(stderr, "  [GPU] d3d11 frame dump: %s (%ux%u)%c", path,
-                    w, h, 10);
     }
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
-    ID3D11Texture2D_Release(staging);
+    if (staging) {
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
+        ID3D11Texture2D_Release(staging);
+    }
+    return f != NULL;
+}
+
+/* The presented rectangle, as <prefix>NNNNN.bmp. */
+static void dump_shown(void)
+{
+    static int seq;
+    char path[512];
+
+    if (s_shown < 0 || !s_shown_w || !s_shown_h)
+        return;
+    snprintf(path, sizeof path, "%s%05d.bmp", getenv("RECOMP_FB_DUMP"), seq++);
+    if (dump_rect(path, s_shown, s_shown_x, s_shown_y, s_shown_w, s_shown_h)
+        && seq == 1)
+        fprintf(stderr, "  [GPU] d3d11 frame dump: %s (%ux%u)%c", path,
+                s_shown_w, s_shown_h, 10);
+}
+
+/* Shadow mode: the software path has just dumped a rectangle of a surface;
+ * dump this back end's copy of it beside it, as <prefix>gpu_NNNNN.bmp. A
+ * surface this back end never made comes out black, and is counted. */
+static void dump_beside_sw(const Nv2aPbDump *sw)
+{
+    char path[512];
+    int i;
+
+    for (i = 0; i < GPU_SURFACES; i++)
+        if (s_surf[i].tex && s_surf[i].addr == sw->addr
+            && s_surf[i].pitch == sw->pitch)
+            break;
+    if (i == GPU_SURFACES) {
+        i = -1;
+        s_stat.shadow_no_surface++;
+    }
+    snprintf(path, sizeof path, "%sgpu_%05d.bmp", getenv("RECOMP_FB_DUMP"),
+             sw->seq);
+    if (dump_rect(path, i, sw->x, sw->y, sw->w, sw->h)
+        && s_stat.shadow_dumps++ == 0)
+        fprintf(stderr, "  [GPU] d3d11 shadow dump: %s (%ux%u)%c", path,
+                sw->w, sw->h, 10);
 }
 
 static void d3d_present(void)
@@ -415,9 +469,16 @@ static void d3d_present(void)
         }
     }
 
-    if (flip_dump_on())
+    if (s_shadow) {
+        /* The software back end presented first and has said what it
+         * dumped; the window is its, not ours. */
+        const Nv2aPbDump *sw = pb_sw_flip_dump();
+        if (sw)
+            dump_beside_sw(sw);
+    } else if (flip_dump_on()) {
         dump_shown();
-    if (ensure_swap_chain()) {
+    }
+    if (!s_shadow && ensure_swap_chain()) {
         ID3D11Texture2D *back = NULL;
         ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
         if (s_shown >= 0
@@ -449,13 +510,17 @@ static void d3d_report(void)
             " %u batches not drawn yet, %u presents, %u surfaces made%c",
             s_stat.clears, s_stat.clears_skipped, s_stat.batches,
             s_stat.presents, s_stat.surfaces, 10);
+    if (s_shadow)
+        fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
+                " software ones (%u from a surface the GPU never made)%c",
+                s_stat.shadow_dumps, s_stat.shadow_no_surface, 10);
 }
 
 static const Nv2aPbBackend s_backend = {
     "d3d11", d3d_clear, d3d_draw, d3d_present, d3d_report
 };
 
-const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(void)
+const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
 {
     static const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0
@@ -500,13 +565,15 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(void)
         ID3D11Device_Release(s_dev); s_dev = NULL;
         return NULL;
     }
+    s_shadow = shadow;
     return &s_backend;
 }
 
 #else
 
-const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(void)
+const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
 {
+    (void)shadow;
     return NULL;
 }
 

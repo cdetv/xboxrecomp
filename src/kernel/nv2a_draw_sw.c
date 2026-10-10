@@ -246,7 +246,13 @@ static void surface_mean(uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *mx)
  * the sequence. */
 static int s_flip_dumping;
 
-static void dump_surface_bmp(void)
+/* What the last dump wrote, and whether the last present's flip dump was it
+ * (pb_sw_flip_dump). */
+static Nv2aPbDump s_last_dump;
+static int s_flip_dumped;
+
+/* 1 when a file was written. */
+static int dump_surface_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -265,16 +271,21 @@ static void dump_surface_bmp(void)
     FILE *f;
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
-        return;
+        return 0;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
+    s_last_dump.seq = seq;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
     f = fopen(path, "wb");
     if (!f)
-        return;
+        return 0;
+    s_last_dump.addr = pb_dma_resolve(offset);
+    s_last_dump.pitch = pitch;
+    s_last_dump.x = cx; s_last_dump.y = cy;
+    s_last_dump.w = w;  s_last_dump.h = h;
 
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
@@ -315,6 +326,7 @@ static void dump_surface_bmp(void)
     if (seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, g_pb.color_offset, bpp);
+    return 1;
 }
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
@@ -1295,7 +1307,7 @@ static int batch_is_screen_space(void)
 #define FB_DUMP_AFTER_DRAW 8
 static int s_drawn_dumps;
 
-static void dump_surface_bmp(void);
+static int dump_surface_bmp(void);
 
 /* One triangle by vertex index: gather position and, if the batch has one,
  * texture coordinate 0. A vertex whose position cannot be read is not drawn;
@@ -2915,6 +2927,7 @@ static void sw_draw(void)
  * it showing a surface the rasteriser is still writing. */
 static void sw_present(void)
 {
+    s_flip_dumped = 0;
     if (g_pb.pitch) {
         extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
         uint32_t done = g_pb.drawn_offset ? g_pb.drawn_offset
@@ -2944,7 +2957,7 @@ static void sw_present(void)
             }
             s_flip_dumping = on;
             if (on)
-                dump_surface_bmp();
+                s_flip_dumped = dump_surface_bmp();
         }
     }
     g_pb.drawn_stale = 1;
@@ -3018,6 +3031,11 @@ static void sw_report(void)
 int pb_probe_frame(void)
 {
     return probe_init() && g_pb.flips == s_probe.from_flip;
+}
+
+const Nv2aPbDump *pb_sw_flip_dump(void)
+{
+    return s_flip_dumped ? &s_last_dump : NULL;
 }
 
 const Nv2aPbBackend nv2a_pb_backend_sw = {
