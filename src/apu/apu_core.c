@@ -121,7 +121,7 @@ void mcpx_debug_end_frame(void) {}
  * ============================================================ */
 
 /* Physical addresses, resolved the way every other bus master here does it
- * (dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
+ * (pb_dma_resolve in nv2a_pb_exec.c, bus_resolve in usb/ohci.c).
  *
  * DirectSound builds its voice, SGE and notifier structures in
  * MmAllocateContiguousMemory and hands the APU their physical addresses.

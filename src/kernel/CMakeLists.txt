@@ -25,6 +25,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
+    nv2a_draw_sw.c
     nv2a_vsh_interp.c
     nv2a_combiner.c
 )
