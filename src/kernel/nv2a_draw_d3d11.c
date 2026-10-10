@@ -14,8 +14,8 @@
  * GPU with four texture stages, the register combiners (one general shader
  * that reads them from a constant buffer), alpha test, fog, blend and colour
  * mask. Step 3: a texture that is a GPU surface is sampled from the GPU
- * (render to texture). Not yet: depth and stencil, near-plane clipping, mip
- * levels.
+ * (render to texture); depth and stencil buffers on the GPU, read back as
+ * textures there too. Not yet: near-plane clipping, mip levels.
  *
  * Guest surfaces live on the GPU only. Nothing is written back to guest
  * memory, so a title that reads its own pixels back sees whatever was there
@@ -68,18 +68,26 @@ static int                   s_shadow;  /* RECOMP_GPU=both: no window */
 /* One GPU texture per guest colour surface, found by its resolved address
  * and pitch. ponytail: always B8G8R8A8 whatever the guest format; a 16-bit
  * surface keeps its alpha at 1 by never writing it (see blend_state), which
- * is what reading it back as R5G6B5 gives the software path. */
+ * is what reading it back as R5G6B5 gives the software path.
+ * Never smaller than ZETA_W x ZETA_H: D3D11 binds a depth buffer only with
+ * colour targets of its own size, and one depth buffer serves every colour
+ * surface drawn with it, as one host buffer does in the software path. */
 typedef struct {
     uint32_t addr, pitch;
     uint32_t w, h;
     uint32_t bpp, swz;                  /* guest pixel size, swizzled */
+    uint32_t used;                      /* s_surf_tick at the last use */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
 } GpuSurface;
 
 #define GPU_SURFACES 32
+/* The software path's depth buffer size (NV_ZBUF_W/H): it draws nothing
+ * with depth past it, and the GPU's depth buffers are the same. */
+#define ZETA_W 1024
+#define ZETA_H 1024
 static GpuSurface s_surf[GPU_SURFACES];
-static int        s_surf_next;
+static uint32_t   s_surf_tick;
 
 /* The surface to present: the biggest one cleared since the last flip, as
  * note_drawn picks the drawn one in the software path (a title also clears
@@ -95,6 +103,8 @@ static struct {
     uint32_t verts_need_clip, combined;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t rtt_binds, rtt_unhandled;
+    uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
+    uint32_t zeta_reads, zeta_unhandled;
 } s_stat;
 
 static void fail(const char *what, HRESULT hr)
@@ -175,10 +185,13 @@ static int surface_current(void)
         if (w > sw) w = sw;
         if (h > sh) h = sh;
     }
+    if (w < ZETA_W) w = ZETA_W;
+    if (h < ZETA_H) h = ZETA_H;
     if (w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return -1;
 
+    s_surf_tick++;
     for (i = 0; i < GPU_SURFACES; i++)
         if (s_surf[i].tex && s_surf[i].addr == addr
             && s_surf[i].pitch == g_pb.pitch)
@@ -186,12 +199,24 @@ static int surface_current(void)
     if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h) {
         s_surf[i].bpp = pb_surface_bpp();
         s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
+        s_surf[i].used = s_surf_tick;
         return i;
     }
     if (i == GPU_SURFACES) {
-        /* Round robin over a table that, in practice, never fills. */
-        i = s_surf_next++ % GPU_SURFACES;
-        s_stat.surfaces++;
+        /* An empty slot, or the one unused longest. Conker's menu room
+         * draws into new render-target addresses every frame; a round
+         * robin threw the frame itself out mid-frame (run 169: 2510
+         * surfaces made, every few frames only the glow left on black). */
+        int k;
+        for (i = 0, k = 1; k < GPU_SURFACES && s_surf[i].tex; k++)
+            if (!s_surf[k].tex || s_surf[k].used < s_surf[i].used)
+                i = k;
+        if (s_stat.surfaces++ < 48)
+            fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
+                    " clip %ux%u+%u+%u fmt 0x%X (slot %d%s)%c",
+                    s_stat.surfaces, addr, g_pb.pitch, g_pb.clip_w,
+                    g_pb.clip_h, g_pb.clip_x, g_pb.clip_y, g_pb.format, i,
+                    s_surf[i].tex ? ", evicting" : "", 10);
     } else {
         /* Grow: keep the larger of old and new in each direction. */
         if (s_surf[i].w > w) w = s_surf[i].w;
@@ -246,6 +271,7 @@ static int surface_current(void)
     s_surf[i].h = h;
     s_surf[i].bpp = pb_surface_bpp();
     s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
+    s_surf[i].used = s_surf_tick;
     return i;
 }
 
@@ -289,8 +315,134 @@ static void clear_rgba(float c[4])
     }
 }
 
-/* ponytail: colour only, and all four channels whatever the mask bits say.
- * Depth and stencil wait for depth buffers on the GPU. */
+/* ── Depth and stencil ─────────────────────────────────────────────────────
+ *
+ * One D24S8 texture per zeta surface, found by SURFACE_ZETA_OFFSET as the
+ * software path finds its host buffers (zbuf_slot), ZETA_W x ZETA_H like
+ * them. Depth arrives in the zeta format's units, as the clear value does
+ * (0..0xFFFFFF for Z24, 0..0xFFFF for Z16), and is stored as 0..1.
+ * Typeless, so the zeta copy pass (texture_from_zeta) can read it back. */
+
+typedef struct {
+    uint32_t offset;                    /* SURFACE_ZETA_OFFSET, as written */
+    uint32_t zf;                        /* zeta format: 1 Z16, 2 Z24S8 */
+    ID3D11Texture2D          *tex;
+    ID3D11DepthStencilView   *dsv;
+    ID3D11ShaderResourceView *srv_z, *srv_s;
+} GpuZeta;
+
+#define GPU_ZETAS 4
+static GpuZeta s_zeta[GPU_ZETAS];
+static int     s_zeta_next;
+
+/* SURFACE_FORMAT bits 4-7, the zeta format: 1 is Z16, 2 is Z24S8. */
+static uint32_t zeta_format(void)
+{
+    return (g_pb.format >> 4) & 0xF;
+}
+
+/* Guest depth units to the 0..1 the depth buffer holds. */
+static float zeta_scale(void)
+{
+    return zeta_format() == 1 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
+}
+
+/* The depth buffer of the current zeta surface, made (depth 1, stencil 0,
+ * as zbuf_slot fills its new buffers: farther than anything) when there is
+ * none and create is set: its index, or -1. */
+static int zeta_current(int create)
+{
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+    GpuZeta *z;
+    HRESULT hr;
+    int i;
+
+    for (i = 0; i < GPU_ZETAS; i++)
+        if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset) {
+            s_zeta[i].zf = zeta_format();
+            return i;
+        }
+    if (!create)
+        return -1;
+    i = s_zeta_next++ % GPU_ZETAS;
+    z = &s_zeta[i];
+    if (z->srv_s) ID3D11ShaderResourceView_Release(z->srv_s);
+    if (z->srv_z) ID3D11ShaderResourceView_Release(z->srv_z);
+    if (z->dsv) ID3D11DepthStencilView_Release(z->dsv);
+    if (z->tex) ID3D11Texture2D_Release(z->tex);
+    memset(z, 0, sizeof *z);
+
+    memset(&d, 0, sizeof d);
+    d.Width = ZETA_W;
+    d.Height = ZETA_H;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &z->tex);
+    if (SUCCEEDED(hr)) {
+        memset(&dv, 0, sizeof dv);
+        dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        hr = ID3D11Device_CreateDepthStencilView(s_dev,
+                (ID3D11Resource *)z->tex, &dv, &z->dsv);
+    }
+    memset(&sv, 0, sizeof sv);
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    if (SUCCEEDED(hr)) {
+        sv.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        hr = ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)z->tex, &sv, &z->srv_z);
+    }
+    if (SUCCEEDED(hr)) {
+        sv.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        hr = ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)z->tex, &sv, &z->srv_s);
+    }
+    if (FAILED(hr)) {
+        static int said;
+        if (!said++)
+            fail("depth buffer", hr);
+        if (z->srv_z) ID3D11ShaderResourceView_Release(z->srv_z);
+        if (z->dsv) ID3D11DepthStencilView_Release(z->dsv);
+        if (z->tex) ID3D11Texture2D_Release(z->tex);
+        memset(z, 0, sizeof *z);
+        return -1;
+    }
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, z->dsv,
+            D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    z->offset = g_pb.zeta_offset;
+    z->zf = zeta_format();
+    s_stat.zeta_made++;
+    return i;
+}
+
+/* Depth (bit 0) and stencil (bit 1) clears: the whole buffer whatever the
+ * clip, as zbuf_clear and sbuf_clear do, to the value in ZSTENCIL_CLEAR. */
+static void zeta_clear(uint32_t param)
+{
+    UINT flags = 0;
+    float z;
+    int i = zeta_current(1);
+
+    if (i < 0)
+        return;
+    if (param & 0x01) flags |= D3D11_CLEAR_DEPTH;
+    if (param & 0x02) flags |= D3D11_CLEAR_STENCIL;
+    z = zeta_format() == 1 ? (float)(g_pb.zstencil_clear & 0xFFFF)
+                           : (float)(g_pb.zstencil_clear >> 8);
+    z *= zeta_scale();
+    ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_zeta[i].dsv, flags,
+            z > 1.0f ? 1.0f : z, (UINT8)(g_pb.zstencil_clear & 0xFF));
+    s_stat.zeta_clears++;
+}
+
+/* ponytail: all four colour channels whatever the mask bits say. */
 static void d3d_clear(uint32_t param)
 {
     D3D11_RECT r;
@@ -299,6 +451,8 @@ static void d3d_clear(uint32_t param)
 
     /* The window opens on the first clear, as in the software path. */
     xbox_FramebufferWindowStart();
+    if (param & 0x03)
+        zeta_clear(param);
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;
     i = surface_current();
@@ -346,8 +500,8 @@ static void d3d_clear(uint32_t param)
  * Nv2aVshOutput, which is also the GPU vertex: the batch goes up as it is,
  * with an index list that cuts its primitive into triangles the way
  * raster_batch cuts it. The shaders are in nv2a_draw_d3d11_hlsl.h.
- * ponytail: no depth buffer yet, and a triangle reaching behind the eye or
- * the near plane is left out rather than clipped (raster_xf_clipped). */
+ * ponytail: a triangle reaching behind the eye or the near plane is left
+ * out rather than clipped (raster_xf_clipped). */
 
 #include "nv2a_draw_d3d11_hlsl.h"
 
@@ -375,7 +529,13 @@ typedef struct {
     float    cf0[8][4], cf1[8][4];
     uint32_t fin[4];
     float    fc0[4], fc1[4], fogc[4], fogp[4];
+    float    zsc[4];                    /* depth units to 0..1 */
 } GpuConsts;
+
+/* The zeta copy pass (texture_from_zeta): its shaders and constants. */
+static ID3D11VertexShader *s_zvs;
+static ID3D11PixelShader  *s_zps;
+static ID3D11Buffer       *s_zcb;
 
 static ID3DBlob *compile(const char *entry, const char *target)
 {
@@ -433,6 +593,30 @@ static int draw_setup(void)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb);
+    }
+    if (SUCCEEDED(hr)) {
+        /* The zeta copy pass. Without it a zeta surface read as a texture
+         * comes from guest memory, as before. */
+        ID3DBlob *zvs = compile("zvs", "vs_4_0"), *zps = compile("zps", "ps_4_0");
+        HRESULT zh = zvs && zps ? S_OK : E_FAIL;
+        if (SUCCEEDED(zh))
+            zh = ID3D11Device_CreateVertexShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(zvs),
+                    ID3D10Blob_GetBufferSize(zvs), NULL, &s_zvs);
+        if (SUCCEEDED(zh))
+            zh = ID3D11Device_CreatePixelShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(zps),
+                    ID3D10Blob_GetBufferSize(zps), NULL, &s_zps);
+        if (SUCCEEDED(zh)) {
+            bd.ByteWidth = 16;
+            zh = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_zcb);
+        }
+        if (zvs) ID3D10Blob_Release(zvs);
+        if (zps) ID3D10Blob_Release(zps);
+        if (FAILED(zh)) {
+            fail("zeta copy pass", zh);
+            s_zcb = NULL;
+        }
     }
     if (SUCCEEDED(hr)) {
         /* No culling: the software path fills both windings. */
@@ -588,6 +772,93 @@ static void blend_constant(float f[4])
     if (g_pb.blend_sfactor == 0x8003 || g_pb.blend_sfactor == 0x8004
         || g_pb.blend_dfactor == 0x8003 || g_pb.blend_dfactor == 0x8004)
         f[0] = f[1] = f[2] = f[3];
+}
+
+/* ── Depth-stencil states ── GL functions and ops (what the NV2A takes) to
+ * D3D11's, as depth_pass, stencil_pass and stencil_apply read them: the
+ * comparisons are "new OP stored" and "ref OP stored" in both. */
+
+static D3D11_COMPARISON_FUNC cmp_func(uint32_t f)
+{
+    switch (f) {
+    case 0x200: return D3D11_COMPARISON_NEVER;
+    case 0x201: return D3D11_COMPARISON_LESS;
+    case 0x202: return D3D11_COMPARISON_EQUAL;
+    case 0x203: return D3D11_COMPARISON_LESS_EQUAL;
+    case 0x204: return D3D11_COMPARISON_GREATER;
+    case 0x205: return D3D11_COMPARISON_NOT_EQUAL;
+    case 0x206: return D3D11_COMPARISON_GREATER_EQUAL;
+    default:    return D3D11_COMPARISON_ALWAYS;
+    }
+}
+
+static D3D11_STENCIL_OP stencil_op(uint32_t op)
+{
+    switch (op) {
+    case 0x0000: return D3D11_STENCIL_OP_ZERO;
+    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
+    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
+    case 0x150A: return D3D11_STENCIL_OP_INVERT;
+    case 0x8507: return D3D11_STENCIL_OP_INCR;          /* INCR_WRAP */
+    case 0x8508: return D3D11_STENCIL_OP_DECR;          /* DECR_WRAP */
+    default:     return D3D11_STENCIL_OP_KEEP;
+    }
+}
+
+/* Depth-stencil states by what they were made from. Depth writes with the
+ * test off are a test that always passes: D3D11 writes no depth with depth
+ * off, the software path does (xf_rows writes whenever DEPTH_MASK is set). */
+#define GPU_DSS 32
+static struct {
+    uint32_t key[8];
+    ID3D11DepthStencilState *ds;
+} s_dss[GPU_DSS];
+static int s_dss_next;
+
+static ID3D11DepthStencilState *ds_state(void)
+{
+    D3D11_DEPTH_STENCIL_DESC d;
+    uint32_t key[8], zon = g_pb.depth_test || g_pb.depth_mask;
+    uint32_t son = g_pb.stencil_test != 0;
+    int i;
+
+    memset(key, 0, sizeof key);
+    key[0] = zon | son << 1 | (g_pb.depth_mask ? 4u : 0u);
+    key[1] = g_pb.depth_test ? g_pb.depth_func : 0x207;
+    if (son) {
+        key[2] = g_pb.stencil_func;
+        key[3] = g_pb.stencil_rmask & 0xFF;
+        key[4] = g_pb.stencil_wmask & 0xFF;
+        key[5] = g_pb.stencil_op_fail;
+        key[6] = g_pb.stencil_op_zfail;
+        key[7] = g_pb.stencil_op_zpass;
+    }
+    for (i = 0; i < GPU_DSS; i++)
+        if (s_dss[i].ds && !memcmp(s_dss[i].key, key, sizeof key))
+            return s_dss[i].ds;
+
+    memset(&d, 0, sizeof d);
+    d.DepthEnable = zon ? TRUE : FALSE;
+    d.DepthWriteMask = g_pb.depth_mask ? D3D11_DEPTH_WRITE_MASK_ALL
+                                       : D3D11_DEPTH_WRITE_MASK_ZERO;
+    d.DepthFunc = cmp_func(key[1]);
+    d.StencilEnable = son ? TRUE : FALSE;
+    d.StencilReadMask = (UINT8)key[3];
+    d.StencilWriteMask = (UINT8)key[4];
+    d.FrontFace.StencilFunc = cmp_func(son ? key[2] : 0x207);
+    d.FrontFace.StencilFailOp = stencil_op(key[5]);
+    d.FrontFace.StencilDepthFailOp = stencil_op(key[6]);
+    d.FrontFace.StencilPassOp = stencil_op(key[7]);
+    d.BackFace = d.FrontFace;           /* one-sided, as the software path */
+    i = s_dss_next++ % GPU_DSS;
+    if (s_dss[i].ds)
+        ID3D11DepthStencilState_Release(s_dss[i].ds);
+    s_dss[i].ds = NULL;
+    if (FAILED(ID3D11Device_CreateDepthStencilState(s_dev, &d, &s_dss[i].ds)))
+        return NULL;
+    memcpy(s_dss[i].key, key, sizeof key);
+    return s_dss[i].ds;
 }
 
 /* ── Textures ──────────────────────────────────────────────────────────────
@@ -746,8 +1017,126 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             (ID3D11Resource *)s_rtt[st].tex, 0, 0, 0, 0,
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     *flags = (uint32_t)r;
+    s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
     return s_rtt[st].srv;
+}
+
+/* A zeta surface read as a texture: Conker's glow bright pass samples its
+ * Z24S8 buffer as LIN_R8G8B8A8 (stencil byte = alpha) and alpha-tests it,
+ * and another pass reads it as LIN_A8B8G8R8 (alpha = depth's top byte).
+ * The software path writes the buffer into guest memory first
+ * (zeta_readback); here a pass draws the same dwords, decoded in the
+ * texture's format, into a colour texture of the texture's size, one per
+ * stage. Linear 32-bit readings of a Z24S8 buffer only, as zeta_readback
+ * writes only linear textures; anything else is counted and read from guest
+ * memory, which nothing writes. */
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} s_zcopy[4];
+
+static ID3D11ShaderResourceView *texture_from_zeta(int st)
+{
+    const Texture *t = &g_pb.texs[st];
+    ID3D11ShaderResourceView *srv[2];
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+    uint32_t zk[4];
+    int i;
+
+    for (i = 0; i < GPU_ZETAS; i++)
+        if (s_zeta[i].tex
+            && (s_zeta[i].offset & 0x0FFFFFFFu) == (t->offset & 0x0FFFFFFFu))
+            break;
+    if (i == GPU_ZETAS)
+        return NULL;
+    if (!s_zcb || s_zeta[i].zf == 1 || tex_size_from_format(t->color)
+        || !(t->color == 0x12 || t->color == 0x1E || t->color == 0x3F
+             || t->color == 0x40 || t->color == 0x41)) {
+        if (s_stat.zeta_unhandled++ < 8)
+            fprintf(stderr, "[GPU] d3d11: texture 0x%08X fmt 0x%02X %ux%u"
+                    " is a zeta surface (format %u) read in a way not"
+                    " handled; read from guest memory%c", t->offset,
+                    t->color, t->width, t->height, s_zeta[i].zf, 10);
+        return NULL;
+    }
+
+    if (!s_zcopy[st].tex || s_zcopy[st].w != t->width
+        || s_zcopy[st].h != t->height) {
+        D3D11_TEXTURE2D_DESC d;
+        if (s_zcopy[st].srv) ID3D11ShaderResourceView_Release(s_zcopy[st].srv);
+        if (s_zcopy[st].rtv) ID3D11RenderTargetView_Release(s_zcopy[st].rtv);
+        if (s_zcopy[st].tex) ID3D11Texture2D_Release(s_zcopy[st].tex);
+        memset(&s_zcopy[st], 0, sizeof s_zcopy[st]);
+        memset(&d, 0, sizeof d);
+        d.Width = t->width;
+        d.Height = t->height;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                &s_zcopy[st].tex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                    (ID3D11Resource *)s_zcopy[st].tex, NULL, &s_zcopy[st].rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_zcopy[st].tex, NULL,
+                    &s_zcopy[st].srv))) {
+            if (s_zcopy[st].rtv) ID3D11RenderTargetView_Release(s_zcopy[st].rtv);
+            if (s_zcopy[st].tex) ID3D11Texture2D_Release(s_zcopy[st].tex);
+            memset(&s_zcopy[st], 0, sizeof s_zcopy[st]);
+            return NULL;
+        }
+        s_zcopy[st].w = t->width;
+        s_zcopy[st].h = t->height;
+    }
+
+    zk[0] = t->color;
+    zk[1] = ZETA_W;
+    zk[2] = ZETA_H;
+    zk[3] = 0;
+    if (!buf_fill(s_zcb, zk, sizeof zk))
+        return NULL;
+    vp.TopLeftX = 0.0f;
+    vp.TopLeftY = 0.0f;
+    vp.Width = (float)t->width;
+    vp.Height = (float)t->height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    sc.left = 0;
+    sc.top = 0;
+    sc.right = (LONG)t->width;
+    sc.bottom = (LONG)t->height;
+    /* The target first: it unbinds the depth buffer from the batch before,
+     * which D3D would otherwise refuse to let the shader read. */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_zcopy[st].rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_zps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_zcb);
+    srv[0] = s_zeta[i].srv_z;
+    srv[1] = s_zeta[i].srv_s;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 4, 2, srv);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    /* Unbound again, so the depth buffer can be a target once more and the
+     * copy can be read: D3D drops a shader view of a bound target. */
+    srv[0] = srv[1] = NULL;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 4, 2, srv);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    s_stat.zeta_reads++;
+    return s_zcopy[st].srv;
 }
 
 /* A shader view of stage st's texture as it is now, or NULL when it cannot
@@ -767,7 +1156,9 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return NULL;
-    rtt = texture_from_surface(st, flags);
+    rtt = texture_from_zeta(st);
+    if (!rtt)
+        rtt = texture_from_surface(st, flags);
     if (rtt)
         return rtt;
     bytes = pb_tex_bytes(t);
@@ -985,7 +1376,8 @@ static void d3d_draw(void)
     float bf[4];
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
     uint32_t offset = 0, path, rtt;
-    int si, st, combiners, program;
+    int si, st, combiners, program, zi;
+    ID3D11DepthStencilState *ds;
 
     s_stat.batches++;
     if (ready < 0)
@@ -1102,12 +1494,28 @@ static void d3d_draw(void)
         || !buf_fill(s_ib_buf, s_ib, (size_t)nidx * 4))
         return;
 
+    /* Depth and stencil where raster_xf_triangle has them: on the program
+     * and combiner paths, when the batch tests or writes either (the flat
+     * path has no depth). */
+    zi = -1;
+    if (path != PATH_FLAT
+        && (g_pb.depth_test || g_pb.depth_mask || g_pb.stencil_test)) {
+        if (s_surf[si].w == ZETA_W && s_surf[si].h == ZETA_H)
+            zi = zeta_current(1);
+        else
+            s_stat.zeta_too_big++;
+    }
+    ds = zi >= 0 ? ds_state() : NULL;
+    if (!ds)
+        zi = -1;
+
     k.rt[0] = 2.0f / (float)s_surf[si].w;
     k.rt[1] = -2.0f / (float)s_surf[si].h;
     k.rt[2] = -1.0f;
     k.rt[3] = 1.0f;
     k.mode[0] = path;
     k.mode[1] = bound;
+    k.zsc[0] = zeta_scale();
     if (!buf_fill(s_cb, &k, sizeof k))
         return;
 
@@ -1141,9 +1549,13 @@ static void d3d_draw(void)
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(bpp), bf,
                                         0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv, NULL);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds,
+            g_pb.stencil_ref & 0xFFu);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
+            zi >= 0 ? s_zeta[zi].dsv : NULL);
     ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    if (zi >= 0)
+        s_stat.zeta_draws++;
     /* Unbound again, so a later batch may draw into a texture this one
      * sampled without D3D refusing the overlap. */
     memset(srv, 0, sizeof srv);
@@ -1383,6 +1795,12 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
             " surface, %u of a surface in a reading not handled (guest"
             " memory used)%c", s_stat.rtt_binds, s_stat.rtt_unhandled, 10);
+    fprintf(stderr, "[GPU] d3d11: depth/stencil: %u buffers made, %u clears,"
+            " %u batches drawn with them, %u on a surface too big for them"
+            " (drawn without); %u reads as a texture, %u in a reading not"
+            " handled (guest memory used)%c", s_stat.zeta_made,
+            s_stat.zeta_clears, s_stat.zeta_draws, s_stat.zeta_too_big,
+            s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
