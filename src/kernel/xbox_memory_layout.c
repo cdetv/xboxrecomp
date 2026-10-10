@@ -1006,11 +1006,20 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
  * segment before it could submit the next, so title and executor took turns
  * instead of overlapping (Conker's field: main thread 60% in the flush, the
  * executor idle a quarter of the time). On hardware the flush only drains
- * the write-combine buffer and is answered at once, not when the GPU is done. */
+ * the write-combine buffer and is answered at once, not when the GPU is done.
+ *
+ * The GPU time (fence_mirrors_tick) is published here too, as soon as the
+ * executor runs a fence. Published only once per segment, it kept
+ * D3D_BlockOnTime waiting for the rest of the segment after its fence had
+ * been reached (Conker's field, flush answered early: main thread 89% there,
+ * executor still idle 27%). */
 void xbox_Nv2aExecProgress(void)
 {
+    extern int nv2a_pb_exec_semaphore(uint32_t *value);
+    static uint32_t published;
+    static int have_published;
     volatile uint32_t *flush;
-    uint32_t v;
+    uint32_t v, sem;
 
     if (!s_ack_regs)
         return;
@@ -1019,6 +1028,12 @@ void xbox_Nv2aExecProgress(void)
     if (v & 0x00010000u)
         InterlockedCompareExchange((volatile LONG *)flush,
                                    (LONG)(v & ~0x00010000u), (LONG)v);
+    if (nv2a_pb_exec_semaphore(&sem)
+            && (!have_published || sem != published)) {
+        published = sem;
+        have_published = 1;
+        fence_mirrors_tick();
+    }
 }
 
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
