@@ -631,6 +631,10 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics);
 PVOID   __stdcall xbox_MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect);
 VOID    __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes);
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress);
+/* Bus masters (APU, NV2A, OHCI): if `pa` (bits 28-31 ignored) is a stand-in
+ * physical page MmGetPhysicalAddress gave a non-contiguous page, store the
+ * guest VA it stands for in *va and return 1; otherwise return 0. */
+int xbox_PhysAliasToVa(uint32_t pa, uint32_t *va);
 
 VOID    __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist);
 ULONG   __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress);
