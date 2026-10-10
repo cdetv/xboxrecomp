@@ -66,6 +66,8 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+static void voice_resample_reset(uint16_t v);
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -300,6 +302,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         }
 
         voice_reset_filters(d, (uint16_t)selected_handle);
+        voice_resample_reset((uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
 
@@ -998,32 +1001,83 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling (linear interpolation, no libsamplerate)
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * This used to fetch source samples one for one and ignore `rate`, so every
+ * voice played at 48 kHz whatever its pitch: a 22.05 kHz sound ran 2.2x fast
+ * and an octave high, and a stream voice drained its packets twice as fast
+ * as the title refilled them (SSL "empty" underruns -> gaps and crackle).
+ * Conker: Live & Reloaded's 48 kHz movie audio sounded right; its menu and
+ * in-game sound was a crackly mess.
+ *
+ * xemu feeds libsamplerate with src_ratio = rate. Here: linear interpolation
+ * between source frames, keeping each voice's fractional read position and
+ * the frames it has fetched but not yet passed, so consecutive se_frames join
+ * up. Source frames are fetched only as interpolation needs them (at most one
+ * frame ahead), so CBO and stream packet completion stay where they were.
+ * VOICE_ON resets a voice's state.
  * ============================================================ */
+
+#define RS_MAX_STEP 16.0f   /* 4 octaves up; NV pitch reaches 2^(+-8) */
+#define RS_BUF      (2 + (int)(NUM_SAMPLES_PER_FRAME * RS_MAX_STEP) + 2)
+
+typedef struct {
+    float  buf[RS_BUF][2];  /* fetched source frames; buf[0] is at position 0 */
+    int    n;               /* frames in buf */
+    double pos;             /* read position in frames, relative to buf[0] */
+} VoiceResampler;
+
+static VoiceResampler s_rs[MCPX_HW_MAX_VOICES];
+
+static void voice_resample_reset(uint16_t v)
+{
+    s_rs[v].n = 0;
+    s_rs[v].pos = 0.0;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceResampler *r = &s_rs[v];
+    double step = (rate > 0.0f) ? 1.0 / rate : 1.0;
+    if (step > RS_MAX_STEP) step = RS_MAX_STEP;
+    if (step < 1.0 / 256.0) step = 1.0 / 256.0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    int out = 0;
+    while (out < requested_num) {
+        /* Drop frames the read position has passed. */
+        int drop = (int)r->pos;
+        if (drop > r->n) drop = r->n;
+        if (drop > 0) {
+            memmove(r->buf, r->buf + drop, (size_t)(r->n - drop) * sizeof(r->buf[0]));
+            r->n -= drop;
+            r->pos -= drop;
+        }
+
+        int idx = (int)r->pos;
+        if (idx + 1 >= r->n) {
+            /* Fetch what the rest of this request needs: frames up to
+             * floor(pos + (left - 1) * step) + 1. */
+            int left = requested_num - out;
+            int need = (int)(r->pos + (left - 1) * step) + 2 - r->n;
+            if (need < 1) need = 1;
+            if (need > RS_BUF - r->n) need = RS_BUF - r->n;
+            int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+            if (!active) break;
+            int count = voice_get_samples(d, v, &r->buf[r->n], need);
+            if (count <= 0) break;  /* ended, or underrun */
+            r->n += count;
+            continue;
+        }
+
+        float t = (float)(r->pos - idx);
+        samples[out][0] = r->buf[idx][0] + (r->buf[idx + 1][0] - r->buf[idx][0]) * t;
+        samples[out][1] = r->buf[idx][1] + (r->buf[idx + 1][1] - r->buf[idx][1]) * t;
+        out++;
+        r->pos += step;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return out > 0 ? out : -1;
 }
 
 /* ============================================================
