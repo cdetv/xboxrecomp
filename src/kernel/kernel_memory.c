@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -163,24 +164,67 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
-/* Per 4 KB page of the 256 MB a bus master can address: which kind of
- * address MmGetPhysicalAddress last returned there.
+/* Stand-in physical pages for memory outside the contiguous window.
  *
- * Outside the contiguous window the answer is the VA unchanged, and a heap
- * VA (the heap starts at 0x00F80000) is the same number as a physical
- * address inside the contiguous arena. A bus master given that number
- * cannot tell which memory is meant, and the resolvers guess "contiguous"
- * below the arena's high-water mark. DirectSound splits a stream packet in
- * ordinary heap memory into page segments by physical address, so the APU
- * read those segments from the contiguous window -- other data -- and
- * played noise: Conker: Live & Reloaded's 16-bit PCM menu music and in-game
- * sound. Remembering what was handed out makes the answer exact for every
- * address that came from here; anything else keeps the old guess. */
-static volatile uint8_t s_phys_kind[0x10000000u >> 12];
+ * The contiguous window maps physical P at XBOX_CONTIG_BASE + P, so its
+ * physical address is exact. Anything else used to be handed back as its VA,
+ * and that number means two things at once: a heap VA (the heap starts at
+ * 0x00F80000) is also a physical address inside the contiguous arena, and an
+ * EXT_VMA heap VA (Conker's CRT heap, 0x74000000+) loses its top bits to the
+ * 28-bit mask bus masters apply. DirectSound splits a stream packet in heap
+ * memory into page segments by physical address, so the APU read other
+ * memory and played noise (Conker: Live & Reloaded's PCM menu music,
+ * dialogue and effects).
+ *
+ * So each such page gets its own physical page number, as on hardware: one
+ * from 0x08000000-0x0FFFFFFF, above any Xbox RAM, handed out in first-asked
+ * order and kept for good. Bus masters translate back with
+ * xbox_PhysAliasToVa. A buffer whose pages are asked for in order gets
+ * consecutive stand-ins, so it still looks physically contiguous. */
+#define PHYS_ALIAS_BASE  0x08000000u
+#define PHYS_ALIAS_PAGES ((0x10000000u - PHYS_ALIAS_BASE) >> 12)   /* 32768 */
 
-int xbox_PhysAddressKind(uint32_t pa)
+static uint32_t s_alias_va_page[PHYS_ALIAS_PAGES];   /* slot -> VA >> 12 */
+static uint16_t s_va_alias_slot[1u << 20];           /* VA >> 12 -> slot + 1 */
+static volatile LONG s_alias_used;
+static SRWLOCK s_alias_lock = SRWLOCK_INIT;
+
+int xbox_PhysAliasToVa(uint32_t pa, uint32_t *va)
 {
-    return s_phys_kind[(pa & 0x0FFFFFFFu) >> 12];
+    pa &= 0x0FFFFFFFu;
+    if (pa < PHYS_ALIAS_BASE)
+        return 0;
+    uint32_t slot = (pa - PHYS_ALIAS_BASE) >> 12;
+    if (slot >= (uint32_t)s_alias_used)
+        return 0;
+    *va = (s_alias_va_page[slot] << 12) | (pa & 0xFFFu);
+    return 1;
+}
+
+static uint32_t phys_alias(uint32_t va)
+{
+    uint32_t page = va >> 12;
+    uint32_t slot1 = s_va_alias_slot[page];
+    if (!slot1) {
+        AcquireSRWLockExclusive(&s_alias_lock);
+        slot1 = s_va_alias_slot[page];
+        if (!slot1 && (uint32_t)s_alias_used < PHYS_ALIAS_PAGES) {
+            uint32_t slot = (uint32_t)s_alias_used;
+            s_alias_va_page[slot] = page;
+            s_va_alias_slot[page] = (uint16_t)(slot + 1);
+            InterlockedIncrement(&s_alias_used);
+            slot1 = slot + 1;
+        }
+        ReleaseSRWLockExclusive(&s_alias_lock);
+        if (!slot1) {
+            static int warned;
+            if (!warned++)
+                fprintf(stderr, "[MEM] MmGetPhysicalAddress: stand-in physical"
+                                " pages used up; passing VAs through\n");
+            return va;
+        }
+    }
+    return PHYS_ALIAS_BASE + ((slot1 - 1) << 12) + (va & 0xFFFu);
 }
 
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
@@ -201,10 +245,7 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
     int contig = va >= XBOX_CONTIG_BASE &&
                  (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
-    uint32_t pa = contig ? va - XBOX_CONTIG_BASE : va;
-    s_phys_kind[(pa & 0x0FFFFFFFu) >> 12] =
-        (uint8_t)(contig ? XBOX_PHYS_KIND_CONTIG : XBOX_PHYS_KIND_VA);
-    return (ULONG_PTR)pa;
+    return (ULONG_PTR)(contig ? va - XBOX_CONTIG_BASE : phys_alias(va));
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

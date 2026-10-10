@@ -498,6 +498,12 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    extern int xbox_PhysAliasToVa(uint32_t pa, uint32_t *va);
+    uint32_t va;
+    /* A stand-in page MmGetPhysicalAddress gave non-contiguous memory (the
+     * driver's statics in the image, heap buffers): the VA it stands for. */
+    if (xbox_PhysAliasToVa(addr, &va))
+        return va;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())

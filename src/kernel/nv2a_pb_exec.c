@@ -105,6 +105,13 @@ int pb_surface_hits_image(uint32_t base, uint32_t bytes)
 uint32_t pb_dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
+    extern int xbox_PhysAliasToVa(uint32_t pa, uint32_t *va);
+    uint32_t va;
+
+    /* A stand-in page MmGetPhysicalAddress gave non-contiguous memory
+     * (kernel_memory.c): exactly the VA it stands for. */
+    if (xbox_PhysAliasToVa(offset, &va))
+        return va;
 
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window, and that is not a guess: the arena is a bump
