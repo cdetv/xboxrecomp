@@ -6,7 +6,9 @@
  * screen-space x, y, z with the clip-space w kept, as nv2a_vsh_run leaves
  * them -- and maps pixels back to clip space, times w so the GPU divides it
  * out again and interpolates texture coordinates with perspective. Colours
- * and fog interpolate across the screen without it, as xf_rows does.
+ * and fog interpolate across the screen without it, as xf_rows does. z is
+ * in the zeta format's units (0..0xFFFFFF for Z24) and goes to the depth
+ * buffer as 0..1; like xf_rows' z it interpolates linearly on the screen.
  *
  * The pixel shader has three paths, chosen per batch (mode.x):
  *   0  flat: the texel alone, or the triangle's first vertex colour
@@ -44,6 +46,7 @@ static const char s_hlsl[] =
 "  float4 fc0, fc1;    /* final combiner constants */\n"
 "  float4 fogc;        /* fog colour, r g b */\n"
 "  float4 fogp;        /* fog parameters 0, 1 */\n"
+"  float4 zsc;         /* x: guest depth units to 0..1 (1/0xFFFFFF Z24) */\n"
 "};\n"
 "struct VI {\n"
 "  float4 p : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
@@ -77,7 +80,7 @@ static const char s_hlsl[] =
 "V vs(VI i) {\n"
 "  V o; float w = i.p.w;\n"
 "  o.p = float4((i.p.x * rt.x + rt.z) * w, (i.p.y * rt.y + rt.w) * w,\n"
-"               0.5 * w, w);\n"
+"               i.p.z * zsc.x * w, w);\n"
 "  o.cf = i.d0; o.d0 = i.d0; o.d1 = i.d1; o.fog = fog_factor(i.fog.x);\n"
 "  o.t0 = i.t0; o.t1 = i.t1; o.t2 = i.t2; o.t3 = i.t3;\n"
 "  return o;\n"
@@ -237,6 +240,32 @@ static const char s_hlsl[] =
 "    if (!ok) discard;\n"
 "  }\n"
 "  return o;\n"
+"}\n"
+"\n"
+"/* The zeta copy pass (texture_from_zeta): a depth/stencil buffer read as\n"
+"   a colour texture. Each pixel becomes the dword zeta_readback writes to\n"
+"   guest memory (Z24 << 8 | stencil), decoded as pb_tex_texel decodes\n"
+"   that dword in format zk.x. zk.yz: the buffer's size; past it, 0. */\n"
+"Texture2D<float> zd : register(t4); Texture2D<uint2> zst : register(t5);\n"
+"cbuffer Z : register(b1) { uint4 zk; };\n"
+"float4 zvs(uint id : SV_VertexID) : SV_Position {\n"
+"  float2 p = float2((id << 1) & 2, id & 2);\n"
+"  return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+"}\n"
+"float4 zps(float4 p : SV_Position) : SV_Target {\n"
+"  int3 c = int3(p.xy, 0); uint d = 0, a;\n"
+"  if ((uint)c.x < zk.y && (uint)c.y < zk.z)\n"
+"    d = min((uint)(zd.Load(c) * 16777215.0 + 0.5), 0xFFFFFFu) << 8\n"
+"        | (zst.Load(c).y & 0xFF);\n"
+"  if (zk.x == 0x41) a = (d << 24) | (d >> 8);\n"
+"  else if (zk.x == 0x40) a = (d << 24) | ((d >> 8) & 0xFF) << 16\n"
+"                           | ((d >> 16) & 0xFF) << 8 | (d >> 24);\n"
+"  else if (zk.x == 0x3F) a = (d & 0xFF00FF00u) | ((d & 0xFF) << 16)\n"
+"                           | ((d >> 16) & 0xFF);\n"
+"  else if (zk.x == 0x1E) a = d | 0xFF000000u;\n"
+"  else a = d;\n"
+"  return float4((a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF, a >> 24)\n"
+"         / 255.0;\n"
 "}\n";
 
 #endif
