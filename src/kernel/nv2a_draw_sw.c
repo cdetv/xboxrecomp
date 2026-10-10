@@ -246,7 +246,13 @@ static void surface_mean(uint32_t *r, uint32_t *g, uint32_t *b, uint32_t *mx)
  * the sequence. */
 static int s_flip_dumping;
 
-static void dump_surface_bmp(void)
+/* What the last dump wrote, and whether the last present's flip dump was it
+ * (pb_sw_flip_dump). */
+static Nv2aPbDump s_last_dump;
+static int s_flip_dumped;
+
+/* 1 when a file was written. */
+static int dump_surface_bmp(void)
 {
     const char *prefix = getenv("RECOMP_FB_DUMP");
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -265,16 +271,21 @@ static void dump_surface_bmp(void)
     FILE *f;
 
     if (!prefix || !w || !h || (bpp != 2 && bpp != 4) || !offset)
-        return;
+        return 0;
 
     row_bytes = w * 3;
     pad = (4 - (row_bytes & 3)) & 3;
     filesz = 54 + (row_bytes + pad) * h;
 
+    s_last_dump.seq = seq;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq++);
     f = fopen(path, "wb");
     if (!f)
-        return;
+        return 0;
+    s_last_dump.addr = pb_dma_resolve(offset);
+    s_last_dump.pitch = pitch;
+    s_last_dump.x = cx; s_last_dump.y = cy;
+    s_last_dump.w = w;  s_last_dump.h = h;
 
     memset(hdr, 0, sizeof hdr);
     hdr[0] = 'B'; hdr[1] = 'M';
@@ -315,6 +326,7 @@ static void dump_surface_bmp(void)
     if (seq == 1)
         fprintf(stderr, "  [GPU] framebuffer dump: %s (%ux%u from 0x%08X %ubpp)\n",
                 path, w, h, g_pb.color_offset, bpp);
+    return 1;
 }
 
 /* Defined below, next to the rest of the rasteriser; the clear path uses it
@@ -1268,34 +1280,12 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types.
- *
- * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
- * at 1. They were each one too low, so every title's geometry was decomposed
- * as the primitive below the one it asked for -- a strip as a fan, a fan as
- * quads, and TRIANGLES, the one case whose vertex count must be a multiple
- * of three, as a strip.
- *
- * The vertex order says which numbering is right without taking a table on
- * trust: a strip arrives in Z order and a fan in cyclic order, and they only
- * line up with the primitive under this one. */
-#define NV_PRIM_POINTS         1
-#define NV_PRIM_LINES          2
-#define NV_PRIM_LINE_LOOP      3
-#define NV_PRIM_LINE_STRIP     4
-#define NV_PRIM_TRIANGLES      5
-#define NV_PRIM_TRIANGLE_STRIP 6
-#define NV_PRIM_TRIANGLE_FAN   7
-#define NV_PRIM_QUADS          8
-#define NV_PRIM_QUAD_STRIP     9
-#define NV_PRIM_POLYGON        10
-
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
 #define FB_DUMP_AFTER_DRAW 8
 static int s_drawn_dumps;
 
-static void dump_surface_bmp(void);
+static int dump_surface_bmp(void);
 
 /* One triangle by vertex index: gather position and, if the batch has one,
  * texture coordinate 0. A vertex whose position cannot be read is not drawn;
@@ -2499,11 +2489,27 @@ static int transform_batch(uint32_t n)
     return 1;
 }
 
+/* transform_batch for the current batch, once: a second back end asking for
+ * the same batch (RECOMP_GPU=both) gets these results rather than running
+ * the program again, which a program that writes constants would not
+ * survive. Keyed on the front end's batch number. */
+static uint32_t s_xf_draw;
+static int      s_xf_ok;
+
+const Nv2aVshOutput *pb_transform_batch(void)
+{
+    if (s_xf_draw != g_pb.draws) {
+        s_xf_ok = transform_batch(g_pb.idx_count);
+        s_xf_draw = g_pb.draws;
+    }
+    return s_xf_ok ? s_xf : NULL;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = g_pb.idx_count;
 
-    if (!transform_batch(n)) {
+    if (!pb_transform_batch()) {
         if (probe_init() && g_pb.flips == s_probe.from_flip)
             fprintf(stderr, "[PROBE-DRAW] draw %u prim %u verts %u: vertex"
                     " program did not run (no END), batch dropped\n",
@@ -2915,6 +2921,7 @@ static void sw_draw(void)
  * it showing a surface the rasteriser is still writing. */
 static void sw_present(void)
 {
+    s_flip_dumped = 0;
     if (g_pb.pitch) {
         extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
         uint32_t done = g_pb.drawn_offset ? g_pb.drawn_offset
@@ -2944,7 +2951,7 @@ static void sw_present(void)
             }
             s_flip_dumping = on;
             if (on)
-                dump_surface_bmp();
+                s_flip_dumped = dump_surface_bmp();
         }
     }
     g_pb.drawn_stale = 1;
@@ -3018,6 +3025,42 @@ static void sw_report(void)
 int pb_probe_frame(void)
 {
     return probe_init() && g_pb.flips == s_probe.from_flip;
+}
+
+int pb_batch_screen_space(void)
+{
+    return batch_is_screen_space();
+}
+
+int pb_fetch_color(uint32_t index, float c[4])
+{
+    return pb_fetch_attr(color_attr(), index, c) || constant_color(c);
+}
+
+void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out)
+{
+    fixed_vertex(index, out);
+}
+
+int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex(t, 0, u, v, argb);
+}
+
+uint32_t pb_tex_bytes(const Texture *t)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+
+    if (block)
+        return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
+    if (d3d8_format_is_swizzled(t->color))
+        return t->width * t->height * tex_texel_bytes(t->color);
+    return t->pitch * t->height;
+}
+
+const Nv2aPbDump *pb_sw_flip_dump(void)
+{
+    return s_flip_dumped ? &s_last_dump : NULL;
 }
 
 const Nv2aPbBackend nv2a_pb_backend_sw = {

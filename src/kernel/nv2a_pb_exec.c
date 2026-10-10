@@ -51,8 +51,11 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 Nv2aPbState g_pb;
 int g_pb_ftrace;
 
-/* The back end every batch goes to; chosen at the first method. */
+/* The back end every batch goes to; chosen at the first method. s_shadow,
+ * when set (RECOMP_GPU=both), gets every call too, after s_be: a second back
+ * end checked against the first in the same run. */
 static const Nv2aPbBackend *s_be = &nv2a_pb_backend_sw;
+static const Nv2aPbBackend *s_shadow;
 
 /* Would writing this surface land on the title's own image?
  *
@@ -344,6 +347,8 @@ static void draw_primitive(void)
     }
 
     s_be->draw();
+    if (s_shadow)
+        s_shadow->draw();
 
     if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
         static int shown;
@@ -732,20 +737,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         inited = 1;
         {
             /* RECOMP_GPU picks the back end: unset or "sw" is the software
-             * rasteriser, "d3d11" the GPU. */
+             * rasteriser, "d3d11" the GPU, "both" the software one in
+             * charge and the GPU beside it. Two runs only repeat each other
+             * for the first few hundred frames, so comparing the back ends
+             * past that needs them in one run, fed the same methods. */
             const char *gpu = getenv("RECOMP_GPU");
-            if (gpu && strcmp(gpu, "d3d11") == 0) {
-                const Nv2aPbBackend *b = nv2a_pb_backend_d3d11_open();
-                if (b)
-                    s_be = b;
-                else
+            int both = gpu && strcmp(gpu, "both") == 0;
+            if (gpu && (both || strcmp(gpu, "d3d11") == 0)) {
+                const Nv2aPbBackend *b = nv2a_pb_backend_d3d11_open(both);
+                if (!b)
                     fprintf(stderr, "[GPU] d3d11 back end did not start,"
                             " using %s%c", s_be->name, 10);
+                else if (both)
+                    s_shadow = b;
+                else
+                    s_be = b;
             } else if (gpu && strcmp(gpu, "sw") != 0) {
                 fprintf(stderr, "[GPU] RECOMP_GPU=%s: unknown back end,"
                         " using %s%c", gpu, s_be->name, 10);
             }
-            fprintf(stderr, "[GPU] back end: %s%c", s_be->name, 10);
+            fprintf(stderr, "[GPU] back end: %s%s%s%c", s_be->name,
+                    s_shadow ? ", shadowed by " : "",
+                    s_shadow ? s_shadow->name : "", 10);
         }
         g_pb.color_mask = 0x01010101u;           /* all channels, as reset */
         {
@@ -920,6 +933,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     param, g_pb.color_offset, g_pb.clip_w, g_pb.clip_h,
                     g_pb.clear_color, 10);
         s_be->clear(param);
+        if (s_shadow)
+            s_shadow->clear(param);
         break;
 
     case NV097_SET_BEGIN_END:
@@ -1034,6 +1049,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             draws_at_flip = g_pb.draws;
         }
         s_be->present();
+        if (s_shadow)
+            s_shadow->present();
 
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
@@ -1340,6 +1357,8 @@ void nv2a_pb_exec_report(void)
             g_pb.draws, g_pb.nonzero_draws, g_pb.verts,
             g_pb.min_x, g_pb.max_x, g_pb.min_y, g_pb.max_y);
     s_be->report();
+    if (s_shadow)
+        s_shadow->report();
 
     if (getenv("RECOMP_TEX_STATE")) {
         uint32_t k;
