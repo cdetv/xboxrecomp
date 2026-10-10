@@ -631,6 +631,10 @@ NTSTATUS __stdcall xbox_MmQueryStatistics(PXBOX_MM_STATISTICS MemoryStatistics);
 PVOID   __stdcall xbox_MmMapIoSpace(ULONG_PTR PhysicalAddress, ULONG NumberOfBytes, ULONG Protect);
 VOID    __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes);
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress);
+/* What MmGetPhysicalAddress last handed out for the 4 KB page holding
+ * physical address `pa` (bits 28-31 ignored, as bus masters do). */
+enum { XBOX_PHYS_KIND_UNKNOWN = 0, XBOX_PHYS_KIND_VA = 1, XBOX_PHYS_KIND_CONTIG = 2 };
+int xbox_PhysAddressKind(uint32_t pa);
 
 VOID    __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist);
 ULONG   __stdcall xbox_MmQueryAddressProtect(PVOID VirtualAddress);

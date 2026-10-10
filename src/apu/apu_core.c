@@ -153,10 +153,19 @@ void mcpx_debug_end_frame(void) {}
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 extern uint32_t xbox_ContiguousAllocatedBytes(void);
+extern int xbox_PhysAddressKind(uint32_t pa);
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    /* An address MmGetPhysicalAddress handed out is no guess: a heap VA
+     * passed through means the VA, a contiguous one means the window. Stream
+     * packets in heap memory read as contiguous were noise. */
+    switch (xbox_PhysAddressKind(a)) {
+    case 1: return g_apu_ram_ptr + a;                 /* XBOX_PHYS_KIND_VA */
+    case 2: return g_apu_ram_ptr + 0x80000000u + a;   /* XBOX_PHYS_KIND_CONTIG */
+    default: break;
+    }
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())

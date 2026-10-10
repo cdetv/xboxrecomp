@@ -163,6 +163,26 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
 }
 
+/* Per 4 KB page of the 256 MB a bus master can address: which kind of
+ * address MmGetPhysicalAddress last returned there.
+ *
+ * Outside the contiguous window the answer is the VA unchanged, and a heap
+ * VA (the heap starts at 0x00F80000) is the same number as a physical
+ * address inside the contiguous arena. A bus master given that number
+ * cannot tell which memory is meant, and the resolvers guess "contiguous"
+ * below the arena's high-water mark. DirectSound splits a stream packet in
+ * ordinary heap memory into page segments by physical address, so the APU
+ * read those segments from the contiguous window -- other data -- and
+ * played noise: Conker: Live & Reloaded's 16-bit PCM menu music and in-game
+ * sound. Remembering what was handed out makes the answer exact for every
+ * address that came from here; anything else keeps the old guess. */
+static volatile uint8_t s_phys_kind[0x10000000u >> 12];
+
+int xbox_PhysAddressKind(uint32_t pa)
+{
+    return s_phys_kind[(pa & 0x0FFFFFFFu) >> 12];
+}
+
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
 {
     /*
@@ -179,9 +199,12 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    int contig = va >= XBOX_CONTIG_BASE &&
+                 (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    uint32_t pa = contig ? va - XBOX_CONTIG_BASE : va;
+    s_phys_kind[(pa & 0x0FFFFFFFu) >> 12] =
+        (uint8_t)(contig ? XBOX_PHYS_KIND_CONTIG : XBOX_PHYS_KIND_VA);
+    return (ULONG_PTR)pa;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)
