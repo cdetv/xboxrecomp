@@ -2434,16 +2434,52 @@ static void xf_job(int k, int n)
     }
 }
 
-/* Every vertex of the batch into s_xf. 0: the program did not run. */
+/* The same, NV2A_VSH_LANES vertices per interpreter call (nv2a_vsh_run_lanes):
+ * every slot of s_xf_run, the first included, since nv2a_vsh_prepare has
+ * already decoded the program on this thread. Only the inputs the program
+ * reads are fetched. */
+static uint32_t s_xf_used;
+
+static void xf_lanes_job(int k, int n)
+{
+    float in[NV2A_VSH_LANES][NV2A_VSH_INPUTS][4];
+    Nv2aVshOutput *out[NV2A_VSH_LANES];
+    uint32_t lo = (uint32_t)((uint64_t)s_xf_nrun * k / n);
+    uint32_t hi = (uint32_t)((uint64_t)s_xf_nrun * (k + 1) / n);
+
+    while (lo < hi) {
+        int m = 0, a;
+        for (; lo < hi && m < NV2A_VSH_LANES; lo++, m++) {
+            uint32_t i = s_xf_run[lo], index = g_pb.idx[i];
+            for (a = 0; a < NV2A_VSH_INPUTS; a++)
+                if (s_xf_used & (1u << a))
+                    pb_fetch_attr(&g_pb.attr[a], index, in[m][a]);
+            out[m] = &s_xf[i];
+        }
+        if (!nv2a_vsh_run_lanes((const float (*)[NV2A_VSH_INPUTS][4])in,
+                                out, m))
+            s_xf_failed = 1;
+    }
+}
+
+/* Every vertex of the batch into s_xf. 0: the program did not run.
+ * RECOMP_VSH_LANES=0 runs the program one vertex at a time as before
+ * (nv2a_vsh_run); so do RECOMP_VSH_DUMP/_STEP, which work per vertex.
+ * RECOMP_VSH_CHECK keeps the work on this thread: its tally is not shared. */
 static int transform_batch(uint32_t n)
 {
-    static int vsh_debug = -1;
+    static int vsh_debug = -1, lanes = -1, one_thread;
     int cache = !nv2a_vsh_cxt_write();
     uint32_t i;
 
     static long mt_min = -1;
     if (vsh_debug < 0)
         vsh_debug = getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_STEP");
+    if (lanes < 0) {
+        const char *e = getenv("RECOMP_VSH_LANES");
+        lanes = !vsh_debug && !(e && !strcmp(e, "0"));
+        one_thread = getenv("RECOMP_VSH_CHECK") != NULL;
+    }
     if (mt_min < 0) {                       /* RECOMP_VSH_MT_MIN=<runs> */
         const char *e = getenv("RECOMP_VSH_MT_MIN");
         mt_min = e ? atol(e) : NV_VSH_MT_MIN;
@@ -2472,13 +2508,24 @@ static int transform_batch(uint32_t n)
         s_xf_from[i] = i;
         s_xf_run[s_xf_nrun++] = i;
     }
-    if (!transform_vertex(g_pb.idx[s_xf_run[0]], &s_xf[s_xf_run[0]]))
-        return 0;
     s_xf_failed = 0;
-    if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1 && !vsh_debug)
-        pool_run(xf_job);
-    else
-        xf_job(0, 1);
+    if (lanes) {
+        if (!nv2a_vsh_prepare(&s_xf_used))
+            return 0;
+        if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1
+                && !one_thread)
+            pool_run(xf_lanes_job);
+        else
+            xf_lanes_job(0, 1);
+    } else {
+        if (!transform_vertex(g_pb.idx[s_xf_run[0]], &s_xf[s_xf_run[0]]))
+            return 0;
+        if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1
+                && !vsh_debug)
+            pool_run(xf_job);
+        else
+            xf_job(0, 1);
+    }
     if (s_xf_failed)
         return 0;
     for (i = 0; i < n; i++)

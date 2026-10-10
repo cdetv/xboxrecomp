@@ -5,8 +5,9 @@
  * in screen space. A title running vertex programs -- every 3D scene on the
  * Xbox -- sends model-space positions and lets the GPU transform them, so
  * those batches were counted and skipped. This runs the uploaded program on
- * the CPU, one vertex at a time, and hands back the outputs the rasteriser
- * needs.
+ * the CPU, one vertex at a time (nv2a_vsh_run) or a group of them per
+ * instruction (nv2a_vsh_run_lanes), and hands back the outputs the
+ * rasteriser needs.
  *
  * Programs and constants arrive through the pushbuffer exactly as the GPU
  * would take them (SET_TRANSFORM_PROGRAM_LOAD / _PROGRAM, _CONSTANT_LOAD /
@@ -50,6 +51,16 @@ int  nv2a_vsh_cxt_write(void);   /* programs may write c[]: no vertex cache */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+
+/* The same program on up to NV2A_VSH_LANES vertices at once, same results
+ * bit for bit, much faster. in[l] and out[l] are vertex l's; only the inputs
+ * nv2a_vsh_prepare reports as used are read. Not for programs that may
+ * write constants (nv2a_vsh_cxt_write). Safe on several threads at once
+ * once nv2a_vsh_prepare has run on one. Returns 0 as nv2a_vsh_run does. */
+#define NV2A_VSH_LANES 32
+int  nv2a_vsh_prepare(uint32_t *inputs_used);  /* decode; 0 = no program */
+int  nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
+                        Nv2aVshOutput *const *out, int count);
 
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);

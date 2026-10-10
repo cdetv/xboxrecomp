@@ -68,6 +68,8 @@ typedef struct {
 static VshIns s_dec[NV2A_VSH_SLOTS];
 static uint32_t s_dec_count;            /* instructions from s_start_slot */
 static int s_dec_valid;
+static int s_dec_final;                 /* a FINAL was found */
+static uint32_t s_dec_inputs;           /* bit i: the program reads v[i] */
 
 /* ---- uploads ------------------------------------------------------------ */
 
@@ -392,6 +394,8 @@ static void decode_program(void)
 {
     uint32_t s, n = 0;
 
+    s_dec_final = 0;
+    s_dec_inputs = 0;
     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++, n++) {
         const uint32_t *ins = s_program[s];
         VshIns *I = &s_dec[n];
@@ -420,7 +424,11 @@ static void decode_program(void)
             I->need |= VSH_NEED_B;
         if (I->mac == 3 || I->mac == 4 || I->ilu)
             I->need |= VSH_NEED_C;
+        for (k = 0; k < 3; k++)
+            if ((I->need & (1 << k)) && I->src[k].mux == 2)
+                s_dec_inputs |= 1u << I->iidx;
         if (I->final) {
+            s_dec_final = 1;
             n++;
             break;
         }
@@ -553,4 +561,328 @@ static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
         }
     }
     return 0;
+}
+
+/* ---- many vertices at once ----------------------------------------------
+ *
+ * run_program pays for every instruction once per vertex: the op switch,
+ * the masks, the swizzles. Here each instruction runs on up to
+ * NV2A_VSH_LANES vertices before the next one, with every register held as
+ * four rows of one float per vertex ("lanes"), so that cost is paid once
+ * per group and the arithmetic is plain loops over rows, which the compiler
+ * turns into SIMD. The maths is run_program's, operation for operation and
+ * in the same order, so the results are the same bits; RECOMP_VSH_CHECK=1
+ * runs run_program beside it on every vertex and counts any that differ.
+ *
+ * Not for programs that write constants: one vertex's write would have to
+ * be seen by the next, and here they all run each instruction together. */
+
+#define VL NV2A_VSH_LANES
+typedef float VshRows[4][VL];
+
+typedef struct {
+    VshRows in[NV2A_VSH_INPUTS];
+    VshRows temp[12], opos, outregs[13];
+    int a0[VL];
+} VshLanes;
+
+static int s_check = -1;                 /* RECOMP_VSH_CHECK */
+static unsigned long long s_check_runs, s_check_bad;
+
+int nv2a_vsh_prepare(uint32_t *inputs_used)
+{
+    if (s_check < 0)
+        s_check = getenv("RECOMP_VSH_CHECK") != NULL;
+    if (!s_dec_valid)
+        decode_program();
+    if (inputs_used)
+        *inputs_used = s_dec_inputs;
+    return s_dec_final;
+}
+
+static void read_lanes(const VshIns *I, int which, const VshLanes *S, int n,
+                       VshRows r)
+{
+    const VshSrc *d = &I->src[which];
+    int j, l;
+
+    if (d->mux == 1 || d->mux == 2) {
+        const float (*s)[VL] = d->mux == 2 ? S->in[I->iidx]
+                             : d->reg == 12 ? S->opos
+                             : S->temp[d->reg < 12 ? d->reg : 0];
+        for (j = 0; j < 4; j++)
+            memcpy(r[j], s[d->sw[j]], (size_t)n * sizeof(float));
+    } else if (!I->rel) {
+        const float *c = s_const[I->cidx < NV2A_VSH_CONSTANTS ? I->cidx : 0];
+        for (j = 0; j < 4; j++) {
+            float f = c[d->sw[j]];
+            for (l = 0; l < n; l++)
+                r[j][l] = f;
+        }
+    } else {
+        for (l = 0; l < n; l++) {
+            int ci = I->cidx + S->a0[l];
+            const float *c;
+            if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
+                ci = 0;
+            c = s_const[ci];
+            for (j = 0; j < 4; j++)
+                r[j][l] = c[d->sw[j]];
+        }
+    }
+    if (d->neg)
+        for (j = 0; j < 4; j++)
+            for (l = 0; l < n; l++)
+                r[j][l] = -r[j][l];
+}
+
+static void mac_lanes(uint32_t op, VshRows a, VshRows b, VshRows c, VshRows r,
+                      int *a0, int n)
+{
+    int j, l;
+
+    switch (op) {
+    case 2:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] * b[j][l];
+        return;
+    case 3:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] + c[j][l];
+        return;
+    case 4:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] * b[j][l] + c[j][l];
+        return;
+    case 5:
+        for (l = 0; l < n; l++)
+            r[0][l] = a[0][l]*b[0][l] + a[1][l]*b[1][l] + a[2][l]*b[2][l];
+        break;
+    case 6:                                                    /* dph */
+        for (l = 0; l < n; l++)
+            r[0][l] = a[0][l]*b[0][l] + a[1][l]*b[1][l] + a[2][l]*b[2][l]
+                    + b[3][l];
+        break;
+    case 7:
+        for (l = 0; l < n; l++)
+            r[0][l] = a[0][l]*b[0][l] + a[1][l]*b[1][l] + a[2][l]*b[2][l]
+                    + a[3][l]*b[3][l];
+        break;
+    case 8:                                                    /* dst */
+        for (l = 0; l < n; l++) {
+            r[0][l] = 1.0f; r[1][l] = a[1][l] * b[1][l];
+            r[2][l] = a[2][l]; r[3][l] = b[3][l];
+        }
+        return;
+    case 9:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] < b[j][l] ? a[j][l] : b[j][l];
+        return;
+    case 10:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] >= b[j][l] ? a[j][l] : b[j][l];
+        return;
+    case 11:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] < b[j][l] ? 1.0f : 0.0f;
+        return;
+    case 12:
+        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
+            r[j][l] = a[j][l] >= b[j][l] ? 1.0f : 0.0f;
+        return;
+    case 13:                                                   /* arl */
+        for (l = 0; l < n; l++)
+            a0[l] = (int)floorf(a[0][l] + 0.001f);
+        /* fall through: the result is A, as run_mac leaves it */
+    default:                                                   /* mov etc. */
+        memcpy(r, a, sizeof(VshRows));
+        return;
+    }
+    /* dp3 / dph / dp4: x spread to all four */
+    for (j = 1; j < 4; j++)
+        memcpy(r[j], r[0], (size_t)n * sizeof(float));
+}
+
+static void ilu_lanes(uint32_t op, VshRows c, VshRows r, int n)
+{
+    int j, l;
+
+    if (op == 1) {                                             /* mov */
+        memcpy(r, c, sizeof(VshRows));
+        return;
+    }
+    for (l = 0; l < n; l++) {
+        float x = c[0][l];
+        switch (op) {
+        case 2: r[0][l] = x == 0.0f ? INFINITY : 1.0f / x; break;
+        case 3: {
+            float f = 1.0f / x;
+            if (fabsf(f) < 5.42101e-20f) f = f < 0 ? -5.42101e-20f : 5.42101e-20f;
+            if (fabsf(f) > 1.884467e19f) f = f < 0 ? -1.884467e19f : 1.884467e19f;
+            r[0][l] = f;
+            break;
+        }
+        case 4: r[0][l] = 1.0f / sqrtf(fabsf(x)); break;
+        case 5: {
+            float fl = floorf(x);
+            r[0][l] = exp2f(fl); r[1][l] = x - fl; r[2][l] = exp2f(x);
+            r[3][l] = 1.0f;
+            break;
+        }
+        case 6: {
+            float ax = fabsf(x);
+            if (ax == 0.0f) {
+                r[0][l] = r[2][l] = -INFINITY; r[1][l] = 1.0f;
+            } else {
+                float e = floorf(log2f(ax));
+                r[0][l] = e; r[1][l] = ax / exp2f(e); r[2][l] = log2f(ax);
+            }
+            r[3][l] = 1.0f;
+            break;
+        }
+        case 7: {
+            float nl = c[0][l] > 0.0f ? c[0][l] : 0.0f;
+            float nh = c[1][l] > 0.0f ? c[1][l] : 0.0f;
+            float p = c[3][l] < -127.9961f ? -127.9961f
+                    : (c[3][l] > 127.9961f ? 127.9961f : c[3][l]);
+            r[0][l] = 1.0f; r[1][l] = nl;
+            r[2][l] = c[0][l] > 0.0f ? powf(nh, p) : 0.0f; r[3][l] = 1.0f;
+            break;
+        }
+        default:                                   /* ilu 0 is never run */
+            for (j = 0; j < 4; j++) r[j][l] = c[j][l];
+            break;
+        }
+    }
+    if (op >= 2 && op <= 4)                        /* rcp rcc rsq: splat x */
+        for (j = 1; j < 4; j++)
+            memcpy(r[j], r[0], (size_t)n * sizeof(float));
+}
+
+static void write_lanes(float (*dst)[VL], VshRows src, uint32_t mask, int n)
+{
+    if (mask & 8) memcpy(dst[0], src[0], (size_t)n * sizeof(float));
+    if (mask & 4) memcpy(dst[1], src[1], (size_t)n * sizeof(float));
+    if (mask & 2) memcpy(dst[2], src[2], (size_t)n * sizeof(float));
+    if (mask & 1) memcpy(dst[3], src[3], (size_t)n * sizeof(float));
+}
+
+
+int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
+                       Nv2aVshOutput *const *out, int count)
+{
+    VshLanes S;
+    VshRows a, b, c, mres, ires;
+    uint32_t i, used;
+    int n, l, j;
+
+    if (count <= 0)
+        return 1;
+    if (count > VL)
+        count = VL;
+    if (!nv2a_vsh_prepare(&used))
+        return 0;
+    /* Rows run in whole SIMD widths; the spare lanes compute on zeroes. */
+    n = (count + 3) & ~3;
+
+    /* Starting values as run_program's; inputs the program never reads are
+     * left unset. */
+    memset(S.temp, 0, sizeof S.temp);
+    memset(S.opos, 0, sizeof S.opos);
+    memset(S.outregs, 0, sizeof S.outregs);
+    memset(S.a0, 0, sizeof S.a0);
+    for (l = 0; l < n; l++) {
+        S.outregs[3][3][l] = S.outregs[4][3][l] = 1.0f;
+        S.outregs[9][3][l] = S.outregs[10][3][l] = 1.0f;
+        S.outregs[11][3][l] = S.outregs[12][3][l] = 1.0f;
+    }
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        if (used & (1u << i))
+            for (j = 0; j < 4; j++) {
+                for (l = 0; l < count; l++)
+                    S.in[i][j][l] = in[l][i][j];
+                for (; l < n; l++)
+                    S.in[i][j][l] = 0.0f;
+            }
+
+    for (i = 0; i < s_dec_count; i++) {
+        const VshIns *I = &s_dec[i];
+        uint32_t mac = I->mac, ilu = I->ilu;
+
+        if (I->need & VSH_NEED_A) read_lanes(I, 0, &S, n, a);
+        if (I->need & VSH_NEED_B) read_lanes(I, 1, &S, n, b);
+        if (I->need & VSH_NEED_C) read_lanes(I, 2, &S, n, c);
+        if (mac)
+            mac_lanes(mac, a, b, c, mres, S.a0, n);
+        if (ilu)
+            ilu_lanes(ilu, c, ires, n);
+
+        if (mac && mac != 13 && I->mac_mask) {
+            uint32_t t = I->tdst;
+            if (t <= 12)
+                write_lanes(t == 12 ? S.opos : S.temp[t], mres, I->mac_mask, n);
+        }
+        if (ilu && I->ilu_mask) {
+            uint32_t t = mac ? 1u : I->tdst;      /* see run_program */
+            if (t <= 12)
+                write_lanes(t == 12 ? S.opos : S.temp[t], ires, I->ilu_mask, n);
+        }
+        if (I->omask) {
+            /* An unused unit's result is zero, as in run_program. */
+            int from_ilu = I->out_ilu;
+            if ((from_ilu && !ilu) || (!from_ilu && !mac))
+                memset(from_ilu ? ires : mres, 0, sizeof(VshRows));
+            if (!I->out_o) {                      /* to c[]: the last lane */
+                if (s_cxt_write && I->oaddr < NV2A_VSH_CONSTANTS) {
+                    vec4 t;
+                    for (j = 0; j < 4; j++)
+                        t.v[j] = (from_ilu ? ires : mres)[j][count - 1];
+                    write_masked(s_const[I->oaddr], &t, I->omask);
+                }
+            } else if (I->oaddr == 0) {
+                write_lanes(S.opos, from_ilu ? ires : mres, I->omask, n);
+            } else if (I->oaddr < 13) {
+                write_lanes(S.outregs[I->oaddr], from_ilu ? ires : mres,
+                            I->omask, n);
+            }
+        }
+    }
+
+    for (l = 0; l < count; l++) {
+        Nv2aVshOutput *o = out[l];
+        for (j = 0; j < 4; j++) {
+            o->pos[j]    = S.opos[j][l];
+            o->d0[j]     = S.outregs[3][j][l];
+            o->d1[j]     = S.outregs[4][j][l];
+            o->fog[j]    = S.outregs[5][j][l];
+            o->tex[0][j] = S.outregs[9][j][l];
+            o->tex[1][j] = S.outregs[10][j][l];
+            o->tex[2][j] = S.outregs[11][j][l];
+            o->tex[3][j] = S.outregs[12][j][l];
+        }
+    }
+
+    /* RECOMP_VSH_CHECK=1: run_program on the same vertices; any that come
+     * out in other bits are counted and the first few printed. The caller
+     * runs everything on one thread while this is on. */
+    if (s_check > 0) {
+        for (l = 0; l < count; l++) {
+            Nv2aVshOutput ref;
+            run_program(in[l], &ref, 0);
+            if (memcmp(&ref, out[l], sizeof ref)) {
+                if (s_check_bad++ < 8) {
+                    const float *p = (const float *)&ref, *q = (const float *)out[l];
+                    fprintf(stderr, "[VSH] check: lane %d differs:", l);
+                    for (j = 0; j < (int)(sizeof ref / sizeof(float)); j++)
+                        if (memcmp(&p[j], &q[j], sizeof(float)))
+                            fprintf(stderr, " [%d] %g vs %g", j, p[j], q[j]);
+                    fputc('\n', stderr);
+                }
+            }
+            if ((++s_check_runs & 0xFFFFF) == 0)
+                fprintf(stderr, "[VSH] check: %llu vertices, %llu differ\n",
+                        s_check_runs, s_check_bad);
+        }
+    }
+    return 1;
 }
