@@ -851,7 +851,10 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+    else if (is_write) {
+        /* GP (0x30000) and EP (0x50000) regions */
+        mcpx_apu_gp_ep_write(d, addr, (uint32_t)val);
+    }
 }
 
 /* ============================================================
@@ -867,7 +870,7 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
-    return 0;
+    return mcpx_apu_gp_ep_read(d, (hwaddr)addr);
 }
 
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)

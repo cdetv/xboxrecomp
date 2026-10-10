@@ -2660,10 +2660,24 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+                /* Except each DSP window's last page (GP +0x3F000, EP
+                 * +0x5F000): control registers, not DSP memory. GPRST/EPRST
+                 * at +0xFFFC must reach the APU, whose boot ROM then loads
+                 * program memory from scratch (apu_dsp.c). DirectSound reads
+                 * EP program memory back and resets both DSPs on every
+                 * DoWork while it holds 0. */
+                int dsp_ctl_trapped = 0;
+                if (g_apu_mmio_trapped
+                    && VirtualProtect((char *)g_mcpx_memory + 0x3F000, 0x1000,
+                                      PAGE_NOACCESS, &old_protect)
+                    && VirtualProtect((char *)g_mcpx_memory + 0x5F000, 0x1000,
+                                      PAGE_NOACCESS, &old_protect))
+                    dsp_ctl_trapped = 1;
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
-                                    " (GP/EP DSP memory left as RAM)\n",
-                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES);
+                                    " (GP/EP DSP memory left as RAM%s)\n",
+                            XBOX_MCPX_BASE, XBOX_MCPX_BASE + APU_TRAP_BYTES,
+                            dsp_ctl_trapped ? ", their control pages trapped" : "");
                 *(volatile uint32_t *)((char *)g_mcpx_memory
                                        + MCPX_AC97_CODEC_STATUS)
                     |= MCPX_AC97_CODEC_READY;
