@@ -2064,7 +2064,22 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    { int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+    {
+        /* A DPC runs holding the dispatch gate, so every device ISR waits
+         * for it (APU, OHCI). Name any that runs long: during Conker's level
+         * loads the gate holder was this function for over a second. */
+        ULONGLONG t0 = GetTickCount64(), ms;
+        int _irql = xbox_IrqlEnterInterrupt(2); fn(); xbox_IrqlLeaveInterrupt(_irql);
+        ms = GetTickCount64() - t0;
+        if (ms >= 100) {
+            static LONG shown;
+            if (InterlockedIncrement(&shown) <= 40) {
+                fprintf(stderr, "  [KERNEL] DPC 0x%08X routine 0x%08X ran %llu ms\n",
+                        dpc_va, routine, ms);
+                fflush(stderr);
+            }
+        }
+    }
     return 1;
 }
 
