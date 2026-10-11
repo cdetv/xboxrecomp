@@ -135,6 +135,11 @@ static void prof_voices_routing(void)
         shown++;
         if (len >= sizeof(line)) break;
     }
+    if (g_state)
+        fprintf(stderr, "  [APUPROF] hrtf submixes %d,%d,%d,%d headroom %d\n",
+                g_state->vp.hrtf_submix[0], g_state->vp.hrtf_submix[1],
+                g_state->vp.hrtf_submix[2], g_state->vp.hrtf_submix[3],
+                g_state->vp.hrtf_headroom);
     fprintf(stderr, "  [APUPROF] routing (voice(peak) bin:dB):%s\n",
             line[0] ? line : " none");
     memset(s_route_gain, 0, sizeof(s_route_gain));
@@ -173,6 +178,19 @@ void mcpx_apu_vp_prof_voices(void)
     prof_voices_routing();
     memset(s_clk_count, 0, sizeof(s_clk_count));
     memset(s_clk_frames, 0, sizeof(s_clk_frames));
+}
+
+/* RECOMP_APU_HRTF: HRTF filtering of 3D voices, default on (see
+ * voice_process). Replaces the xemu config flag the shim pins to false. */
+static bool apu_hrtf_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_HRTF");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+        fprintf(stderr, "[APU] HRTF for 3D voices: %s\n", on ? "on" : "off");
+    }
+    return on != 0;
 }
 
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
@@ -1351,13 +1369,47 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
-    /* HRTF processing for 3D voices */
-    if (v < MCPX_HW_MAX_3D_VOICES && g_config.audio.hrtf) {
+    /* HRTF processing for 3D voices.
+     *
+     * A 3D voice's first four bins are the HRTF submixes (SET_HRTF_SUBMIXES:
+     * DirectSound points them at the XTLK front/back left/right bins) and
+     * the filter turns the mono voice into a left-ear/right-ear pair. The
+     * xemu code this came from mixed bins with samples[i][b % channels],
+     * which for a mono voice feeds the left-ear output to all four, so the
+     * direction was lost (xemu only hears it in its no-DSP monitor mix).
+     * DirectSound sets the submixes in the order front-left, back-left,
+     * front-right, back-right (Conker: 6,8,7,9), so HRTF slots 0-1 take
+     * the left ear and 2-3 the right; the voice's other bins (centre, LFE,
+     * I3DL2 sends) take the dry signal. DirectSound gives both XTLK fronts
+     * the same volume, so without this every 3D sound is dead centre.
+     *
+     * The filter output is scaled so the two ears together keep the dry
+     * voice's power (white-noise gain of the current HRIRs): with the
+     * coefficients as int8/128, Conker's HRIRs came out ~10 dB down, while
+     * xemu's monitor mix, the reference players hear, still carries each
+     * source dry at full level beside it.
+     *
+     * On by default (as xemu's audio.hrtf); RECOMP_APU_HRTF=0 turns it off. */
+    float dry[NUM_SAMPLES_PER_FRAME][2];
+    bool hrtf_on = false;
+    if (v < MCPX_HW_MAX_3D_VOICES && apu_hrtf_enabled()) {
         uint16_t hrtf_handle =
             (uint16_t)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                                      NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
         if (hrtf_handle != HRTF_NULL_HANDLE) {
-            hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+            HrtfFilter *hf = &d->vp.filters[v].hrtf;
+            memcpy(dry, samples, sizeof(dry));
+            hrtf_filter_process(hf, samples, samples);
+            float e = 0.0f;
+            for (int ch = 0; ch < 2; ch++)
+                for (int k = 0; k < HRTF_NUM_TAPS; k++)
+                    e += hf->ch[ch].hrir_coeff_cur[k] * hf->ch[ch].hrir_coeff_cur[k];
+            float norm = e > 1e-6f ? fminf(sqrtf(2.0f / e), 8.0f) : 1.0f;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                samples[i][0] *= norm;
+                samples[i][1] *= norm;
+            }
+            hrtf_on = true;
         }
     }
 
@@ -1373,6 +1425,12 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b]) / hr;
         bin_gain[b] = g;
+        if (hrtf_on) {
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                mixbins[bin[b]][i] += g * (b < 4 ? samples[i][b >> 1]
+                                                 : dry[i][b % channels]);
+            continue;
+        }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
