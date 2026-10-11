@@ -284,6 +284,27 @@ void xbox_IsrGateEnter(void)
     t_isr_gate_held = 1;
 }
 
+/* xbox_IsrGateEnter without the wait: 1 when the caller may run its ISR now
+ * (gate taken, or not needed), 0 when a guest thread holds the dispatch
+ * boundary. For a device thread with real-time work of its own between
+ * deliveries: the APU frame thread waited here up to 0.5 s while the holder
+ * was descheduled (host overloaded), and the speakers ran dry meanwhile.
+ * It keeps the line up and tries again on its next frame instead. */
+int xbox_IsrGateTryEnter(void)
+{
+    InitOnceExecuteOnce(&s_gate_once, gate_init, NULL, NULL);
+    if (s_isr_gate_on < 0) {
+        const char *e = getenv("RECOMP_ISR_GATE");
+        s_isr_gate_on = s_gate_on && !(e && *e == '0');
+    }
+    if (!s_isr_gate_on || t_isr_gate_held || t_gate_held || t_isr_depth)
+        return 1;
+    if (!TryEnterCriticalSection(&s_gate))
+        return 0;
+    t_isr_gate_held = 1;
+    return 1;
+}
+
 void xbox_IsrGateLeave(void)
 {
     if (t_isr_gate_held) {

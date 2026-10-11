@@ -552,6 +552,10 @@ struct ApuProfile {
      * the frame thread woke too late to catch up and gave the time up. */
     unsigned long xa2_starved, xa2_dropped, throttle_resets;
     double throttle_lost_ms;
+    /* Where the frame thread blocks: the ISR gate, retaking d->lock from
+     * guest threads, and the longest gap between two loops. */
+    double t_gate, max_gate, t_relock, max_relock, max_loop;
+    unsigned long gate_busy;   /* ISR gate busy: delivery retried next frame */
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;
