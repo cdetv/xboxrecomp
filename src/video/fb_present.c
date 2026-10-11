@@ -160,6 +160,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* The X button or Alt+F4: quit, as the title's own quit does
+         * (HalReturnToFirmware). Only closing the window left the game
+         * running with nothing on screen. File writes go straight through
+         * WriteFile, so nothing written so far is lost. */
+        fprintf(stderr, "[EXIT] window closed\n");
+        fflush(stderr);
+        ExitProcess(0);
+        return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;
