@@ -25,6 +25,41 @@
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 
+/* ---- which XInput slot answers for which Xbox port ------------------------
+ *
+ * Xbox port n is the n-th connected XInput pad, not XInput slot n. Windows
+ * hands out slots in connection order and keeps a slot taken by a virtual
+ * pad that has come and gone, so the only pad on a machine can sit in slot 1
+ * with slot 0 empty (Parsec's virtual pad on a PC with Steam, ViGEm and
+ * Virtual Desktop gamepad drivers): read as slot 0, nothing answered.
+ *
+ * Rescanned once a second, and at once when the mapped slot stops
+ * answering, because XInputGetState on an empty slot is slow enough not to
+ * be done for every report. */
+#define NO_SLOT XBOX_MAX_CONTROLLERS
+static DWORD     g_slot_of_port[XBOX_MAX_CONTROLLERS];
+static ULONGLONG g_next_scan;
+
+static void scan_slots(void)
+{
+    DWORD i, n = 0;
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+        XINPUT_STATE s;
+        if (XInputGetState(i, &s) == ERROR_SUCCESS)
+            g_slot_of_port[n++] = i;
+    }
+    for (; n < XBOX_MAX_CONTROLLERS; n++)
+        g_slot_of_port[n] = NO_SLOT;
+    g_next_scan = GetTickCount64() + 1000;
+}
+
+static DWORD slot_of_port(DWORD port)
+{
+    if (GetTickCount64() >= g_next_scan)
+        scan_slots();
+    return g_slot_of_port[port];
+}
+
 /* ---- keyboard, when there is no pad --------------------------------------
  *
  * A title that waits on PRESS START is unreachable on a machine with no
@@ -126,23 +161,25 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 
 void xbox_InputInit(void)
 {
-    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
-        XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
-    }
+    scan_slots();
+    for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        g_controller_connected[i] = g_slot_of_port[i] != NO_SLOT;
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
-    DWORD result;
+    DWORD result, slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    slot = slot_of_port(dwPort);
+    result = slot == NO_SLOT ? ERROR_DEVICE_NOT_CONNECTED
+                             : XInputGetState(slot, &xi_state);
     if (result != ERROR_SUCCESS) {
+        if (slot != NO_SLOT)
+            g_next_scan = 0;            /* unplugged: look again next time */
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
@@ -213,13 +250,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    DWORD slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
+    slot = slot_of_port(dwPort);
+    if (slot == NO_SLOT)
+        return ERROR_DEVICE_NOT_CONNECTED;
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    return XInputSetState(slot, &xi_vib);
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -231,12 +272,15 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
 {
     XINPUT_CAPABILITIES xi_caps;
-    DWORD result;
+    DWORD result, slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    slot = slot_of_port(dwPort);
+    if (slot == NO_SLOT)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    result = XInputGetCapabilities(slot, dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
