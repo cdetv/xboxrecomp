@@ -95,6 +95,52 @@ static void prof_voice_clicks(uint16_t v, float samples[][2], uint32_t fmt,
     s_clk_rate[v] = rate;
 }
 
+/* RECOMP_APU_PROFILE: where each voice goes. Per voice and mixbin, the
+ * largest gain (envelope x volume / headroom) seen in the window, and the
+ * voice's own peak sample, so the stereo mixdown can be checked against
+ * what the guest routed (dialogue to the centre bin, 3D sends, reverb). */
+static float         s_route_gain[MCPX_HW_MAX_VOICES][NUM_MIXBINS];
+static float         s_route_peak[MCPX_HW_MAX_VOICES];
+
+static void prof_voice_route(uint16_t v, const int bin[8], const float gain[8],
+                             float samples[][2], unsigned int channels)
+{
+    for (int b = 0; b < 8; b++)
+        if (gain[b] > s_route_gain[v][bin[b]])
+            s_route_gain[v][bin[b]] = gain[b];
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        for (unsigned int c = 0; c < channels; c++)
+            if (fabsf(samples[i][c]) > s_route_peak[v])
+                s_route_peak[v] = fabsf(samples[i][c]);
+}
+
+static void prof_voices_routing(void)
+{
+    char line[2048];
+    size_t len = 0;
+    int shown = 0;
+    line[0] = 0;
+    for (int v = 0; v < MCPX_HW_MAX_VOICES && shown < 16; v++) {
+        if (s_route_peak[v] <= 0.0f)
+            continue;
+        len += (size_t)snprintf(line + len, sizeof(line) - len, " v%d%s(%.2f)",
+                                v, v < MCPX_HW_MAX_3D_VOICES ? "/3d" : "",
+                                s_route_peak[v]);
+        for (int b = 0; b < NUM_MIXBINS && len < sizeof(line); b++)
+            if (s_route_gain[v][b] > 0.0f)
+                len += (size_t)snprintf(line + len, sizeof(line) - len, " %d:%.0f",
+                                        b, 20.0f * log10f(s_route_gain[v][b]));
+        if (len < sizeof(line))
+            len += (size_t)snprintf(line + len, sizeof(line) - len, " |");
+        shown++;
+        if (len >= sizeof(line)) break;
+    }
+    fprintf(stderr, "  [APUPROF] routing (voice(peak) bin:dB):%s\n",
+            line[0] ? line : " none");
+    memset(s_route_gain, 0, sizeof(s_route_gain));
+    memset(s_route_peak, 0, sizeof(s_route_peak));
+}
+
 /* Printed by prof_report every 5 s: the voices that clicked most. */
 void mcpx_apu_vp_prof_voices(void)
 {
@@ -124,6 +170,7 @@ void mcpx_apu_vp_prof_voices(void)
         if (len >= sizeof(line)) break;
     }
     fprintf(stderr, "  [APUPROF] voices by clicks:%s\n", line[0] ? line : " none");
+    prof_voices_routing();
     memset(s_clk_count, 0, sizeof(s_clk_count));
     memset(s_clk_frames, 0, sizeof(s_clk_frames));
 }
@@ -1315,6 +1362,7 @@ static void voice_process(MCPXAPUState *d,
     }
 
     /* Mix into bins */
+    float bin_gain[8];
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
         float hr;
@@ -1324,10 +1372,14 @@ static void voice_process(MCPXAPUState *d,
             hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
         }
         g *= attenuate(vol[b]) / hr;
+        bin_gain[b] = g;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             mixbins[bin[b]][i] += g * samples[i][b % channels];
         }
     }
+
+    if (g_apu_prof_on)
+        prof_voice_route(v, bin, bin_gain, samples, channels);
 
     /* VP monitor mix */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

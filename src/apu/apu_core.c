@@ -120,9 +120,14 @@ static void prof_report(void)
         fprintf(stderr, "  [APUPROF] out: xa2 starved %lu dropped %lu | throttle"
                 " resets %lu, %.0f ms given up\n", p->xa2_starved,
                 p->xa2_dropped, p->throttle_resets, p->throttle_lost_ms);
+        double n = p->mix_samples ? (double)p->mix_samples : 1.0;
+        double rl = sqrt(p->mix_l2 / n), rr = sqrt(p->mix_r2 / n);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
+                " | rms L %.4f R %.4f (L-R %+.1f dB)"
                 " | bins (frames/peak):%s\n", p->mix_clipped, p->mix_samples,
-                p->mix_peak, bins[0] ? bins : " none");
+                p->mix_peak, rl, rr,
+                (rl > 0 && rr > 0) ? 20.0 * log10(rl / rr) : 0.0,
+                bins[0] ? bins : " none");
     }
     fflush(stderr);
     memset(p, 0, sizeof(*p));

@@ -545,6 +545,7 @@ struct ApuProfile {
      * clamp, and per mixbin how many frames carried sound and its peak. */
     unsigned long mix_samples, mix_clipped;
     float mix_peak;
+    double mix_l2, mix_r2;   /* sum of squares per side: L/R balance */
     unsigned long bin_frames[NUM_MIXBINS];
     float bin_peak[NUM_MIXBINS];
     /* Output pacing: XAudio2 found empty / full at a submit, and how often
