@@ -118,8 +118,12 @@ static void prof_report(void)
         }
         mcpx_apu_vp_prof_voices();
         fprintf(stderr, "  [APUPROF] out: xa2 starved %lu dropped %lu | throttle"
-                " resets %lu, %.0f ms given up\n", p->xa2_starved,
-                p->xa2_dropped, p->throttle_resets, p->throttle_lost_ms);
+                " resets %lu, %.0f ms given up | waits: isr gate %.0f ms (max"
+                " %.1f, busy %lu), d->lock %.0f ms (max %.1f), longest loop"
+                " %.1f ms\n",
+                p->xa2_starved, p->xa2_dropped, p->throttle_resets,
+                p->throttle_lost_ms, p->t_gate, p->max_gate, p->gate_busy,
+                p->t_relock, p->max_relock, p->max_loop);
         double n = p->mix_samples ? (double)p->mix_samples : 1.0;
         double rl = sqrt(p->mix_l2 / n), rr = sqrt(p->mix_r2 / n);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
@@ -213,6 +217,7 @@ extern int xbox_IrqlBlocksInterrupts(void);
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 extern void xbox_IsrGateEnter(void);
+extern int  xbox_IsrGateTryEnter(void);
 extern void xbox_IsrGateLeave(void);
 #if defined(_MSC_VER)
 #  define APU_TLS __declspec(thread)
@@ -228,6 +233,19 @@ extern APU_TLS uint32_t g_fs_base;
  * while a guest thread sits at raised IRQL, which is when the single-CPU
  * console could not have taken the interrupt. The routine acknowledges by
  * writing ISTS, which drops the line through update_irq. */
+/* RECOMP_APU_GATE_WAIT=1: wait for the ISR gate as before instead of
+ * retrying next frame; RECOMP_APU_THREAD_PRIO=0: leave the frame thread at
+ * normal priority. Both default to the new behaviour (see their uses). */
+static int apu_gate_nowait(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_APU_GATE_WAIT");
+        v = !(e && *e && atoi(e));
+    }
+    return v;
+}
+
 static void apu_deliver_irq(MCPXAPUState *d)
 {
     static int tib_ready;
@@ -267,7 +285,25 @@ static void apu_deliver_irq(MCPXAPUState *d)
     /* The hold-off above only asks; the gate makes it so for the whole call
      * (see xbox_IsrGateEnter). Taken after dropping d->lock: a raised guest
      * thread may be in the middle of an APU register write. */
-    xbox_IsrGateEnter();
+    double tg = g_apu_prof_on ? prof_now_ms() : 0.0;
+    if (apu_gate_nowait()) {
+        /* Busy: leave the line up and try on the next frame (0.67 ms) rather
+         * than stop producing audio until a descheduled guest thread lowers
+         * IRQL (xbox_IsrGateTryEnter). */
+        if (!xbox_IsrGateTryEnter()) {
+            if (g_apu_prof_on) g_apu_prof.gate_busy++;
+            xbox_worker_stack_free(slot);
+            qemu_mutex_lock(&d->lock);
+            return;
+        }
+    } else {
+        xbox_IsrGateEnter();
+    }
+    if (g_apu_prof_on) {
+        double ms = prof_now_ms() - tg;
+        g_apu_prof.t_gate += ms;
+        if (ms > g_apu_prof.max_gate) g_apu_prof.max_gate = ms;
+    }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
@@ -286,7 +322,13 @@ static void apu_deliver_irq(MCPXAPUState *d)
     }
     xbox_IsrGateLeave();
     xbox_worker_stack_free(slot);
+    double tl = g_apu_prof_on ? prof_now_ms() : 0.0;
     qemu_mutex_lock(&d->lock);
+    if (g_apu_prof_on) {
+        double ms = prof_now_ms() - tl;
+        g_apu_prof.t_relock += ms;
+        if (ms > g_apu_prof.max_relock) g_apu_prof.max_relock = ms;
+    }
 
     {
         static unsigned n;
@@ -793,7 +835,14 @@ static void *mcpx_apu_frame_thread(void *arg)
             d->set_irq = false;
         }
         apu_deliver_irq(d);
-        if (g_apu_prof_on) g_apu_prof.loops++;
+        if (g_apu_prof_on) {
+            static double last;
+            double now = prof_now_ms();
+            if (last > 0.0 && now - last > g_apu_prof.max_loop)
+                g_apu_prof.max_loop = now - last;
+            last = now;
+            g_apu_prof.loops++;
+        }
         prof_report();
 
         /* Let the guest in once per frame.
@@ -808,7 +857,15 @@ static void *mcpx_apu_frame_thread(void *arg)
          * off every USB interrupt. */
         qemu_mutex_unlock(&d->lock);
         SwitchToThread();
-        qemu_mutex_lock(&d->lock);
+        {
+            double tl = g_apu_prof_on ? prof_now_ms() : 0.0;
+            qemu_mutex_lock(&d->lock);
+            if (g_apu_prof_on) {
+                double ms = prof_now_ms() - tl;
+                g_apu_prof.t_relock += ms;
+                if (ms > g_apu_prof.max_relock) g_apu_prof.max_relock = ms;
+            }
+        }
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -900,6 +957,17 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     /* Start background frame thread */
     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread",
                        mcpx_apu_frame_thread, d, QEMU_THREAD_JOINABLE);
+    /* Above the guest's threads, like any audio thread: it sleeps ~93% of
+     * the time in throttle(), but when the host is overloaded a normal-
+     * priority frame thread got the CPU 30 ms late per loop and fell to
+     * ~900 of 7504 frames per 5 s (Conker field, 16 busy host processes):
+     * the clock restarts and the output runs dry -- pops. */
+    {
+        const char *e = getenv("RECOMP_APU_THREAD_PRIO");
+        if (!(e && *e == '0') &&
+            SetThreadPriority(d->apu_thread.thread, THREAD_PRIORITY_TIME_CRITICAL))
+            fprintf(stderr, "[APU] frame thread at time-critical priority\n");
+    }
     mcpx_apu_wait_for_idle(d);
     qemu_mutex_unlock(&d->lock);
 

@@ -803,6 +803,7 @@ void    xbox_IrqlLeaveInterrupt(int saved);
 /* Hold the dispatch gate around a host-delivered ISR, so no guest thread is
  * at raised IRQL (and no DPC runs) while it does. Call without device locks. */
 void    xbox_IsrGateEnter(void);
+int     xbox_IsrGateTryEnter(void);
 void    xbox_IsrGateLeave(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
