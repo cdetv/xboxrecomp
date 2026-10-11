@@ -63,6 +63,31 @@ int main(void)
                o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
         return 1;
     }
+
+    /* mov o[6].x, v1 ; final -- oPts, the point size a POINTS batch draws
+     * its sprites at. Dropped, every point came out 1 pixel. Both the
+     * one-vertex and the lanes path. */
+    {
+        uint32_t p0[4] = {0};
+        Nv2aVshOutput lo, *lp = &lo;
+        float lin[1][NV2A_VSH_INPUTS][4] = {{{0}}};
+        p0[1] = (1u << 21) | (1u << 9);             /* MAC mov, input v1 */
+        src(p0, 0, V, 0, XYZW);
+        p0[3] |= (0x8u << 12) | (1u << 11) | (6u << 3) | 1u;
+        nv2a_vsh_set_instruction(0, p0);
+        in[1][0] = 12.5f;
+        lin[0][1][0] = 7.25f;
+        if (!nv2a_vsh_run((const float (*)[4])in, &o) || o.pts != 12.5f) {
+            printf("FAIL: oPts %g, want 12.5\n", o.pts);
+            return 1;
+        }
+        if (!nv2a_vsh_prepare(NULL) || !nv2a_vsh_run_lanes(
+                (const float (*)[NV2A_VSH_INPUTS][4])lin, &lp, 1)
+            || lo.pts != 7.25f) {
+            printf("FAIL: lanes oPts %g, want 7.25\n", lo.pts);
+            return 1;
+        }
+    }
     puts("ok");
     return 0;
 }
