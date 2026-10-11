@@ -778,6 +778,8 @@ static void flip_pace(void)
         on = e != NULL;
         if (on && atoi(e) > 1)
             every = atoi(e);
+        else if (on && !_strnicmp(e, "title", 5))
+            every = 2;                 /* flip_follow_title's fallback */
         if (on) {
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&origin);
@@ -808,6 +810,102 @@ static void flip_pace(void)
         slot = last_slot + 1;
     }
     last_slot = slot;
+}
+
+/* RECOMP_FLIP_PACE=title: the flip waits for the title's own vblank code.
+ *
+ * On hardware the rate is the title's choice, not the display's: D3D's Swap
+ * queues software method 1 carrying the new front buffer and the present
+ * interval (1 = every refresh, 2 = every second ...), then
+ * FLIP_INCREMENT_WRITE and FLIP_STALL. Method 1's handler picks the vblank
+ * the flip is due on; D3D's vblank DPC, on that vblank, points the display
+ * at the buffer and sets NV_PGRAPH_INCREMENT READ_3D, which advances the read
+ * index. FLIP_STALL holds the pusher while read == write: the buffer to draw
+ * next is still the one on screen (xemu pgraph does the same). Needs method 1
+ * delivered (RECOMP_PGRAPH_SWM with 1 in it) and vblanks (RECOMP_VBLANK).
+ * =title also lets a frame that missed its vblank flip at once instead of on
+ * the next one (xbox_Nv2aSoftwareMethod); =title_strict waits, as hardware.
+ *
+ * A release that does not come in FLIP_WAIT_MS lets the flip go anyway; after
+ * FLIP_WAIT_GIVE_UP of those in a row (method 1 not delivered, say) this
+ * stands down for good and the fixed 30 Hz pace takes over. */
+#define FLIP_WAIT_MS       200
+#define FLIP_WAIT_GIVE_UP  5
+extern int xbox_Nv2aTakeFlipRelease(DWORD wait_ms);
+static unsigned long s_flip_released, s_flip_timeouts;
+
+static void flip_read_advance(void)
+{
+    g_pb.flip_read = g_pb.flip_modulo
+                   ? (g_pb.flip_read + 1) % g_pb.flip_modulo
+                   : g_pb.flip_read + 1;
+}
+
+/* 1 if the flip was handled here, 0 if the caller should pace it itself. */
+static int flip_follow_title(void)
+{
+    static int on = -1;
+    static int misses;
+    const char *e;
+
+    if (on < 0) {
+        e = getenv("RECOMP_FLIP_PACE");
+        on = e && (!_stricmp(e, "title") || !_stricmp(e, "title_strict"));
+        if (on)
+            timeBeginPeriod(1);        /* as flip_pace: the title's Sleeps */
+    }
+    if (!on)
+        return 0;
+    /* D3D sets modulo = its buffer count (2 or 3) and keeps both indices
+     * below it. Once (run 20261011_145044, not seen again) the stall stopped
+     * waiting after a load and the intro ran at ~245 fps with no release
+     * and no timeout, which only out-of-range indices explain. */
+    if (g_pb.flip_modulo < 2 || g_pb.flip_modulo > 3
+            || g_pb.flip_read >= g_pb.flip_modulo
+            || g_pb.flip_write >= g_pb.flip_modulo) {
+        static unsigned n;
+        if (n++ < 8) {
+            fprintf(stderr, "  [GPU] FLIP_STALL: flip indices out of range"
+                    " (read %u write %u modulo %u); reset to read = write\n",
+                    g_pb.flip_read, g_pb.flip_write, g_pb.flip_modulo);
+            fflush(stderr);
+        }
+        if (g_pb.flip_modulo < 2 || g_pb.flip_modulo > 3)
+            g_pb.flip_modulo = 2;
+        g_pb.flip_write %= g_pb.flip_modulo;
+        g_pb.flip_read = g_pb.flip_write;
+    }
+    /* Releases that came while the executor was busy elsewhere. */
+    while (g_pb.flip_read != g_pb.flip_write && xbox_Nv2aTakeFlipRelease(0)) {
+        s_flip_released++;
+        flip_read_advance();
+    }
+    while (g_pb.flip_read == g_pb.flip_write) {
+        if (xbox_Nv2aTakeFlipRelease(FLIP_WAIT_MS)) {
+            s_flip_released++;
+            misses = 0;
+            flip_read_advance();
+            continue;
+        }
+        s_flip_timeouts++;
+        if (s_flip_timeouts <= 4) {
+            fprintf(stderr, "  [GPU] FLIP_STALL: no release from the title's"
+                    " vblank code in %d ms (read %u write %u modulo %u)\n",
+                    FLIP_WAIT_MS, g_pb.flip_read, g_pb.flip_write,
+                    g_pb.flip_modulo);
+            fflush(stderr);
+        }
+        if (++misses >= FLIP_WAIT_GIVE_UP) {
+            on = 0;
+            fprintf(stderr, "  [GPU] FLIP_STALL: %d releases missed in a row;"
+                    " RECOMP_FLIP_PACE=title falls back to a fixed 30 Hz"
+                    " (is 1 in RECOMP_PGRAPH_SWM?)\n", FLIP_WAIT_GIVE_UP);
+            fflush(stderr);
+            return 0;
+        }
+        flip_read_advance();
+    }
+    return 1;
 }
 
 static volatile uint32_t s_sem_release;
@@ -1114,6 +1212,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_FLIP_MODULO:
         g_pb.flip_modulo = param;
+        if (s_flip_released || s_flip_timeouts) {
+            static unsigned n;
+            if (n++ < 16) {
+                fprintf(stderr, "  [GPU] flip indices set: read %u write %u"
+                        " modulo %u (after %lu releases)\n", g_pb.flip_read,
+                        g_pb.flip_write, param, s_flip_released);
+                fflush(stderr);
+            }
+        }
         return;
 
     case NV097_FLIP_INCREMENT_WRITE:
@@ -1130,9 +1237,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     g_pb.drawn_offset, g_pb.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now -- or, under
-         * RECOMP_FLIP_PACE, the next 60 Hz slot. */
-        flip_pace();
-        g_pb.flip_read = g_pb.flip_write;
+         * RECOMP_FLIP_PACE, the next 60 Hz slot, or under =title, when the
+         * title's vblank code releases it (flip_follow_title). */
+        if (!flip_follow_title()) {
+            flip_pace();
+            g_pb.flip_read = g_pb.flip_write;
+        }
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
@@ -1438,6 +1548,11 @@ void nv2a_pb_exec_report(void)
             fprintf(stderr, "[GPU] %.2f fps (%u flips), last fence run %08X%c",
                     (g_pb.flips - last_flips) * 1000.0 / (now - last_ms),
                     g_pb.flips, s_sem_release, 10);
+        if (s_flip_released || s_flip_timeouts)
+            fprintf(stderr, "[GPU] flips released by the title's vblank code"
+                    " %lu, timed out %lu (read %u write %u modulo %u)%c",
+                    s_flip_released, s_flip_timeouts, g_pb.flip_read,
+                    g_pb.flip_write, g_pb.flip_modulo, 10);
         last_flips = g_pb.flips;
         last_ms = now;
     }

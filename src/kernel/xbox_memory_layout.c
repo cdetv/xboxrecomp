@@ -1141,6 +1141,24 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
     uint64_t turn_t0 = 0;
     LONG turn_prev = TURN_EXEC;
 
+    /* RECOMP_FLIP_PACE=title: a late frame flips at once. Software method 1
+     * is D3D's flip (nv2a_pb_exec.c, flip_follow_title): param >> 5 is the
+     * buffer address | the present interval in bits 0-2 | 8 = immediate.
+     * D3D's handler (Conker 0x00541410) flips on last flip + interval, or,
+     * when that vblank has already gone by, on the next one -- or on this one
+     * if bit 8 is set. Hardware draws a frame in time; we do not always, and
+     * a 36 ms frame in a 30 fps scene then waits for every third refresh and
+     * shows at 20 instead of ~28. Frames on time are not affected.
+     * =title_strict leaves the parameter alone, as the hardware would. */
+    {
+        static int late_now = -1;
+        if (late_now < 0) {
+            const char *e = getenv("RECOMP_FLIP_PACE");
+            late_now = e && !_stricmp(e, "title");
+        }
+        if (late_now && (param & 0x1Fu) == 1)
+            param |= 8u << 5;
+    }
     if (!s_ack_regs || !kernel_pgraph_swm_post(subch, param))
         return;
     if (s_turn_on) {
@@ -1174,6 +1192,39 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
         s_turn.swm_n++;
         s_turn.swm_ticks += turn_now() - turn_t0;
         InterlockedExchange(&s_turn_phase, turn_prev);
+    }
+}
+
+/* NV_PGRAPH_INCREMENT, READ_3D: D3D's flip routine (Conker 0x00540EA0, run
+ * from its vblank DPC and from software method 1) sets this bit once the
+ * display has been pointed at a finished buffer. On hardware that advances
+ * the 3D read index and lets a waiting FLIP_STALL go on; here nothing reads
+ * it, so the bit just stays set in plain memory until taken.
+ *
+ * Take one release if one is pending; otherwise wait up to wait_ms for one,
+ * keeping the handshakes going meanwhile -- the vblank DPC that would write it
+ * spins until this thread clears the vblank's PMC_INTR_0 bit. 1 if a release
+ * was taken, 0 if none came.
+ *
+ * ponytail: one bit, so two releases between two looks count as one. A
+ * double-buffered title waits on every flip and never has two in flight. */
+#define NV2A_PGRAPH_INCREMENT_OFS 0x40071Cu
+int xbox_Nv2aTakeFlipRelease(DWORD wait_ms)
+{
+    volatile LONG *inc;
+    ULONGLONG t0;
+
+    if (!s_ack_regs)
+        return 0;
+    inc = (volatile LONG *)((char *)s_ack_regs + NV2A_PGRAPH_INCREMENT_OFS);
+    t0 = GetTickCount64();
+    for (;;) {
+        if (InterlockedAnd(inc, ~2L) & 2L)
+            return 1;
+        if (GetTickCount64() - t0 >= wait_ms)
+            return 0;
+        nv2a_handshake_pass(s_ack_regs, 1);
+        SwitchToThread();
     }
 }
 

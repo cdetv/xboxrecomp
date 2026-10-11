@@ -2319,11 +2319,36 @@ static unsigned long g_vblanks_counted, g_vblanks_declined;
 volatile LONG64 g_nv2a_vblank_hold_until_ms;
 static double g_vblank_isr_max_ms;
 
+/* The vblank clock runs on QueryPerformanceCounter, not GetTickCount64: the
+ * tick count moves in 15.6 ms steps, so vblanks came late and two at a time,
+ * and a flip that waits for the title's vblank code (RECOMP_FLIP_PACE=title)
+ * slipped a whole refresh -- a 30 fps scene showed at 20. The timer thread
+ * asks kernel_vblank_wait_ms how long to sleep so it wakes when one is due. */
+static LARGE_INTEGER g_vblank_freq, g_vblank_origin;
+static long long g_vblank_delivered;
+
+/* Milliseconds until the next vblank is due, at most cap; cap when off. */
+static DWORD kernel_vblank_wait_ms(DWORD cap)
+{
+    LARGE_INTEGER now;
+    long long next, ms;
+
+    if (!g_vblank_origin.QuadPart)
+        return cap;
+    QueryPerformanceCounter(&now);
+    next = g_vblank_origin.QuadPart
+         + (g_vblank_delivered + 1) * g_vblank_freq.QuadPart / 60;
+    ms = (next - now.QuadPart) * 1000 / g_vblank_freq.QuadPart;
+    if (ms < 0)
+        ms = 0;
+    return ms < (long long)cap ? (DWORD)ms : cap;
+}
+
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long origin_ms = -1, delivered;
-    long long now, due, owed;
+    long long due, owed;
+    LARGE_INTEGER now;
 
     if (enabled < 0) {
         const char *c = getenv("RECOMP_VBLANK_COUNTER");
@@ -2334,15 +2359,18 @@ static void kernel_vblank_tick(void)
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
-    if (origin_ms < 0)
-        origin_ms = now;
-    due = (now - origin_ms) * 60 / 1000;      /* vblanks since the first call */
-    owed = due - delivered;
+    QueryPerformanceCounter(&now);
+    if (!g_vblank_origin.QuadPart) {
+        QueryPerformanceFrequency(&g_vblank_freq);
+        g_vblank_origin = now;
+    }
+    /* vblanks since the first call */
+    due = (now.QuadPart - g_vblank_origin.QuadPart) * 60 / g_vblank_freq.QuadPart;
+    owed = due - g_vblank_delivered;
     if (owed <= 0)
         return;
     if (owed > NV2A_VBLANK_CATCH_UP) {
-        delivered = due - NV2A_VBLANK_CATCH_UP;
+        g_vblank_delivered = due - NV2A_VBLANK_CATCH_UP;
         owed = NV2A_VBLANK_CATCH_UP;
     }
 
@@ -2353,7 +2381,7 @@ static void kernel_vblank_tick(void)
         static unsigned n;
         int claimed;
 
-        delivered++;
+        g_vblank_delivered++;
         g_vblanks_delivered++;
         /* Hold first, then raise: see nv2a_ack_thread for why the bits must
          * survive until D3D acknowledges them. */
@@ -2981,10 +3009,13 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
         LARGE_INTEGER pa, pb, pc;
 
-        /* Sleeps the same 10 ms, but a posted PGRAPH trap wakes it: the
-         * pushbuffer executor is stopped until the trap is delivered. */
-        if (!g_timer_wake || WaitForSingleObject(g_timer_wake, 10) == WAIT_FAILED)
-            Sleep(10);
+        /* Sleeps up to 10 ms, less when a vblank is due sooner, and a posted
+         * PGRAPH trap wakes it: the pushbuffer executor is stopped until the
+         * trap is delivered. */
+        DWORD sleep_ms = kernel_vblank_wait_ms(10);
+        if (!g_timer_wake
+                || WaitForSingleObject(g_timer_wake, sleep_ms) == WAIT_FAILED)
+            Sleep(sleep_ms);
         QueryPerformanceCounter(&pa);
         kernel_pgraph_swm_tick();
         kernel_vblank_tick();  /* the GPU's frame clock */
