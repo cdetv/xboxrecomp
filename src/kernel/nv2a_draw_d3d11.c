@@ -1530,6 +1530,45 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
 /* Sampler states: point or bilinear, wrap or clamp per axis. */
 static ID3D11SamplerState *s_samp[8];
 
+/* Border mode (address 4 with FORMAT's border-from-colour bit), as the
+ * software sampler does it: outside the image the texture reads the border
+ * colour. Conker projects its room light maps with a white border, so a
+ * character outside the map is fully lit; clamped, it took the map's edge
+ * texels and came out darker. Few distinct border colours exist, so these
+ * are cached by key and colour in a short list. */
+static struct { int k; uint32_t color; ID3D11SamplerState *s; } s_samp_border[16];
+
+static ID3D11SamplerState *sampler_border(int lin, int bu, int bv,
+                                          int wu, int wv, uint32_t argb)
+{
+    int k = lin | bu << 1 | bv << 2 | wu << 3 | wv << 4, i;
+    D3D11_SAMPLER_DESC d;
+
+    for (i = 0; i < 16 && s_samp_border[i].s; i++)
+        if (s_samp_border[i].k == k && s_samp_border[i].color == argb)
+            return s_samp_border[i].s;
+    if (i == 16)
+        return NULL;                    /* full: caller falls back to clamp */
+    memset(&d, 0, sizeof d);
+    d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                   : D3D11_FILTER_MIN_MAG_MIP_POINT;
+    d.AddressU = bu ? D3D11_TEXTURE_ADDRESS_BORDER
+               : wu ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.AddressV = bv ? D3D11_TEXTURE_ADDRESS_BORDER
+               : wv ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.BorderColor[0] = ((argb >> 16) & 0xFF) / 255.0f;
+    d.BorderColor[1] = ((argb >>  8) & 0xFF) / 255.0f;
+    d.BorderColor[2] = ( argb        & 0xFF) / 255.0f;
+    d.BorderColor[3] = ((argb >> 24) & 0xFF) / 255.0f;
+    d.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp_border[i].s)))
+        return NULL;
+    s_samp_border[i].k = k;
+    s_samp_border[i].color = argb;
+    return s_samp_border[i].s;
+}
+
 static ID3D11SamplerState *sampler_stage(int st, int combiners)
 {
     const Texture *t = &g_pb.texs[st];
@@ -1540,6 +1579,13 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     int lin = combiners && (mag == 2 || min == 2 || min == 4 || min == 6);
     int k = lin | (t->addr_u == 1) << 1 | (t->addr_v == 1) << 2;
 
+    if (t->border_from_color && (t->addr_u == 4 || t->addr_v == 4)) {
+        ID3D11SamplerState *b = sampler_border(lin, t->addr_u == 4,
+                                               t->addr_v == 4, t->addr_u == 1,
+                                               t->addr_v == 1, t->border_color);
+        if (b)
+            return b;
+    }
     if (!s_samp[k]) {
         D3D11_SAMPLER_DESC d;
         memset(&d, 0, sizeof d);

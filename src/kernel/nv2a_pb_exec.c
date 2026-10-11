@@ -744,6 +744,67 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         record_tex_reg(method, param);
 }
 
+/* RECOMP_FLIP_PACE=1: at most one flip per 60 Hz refresh.
+ *
+ * On the hardware FLIP_STALL holds the pusher until the vblank handler has
+ * swapped, so a title that draws a frame in 4 ms still shows 60 a second and
+ * its per-frame animation runs at the speed it was tuned for. Here the stall
+ * clears at once (above), and Conker's intro text, which fades by a fixed
+ * step per frame, ran at ~255 fps: each card faded in 4x too fast and was gone
+ * before it held. So: the refreshes form a 60 Hz grid from the first flip,
+ * and a flip that lands in a slot already used waits for the next slot. A
+ * flip that is late is not held back further -- missed slots are skipped, not
+ * owed, so a slow scene loses nothing. The wait is a high-resolution
+ * waitable timer, as Sleep(1) is 15.6 ms at the default timer resolution. */
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* winmm: once the flip waits, the title's own short waits for the GPU
+ * (Sleep-based) land on the 15.6 ms default tick and halve a 44 fps menu. */
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
+static void flip_pace(void)
+{
+    static int on = -1;
+    static LARGE_INTEGER freq, origin;
+    static long long last_slot = -1;
+    static HANDLE timer;
+    LARGE_INTEGER now;
+    long long slot;
+
+    if (on < 0) {
+        on = getenv("RECOMP_FLIP_PACE") != NULL;
+        if (on) {
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&origin);
+            timer = CreateWaitableTimerExW(NULL, NULL,
+                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!timer)
+                timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+            timeBeginPeriod(1);
+        }
+    }
+    if (!on)
+        return;
+    QueryPerformanceCounter(&now);
+    slot = (now.QuadPart - origin.QuadPart) * 60 / freq.QuadPart;
+    if (slot <= last_slot) {
+        /* Wait for the start of the next slot. */
+        long long next = origin.QuadPart + (last_slot + 1) * freq.QuadPart / 60;
+        long long wait_100ns = (next - now.QuadPart) * 10000000 / freq.QuadPart;
+        if (wait_100ns > 0) {
+            LARGE_INTEGER due;
+            due.QuadPart = -wait_100ns;      /* relative */
+            if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(timer, 100);
+            else
+                Sleep((DWORD)(wait_100ns / 10000) + 1);
+        }
+        slot = last_slot + 1;
+    }
+    last_slot = slot;
+}
+
 static volatile uint32_t s_sem_release;
 static volatile int s_sem_seen;
 
@@ -1063,7 +1124,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     g_pb.drawn_offset, g_pb.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is now -- or, under
+         * RECOMP_FLIP_PACE, the next 60 Hz slot. */
+        flip_pace();
         g_pb.flip_read = g_pb.flip_write;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
