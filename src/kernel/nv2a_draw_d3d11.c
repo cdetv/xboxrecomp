@@ -1968,13 +1968,13 @@ static void d3d_draw(void)
         }
         fprintf(stderr, "[FTRACE] d3d %s n %u surf %08X slot %d %ux%u+%u+%u"
                 " | box x %.1f..%.1f y %.1f..%.1f | blend %u %X/%X eq %X"
-                " | z %u st %u at %u | tris %u%c",
+                " | z %u st %u at %u | tris %u prim %u%c",
                 path == PATH_FLAT ? "FLAT" : program ? "PRG" : "RC", n,
                 g_pb.color_offset, si, g_pb.clip_w, g_pb.clip_h,
                 g_pb.clip_x, g_pb.clip_y, x0, x1, y0, y1, g_pb.blend_enable,
                 g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
                 g_pb.depth_test, g_pb.stencil_test, g_pb.alpha_test,
-                nidx / 3, 10);
+                nidx / 3, g_pb.prim, 10);
         fprintf(stderr, "[FTRACE]     cmask %08X | stencil func %X ref %02X"
                 " r %02X w %02X op %X/%X/%X | alpha func %X ref %02X | zmask"
                 " %u zfunc %X | d0 %.2f %.2f %.2f %.2f%c", g_pb.color_mask,
