@@ -82,7 +82,11 @@ typedef struct {
     ID3D11RenderTargetView *rtv;
 } GpuSurface;
 
-#define GPU_SURFACES 32
+/* Conker's 3D menu room renders into 39 small targets plus the frame: with
+ * 32 slots it threw out and remade ~13 surfaces a frame, and textures read
+ * from a thrown-out one came from guest memory. Each slot is at least
+ * ZETA_W x ZETA_H x 4 bytes (4 MB) once used, so 128 is 512 MB at most. */
+#define GPU_SURFACES 128
 /* The software path's depth buffer size (NV_ZBUF_W/H): it draws nothing
  * with depth past it, and the GPU's depth buffers are the same. */
 #define ZETA_W 1024
