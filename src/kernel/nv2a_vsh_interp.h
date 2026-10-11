@@ -51,6 +51,9 @@ int  nv2a_vsh_cxt_write(void);   /* programs may write c[]: no vertex cache */
  * FINAL flag within program memory), which the caller treats as "cannot
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
+/* Disassemble the current program and run one vertex through it printing
+ * every instruction's reads and writes ([VSTEP]); for RECOMP_PIXEL_PROBE. */
+void nv2a_vsh_trace(const float in[NV2A_VSH_INPUTS][4]);
 
 /* The same program on up to NV2A_VSH_LANES vertices at once, same results
  * bit for bit, much faster. in[l] and out[l] are vertex l's; only the inputs

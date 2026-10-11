@@ -369,6 +369,21 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
     return r;
 }
 
+void nv2a_vsh_trace(const float in[NV2A_VSH_INPUTS][4])
+{
+    Nv2aVshOutput tmp;
+    int i;
+
+    dump_program(s_start_slot);
+    fprintf(stderr, "[VSTEP] program %08X at slot %u, inputs:\n",
+            program_hash(), s_start_slot);
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        fprintf(stderr, "[VSTEP]   v%d %g %g %g %g\n", i, in[i][0], in[i][1],
+                in[i][2], in[i][3]);
+    run_program(in, &tmp, 1);
+    fflush(stderr);
+}
+
 static void decode_src(VshSrc *d, const uint32_t *ins, int which)
 {
     uint32_t swz;

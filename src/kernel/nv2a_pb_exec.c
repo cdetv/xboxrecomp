@@ -186,6 +186,7 @@ int pb_surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
+#define NV097_SET_TEXTURE_BORDER_COLOR    0x1B24
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
  * the CRTC reads and which it draws into, advancing the write index and
  * then stalling until the flip has happened. Ignoring these means the
@@ -688,6 +689,7 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case NV097_SET_TEXTURE_FORMAT:
         t->color = (param >> 8) & 0xFF;
         t->cube = (param >> 2) & 1;
+        t->border_from_color = (param >> 3) & 1;
         t->levels = (param >> 16) & 0xF;
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
@@ -702,10 +704,14 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->palette = pb_dma_resolve(param & ~0x3Fu);
         break;
     case NV097_SET_TEXTURE_ADDRESS:
-        /* Four bits per axis. 1 is wrap, 3 clamp-to-edge; mirror and border
-         * fall back to clamp, wrong at an edge rather than everywhere. */
+        /* Four bits per axis. 1 is wrap, 3 clamp-to-edge, 4 border (the
+         * border colour outside the image: sample_tex); mirror falls back to
+         * clamp, wrong at an edge rather than everywhere. */
         t->addr_u =  param        & 0xF;
         t->addr_v = (param >>  8) & 0xF;
+        break;
+    case NV097_SET_TEXTURE_BORDER_COLOR:
+        t->border_color = param;
         break;
     case NV097_SET_TEXTURE_CONTROL1:
         t->pitch = param >> 16;          /* linear formats only */

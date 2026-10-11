@@ -572,6 +572,17 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
 
     if (!t->valid)
         return 0;
+    /* Border mode: outside the image is the border colour, not the edge.
+     * Conker's characters take their key light through a 32x32 texture
+     * projected over the level and reached far outside it; clamped, they
+     * got its black edge and no key light at all. A border stored with the
+     * image (border_from_color 0) still clamps. */
+    if (t->border_from_color
+        && ((t->addr_u == 4 && (int32_t)u < 0) || (t->addr_u == 4 && u >= t->width)
+            || (t->addr_v == 4 && (int32_t)v < 0) || (t->addr_v == 4 && v >= t->height))) {
+        *argb = t->border_color;
+        return 1;
+    }
     u = wrap_coord(u, t->width,  t->addr_u);
     v = wrap_coord(v, t->height, t->addr_v);
 
@@ -2022,6 +2033,8 @@ static void triq_push(const XfTri *T)
  * flip first_flip on. */
 static struct { int on, x, y; uint32_t from_flip, hits; } s_probe = { -1 };
 static int s_probe_clipped;             /* triangle came from near clipping */
+static uint32_t s_xf_used;              /* inputs the program reads (below) */
+static Nv2aVshOutput s_xf[NV_MAX_INDICES];          /* (below) */
 
 static int probe_init(void)
 {
@@ -2031,8 +2044,28 @@ static int probe_init(void)
         if (e && sscanf(e, "%d,%d,%u", &s_probe.x, &s_probe.y,
                         &s_probe.from_flip) >= 2)
             s_probe.on = 1;
+        /* RECOMP_PIXEL_PROBE_FLAG=<file>: wait for the file instead of a
+         * flip number, which drifts by a hundred flips run to run. */
+        if (s_probe.on && getenv("RECOMP_PIXEL_PROBE_FLAG"))
+            s_probe.from_flip = UINT32_MAX;
     }
     return s_probe.on;
+}
+
+/* At each flip: arm a RECOMP_PIXEL_PROBE_FLAG probe for the next one. */
+static void probe_flag_check(void)
+{
+    const char *flag = getenv("RECOMP_PIXEL_PROBE_FLAG");
+    FILE *f;
+    if (!flag || !probe_init() || s_probe.from_flip != UINT32_MAX)
+        return;
+    f = fopen(flag, "rb");
+    if (f) {
+        fclose(f);
+        s_probe.from_flip = g_pb.flips + 1;
+        fprintf(stderr, "[PROBE] flag seen: probing from flip %u\n",
+                s_probe.from_flip);
+    }
 }
 
 static uint32_t probe_read(uint32_t bpp)
@@ -2085,6 +2118,50 @@ static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
                 v[k]->pos[1], v[k]->pos[2], v[k]->pos[3], v[k]->d0[0],
                 v[k]->d0[1], v[k]->d0[2], v[k]->d0[3], v[k]->tex[0][0],
                 v[k]->tex[0][1], v[k]->tex[0][2], v[k]->tex[0][3]);
+    {
+        /* Which inputs the program reads, which have an array, and what the
+         * array-less ones hold as their SET_VERTEX_DATA value. */
+        uint32_t arrays = 0, at;
+        for (at = 0; at < NV_VERTEX_ATTRS; at++)
+            if (g_pb.attr[at].size && g_pb.attr[at].stride)
+                arrays |= 1u << at;
+        fprintf(stderr, "[PROBE]   inputs read %04X arrays %04X inline set %04X\n",
+                s_xf_used, arrays, g_pb.imm_set);
+        for (at = 0; at < NV2A_VSH_INPUTS; at++)
+            if ((s_xf_used >> at & 1) && !(arrays >> at & 1))
+                fprintf(stderr, "[PROBE]   v%u no array, inline %s %.3f %.3f %.3f %.3f\n",
+                        at, (g_pb.imm_set >> at & 1) ? "set" : "unset",
+                        g_pb.imm_attr[at][0], g_pb.imm_attr[at][1],
+                        g_pb.imm_attr[at][2], g_pb.imm_attr[at][3]);
+    }
+    {
+        /* RECOMP_PROBE_VSTEP=<texture address>: the first probed draws (up
+         * to 4) that bind that texture on any stage run their first corner
+         * through the vertex program again, instruction by instruction. */
+        static uint32_t want = 1, traced_draw = ~0u;
+        static int traces;
+        ptrdiff_t vi = T->va - s_xf;
+        if (want == 1) {
+            const char *e = getenv("RECOMP_PROBE_VSTEP");
+            want = e ? (uint32_t)strtoul(e, NULL, 16) : 0;
+        }
+        if (want && g_pb.draws != traced_draw && traces < 4 && vi >= 0
+                && vi < NV_MAX_INDICES) {
+            int hit = 0;
+            for (k = 0; k < 4; k++)
+                if (g_pb.texs[k].valid && g_pb.texs[k].offset == want)
+                    hit = 1;
+            if (hit) {
+                float in[NV2A_VSH_INPUTS][4];
+                uint32_t at;
+                traced_draw = g_pb.draws;
+                traces++;
+                for (at = 0; at < NV2A_VSH_INPUTS; at++)
+                    pb_fetch_attr(&g_pb.attr[at], g_pb.idx[vi], in[at]);
+                nv2a_vsh_trace((const float (*)[4])in);
+            }
+        }
+    }
     /* The combiner program and what it made of this pixel. */
     fprintf(stderr, "[PROBE]   cmask %08X  rc ctl %08X fin %08X %08X fc %08X %08X\n",
             g_pb.color_mask, g_pb.rc.control, g_pb.rc.final0,
@@ -2112,11 +2189,13 @@ static void probe_log(const XfTri *T, uint32_t before, uint32_t after,
                         solid += (texel >> 24) >= 0x80;
                     }
             fprintf(stderr, "[PROBE]   t%d %08X %ux%u fmt %02X%s pitch %u levels %u"
-                    " addr %X/%X filter %08X cube %d  alpha>=.5 %u/%u mean %.3f\n",
+                    " addr %X/%X border %08X from %s filter %08X cube %d"
+                    "  alpha>=.5 %u/%u mean %.3f\n",
                     k, tx->offset, tx->width, tx->height, tx->color,
                     tx->valid ? "" : " (invalid)", tx->pitch, tx->levels,
-                    tx->addr_u, tx->addr_v, tx->filter, tx->cube, solid, n,
-                    n ? (double)asum / n / 255.0 : 0.0);
+                    tx->addr_u, tx->addr_v, tx->border_color,
+                    tx->border_from_color ? "colour" : "texels", tx->filter,
+                    tx->cube, solid, n, n ? (double)asum / n / 255.0 : 0.0);
             probe_dump_stage_tex(tx, k);
         }
     if (s_probe_px.hit) {
@@ -2979,6 +3058,7 @@ static void sw_draw(void)
 static void sw_present(void)
 {
     s_flip_dumped = 0;
+    probe_flag_check();
     if (g_pb.pitch) {
         extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
         uint32_t done = g_pb.drawn_offset ? g_pb.drawn_offset
@@ -3007,8 +3087,14 @@ static void sw_present(void)
                 if (f) { fclose(f); on = 1; }
             }
             s_flip_dumping = on;
-            if (on)
+            if (on) {
                 s_flip_dumped = dump_surface_bmp();
+                /* Which flip each picture is, for RECOMP_PIXEL_PROBE's
+                 * first_flip: the probe counts flips, the dumps count files. */
+                if (s_flip_dumped)
+                    fprintf(stderr, "[FBDUMP] %05d flip %u\n", s_last_dump.seq,
+                            g_pb.flips);
+            }
         }
     }
     g_pb.drawn_stale = 1;

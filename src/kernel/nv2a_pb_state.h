@@ -78,6 +78,9 @@ typedef struct {
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+    uint32_t border_color;              /* SET_TEXTURE_BORDER_COLOR, ARGB */
+    int      border_from_color;         /* FORMAT bit 3: border is the colour,
+                                         * not texels stored with the image */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
 } Texture;

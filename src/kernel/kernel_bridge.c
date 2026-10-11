@@ -700,6 +700,28 @@ static void bridge_NtClose(void)
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
+/* RECOMP_CONTIG_LOG: every contiguous allocation and free, with the guest
+ * return address, so a texture overwritten by a loader buffer can be traced
+ * to the two allocations that overlap. */
+static int contig_log_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_CONTIG_LOG") != NULL;
+    return on;
+}
+
+static void contig_log(const char *what, uint32_t va, uint32_t size,
+                       uint32_t low, uint32_t high, uint32_t align)
+{
+    if (!contig_log_on())
+        return;
+    fprintf(stderr, "[CONTIG] %s va %08X size %08X end %08X low %08X high %08X"
+            " align %X from %08X\n", what, va, size, va + size, low, high,
+            align, g_xbox_kernel_caller);
+    fflush(stderr);
+}
+
 static void bridge_MmAllocateContiguousMemory(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -710,6 +732,7 @@ static void bridge_MmAllocateContiguousMemory(void)
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
 
+    contig_log("alloc", xbox_va, size, 0, 0, 4096);
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
                 size, xbox_va);
@@ -795,6 +818,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
 
+        contig_log("pinned", xbox_va, size, low, high, align);
         if (KERNEL_LOG_ON_HALF()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
                     "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
@@ -808,6 +832,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     if (align < 4096) align = 4096;
     xbox_va = xbox_ContiguousAlloc(size, align);
 
+    contig_log("allocEx", xbox_va, size, low, high, align);
     if (KERNEL_LOG_ON_HALF()) {
         fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
                 size, align, xbox_va);
@@ -824,6 +849,7 @@ static void bridge_MmFreeContiguousMemory(void)
 {
     extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
+    contig_log("free", addr, 0, 0, 0, 0);
     /* Contiguous blocks come from their own arena, not the heap: passing
      * them to xbox_HeapFree found nothing, so none ever came back. */
     if (!xbox_ContiguousFree(addr))
