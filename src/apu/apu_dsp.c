@@ -6,9 +6,8 @@
  * DSP is ~3000 lines of DSP56300 emulation code.
  *
  * For initial audio, we bypass the DSP entirely:
- * - VP mixbins are passed directly to the EP output
+ * - VP mixbins are mixed straight down to stereo (speaker table below)
  * - GP effects processing is skipped
- * - The EP just copies mixbin 0/1 (front L/R) to the monitor buffer
  *
  * This gives us basic voice playback without effects. The DSP can be
  * connected later for reverb, EQ, and other processing.
@@ -79,19 +78,82 @@ static void dsp_ack_init(void)
                 s_dsp_ack_count, s_dsp_ack[0]);
 }
 
-/* SUM EVERY MIXBIN THE GUEST ROUTED TO, NOT JUST THE FIRST TWO.
+/* STEREO MIXDOWN OF THE 32 MIXBINS.
  *
- * Default ON. RECOMP_APU_MIXDOWN_ALL=0 restores the previous two-bin read,
- * because this changes audible output for every title and an escape hatch
- * costs one branch. */
-static int mcpx_apu_mixdown_all(void)
+ * On hardware the GP and EP turn the VP's mixbins into speaker output (the
+ * GP runs the title's effects image: I3DL2 reverb, crosstalk; the EP
+ * downmixes/encodes). Both are stubs here, so this table stands in for
+ * them. The bins follow DirectSound's DSMIXBIN layout (XDK dsound.h):
+ *
+ *   0 FRONT_LEFT   1 FRONT_RIGHT   2 FRONT_CENTER   3 LOW_FREQUENCY
+ *   4 BACK_LEFT    5 BACK_RIGHT    6-9 XTLK_FRONT_LEFT/RIGHT, BACK_LEFT/RIGHT
+ *   10 I3DL2 (reverb send)        11-30 FXSEND_0..19 (effect sends)
+ *
+ * The previous mixdown summed even bins left and odd bins right. That put
+ * the centre bin (where titles route mono dialogue) and the I3DL2 reverb
+ * send wholly on the left, and LFE on the right: Conker's voices and
+ * effects came out far louder on the left, and 3D voices, which DirectSound
+ * also sends to LFE and I3DL2 at about their direct level, were summed two
+ * or three times over (positional loops too loud).
+ *
+ * Here: fronts to their side, centre to both at -3 dB, backs to their side
+ * at -3 dB (ITU-R BS.775 stereo downmix), crosstalk bins as their speakers.
+ * LFE and I3DL2 are sends to DSP stages that do not exist (subwoofer
+ * crossover, reverb); feeding them dry adds full-band copies of sounds that
+ * are already in the mix, so they default to 0. FXSEND bins are effect
+ * sends of unknown purpose: centred at -3 dB so nothing a title routes
+ * there is lost.
+ *
+ *   RECOMP_APU_MIXDOWN=speakers (default) | evenodd (the old sum) | front
+ *   (bins 0/1 only; RECOMP_APU_MIXDOWN_ALL=0 also selects it)
+ *   RECOMP_APU_MIX_LFE=<gain>, RECOMP_APU_MIX_I3DL2=<gain>: feed those bins
+ *   to both sides at that gain (default 0). */
+static float s_mix_l[NUM_MIXBINS], s_mix_r[NUM_MIXBINS];
+static int s_mix_ready;
+
+static float env_gain(const char *name, float def)
 {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+    const char *e = getenv(name);
+    return (e && *e) ? (float)atof(e) : def;
+}
+
+static void mixdown_init(void)
+{
+    const float h = 0.70710678f;
+    const char *mode = getenv("RECOMP_APU_MIXDOWN");
+    const char *all = getenv("RECOMP_APU_MIXDOWN_ALL");
+    const char *name = "speakers";
+
+    memset(s_mix_l, 0, sizeof(s_mix_l));
+    memset(s_mix_r, 0, sizeof(s_mix_r));
+    if ((mode && !strcmp(mode, "front")) || (all && *all && !atoi(all))) {
+        name = "front";
+        s_mix_l[0] = 1.0f;
+        s_mix_r[1] = 1.0f;
+    } else if (mode && !strcmp(mode, "evenodd")) {
+        name = "evenodd";
+        for (int b = 0; b < NUM_MIXBINS; b++) {
+            if (b & 1) s_mix_r[b] = 1.0f;
+            else       s_mix_l[b] = 1.0f;
+        }
+    } else {
+        float lfe = env_gain("RECOMP_APU_MIX_LFE", 0.0f);
+        float rev = env_gain("RECOMP_APU_MIX_I3DL2", 0.0f);
+        s_mix_l[0] = 1.0f;               s_mix_r[1] = 1.0f;
+        s_mix_l[2] = h;                  s_mix_r[2] = h;
+        s_mix_l[3] = lfe;                s_mix_r[3] = lfe;
+        s_mix_l[4] = h;                  s_mix_r[5] = h;
+        s_mix_l[6] = 1.0f;               s_mix_r[7] = 1.0f;
+        s_mix_l[8] = h;                  s_mix_r[9] = h;
+        s_mix_l[10] = rev;               s_mix_r[10] = rev;
+        for (int b = 11; b <= 30; b++) {
+            s_mix_l[b] = h;
+            s_mix_r[b] = h;
+        }
     }
-    return on;
+    fprintf(stderr, "[APU] stereo mixdown: %s (LFE %.2f, I3DL2 %.2f)\n", name,
+            s_mix_l[3], s_mix_l[10]);
+    s_mix_ready = 1;
 }
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -236,19 +298,8 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
-    /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
-     * and write them directly to the monitor frame buffer as the final
-     * EP output.
-     *
-     * The Xbox DirectSound typically routes:
-     *   Mixbin 0 = Front Left
-     *   Mixbin 1 = Front Right
-     *   Mixbin 2 = Center (often unused in stereo)
-     *   Mixbin 3 = LFE
-     *   Mixbin 4-5 = Rear L/R
-     *
-     * For stereo output, bins 0 and 1 are what we want.
-     */
+    /* Bypass DSP: mix the bins down to stereo (see mixdown_init) and write
+     * the result to the monitor frame buffer as the final EP output. */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
@@ -291,25 +342,23 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Gating the HRTF submix override was tried first and did not fix
              * it, so the defect is the width of this mixdown and nothing else.
              *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
-            float left, right;
-            if (mcpx_apu_mixdown_all()) {
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
-                }
-            } else {
-                left = mixbins[0][i];
-                right = mixbins[1][i];
+             * Bins 6/7 and 8/9 arrive with matched counts: the guest's own
+             * stereo pairing, kept by the speaker table above. */
+            /* (The even-left/odd-right sum that followed was the cheapest
+             * mixdown that stopped discarding audio; the table above
+             * replaces it.) */
+            float left = 0.0f, right = 0.0f;
+            if (!s_mix_ready)
+                mixdown_init();
+            for (int b = 0; b < NUM_MIXBINS; ++b) {
+                left  += s_mix_l[b] * mixbins[b][i];
+                right += s_mix_r[b] * mixbins[b][i];
             }
             if (g_apu_prof_on) {
                 float al = fabsf(left), ar = fabsf(right);
                 float m = al > ar ? al : ar;
+                g_apu_prof.mix_l2 += (double)left * left;
+                g_apu_prof.mix_r2 += (double)right * right;
                 g_apu_prof.mix_samples++;
                 if (m > 1.0f) g_apu_prof.mix_clipped++;
                 if (m > g_apu_prof.mix_peak) g_apu_prof.mix_peak = m;
