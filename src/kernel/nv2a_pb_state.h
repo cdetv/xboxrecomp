@@ -85,6 +85,11 @@ typedef struct {
                                          * not texels stored with the image */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
+    /* SET_TEXTURE_SET_BUMP_ENV_MAT/SCALE/OFFSET (stages 1-3): how a bump-env
+     * stage turns the previous stage's (du, dv) into a coordinate offset,
+     * and the luminance variant's scale. Order 00, 01, 10, 11, as xemu. */
+    float    bump_mat[4];
+    float    bump_scale, bump_offset;
 } Texture;
 
 typedef struct Nv2aPbState {
@@ -151,6 +156,7 @@ typedef struct Nv2aPbState {
     Nv2aCombiner rc;
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
     float    fog_param[2];
@@ -248,6 +254,9 @@ void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out);
 int pb_fetch_color(uint32_t index, float c[4]);
 int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
 uint32_t pb_tex_bytes(const Texture *t);
+/* pb_rc_input_stage: the earlier stage a bump-env stage (1-3) reads its
+ * du/dv from: stage 0 for stage 1, SHADER_OTHER_STAGE_INPUT for 2 and 3. */
+int pb_rc_input_stage(int st);
 
 /* nv2a_draw_sw.c: the frame dump the last software present wrote, or NULL
  * when it wrote none. RECOMP_GPU=both dumps the GPU's copy of the same

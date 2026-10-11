@@ -21,7 +21,7 @@
  * Alpha test (mode.z, the GL function; 0 off) follows alpha_test_pass.
  *
  * ponytail: level 0 only (SampleLevel 0), as the software sampler; cube
- * maps and the bump/dot-product stage modes read as the software path's
+ * maps and the dot-product stage modes read as the software path's
  * fallbacks do, near enough: an unbound stage reads white.
  */
 #ifndef NV2A_DRAW_D3D11_HLSL_H
@@ -47,6 +47,8 @@ static const char s_hlsl[] =
 "  float4 fogc;        /* fog colour, r g b */\n"
 "  float4 fogp;        /* fog parameters 0, 1 */\n"
 "  float4 zsc;         /* x: guest depth units to 0..1 (1/0xFFFFFF Z24) */\n"
+"  float4 bmat[4];     /* per stage: bump-env matrix 00 01 10 11 */\n"
+"  float4 bsc[4];      /* per stage: bump scale, offset, input stage */\n"
 "};\n"
 "struct VI {\n"
 "  float4 p : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
@@ -96,10 +98,26 @@ static const char s_hlsl[] =
 "  return x;\n"
 "}\n"
 "\n"
-"/* rc_stage_fetch: what stage st contributes, by its program mode. */\n"
-"float4 stage_fetch(Texture2D t, SamplerState s, uint st, float4 c) {\n"
+"/* sign3 (nv2a_draw_sw.c): a two's-complement byte read as unsigned. */\n"
+"float sign3(float x) {\n"
+"  float b = floor(x * 255.0 + 0.5);\n"
+"  return b >= 128.0 ? (b - 256.0) / 127.0 : b / 127.0;\n"
+"}\n"
+"\n"
+"/* rc_stage_fetch: what stage st contributes, by its program mode; P holds\n"
+"   the earlier stages' results (bump-env reads one). */\n"
+"float4 stage_fetch(Texture2D t, SamplerState s, uint st, float4 c,\n"
+"                   float4 P[4]) {\n"
 "  uint m = (stage.x >> (st * 5)) & 31, j;\n"
 "  if (m == 0) return float4(0, 0, 0, 1);\n"
+"  if ((m == 6 || m == 7) && st > 0) {\n"
+"    float4 p = P[(uint)bsc[st].z], x;\n"
+"    float du = sign3(p.b), dv = sign3(p.g);\n"
+"    x = texel(t, s, st, c.xy + float2(bmat[st].x * du + bmat[st].z * dv,\n"
+"                                      bmat[st].y * du + bmat[st].w * dv));\n"
+"    if (m == 7) x *= p.r * bsc[st].x + bsc[st].y;\n"
+"    return x;\n"
+"  }\n"
 "  if (m == 1 || m == 2) {\n"
 "    float q = c.w != 0.0 ? c.w : 1.0;\n"
 "    return texel(t, s, st, c.xy / q);\n"
@@ -215,10 +233,11 @@ static const char s_hlsl[] =
 "  float4 o;\n"
 "  if (mode.x == 2) {\n"
 "    float4 T[4];\n"
-"    T[0] = stage_fetch(t0, s0, 0, i.t0);\n"
-"    T[1] = stage_fetch(t1, s1, 1, i.t1);\n"
-"    T[2] = stage_fetch(t2, s2, 2, i.t2);\n"
-"    T[3] = stage_fetch(t3, s3, 3, i.t3);\n"
+"    T[0] = T[1] = T[2] = T[3] = float4(0, 0, 0, 1);\n"
+"    T[0] = stage_fetch(t0, s0, 0, i.t0, T);\n"
+"    T[1] = stage_fetch(t1, s1, 1, i.t1, T);\n"
+"    T[2] = stage_fetch(t2, s2, 2, i.t2, T);\n"
+"    T[3] = stage_fetch(t3, s3, 3, i.t3, T);\n"
 "    o = combine(i.d0, i.d1, i.fog, T);\n"
 "  } else {\n"
 "    float4 t = texel(t0, s0, 0, i.t0.xy);\n"

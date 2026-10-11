@@ -558,6 +558,8 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
     case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
+    case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
+    case 0x29: return 0x16;                /* R8B8      -> LIN_R8B8      */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -711,6 +713,21 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     case 0x20: {                                    /* LIN_A8L8 */
         uint32_t t = ((const uint16_t *)p)[u], l = t & 0xFF;
         *argb = ((t >> 8) << 24) | (l << 16) | (l << 8) | l;
+        return 1;
+    }
+    /* Two bytes spread over four channels (xemu's swizzles). G8B8 is also
+     * D3D's V8U8: U in the low byte, V in the high one, two's complement,
+     * which a bump-env stage reads back from blue and green (sign3). Conker's
+     * water ripples are one; unread, the stage was dropped and the water
+     * flat. */
+    case 0x17: {                                    /* LIN_G8B8: R=lo G=hi B=lo A=hi */
+        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFF, hi = t >> 8;
+        *argb = (hi << 24) | (lo << 16) | (hi << 8) | lo;
+        return 1;
+    }
+    case 0x16: {                                    /* LIN_R8B8: R=hi G=lo B=lo A=hi */
+        uint32_t t = ((const uint16_t *)p)[u], lo = t & 0xFF, hi = t >> 8;
+        *argb = (hi << 24) | (hi << 16) | (lo << 8) | lo;
         return 1;
     }
 
@@ -1554,6 +1571,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
         return 1;
     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
     case 0x1A: case 0x1C: case 0x1D: case 0x20:
+    case 0x16: case 0x17: case 0x28: case 0x29:
         return 2;
     default:
         return 4;
@@ -1619,9 +1637,28 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
+/* A two's-complement byte stored as an unsigned channel, as -1..1 (xemu
+ * psh.c sign3): how a bump-env stage reads its input's du/dv. */
+static float sign3(float x)
+{
+    float b = floorf(x * 255.0f + 0.5f);
+    return b >= 128.0f ? (b - 256.0f) / 127.0f : b / 127.0f;
+}
+
+/* The stage a bump-env stage takes its du/dv from (xemu psh.c): stage 1
+ * reads stage 0; stages 2 and 3 say which in SHADER_OTHER_STAGE_INPUT. */
+int pb_rc_input_stage(int st)
+{
+    uint32_t in = st == 1 ? 0u
+                : (g_pb.other_stage_input >> (st == 2 ? 16 : 20)) & 0xF;
+    return in < (uint32_t)st ? (int)in : st - 1;
+}
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
- * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+ * (xemu psh.c). `prev` holds the earlier stages' results, which the
+ * bump-env modes read. Returns 0 when a clip-plane stage kills the pixel. */
+static int rc_stage_fetch(int st, const float c[4], const float prev[][4],
+                          float out[4])
 {
     const Texture *t = &g_pb.texs[st];
     uint32_t mode = (g_pb.rc.stage_program >> (st * 5)) & 0x1F, j;
@@ -1667,9 +1704,34 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
                 return 0;
         }
         return 1;
+    case 6: case 7: {                             /* BUMPENVMAP (_LUM) */
+        /* The input stage's blue/green are (du, dv); the stage's matrix turns
+         * them into an offset added to this stage's coordinates, with no
+         * projective divide (xemu). Conker's water: a V8U8 ripple map on
+         * stage 0 shifts a reduced copy of the screen on stage 1.
+         * ponytail: the input was filtered as unsigned bytes, so texels
+         * either side of 0x80 blend wrong -- xemu does the same. */
+        const float *in = prev[pb_rc_input_stage(st)];
+        const float *m = t->bump_mat;
+        float du, dv;
+        if (st == 0) {
+            out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f;
+            return 1;
+        }
+        du = sign3(in[2]);
+        dv = sign3(in[1]);
+        rc_texel(t, 0, c[0] + m[0] * du + m[2] * dv,
+                 c[1] + m[1] * du + m[3] * dv, out);
+        if (mode == 7) {
+            float l = in[0] * t->bump_scale + t->bump_offset;
+            for (j = 0; j < 4; j++)
+                out[j] *= l;
+        }
+        return 1;
+    }
     default:
-        /* ponytail: bump-env and dot-product modes read zero; they are water
-         * and bump effects -- add them when a title's look depends on one. */
+        /* ponytail: the dot-product modes read zero -- add them when a
+         * title's look depends on one. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
     }
@@ -1797,7 +1859,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                                        + l2 * T->stc[2][st][j]) / pw;
                             if (x == T->probe_x && y == T->probe_y)
                                 memcpy(s_probe_px.tc[st], tc, sizeof tc);
-                            keep = rc_stage_fetch(st, tc, t[st]);
+                            keep = rc_stage_fetch(st, tc,
+                                                  (const float (*)[4])t, t[st]);
                         }
                         if (!keep)
                             continue;
