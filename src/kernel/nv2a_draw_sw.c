@@ -557,6 +557,7 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
     case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
     case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
+    case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
@@ -690,6 +691,15 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
               | (expand((t >>  8) & 0x0F, 4) << 16)
               | (expand((t >>  4) & 0x0F, 4) <<  8)
               |  expand( t        & 0x0F, 4);
+        return 1;
+    }
+    /* Luminance in the low byte, alpha in the high one (xemu: SZ_A8Y8 is
+     * LUMINANCE_ALPHA). Conker's fur shells use it for their hair layers;
+     * as the unsupported-format fill they drew solid white, so the fur was
+     * a smooth opaque shell. */
+    case 0x20: {                                    /* LIN_A8L8 */
+        uint32_t t = ((const uint16_t *)p)[u], l = t & 0xFF;
+        *argb = ((t >> 8) << 24) | (l << 16) | (l << 8) | l;
         return 1;
     }
 
@@ -1532,7 +1542,7 @@ static uint32_t tex_texel_bytes(uint32_t fmt)
     case 0x00: case 0x01: case 0x0B: case 0x13: case 0x19: case 0x1F:
         return 1;
     case 0x02: case 0x03: case 0x04: case 0x05: case 0x10: case 0x11:
-    case 0x1C: case 0x1D:
+    case 0x1A: case 0x1C: case 0x1D: case 0x20:
         return 2;
     default:
         return 4;

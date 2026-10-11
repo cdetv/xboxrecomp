@@ -77,11 +77,16 @@ typedef struct {
     uint32_t w, h;
     uint32_t bpp, swz;                  /* guest pixel size, swizzled */
     uint32_t used;                      /* s_surf_tick at the last use */
+    uint32_t drawn_flip;                /* g_pb.flips when last drawn on */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
 } GpuSurface;
 
-#define GPU_SURFACES 32
+/* Conker's 3D menu room renders into 39 small targets plus the frame: with
+ * 32 slots it threw out and remade ~13 surfaces a frame, and textures read
+ * from a thrown-out one came from guest memory. Each slot is at least
+ * ZETA_W x ZETA_H x 4 bytes (4 MB) once used, so 128 is 512 MB at most. */
+#define GPU_SURFACES 128
 /* The software path's depth buffer size (NV_ZBUF_W/H): it draws nothing
  * with depth past it, and the GPU's depth buffers are the same. */
 #define ZETA_W 1024
@@ -105,7 +110,33 @@ static struct {
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t zeta_reads, zeta_unhandled;
+    uint32_t stale_reads, rtt_old, rtt_twin;
+    uint32_t evictions, evicted_reads;
 } s_stat;
+
+/* Diagnostic: addresses of surfaces thrown out of the table, so a texture
+ * read later from one is counted. Its GPU copy is gone and guest memory,
+ * which this back end never writes, is read instead. First 1024 kept. */
+#define EVICTED_MAX 1024
+static uint32_t s_evicted[EVICTED_MAX];
+static int      s_nevicted;
+
+static int was_evicted(uint32_t addr)
+{
+    int k;
+    for (k = 0; k < s_nevicted; k++)
+        if (s_evicted[k] == addr)
+            return 1;
+    return 0;
+}
+
+static void note_evicted(uint32_t addr)
+{
+    addr &= 0x0FFFFFFFu;
+    s_stat.evictions++;
+    if (s_nevicted < EVICTED_MAX && !was_evicted(addr))
+        s_evicted[s_nevicted++] = addr;
+}
 
 /* RECOMP_GPU_CALL_TIMES=1: wall time spent in each group of D3D11 calls,
  * reported with the [GPU] lines. A sampling profile shows the executor
@@ -253,6 +284,7 @@ static int surface_current(void)
         s_surf[i].bpp = pb_surface_bpp();
         s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
         s_surf[i].used = s_surf_tick;
+        s_surf[i].drawn_flip = g_pb.flips;
         return i;
     }
     if (i == GPU_SURFACES) {
@@ -264,6 +296,8 @@ static int surface_current(void)
         for (i = 0, k = 1; k < GPU_SURFACES && s_surf[i].tex; k++)
             if (!s_surf[k].tex || s_surf[k].used < s_surf[i].used)
                 i = k;
+        if (s_surf[i].tex)
+            note_evicted(s_surf[i].addr);
         if (s_stat.surfaces++ < 48)
             fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
                     " clip %ux%u+%u+%u fmt 0x%X (slot %d%s)%c",
@@ -325,6 +359,7 @@ static int surface_current(void)
     s_surf[i].bpp = pb_surface_bpp();
     s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
     s_surf[i].used = s_surf_tick;
+    s_surf[i].drawn_flip = g_pb.flips;
     return i;
 }
 
@@ -1033,6 +1068,13 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
 #define RTT_ALPHA_ONE 1u
 #define RTT_SWAP_RB   2u
 
+/* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
+ * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
+ * '-' nothing bound. Set by texture_stage. */
+static char s_tex_src[4];
+static int  s_tex_slot[4];
+static int  s_rtt_slot;
+
 static struct {
     uint32_t w, h;
     ID3D11Texture2D *tex;
@@ -1080,6 +1122,44 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             break;
     if (i == GPU_SURFACES)
         return NULL;
+    {
+        /* Diagnostic: a surface not drawn on this flip or the last, or a
+         * second surface at the same address (another pitch) that the
+         * lookup above did not pick. Logged once per address and kind. */
+        static struct { uint32_t addr, kind; } seen[128];
+        static int nseen;
+        uint32_t age = g_pb.flips - s_surf[i].drawn_flip, kind = 0;
+        int k, twin = -1;
+        for (k = i + 1; k < GPU_SURFACES; k++)
+            if (s_surf[k].tex
+                && (s_surf[k].addr & 0x0FFFFFFFu) == (t->offset & 0x0FFFFFFFu))
+                twin = k;
+        if (age > 1) {
+            s_stat.rtt_old++;
+            kind |= 1;
+        }
+        if (twin >= 0) {
+            s_stat.rtt_twin++;
+            kind |= 2;
+        }
+        for (k = 0; kind && k < nseen; k++)
+            if (seen[k].addr == t->offset && seen[k].kind == kind)
+                kind = 0;
+        if (kind && nseen < 128) {
+            seen[nseen].addr = t->offset;
+            seen[nseen++].kind = kind;
+            fprintf(stderr, "[GPU] d3d11: rtt stage %d texture 0x%08X fmt"
+                    " 0x%02X %ux%u: surface slot %d 0x%08X pitch %u%s last"
+                    " drawn %u flips ago", st, t->offset, t->color,
+                    t->width, t->height, i, s_surf[i].addr, s_surf[i].pitch,
+                    s_surf[i].swz ? " swizzled" : "", age);
+            if (twin >= 0)
+                fprintf(stderr, "; twin slot %d pitch %u drawn %u flips ago",
+                        twin, s_surf[twin].pitch,
+                        g_pb.flips - s_surf[twin].drawn_flip);
+            fprintf(stderr, " (flip %u)%c", g_pb.flips, 10);
+        }
+    }
     r = rtt_reading(t->color, s_surf[i].bpp);
     if (r < 0) {
         if (s_stat.rtt_unhandled++ < 8)
@@ -1127,6 +1207,7 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
     *flags = (uint32_t)r;
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
+    s_rtt_slot = i;
     return s_rtt[st].srv;
 }
 
@@ -1247,6 +1328,66 @@ static ID3D11ShaderResourceView *texture_from_zeta(int st)
     return s_zcopy[st].srv;
 }
 
+/* A texture read from guest memory although its bytes overlap a GPU colour
+ * surface or zeta buffer. This back end writes neither back to guest memory,
+ * so such a read sees whatever was there before. In RECOMP_GPU=both the
+ * software path has written those bytes first, which hides it. Counted
+ * always; each address/format/size logged once (first 256), with the surface
+ * it overlaps. Surfaces are taken as pitch x their (padded) height, zeta
+ * buffers as 4 MB: generous on purpose, the log says which overlap is real. */
+static void note_stale_read(int st, uint32_t bytes)
+{
+    static struct { uint32_t addr, fmt, wh; } seen[256];
+    static int nseen;
+    const Texture *t = &g_pb.texs[st];
+    uint32_t a = t->offset & 0x0FFFFFFFu, b = a + bytes;
+    uint32_t key = (t->width << 16) | t->height;
+    int i, k;
+
+    for (i = 0; i < GPU_SURFACES; i++) {
+        uint32_t s = s_surf[i].addr & 0x0FFFFFFFu;
+        if (s_surf[i].tex && a < s + s_surf[i].pitch * s_surf[i].h && s < b)
+            break;
+    }
+    for (k = 0; i == GPU_SURFACES && k < GPU_ZETAS; k++) {
+        uint32_t s = s_zeta[k].offset & 0x0FFFFFFFu;
+        if (s_zeta[k].tex && a < s + (4u << 20) && s < b)
+            break;
+    }
+    if (i == GPU_SURFACES && k == GPU_ZETAS)
+        return;
+    s_stat.stale_reads++;
+    for (k = 0; k < nseen; k++)
+        if (seen[k].addr == a && seen[k].fmt == t->color && seen[k].wh == key)
+            return;
+    if (nseen == 256)
+        return;
+    seen[nseen].addr = a;
+    seen[nseen].fmt = t->color;
+    seen[nseen++].wh = key;
+    if (i < GPU_SURFACES)
+        fprintf(stderr, "[GPU] d3d11: stale read: stage %d texture 0x%08X"
+                " fmt 0x%02X %ux%u pitch %u (%u bytes) overlaps GPU surface"
+                " 0x%08X pitch %u %ux%u%s at +0x%X (flip %u)%c", st, a,
+                t->color, t->width, t->height, t->pitch, bytes,
+                s_surf[i].addr, s_surf[i].pitch, s_surf[i].w, s_surf[i].h,
+                s_surf[i].swz ? " swizzled" : "",
+                a - (s_surf[i].addr & 0x0FFFFFFFu), g_pb.flips, 10);
+    else
+        for (k = 0; k < GPU_ZETAS; k++) {
+            uint32_t s = s_zeta[k].offset & 0x0FFFFFFFu;
+            if (s_zeta[k].tex && a < s + (4u << 20) && s < b) {
+                fprintf(stderr, "[GPU] d3d11: stale read: stage %d texture"
+                        " 0x%08X fmt 0x%02X %ux%u pitch %u (%u bytes)"
+                        " overlaps zeta 0x%08X (format %u) at %+d (flip %u)%c",
+                        st, a, t->color, t->width, t->height, t->pitch,
+                        bytes, s_zeta[k].offset, s_zeta[k].zf,
+                        (int)(a - s), g_pb.flips, 10);
+                break;
+            }
+        }
+}
+
 /* A shader view of stage st's texture as it is now, or NULL when it cannot
  * be read; RTT_* flags in *flags. */
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
@@ -1260,18 +1401,33 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     int i, lru = 0;
 
     *flags = 0;
+    s_tex_src[st] = '-';
     if (!t->valid || t->cube || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return NULL;
     rtt = texture_from_zeta(st);
-    if (!rtt)
-        rtt = texture_from_surface(st, flags);
-    if (rtt)
+    if (rtt) {
+        s_tex_src[st] = 'Z';
         return rtt;
+    }
+    rtt = texture_from_surface(st, flags);
+    if (rtt) {
+        s_tex_src[st] = 'S';
+        s_tex_slot[st] = s_rtt_slot;
+        return rtt;
+    }
+    s_tex_src[st] = 'G';
     bytes = pb_tex_bytes(t);
     if (!bytes)
         return NULL;
+    note_stale_read(st, bytes);
+    if (s_nevicted && was_evicted(t->offset & 0x0FFFFFFFu)
+        && s_stat.evicted_reads++ < 8)
+        fprintf(stderr, "[GPU] d3d11: stage %d texture 0x%08X fmt 0x%02X"
+                " %ux%u is a surface evicted from the table; read from"
+                " guest memory (flip %u)%c", st, t->offset, t->color,
+                t->width, t->height, g_pb.flips, 10);
     palette = t->color == 0x0B ? t->palette : 0;
 
     s_tex_tick++;
@@ -1741,6 +1897,59 @@ static void d3d_draw(void)
     }
 
     nidx = build_triangles(verts, n);
+    if (g_pb_ftrace == 2) {
+        /* What this batch draws where, from which textures: the GPU-side
+         * counterpart of sw_draw's trace, for runs without the software
+         * path. Screen box and texture coordinate ranges are over the
+         * batch's vertices (positions in surface pixels, as the vertex
+         * shader takes them; coordinates as the pixel shader gets them). */
+        float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+        for (i = 0; i < n; i++) {
+            float x = verts[i].pos[0], y = verts[i].pos[1];
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+        }
+        fprintf(stderr, "[FTRACE] d3d %s n %u surf %08X slot %d %ux%u+%u+%u"
+                " | box x %.1f..%.1f y %.1f..%.1f | blend %u %X/%X eq %X"
+                " | z %u st %u at %u | tris %u%c",
+                path == PATH_FLAT ? "FLAT" : program ? "PRG" : "RC", n,
+                g_pb.color_offset, si, g_pb.clip_w, g_pb.clip_h,
+                g_pb.clip_x, g_pb.clip_y, x0, x1, y0, y1, g_pb.blend_enable,
+                g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
+                g_pb.depth_test, g_pb.stencil_test, g_pb.alpha_test,
+                nidx / 3, 10);
+        fprintf(stderr, "[FTRACE]     cmask %08X | stencil func %X ref %02X"
+                " r %02X w %02X op %X/%X/%X | alpha func %X ref %02X | zmask"
+                " %u zfunc %X | d0 %.2f %.2f %.2f %.2f%c", g_pb.color_mask,
+                g_pb.stencil_func, g_pb.stencil_ref & 0xFF,
+                g_pb.stencil_rmask & 0xFF, g_pb.stencil_wmask & 0xFF,
+                g_pb.stencil_op_fail, g_pb.stencil_op_zfail,
+                g_pb.stencil_op_zpass, g_pb.alpha_func, g_pb.alpha_ref & 0xFF,
+                g_pb.depth_mask, g_pb.depth_func, verts[0].d0[0],
+                verts[0].d0[1], verts[0].d0[2], verts[0].d0[3], 10);
+        for (st = 0; st < 4; st++) {
+            const Texture *t = &g_pb.texs[st];
+            float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
+            if (!(bound & (1u << st)))
+                continue;
+            for (i = 0; i < n; i++) {
+                float u = verts[i].tex[st][0], v = verts[i].tex[st][1];
+                if (u < u0) u0 = u;
+                if (u > u1) u1 = u;
+                if (v < v0) v0 = v;
+                if (v > v1) v1 = v;
+            }
+            fprintf(stderr, "[FTRACE]     t%d %c", st, s_tex_src[st]);
+            if (s_tex_src[st] == 'S')
+                fprintf(stderr, "%d", s_tex_slot[st]);
+            fprintf(stderr, " %08X fmt %02X %ux%u pitch %u | u %.2f..%.2f"
+                    " v %.2f..%.2f q0 %.2f%c", t->offset, t->color, t->width,
+                    t->height, t->pitch, u0, u1, v0, v1, verts[0].tex[st][3],
+                    10);
+        }
+    }
     if (!nidx)
         return;
     {
@@ -2077,6 +2286,15 @@ static void d3d_report(void)
             " handled (guest memory used)%c", s_stat.zeta_made,
             s_stat.zeta_clears, s_stat.zeta_draws, s_stat.zeta_too_big,
             s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
+    fprintf(stderr, "[GPU] d3d11: %u texture binds read from guest memory"
+            " inside a GPU surface or zeta buffer (stale); surface binds:"
+            " %u of a surface not drawn for 2+ flips, %u with a twin at the"
+            " same address%c", s_stat.stale_reads, s_stat.rtt_old,
+            s_stat.rtt_twin, 10);
+    fprintf(stderr, "[GPU] d3d11: surface table (%d slots): %u evictions"
+            " (%d addresses), %u texture binds of an evicted surface%c",
+            GPU_SURFACES, s_stat.evictions, s_nevicted,
+            s_stat.evicted_reads, 10);
     fprintf(stderr, "[GPU] d3d11: rings: vertices %u wraps (%u MB), indices"
             " %u wraps (%u MB)%c", s_vb.wraps, s_vb.bytes >> 20,
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
