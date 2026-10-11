@@ -736,6 +736,15 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
         break;
+    case 0x1B38: case 0x1B3C: case 0x1B40: case 0x1B44:  /* BUMP_ENV_MAT */
+        memcpy(&t->bump_mat[(reg - 0x1B38) / 4], &param, 4);
+        break;
+    case 0x1B48:                                  /* SET_BUMP_ENV_SCALE */
+        memcpy(&t->bump_scale, &param, 4);
+        break;
+    case 0x1B4C:                                  /* SET_BUMP_ENV_OFFSET */
+        memcpy(&t->bump_offset, &param, 4);
+        break;
     default:
         break;
     }
@@ -1076,6 +1085,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case 0x1E70: g_pb.rc.stage_program = param; break;
     case 0x17F8: g_pb.clip_plane_mode = param; break;
+    case 0x1E78: g_pb.other_stage_input = param; break;
 
     /* Alpha test and fog. */
     case 0x0300: g_pb.alpha_test = param; break;

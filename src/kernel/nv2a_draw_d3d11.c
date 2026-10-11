@@ -620,6 +620,8 @@ typedef struct {
     uint32_t fin[4];
     float    fc0[4], fc1[4], fogc[4], fogp[4];
     float    zsc[4];                    /* depth units to 0..1 */
+    float    bmat[4][4];                /* per stage: BUMP_ENV_MAT 00 01 10 11 */
+    float    bsc[4][4];                 /* per stage: bump scale, offset, input stage */
 } GpuConsts;
 
 /* The zeta copy pass (texture_from_zeta): its shaders and constants. */
@@ -1880,9 +1882,16 @@ static void d3d_draw(void)
         for (st = 0; st < 4; st++) {
             uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
             const Texture *t = &g_pb.texs[st];
-            /* Without combiners only stage 0 is sampled (xf_rows). */
-            if (combiners ? !(m >= 1 && m <= 3) : st != 0)
+            /* Without combiners only stage 0 is sampled (xf_rows). Bump-env
+             * stages (6, 7) sample too, at coordinates the shader shifts. */
+            if (combiners ? !((m >= 1 && m <= 3) || m == 6 || m == 7) : st != 0)
                 continue;
+            if (m == 6 || m == 7) {
+                memcpy(k.bmat[st], t->bump_mat, sizeof k.bmat[st]);
+                k.bsc[st][0] = t->bump_scale;
+                k.bsc[st][1] = t->bump_offset;
+                k.bsc[st][2] = (float)pb_rc_input_stage(st);
+            }
             srv[st] = texture_stage(st, &rtt);
             samp[st] = srv[st] ? sampler_stage(st, combiners) : NULL;
             if (!samp[st]) {
@@ -1994,8 +2003,14 @@ static void d3d_draw(void)
         for (st = 0; st < 4; st++) {
             const Texture *t = &g_pb.texs[st];
             float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
-            if (!(bound & (1u << st)))
+            uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
+            /* Unbound stages too, when the program uses them: a stage the
+             * GPU could not make a texture of is the first thing to know. */
+            if (!(bound & (1u << st)) && !(combiners && m))
                 continue;
+            if (!(bound & (1u << st)))
+                fprintf(stderr, "[FTRACE]     t%d unbound mode %u (%c)%c", st,
+                        m, s_tex_src[st], 10);
             for (i = 0; i < n; i++) {
                 float u = verts[i].tex[st][0], v = verts[i].tex[st][1];
                 if (u < u0) u0 = u;
