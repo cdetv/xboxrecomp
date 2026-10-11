@@ -593,6 +593,7 @@ static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            out->pts = outregs[6][0];                    /* oPts.x */
             clamp_colours(out);
             return 1;
         }
@@ -897,6 +898,7 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
             o->tex[2][j] = S.outregs[11][j][l];
             o->tex[3][j] = S.outregs[12][j][l];
         }
+        o->pts = S.outregs[6][0][l];                     /* oPts.x */
         clamp_colours(o);
     }
 

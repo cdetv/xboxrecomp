@@ -1311,6 +1311,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0374: g_pb.stencil_op_zfail = param; break;
     case 0x0378: g_pb.stencil_op_zpass = param; break;
 
+    /* Points. */
+    case 0x0318: g_pb.point_params_enable = param; break;
+    case 0x031C: g_pb.point_sprite = param; break;     /* POINT_SMOOTH_ENABLE */
+    case 0x043C:                                        /* SET_POINT_SIZE */
+        if (param <= 0x1FF)                             /* xemu ignores more */
+            g_pb.point_size = param;
+        break;
+
     default:
         if (method >= 0x0260 && method < 0x0280) {         /* ALPHA_ICW(i) */
             g_pb.rc.alpha_icw[(method - 0x0260) / 4] = param;
@@ -1347,6 +1355,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         if (method >= 0x0AF0 && method < 0x0B00) {
             nv2a_vsh_constant_component(58, (method - 0x0AF0) / 4, param);
+            break;
+        }
+        if (method >= 0x0A30 && method < 0x0A50) {         /* POINT_PARAMS(i) */
+            memcpy(&g_pb.point_params[(method - 0x0A30) / 4], &param, 4);
             break;
         }
         if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
