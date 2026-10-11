@@ -216,6 +216,27 @@ static void write_masked(float *dst, const vec4 *src, uint32_t mask)
     if (mask & 1) dst[3] = src->v[3];
 }
 
+/* The colour outputs (oD0, oD1) leave the vertex unit clamped to [0,1], per
+ * vertex and before they are interpolated, as on the hardware (xemu clamps
+ * them at the end of its vertex shaders too). Programs rely on it: Conker's
+ * character lighting writes N.L straight into oD1 with no max(), and the
+ * combiners read v1 as signed, so unclamped the side facing away from the key
+ * light took light away -- and, interpolated from such a vertex, so did the
+ * lit pixels next to it: dark blotches on every character. NaN reads 0. */
+static float clamp01(float x)
+{
+    return x > 0.0f ? (x < 1.0f ? x : 1.0f) : 0.0f;
+}
+
+static void clamp_colours(Nv2aVshOutput *o)
+{
+    int j;
+    for (j = 0; j < 4; j++) {
+        o->d0[j] = clamp01(o->d0[j]);
+        o->d1[j] = clamp01(o->d1[j]);
+    }
+}
+
 static vec4 splat(float f)
 {
     vec4 r;
@@ -572,6 +593,7 @@ static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
             memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
             memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
+            clamp_colours(out);
             return 1;
         }
     }
@@ -875,6 +897,7 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
             o->tex[2][j] = S.outregs[11][j][l];
             o->tex[3][j] = S.outregs[12][j][l];
         }
+        clamp_colours(o);
     }
 
     /* RECOMP_VSH_CHECK=1: run_program on the same vertices; any that come
