@@ -177,6 +177,13 @@ typedef struct Nv2aPbState {
      * STENCIL_MASK the write mask and FUNC_MASK the read mask. */
     uint32_t stencil_test, stencil_func, stencil_ref, stencil_rmask;
     uint32_t stencil_wmask, stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    /* Points, as xemu keeps them: SET_POINT_PARAMS_ENABLE (a program's oPts
+     * sizes each point; off, SET_POINT_SIZE does, in 1/8 pixels), and
+     * SET_POINT_SMOOTH_ENABLE, which makes each point a sprite: stage 3's
+     * coordinates run 0..1 across it. SET_POINT_PARAMS is kept for the
+     * fixed-function size formula, not used yet. */
+    uint32_t point_params_enable, point_sprite, point_size;
+    float    point_params[8];
 } Nv2aPbState;
 extern Nv2aPbState g_pb;
 
@@ -257,6 +264,12 @@ uint32_t pb_tex_bytes(const Texture *t);
 /* pb_rc_input_stage: the earlier stage a bump-env stage (1-3) reads its
  * du/dv from: stage 0 for stage 1, SHADER_OTHER_STAGE_INPUT for 2 and 3. */
 int pb_rc_input_stage(int st);
+/* pb_point_quad: the square a POINTS vertex p (screen space, as
+ * pb_transform_batch gives it) covers, as four corners clockwise from the
+ * top left; under SET_POINT_SMOOTH_ENABLE stage 3's coordinates run from
+ * (0,0) there to (1,1). 0 when the point is not drawn: not finite, behind
+ * the eye or in front of the near plane. */
+int pb_point_quad(const Nv2aVshOutput *p, Nv2aVshOutput q[4]);
 
 /* nv2a_draw_sw.c: the frame dump the last software present wrote, or NULL
  * when it wrote none. RECOMP_GPU=both dumps the GPU's copy of the same

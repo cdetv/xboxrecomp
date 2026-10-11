@@ -36,6 +36,10 @@ typedef struct {
     float d0[4], d1[4];
     float fog[4];
     float tex[4][4];
+    /* oPts.x: the point size in pixels a program writes, which a POINTS
+     * batch draws its sprites at while SET_POINT_PARAMS_ENABLE is on. Last,
+     * so the D3D11 input layout's offsets above it stay as they were. */
+    float pts;
 } Nv2aVshOutput;
 
 void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */

@@ -1761,8 +1761,29 @@ static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
             TRI(i, i + 3, i + 2);
         }
         break;
+    case NV_PRIM_POINTS:
+        /* Each point a sprite square (pb_point_quad), its corners appended
+         * after the batch like clipped vertices. */
+        for (i = 0; i < n; i++) {
+            Nv2aVshOutput q[4], *d;
+            uint32_t base = n + s_cv_n, j;
+            if (!s_bv_ok[i] || !pb_point_quad(&v[i], q))
+                continue;
+            for (j = 0; j < 4; j++) {
+                if (!(d = clip_vertex()))
+                    break;
+                *d = q[j];
+            }
+            if (j < 4) {
+                s_cv_n -= j;
+                break;
+            }
+            s_ib[out++] = base;     s_ib[out++] = base + 1; s_ib[out++] = base + 2;
+            s_ib[out++] = base;     s_ib[out++] = base + 2; s_ib[out++] = base + 3;
+        }
+        break;
     default:
-        break;                          /* points and lines: not yet */
+        break;                          /* lines: not yet */
     }
 #undef TRI
     return out;
@@ -1843,7 +1864,7 @@ static void d3d_draw(void)
         no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
     if (no_vsh < 0)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-    if (!ready || g_pb.idx_count < 3)
+    if (!ready || g_pb.idx_count < (g_pb.prim == NV_PRIM_POINTS ? 1u : 3u))
         return;
     program = (g_pb.xf_mode & 3) == 2 && !no_vsh;
     if (!program && !pb_batch_screen_space()) {
@@ -1984,6 +2005,17 @@ static void d3d_draw(void)
                 g_pb.stencil_op_zpass, g_pb.alpha_func, g_pb.alpha_ref & 0xFF,
                 g_pb.depth_mask, g_pb.depth_func, verts[0].d0[0],
                 verts[0].d0[1], verts[0].d0[2], verts[0].d0[3], 10);
+        if (g_pb.prim == NV_PRIM_POINTS) {
+            float p0 = 1e30f, p1 = -1e30f;
+            for (i = 0; i < n; i++) {
+                if (verts[i].pts < p0) p0 = verts[i].pts;
+                if (verts[i].pts > p1) p1 = verts[i].pts;
+            }
+            fprintf(stderr, "[FTRACE]     points: oPts %.2f..%.2f | params %u"
+                    " sprite %u size %u/8 | %u drawn%c", p0, p1,
+                    g_pb.point_params_enable, g_pb.point_sprite,
+                    g_pb.point_size, nidx / 6, 10);
+        }
         if (path == PATH_COMBINERS) {
             /* The combiner setup: which registers each stage reads. */
             uint32_t s, ns = g_pb.rc.control & 0xFF;

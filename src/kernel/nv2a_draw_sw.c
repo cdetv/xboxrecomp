@@ -2859,11 +2859,63 @@ static void fixed_vertex(uint32_t index, Nv2aVshOutput *out)
     }
 }
 
+/* Points as the square sprites the NV2A draws, a port of what xemu has GL do
+ * (pgraph/glsl/vsh.c, psh.c). Size: the program's oPts.x while point params
+ * are on, else SET_POINT_SIZE in 1/8 pixels (0 = 1 pixel). A point is drawn
+ * or dropped whole on its centre, as GL clips points; the corners share its
+ * depth and w. Conker's floating motes are such sprites: t0 the mote's
+ * colour (one texcoord per point, from an atlas), t3 its round shape across
+ * the square. Fixed-function batches take SET_POINT_SIZE as well; the
+ * distance formula of SET_POINT_PARAMS is not done. */
+int pb_point_quad(const Nv2aVshOutput *p, Nv2aVshOutput q[4])
+{
+    static const float cx[4] = {0, 1, 1, 0}, cy[4] = {0, 0, 1, 1};
+    const float *zs = nv2a_vsh_constant(58), *zo = nv2a_vsh_constant(59);
+    float s;
+    int i;
+
+    if (!(isfinite(p->pos[0]) && isfinite(p->pos[1]) && isfinite(p->pos[2])
+          && isfinite(p->pos[3])))
+        return 0;
+    if ((g_pb.xf_mode & 3) == 2) {          /* program: in clip space first */
+        if (p->pos[3] <= NV_CLIP_W
+            || (zs[2] != 0.0f && (p->pos[2] - zo[2]) / zs[2] < 0.0f))
+            return 0;
+    }
+    s = (g_pb.xf_mode & 3) == 2 && g_pb.point_params_enable
+        ? p->pts : (float)g_pb.point_size / 8.0f;
+    if (!(s >= 1.0f))                      /* GL's smallest; also NaN */
+        s = 1.0f;
+    if (s > 2047.0f)
+        s = 2047.0f;
+    for (i = 0; i < 4; i++) {
+        q[i] = *p;
+        q[i].pos[0] = p->pos[0] + (cx[i] - 0.5f) * s;
+        q[i].pos[1] = p->pos[1] + (cy[i] - 0.5f) * s;
+        if (g_pb.point_sprite) {
+            q[i].tex[3][0] = cx[i];
+            q[i].tex[3][1] = cy[i];
+            q[i].tex[3][2] = 1.0f;
+            q[i].tex[3][3] = 1.0f;
+        }
+    }
+    return 1;
+}
+
 static void raster_xf_prims(uint32_t n)
 {
     uint32_t i;
 
     switch (g_pb.prim) {
+    case NV_PRIM_POINTS:
+        for (i = 0; i < n; i++) {
+            Nv2aVshOutput q[4];
+            if (!pb_point_quad(&s_xf[i], q))
+                continue;
+            raster_xf_triangle(&q[0], &q[1], &q[2]);
+            raster_xf_triangle(&q[0], &q[2], &q[3]);
+        }
+        break;
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
@@ -2900,7 +2952,7 @@ static void raster_batch(void)
     uint32_t i;
     uint32_t before = g_pb.tris_drawn;
 
-    if (g_pb.idx_count < 3)
+    if (g_pb.idx_count < (g_pb.prim == NV_PRIM_POINTS ? 1u : 3u))
         return;
     /* The queue of the batch before has been drawn by now, so a zeta
      * surface sampled here is complete; and from here on this batch's own
