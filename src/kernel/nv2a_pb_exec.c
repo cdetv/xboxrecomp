@@ -769,11 +769,15 @@ static void flip_pace(void)
     static LARGE_INTEGER freq, origin;
     static long long last_slot = -1;
     static HANDLE timer;
+    static int every = 1;              /* refreshes per slot: 2 = 30 Hz */
     LARGE_INTEGER now;
     long long slot;
 
     if (on < 0) {
-        on = getenv("RECOMP_FLIP_PACE") != NULL;
+        const char *e = getenv("RECOMP_FLIP_PACE");
+        on = e != NULL;
+        if (on && atoi(e) > 1)
+            every = atoi(e);
         if (on) {
             QueryPerformanceFrequency(&freq);
             QueryPerformanceCounter(&origin);
@@ -787,10 +791,11 @@ static void flip_pace(void)
     if (!on)
         return;
     QueryPerformanceCounter(&now);
-    slot = (now.QuadPart - origin.QuadPart) * 60 / freq.QuadPart;
+    slot = (now.QuadPart - origin.QuadPart) * 60 / (freq.QuadPart * every);
     if (slot <= last_slot) {
         /* Wait for the start of the next slot. */
-        long long next = origin.QuadPart + (last_slot + 1) * freq.QuadPart / 60;
+        long long next = origin.QuadPart
+                       + (last_slot + 1) * freq.QuadPart * every / 60;
         long long wait_100ns = (next - now.QuadPart) * 10000000 / freq.QuadPart;
         if (wait_100ns > 0) {
             LARGE_INTEGER due;
