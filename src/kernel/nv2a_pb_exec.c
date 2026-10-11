@@ -670,6 +670,19 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* The size a stage samples at. IMAGE_RECT is only read for linear formats
+ * and is otherwise stale state: D3D leaves the last linear texture's rect in
+ * place when it binds a swizzled one. Conker binds its 512x512 room light
+ * map right after a 32x32 rect, and letting the rect win sampled only the
+ * light map's black top-left corner, so every character was unlit. Both
+ * registers are kept, because the format can change after the rect. */
+static void tex_pick_size(Texture *t)
+{
+    int swz = tex_size_from_format(t->color);
+    t->width  = swz ? t->fmt_w : t->rect_w;
+    t->height = swz ? t->fmt_h : t->rect_h;
+}
+
 /* The texture stage registers, all four stages. Stage i's registers are
  * 0x1B00 + 0x40*i onwards; only stage 0 used to be decoded, which was
  * enough for menus drawn one texture at a time and not for a 3D frame that
@@ -694,10 +707,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
          * a title that only uses swizzled textures never sends one. */
-        if (tex_size_from_format(t->color)) {
-            t->width  = 1u << ((param >> 20) & 0xF);
-            t->height = 1u << ((param >> 24) & 0xF);
-        }
+        t->fmt_w = 1u << ((param >> 20) & 0xF);
+        t->fmt_h = 1u << ((param >> 24) & 0xF);
+        tex_pick_size(t);
         break;
     case NV097_SET_TEXTURE_PALETTE:
         /* The low six bits carry the DMA context and the entry count. */
@@ -717,8 +729,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->pitch = param >> 16;          /* linear formats only */
         break;
     case NV097_SET_TEXTURE_IMAGE_RECT:
-        t->width  = param >> 16;
-        t->height = param & 0xFFFF;
+        t->rect_w = param >> 16;
+        t->rect_h = param & 0xFFFF;
+        tex_pick_size(t);
         break;
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;

@@ -2101,6 +2101,21 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
         fprintf(stderr, "    GS %08X %08X\n", a,
                 *(const uint32_t *)(mem + a));
     }
+    /* RECOMP_WATCHDOG_RAM=<file>: write the contiguous window (file offset =
+     * physical address) so it can be compared byte for byte with an xemu RAM
+     * dump of the same scene. A peek answers "what is at this address"; it
+     * cannot answer "where else is this data", and when the two runs lay
+     * memory out differently, the second question is the one that matters. */
+    {
+        const char *ram = getenv("RECOMP_WATCHDOG_RAM");
+        FILE *f;
+        if (ram && *ram && g_contig_memory && (f = fopen(ram, "wb")) != NULL) {
+            size_t n = fwrite(mem + XBOX_CONTIG_BASE, 1, XBOX_CONTIG_SIZE, f);
+            fclose(f);
+            fprintf(stderr, "[WATCHDOG] wrote %zu bytes of 0x%08X.. to %s\n",
+                    n, (unsigned)XBOX_CONTIG_BASE, ram);
+        }
+    }
     fflush(stderr);
     _exit(3);
     return 0;

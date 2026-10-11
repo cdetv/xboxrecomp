@@ -71,7 +71,9 @@ typedef struct {
  * that needs them will say so. */
 typedef struct {
     uint32_t offset;                    /* guest address of texel (0,0)  */
-    uint32_t width, height;             /* from IMAGE_RECT               */
+    uint32_t width, height;             /* in use: fmt_* or rect_*       */
+    uint32_t fmt_w, fmt_h;              /* FORMAT BASE_SIZE_U/V (swizzled) */
+    uint32_t rect_w, rect_h;            /* IMAGE_RECT (linear only)      */
     uint32_t pitch;                     /* bytes per row, from CONTROL1  */
     uint32_t color;                     /* NV097 colour-format code      */
     uint32_t addr_u, addr_v;            /* wrap mode per axis            */
