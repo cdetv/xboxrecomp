@@ -107,7 +107,32 @@ static struct {
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
+    uint32_t evictions, evicted_reads;
 } s_stat;
+
+/* Diagnostic: addresses of surfaces thrown out of the table, so a texture
+ * read later from one is counted. Its GPU copy is gone and guest memory,
+ * which this back end never writes, is read instead. First 1024 kept. */
+#define EVICTED_MAX 1024
+static uint32_t s_evicted[EVICTED_MAX];
+static int      s_nevicted;
+
+static int was_evicted(uint32_t addr)
+{
+    int k;
+    for (k = 0; k < s_nevicted; k++)
+        if (s_evicted[k] == addr)
+            return 1;
+    return 0;
+}
+
+static void note_evicted(uint32_t addr)
+{
+    addr &= 0x0FFFFFFFu;
+    s_stat.evictions++;
+    if (s_nevicted < EVICTED_MAX && !was_evicted(addr))
+        s_evicted[s_nevicted++] = addr;
+}
 
 /* RECOMP_GPU_CALL_TIMES=1: wall time spent in each group of D3D11 calls,
  * reported with the [GPU] lines. A sampling profile shows the executor
@@ -267,6 +292,8 @@ static int surface_current(void)
         for (i = 0, k = 1; k < GPU_SURFACES && s_surf[i].tex; k++)
             if (!s_surf[k].tex || s_surf[k].used < s_surf[i].used)
                 i = k;
+        if (s_surf[i].tex)
+            note_evicted(s_surf[i].addr);
         if (s_stat.surfaces++ < 48)
             fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
                     " clip %ux%u+%u+%u fmt 0x%X (slot %d%s)%c",
@@ -1391,6 +1418,12 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     if (!bytes)
         return NULL;
     note_stale_read(st, bytes);
+    if (s_nevicted && was_evicted(t->offset & 0x0FFFFFFFu)
+        && s_stat.evicted_reads++ < 8)
+        fprintf(stderr, "[GPU] d3d11: stage %d texture 0x%08X fmt 0x%02X"
+                " %ux%u is a surface evicted from the table; read from"
+                " guest memory (flip %u)%c", st, t->offset, t->color,
+                t->width, t->height, g_pb.flips, 10);
     palette = t->color == 0x0B ? t->palette : 0;
 
     s_tex_tick++;
@@ -2254,6 +2287,10 @@ static void d3d_report(void)
             " %u of a surface not drawn for 2+ flips, %u with a twin at the"
             " same address%c", s_stat.stale_reads, s_stat.rtt_old,
             s_stat.rtt_twin, 10);
+    fprintf(stderr, "[GPU] d3d11: surface table (%d slots): %u evictions"
+            " (%d addresses), %u texture binds of an evicted surface%c",
+            GPU_SURFACES, s_stat.evictions, s_nevicted,
+            s_stat.evicted_reads, 10);
     fprintf(stderr, "[GPU] d3d11: rings: vertices %u wraps (%u MB), indices"
             " %u wraps (%u MB)%c", s_vb.wraps, s_vb.bytes >> 20,
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
