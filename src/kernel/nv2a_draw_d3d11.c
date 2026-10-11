@@ -1929,6 +1929,22 @@ static void d3d_draw(void)
                 g_pb.stencil_op_zpass, g_pb.alpha_func, g_pb.alpha_ref & 0xFF,
                 g_pb.depth_mask, g_pb.depth_func, verts[0].d0[0],
                 verts[0].d0[1], verts[0].d0[2], verts[0].d0[3], 10);
+        if (path == PATH_COMBINERS) {
+            /* The combiner setup: which registers each stage reads. */
+            uint32_t s, ns = g_pb.rc.control & 0xFF;
+            fprintf(stderr, "[FTRACE]     rc prog %05X control %X final"
+                    " %08X %08X fc0 %08X fc1 %08X | d1 %.2f %.2f %.2f %.2f%c",
+                    g_pb.rc.stage_program, g_pb.rc.control, g_pb.rc.final0,
+                    g_pb.rc.final1, g_pb.rc.final_c0, g_pb.rc.final_c1,
+                    verts[0].d1[0], verts[0].d1[1], verts[0].d1[2],
+                    verts[0].d1[3], 10);
+            for (s = 0; s < ns && s < 8; s++)
+                fprintf(stderr, "[FTRACE]     rc %u: rgb %08X->%05X a %08X->"
+                        "%05X c0 %08X c1 %08X%c", s, g_pb.rc.color_icw[s],
+                        g_pb.rc.color_ocw[s], g_pb.rc.alpha_icw[s],
+                        g_pb.rc.alpha_ocw[s], g_pb.rc.factor0[s],
+                        g_pb.rc.factor1[s], 10);
+        }
         for (st = 0; st < 4; st++) {
             const Texture *t = &g_pb.texs[st];
             float u0 = 1e30f, u1 = -1e30f, v0 = 1e30f, v1 = -1e30f;
@@ -1945,9 +1961,10 @@ static void d3d_draw(void)
             if (s_tex_src[st] == 'S')
                 fprintf(stderr, "%d", s_tex_slot[st]);
             fprintf(stderr, " %08X fmt %02X %ux%u pitch %u | u %.2f..%.2f"
-                    " v %.2f..%.2f q0 %.2f%c", t->offset, t->color, t->width,
-                    t->height, t->pitch, u0, u1, v0, v1, verts[0].tex[st][3],
-                    10);
+                    " v %.2f..%.2f q0 %.2f | addr %u/%u filter %08X%c",
+                    t->offset, t->color, t->width, t->height, t->pitch, u0,
+                    u1, v0, v1, verts[0].tex[st][3], t->addr_u, t->addr_v,
+                    t->filter, 10);
         }
     }
     if (!nidx)
