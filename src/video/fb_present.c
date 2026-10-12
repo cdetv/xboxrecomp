@@ -53,6 +53,57 @@ void *xbox_FramebufferWindowHandle(void)
     return s_fb_running ? (void *)s_hwnd : NULL;
 }
 
+/* The largest w:h rectangle that fits a cw x ch client area, centred:
+ * letterbox or pillarbox, never stretched. */
+void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
+{
+    if (cw <= 0 || ch <= 0 || w <= 0 || h <= 0) {
+        *x = *y = 0; *fw = cw > 0 ? cw : 0; *fh = ch > 0 ? ch : 0;
+        return;
+    }
+    if ((long long)cw * h > (long long)ch * w) {      /* wider: bars left/right */
+        *fh = ch;
+        *fw = (int)((long long)ch * w / h);
+    } else {                                          /* taller: bars top/bottom */
+        *fw = cw;
+        *fh = (int)((long long)cw * h / w);
+    }
+    *x = (cw - *fw) / 2;
+    *y = (ch - *fh) / 2;
+}
+
+/* A GPU back end's swap chain goes on a child window that the frame window
+ * keeps at the image's aspect ratio, centred on black. The swap chain's own
+ * DXGI_SCALING_STRETCH then scales evenly: a window dragged to any shape
+ * shows the picture bigger or smaller, never squashed. (Aspect-keeping
+ * scaling is not available to swap chains on an HWND.) The child is
+ * disabled, so clicks and keys stay with the frame window. */
+#define FB_WM_MAKE_GPU_VIEW (WM_APP + 1)
+static HWND s_gpu_view;
+static int  s_aspect_w = 4, s_aspect_h = 3;
+
+static void fb_layout_gpu_view(HWND parent)
+{
+    RECT c;
+    int x, y, w, h;
+    if (!s_gpu_view || !GetClientRect(parent, &c))
+        return;
+    if (c.right <= 0 || c.bottom <= 0)                 /* minimised */
+        return;
+    xbox_FitAspect(c.right, c.bottom, s_aspect_w, s_aspect_h, &x, &y, &w, &h);
+    MoveWindow(s_gpu_view, x, y, w, h, TRUE);
+}
+
+void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h)
+{
+    HWND parent = s_fb_running ? s_hwnd : NULL;
+    if (!parent)
+        return NULL;
+    if (!s_gpu_view)   /* made on the window's own thread, which owns it */
+        SendMessageA(parent, FB_WM_MAKE_GPU_VIEW, (WPARAM)w, (LPARAM)h);
+    return (void *)s_gpu_view;
+}
+
 void xbox_FramebufferWindowGpuOwned(int on)
 {
     InterlockedExchange(&s_gpu_owned, on ? 1 : 0);
@@ -170,6 +221,31 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
+        return 0;
+
+    case FB_WM_MAKE_GPU_VIEW:
+        if (!s_gpu_view) {
+            WNDCLASSA wc;
+            memset(&wc, 0, sizeof(wc));
+            wc.lpfnWndProc   = DefWindowProcA;
+            wc.hInstance     = GetModuleHandleA(NULL);
+            wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+            wc.lpszClassName = "XboxRecompGpuView";
+            RegisterClassA(&wc);
+            if (w && l) {
+                s_aspect_w = (int)w;
+                s_aspect_h = (int)l;
+            }
+            s_gpu_view = CreateWindowExA(0, "XboxRecompGpuView", "",
+                                         WS_CHILD | WS_VISIBLE | WS_DISABLED,
+                                         0, 0, 1, 1, h, NULL,
+                                         GetModuleHandleA(NULL), NULL);
+            fb_layout_gpu_view(h);
+        }
+        return 0;
+
+    case WM_SIZE:
+        fb_layout_gpu_view(h);
         return 0;
 
     case WM_KEYDOWN:
@@ -295,6 +371,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpfnWndProc   = fb_wndproc;
         wc.hInstance     = GetModuleHandleA(NULL);
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);  /* the bars */
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
@@ -427,5 +504,8 @@ int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void *xbox_FramebufferWindowHandle(void) { return NULL; }
+void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h) { (void)w; (void)h; return NULL; }
 void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
+void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
+{ (void)w; (void)h; *x = *y = 0; *fw = cw; *fh = ch; }
 #endif
