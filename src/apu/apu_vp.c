@@ -1537,6 +1537,21 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         int16_t isamp[NUM_SAMPLES_PER_FRAME * 2];
+        /* Headroom. The monitor mix plays every voice on both channels at
+         * its loudest bin gain, so a title's four-channel movie (Conker's
+         * opening FMV: four voices at -6 dB) sums to peaks of 0.8-0.98 of
+         * full scale, and the user heard it as fuzzy. RECOMP_APU_GAIN_DB
+         * sets the output gain (default -6). */
+        static float gain = -1.0f;
+        if (gain < 0.0f) {
+            const char *e = getenv("RECOMP_APU_GAIN_DB");
+            gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -6.0f) / 20.0f);
+            fprintf(stderr, "[APU] monitor mix output gain %.2f\n", gain);
+        }
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            d->vp.sample_buf[i][0] *= gain;
+            d->vp.sample_buf[i][1] *= gain;
+        }
         src_float_to_short_array((float *)d->vp.sample_buf, isamp,
                                  NUM_SAMPLES_PER_FRAME * 2);
         int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
