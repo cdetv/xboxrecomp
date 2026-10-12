@@ -49,6 +49,7 @@
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowStart(void);
 extern void *xbox_FramebufferWindowHandle(void);
+extern void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h);
 extern void xbox_FramebufferWindowGpuOwned(int on);
 
 /* The swap chain is the window's client area, which fb_present.c makes
@@ -204,7 +205,7 @@ static int ensure_swap_chain(void)
 {
     DXGI_SWAP_CHAIN_DESC1 d;
     ID3D11Texture2D *back = NULL;
-    HWND hwnd;
+    HWND hwnd, view;
     HRESULT hr;
 
     if (s_swap)
@@ -214,6 +215,11 @@ static int ensure_swap_chain(void)
     hwnd = (HWND)xbox_FramebufferWindowHandle();
     if (!hwnd)
         return 0;
+    /* The swap chain goes on the window's aspect-keeping child view, so a
+     * resized window scales the picture without stretching it. */
+    view = (HWND)xbox_FramebufferWindowGpuView(SC_W, SC_H);
+    if (!view)
+        view = hwnd;
 
     memset(&d, 0, sizeof d);
     d.Width = SC_W;
@@ -225,7 +231,7 @@ static int ensure_swap_chain(void)
     d.Scaling = DXGI_SCALING_STRETCH;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = IDXGIFactory2_CreateSwapChainForHwnd(s_factory, (IUnknown *)s_dev,
-                                              hwnd, &d, NULL, NULL, &s_swap);
+                                              view, &d, NULL, NULL, &s_swap);
     if (FAILED(hr)) {
         fail("CreateSwapChainForHwnd", hr);
         s_swap_failed = 1;
