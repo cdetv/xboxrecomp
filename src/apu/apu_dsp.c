@@ -105,11 +105,12 @@ static void dsp_ack_init(void)
  * there is lost.
  *
  *   RECOMP_APU_MIXDOWN=speakers (default) | evenodd (the old sum) | front
- *   (bins 0/1 only; RECOMP_APU_MIXDOWN_ALL=0 also selects it)
+ *   (bins 0/1 only; RECOMP_APU_MIXDOWN_ALL=0 also selects it) | xemu (no
+ *   mixdown: xemu's VP monitor mix, each voice at its loudest bin gain)
  *   RECOMP_APU_MIX_LFE=<gain>, RECOMP_APU_MIX_I3DL2=<gain>: feed those bins
  *   to both sides at that gain (default 0). */
 static float s_mix_l[NUM_MIXBINS], s_mix_r[NUM_MIXBINS];
-static int s_mix_ready;
+static int s_mix_ready, s_mix_xemu;
 
 static float env_gain(const char *name, float def)
 {
@@ -130,6 +131,10 @@ static void mixdown_init(void)
         name = "front";
         s_mix_l[0] = 1.0f;
         s_mix_r[1] = 1.0f;
+    } else if (mode && !strcmp(mode, "xemu")) {
+        /* The VP monitor mix (apu_vp.c) is the output; this table is unused. */
+        name = "xemu (VP monitor mix, as xemu with use_dsp off)";
+        s_mix_xemu = 1;
     } else if (mode && !strcmp(mode, "evenodd")) {
         name = "evenodd";
         for (int b = 0; b < NUM_MIXBINS; b++) {
@@ -291,8 +296,13 @@ void mcpx_apu_gp_ep_write(MCPXAPUState *d, hwaddr addr, uint32_t val)
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     /* In the real xemu, this reads settings to decide whether
-     * GP/EP should run in realtime or cached mode. We ignore it. */
-    (void)d;
+     * GP/EP should run in realtime or cached mode; with use_dsp off (its
+     * default) it selects the VP monitor mix. RECOMP_APU_MIXDOWN=xemu does
+     * the same here, to hear and measure what xemu players hear. */
+    if (!s_mix_ready)
+        mixdown_init();
+    if (s_mix_xemu)
+        d->monitor.point = MCPX_APU_DEBUG_MON_VP;
 }
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
