@@ -29,6 +29,15 @@ side, centre to both at -3 dB, backs at -3 dB, FXSEND centred at -3 dB, LFE
 and I3DL2 not fed dry (`RECOMP_APU_MIX_LFE` / `RECOMP_APU_MIX_I3DL2` set a
 gain). `RECOMP_APU_MIXDOWN=evenodd` brings the old sum back.
 
+## Then: the default became xemu's monitor mix
+
+Measured against a recording of xemu (Conker field and Birdy scenes), the
+speaker table put 3D voices 4-6 dB too loud at their peaks. The default is
+now `RECOMP_APU_MIXDOWN=xemu`, xemu's no-DSP monitor mix in `apu_vp.c`, which
+matched within 0.5 dB. The table above is still selectable
+(`RECOMP_APU_MIXDOWN=speakers`) and is what these tests exercise: the
+speakers arm sets it explicitly.
+
 ## Running
 
     cmake -S tests/apu_mixdown -B build/apu-mixdown

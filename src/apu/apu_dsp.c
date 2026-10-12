@@ -104,12 +104,21 @@ static void dsp_ack_init(void)
  * sends of unknown purpose: centred at -3 dB so nothing a title routes
  * there is lost.
  *
- *   RECOMP_APU_MIXDOWN=speakers (default) | evenodd (the old sum) | front
- *   (bins 0/1 only; RECOMP_APU_MIXDOWN_ALL=0 also selects it)
+ *   RECOMP_APU_MIXDOWN=xemu (default) | speakers (this table) | evenodd (the
+ *   old sum) | front (bins 0/1 only; RECOMP_APU_MIXDOWN_ALL=0 also selects it)
+ *
+ * xemu is the default because it is what players compare against: xemu with
+ * use_dsp off (its default) plays the VP monitor mix -- each voice at its
+ * loudest bin gain on both channels, raw HRTF on 3D voices. Measured on
+ * Conker's field and Birdy scenes against a recording of xemu: within 0.5 dB
+ * on median, p90, p99 and peak. The speaker table put 3D voices at full level
+ * in the near ear: Birdy's creaks 4-6 dB louder than xemu, ambient loops
+ * 1.5-3 dB, while xemu's music (four channel voices summed) is louder than
+ * this table makes it. The table stays for a real-DSP-like stereo image.
  *   RECOMP_APU_MIX_LFE=<gain>, RECOMP_APU_MIX_I3DL2=<gain>: feed those bins
  *   to both sides at that gain (default 0). */
 static float s_mix_l[NUM_MIXBINS], s_mix_r[NUM_MIXBINS];
-static int s_mix_ready;
+static int s_mix_ready, s_mix_xemu;
 
 static float env_gain(const char *name, float def)
 {
@@ -130,6 +139,10 @@ static void mixdown_init(void)
         name = "front";
         s_mix_l[0] = 1.0f;
         s_mix_r[1] = 1.0f;
+    } else if (!mode || !*mode || !strcmp(mode, "xemu")) {
+        /* The VP monitor mix (apu_vp.c) is the output; this table is unused. */
+        name = "xemu (VP monitor mix, as xemu with use_dsp off)";
+        s_mix_xemu = 1;
     } else if (mode && !strcmp(mode, "evenodd")) {
         name = "evenodd";
         for (int b = 0; b < NUM_MIXBINS; b++) {
@@ -291,8 +304,13 @@ void mcpx_apu_gp_ep_write(MCPXAPUState *d, hwaddr addr, uint32_t val)
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
 {
     /* In the real xemu, this reads settings to decide whether
-     * GP/EP should run in realtime or cached mode. We ignore it. */
-    (void)d;
+     * GP/EP should run in realtime or cached mode; with use_dsp off (its
+     * default) it selects the VP monitor mix. RECOMP_APU_MIXDOWN=xemu does
+     * the same here, to hear and measure what xemu players hear. */
+    if (!s_mix_ready)
+        mixdown_init();
+    if (s_mix_xemu)
+        d->monitor.point = MCPX_APU_DEBUG_MON_VP;
 }
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,

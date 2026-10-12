@@ -1210,6 +1210,25 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* xemu's peek_ahead_multipass_bin: from v along the list, the bin of the
+ * first multipass voice after it (-1 if v is multipass itself or none). */
+static int peek_ahead_multipass_bin(MCPXAPUState *d, uint16_t v)
+{
+    uint16_t h = v;
+    for (int n = 0; h != 0xFFFF && n < MCPX_HW_MAX_VOICES; n++) {
+        if (voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT,
+                           NV_PAVS_VOICE_CFG_FMT_MULTIPASS)) {
+            if (h == v)
+                return -1;
+            return (int)voice_get_mask(d, h, NV_PAVS_VOICE_CFG_FMT,
+                                       NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
+        }
+        h = (uint16_t)voice_get_mask(d, h, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                     NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+    }
+    return -1;
+}
+
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
                           float sample_buf[NUM_SAMPLES_PER_FRAME][2],
@@ -1405,6 +1424,8 @@ static void voice_process(MCPXAPUState *d,
                 for (int k = 0; k < HRTF_NUM_TAPS; k++)
                     e += hf->ch[ch].hrir_coeff_cur[k] * hf->ch[ch].hrir_coeff_cur[k];
             float norm = e > 1e-6f ? fminf(sqrtf(2.0f / e), 8.0f) : 1.0f;
+            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP)
+                norm = 1.0f;          /* xemu's monitor mix: raw HRTF */
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 samples[i][0] *= norm;
                 samples[i][1] *= norm;
@@ -1439,10 +1460,18 @@ static void voice_process(MCPXAPUState *d,
     if (g_apu_prof_on)
         prof_voice_route(v, bin, bin_gain, samples, channels);
 
-    /* VP monitor mix */
+    /* VP monitor mix: what xemu plays with audio.use_dsp off (its default),
+     * RECOMP_APU_MIXDOWN=xemu. Each voice at its loudest bin gain on both
+     * channels; a voice in the MP list skips the bin the next multipass voice
+     * reads, as xemu does, so a submix is not heard twice. */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         float g = 0.0f;
+        int mp_bin = -1;
+        if (voice_list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_MP_TOP - 1)
+            mp_bin = peek_ahead_multipass_bin(d, v);
         for (int b = 0; b < 8; b++) {
+            if (bin[b] == mp_bin)
+                continue;
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
             float bg = attenuate(vol[b]) / hr;
             if (bg > g) g = bg;
@@ -1453,8 +1482,6 @@ static void voice_process(MCPXAPUState *d,
             sample_buf[i][1] += g * samples[i][1];
         }
     }
-
-    (void)voice_list;
 }
 
 /* ============================================================

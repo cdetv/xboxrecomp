@@ -14,7 +14,7 @@ enable_testing()
 # defect the speakers table replaces, or the speakers arm proves nothing.
 add_test(NAME apu_mixdown_speakers COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_speakers PROPERTIES
-                     ENVIRONMENT "APU_MIXDOWN_ARM=speakers")
+                     ENVIRONMENT "RECOMP_APU_MIXDOWN=speakers;APU_MIXDOWN_ARM=speakers")
 add_test(NAME apu_mixdown_evenodd COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_evenodd PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MIXDOWN=evenodd;APU_MIXDOWN_ARM=evenodd")
