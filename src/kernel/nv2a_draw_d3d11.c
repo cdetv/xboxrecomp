@@ -2064,6 +2064,20 @@ static void d3d_draw(void)
                     t->offset, t->color, t->width, t->height, t->pitch, u0,
                     u1, v0, v1, verts[0].tex[st][3], t->addr_u, t->addr_v,
                     t->filter, 10);
+            if (combiners && (m == 6 || m == 7)) {
+                /* Bump-env takes the coordinates as they are, with no
+                 * divide by q: its q range says whether that matters. */
+                float q0 = 1e30f, q1 = -1e30f;
+                for (i = 0; i < n; i++) {
+                    if (verts[i].tex[st][3] < q0) q0 = verts[i].tex[st][3];
+                    if (verts[i].tex[st][3] > q1) q1 = verts[i].tex[st][3];
+                }
+                fprintf(stderr, "[FTRACE]     t%d bump mat %g %g %g %g scale %g"
+                        " offset %g from t%u | q %.2f..%.2f%c", st,
+                        t->bump_mat[0], t->bump_mat[1], t->bump_mat[2],
+                        t->bump_mat[3], t->bump_scale, t->bump_offset,
+                        pb_rc_input_stage(st), q0, q1, 10);
+            }
         }
         if (program) {
             /* What the program was fed: each attribute with an array (format
@@ -2101,6 +2115,38 @@ static void d3d_draw(void)
                     memcpy(prev[r], nv2a_vsh_constant(r), sizeof prev[r]);
             have_prev = 1;
             fprintf(stderr, "[FTRACE]     %u constants changed%c", changed, 10);
+        }
+        if (program && n) {
+            /* The colour outputs' alpha over the whole batch: a layer that
+             * takes its strength from oD0.a (Conker's water glints, added
+             * with SRC_ALPHA/ONE) draws nothing if the program never lifts
+             * it off zero, and verts[0] alone cannot say that. */
+            float a0 = 1e30f, a1 = -1e30f, b0 = 1e30f, b1 = -1e30f;
+            uint32_t top = 0, want, ts;
+            const char *e;
+            for (i = 0; i < n; i++) {
+                if (verts[i].d0[3] < a0) a0 = verts[i].d0[3];
+                if (verts[i].d0[3] > a1) { a1 = verts[i].d0[3]; top = i; }
+                if (verts[i].d1[3] < b0) b0 = verts[i].d1[3];
+                if (verts[i].d1[3] > b1) b1 = verts[i].d1[3];
+            }
+            fprintf(stderr, "[FTRACE]     d0.a %.3f..%.3f (top vertex %u)"
+                    " d1.a %.3f..%.3f%c", a0, a1, top, b0, b1, 10);
+            /* RECOMP_FRAME_TRACE_VSTEP=<texture address>: a traced program
+             * batch that binds that texture on any stage runs its top-alpha
+             * vertex through the program again, instruction by instruction
+             * ([VSTEP]), on GPU runs where the pixel probe cannot reach. */
+            e = getenv("RECOMP_FRAME_TRACE_VSTEP");
+            want = e ? (uint32_t)strtoul(e, NULL, 16) : 0;
+            for (ts = 0; want && ts < 4; ts++)
+                if ((bound & (1u << ts)) && g_pb.texs[ts].offset == want) {
+                    float in[NV2A_VSH_INPUTS][4];
+                    uint32_t at;
+                    for (at = 0; at < NV2A_VSH_INPUTS; at++)
+                        pb_fetch_attr(&g_pb.attr[at], g_pb.idx[top], in[at]);
+                    nv2a_vsh_trace((const float (*)[4])in);
+                    break;
+                }
         }
     }
     if (!nidx)
