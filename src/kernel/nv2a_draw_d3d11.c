@@ -2065,6 +2065,43 @@ static void d3d_draw(void)
                     u1, v0, v1, verts[0].tex[st][3], t->addr_u, t->addr_v,
                     t->filter, 10);
         }
+        if (program) {
+            /* What the program was fed: each attribute with an array (format
+             * and its value at the first vertex), then every constant that
+             * changed since the last traced program batch (all non-zero ones
+             * at the first). A skinned model's bone palette shows up as the
+             * block of constants uploaded before its batches; whether those
+             * matrices differ from one another, and from frame to frame, tells
+             * a model the title never posed from one we pose wrongly. */
+            static float prev[NV2A_VSH_CONSTANTS][4];
+            static int have_prev;
+            uint32_t at, r, changed = 0;
+            float d[4];
+            for (at = 0; at < NV_VERTEX_ATTRS; at++) {
+                const VertexAttr *va = &g_pb.attr[at];
+                if (!va->size || !va->stride)
+                    continue;
+                pb_fetch_attr(va, g_pb.idx[0], d);
+                fprintf(stderr, "[FTRACE]     attr %u type %u size %u stride %u"
+                        " @%08X: v0 %g %g %g %g%c", at, va->type, va->size,
+                        va->stride, va->offset, d[0], d[1], d[2], d[3], 10);
+            }
+            for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+                const float *c = nv2a_vsh_constant(r);
+                if (have_prev ? !memcmp(c, prev[r], sizeof prev[r])
+                              : !(c[0] || c[1] || c[2] || c[3]))
+                    continue;
+                changed++;
+                fprintf(stderr, "[FTRACE]     c[%u] %g %g %g %g%c", r, c[0],
+                        c[1], c[2], c[3], 10);
+                memcpy(prev[r], c, sizeof prev[r]);
+            }
+            if (!have_prev)
+                for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+                    memcpy(prev[r], nv2a_vsh_constant(r), sizeof prev[r]);
+            have_prev = 1;
+            fprintf(stderr, "[FTRACE]     %u constants changed%c", changed, 10);
+        }
     }
     if (!nidx)
         return;
