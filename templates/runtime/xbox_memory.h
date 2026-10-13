@@ -105,8 +105,9 @@ extern "C" {
 
 /** Base VA for fake kernel data exports.
  *  Games read hardware info, kernel version, etc. from kernel data
- *  exports. Allocate a page in unused VA space for these. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000    /* CUSTOMIZE */
+ *  exports. Below 0x00010000, where no XBE image can be: a spot inside the
+ *  image (the old 0x00740000) silently overwrites a large title's .data. */
+#define XBOX_KERNEL_DATA_BASE   0x00008000
 #define XBOX_KERNEL_DATA_SIZE   4096
 
 /* Offsets within the kernel data area (standard layout) */

@@ -236,8 +236,16 @@ void xbox_WatchInit(void);
 
 /** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
  *  These are kernel exports that are DATA, not functions. The game reads
- *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
+ *  their thunk entries and dereferences them to access the data.
+ *
+ *  Below XBOX_BASE_ADDRESS, where no XBE image can be, and clear of the null
+ *  guard and the main TIB at 0x4000. It used to be 0x00740000, free in the
+ *  small images the toolkit started with but inside Conker's initialised
+ *  .data: init overwrote 18 of its character definitions (the Grim Reaper's
+ *  animation list among them, so he stood unposed) and KeTickCount kept
+ *  rewriting another one while the game ran. kernel_data_init() warns if the
+ *  area ever overlaps a loaded image again. */
+#define XBOX_KERNEL_DATA_BASE   0x00008000
 #define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
 
 /* Offsets within the kernel data area */

@@ -363,6 +363,16 @@ static void kernel_data_init(void)
 
     fprintf(stderr, "  Kernel data exports: initialized at Xbox VA 0x%08X\n",
             XBOX_KERNEL_DATA_BASE);
+    /* Nothing faults when this lands on the title's own globals -- the pages
+     * are mapped -- so say it out loud: the values just change behind the
+     * game's back, which is how it went unnoticed inside Conker's .data. */
+    if (g_xbox_image_hi &&
+        XBOX_KERNEL_DATA_BASE < g_xbox_image_hi &&
+        XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE > g_xbox_image_lo)
+        fprintf(stderr, "  WARNING: kernel data area 0x%08X..0x%08X overlaps the "
+                "XBE image 0x%08X..0x%08X; the title's data there is overwritten\n",
+                XBOX_KERNEL_DATA_BASE, XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE,
+                g_xbox_image_lo, g_xbox_image_hi);
 }
 
 /* ── Per-slot ordinal and bridge function ────────────────── */
