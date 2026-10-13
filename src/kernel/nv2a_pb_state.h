@@ -184,6 +184,11 @@ typedef struct Nv2aPbState {
      * fixed-function size formula, not used yet. */
     uint32_t point_params_enable, point_sprite, point_size;
     float    point_params[8];
+    /* Face culling, as the methods give it: SET_CULL_FACE_ENABLE,
+     * SET_CULL_FACE (GL FRONT 0x404 / BACK 0x405 / FRONT_AND_BACK 0x408)
+     * and SET_FRONT_FACE (GL CW 0x900 / CCW 0x901; 0 = never sent, which
+     * pb_cull_tri reads as GL's default CCW). */
+    uint32_t cull_enable, cull_face, front_face;
 } Nv2aPbState;
 extern Nv2aPbState g_pb;
 
@@ -270,6 +275,11 @@ int pb_rc_input_stage(int st);
  * (0,0) there to (1,1). 0 when the point is not drawn: not finite, behind
  * the eye or in front of the near plane. */
 int pb_point_quad(const Nv2aVshOutput *p, Nv2aVshOutput q[4]);
+/* pb_cull_tri: 1 when face culling drops triangle a b c (screen space, as
+ * pb_transform_batch gives it, corners in the order the primitive winds
+ * them: a strip's odd triangles with their first two swapped). */
+int pb_cull_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                const Nv2aVshOutput *c);
 
 /* nv2a_draw_sw.c: the frame dump the last software present wrote, or NULL
  * when it wrote none. RECOMP_GPU=both dumps the GPU's copy of the same

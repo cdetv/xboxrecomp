@@ -106,7 +106,7 @@ static struct {
     uint32_t shadow_dumps, shadow_no_surface;
     /* Batches: drawn, and the reasons the rest were not. */
     uint32_t drawn, tris, skip_program, skip_not_screen, skip_surface;
-    uint32_t verts_need_clip, tris_clipped, tris_behind, combined;
+    uint32_t verts_need_clip, tris_clipped, tris_behind, combined, tris_culled;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
@@ -717,7 +717,8 @@ static int draw_setup(void)
         }
     }
     if (SUCCEEDED(hr)) {
-        /* No culling: the software path fills both windings. */
+        /* No culling here: build_triangles drops culled faces on the CPU
+         * (pb_cull_tri), as the software path does. */
         memset(&rd, 0, sizeof rd);
         rd.FillMode = D3D11_FILL_SOLID;
         rd.CullMode = D3D11_CULL_NONE;
@@ -1736,9 +1737,15 @@ static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
     uint32_t i, out = 0;
 
     s_cv_n = 0;
-#define TRI(a, b, c) do {                                               \
+    /* A strip's odd triangles wind the other way: culling tests them with
+     * the first two corners swapped (the emitted order stays as it was). */
+#define TRI(a, b, c) TRI_W(a, b, c, 0)
+#define TRI_W(a, b, c, odd) do {                                        \
         uint8_t ka = s_bv_ok[a], kb = s_bv_ok[b], kc = s_bv_ok[c];      \
-        if (ka == BV_OK && kb == BV_OK && kc == BV_OK) {                \
+        if (ka && kb && kc && ((odd) ? pb_cull_tri(&v[b], &v[a], &v[c]) \
+                                     : pb_cull_tri(&v[a], &v[b], &v[c]))) \
+            s_stat.tris_culled++;                                       \
+        else if (ka == BV_OK && kb == BV_OK && kc == BV_OK) {           \
             s_ib[out++] = (a); s_ib[out++] = (b); s_ib[out++] = (c);    \
         } else if (ka && kb && kc) {                                    \
             out += clip_triangle(v, n, (a), (b), (c), &s_ib[out]);      \
@@ -1749,7 +1756,7 @@ static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
         for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2);
+        for (i = 0; i + 2 < n; i++) TRI_W(i, i + 1, i + 2, i & 1);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -1792,6 +1799,7 @@ static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
         break;                          /* lines: not yet */
     }
 #undef TRI
+#undef TRI_W
     return out;
 }
 
@@ -2011,6 +2019,9 @@ static void d3d_draw(void)
                 g_pb.stencil_op_zpass, g_pb.alpha_func, g_pb.alpha_ref & 0xFF,
                 g_pb.depth_mask, g_pb.depth_func, verts[0].d0[0],
                 verts[0].d0[1], verts[0].d0[2], verts[0].d0[3], 10);
+        if (g_pb.cull_enable)
+            fprintf(stderr, "[FTRACE]     cull face %X front %X%c",
+                    g_pb.cull_face, g_pb.front_face, 10);
         if (g_pb.prim == NV_PRIM_POINTS) {
             float p0 = 1e30f, p1 = -1e30f;
             for (i = 0; i < n; i++) {
@@ -2466,11 +2477,13 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: %u batches: %u drawn (%u textured, %u"
             " through the combiners, %u triangles); not drawn: %u program"
             " did not run, %u not screen-space, %u no surface; %u vertices"
-            " needing a near clip: %u triangles clipped, %u wholly behind%c",
+            " needing a near clip: %u triangles clipped, %u wholly behind; %u"
+            " triangles culled%c",
             s_stat.batches, s_stat.drawn, s_stat.textured, s_stat.combined,
             s_stat.tris, s_stat.skip_program,
             s_stat.skip_not_screen, s_stat.skip_surface,
             s_stat.verts_need_clip, s_stat.tris_clipped, s_stat.tris_behind,
+            s_stat.tris_culled,
             10);
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads, %u binds"
             " unchanged, %u binds of a format the sampler cannot read%c",
