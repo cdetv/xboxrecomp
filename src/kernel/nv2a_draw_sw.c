@@ -2859,6 +2859,33 @@ static void fixed_vertex(uint32_t index, Nv2aVshOutput *out)
     }
 }
 
+/* Face culling. The winding is the one on screen (y down: positive area is
+ * clockwise), taken before near-plane clipping: a corner behind the eye
+ * projects mirrored, and the sign of w0*w1*w2 undoes that, so a triangle
+ * crossing the near plane gets the winding its visible part has (the sign
+ * of the homogeneous determinant). Conker culls with SET_CULL_FACE FRONT on
+ * most batches; drawing both sides put a sky card that faces away from the
+ * camera over the Cock and Plucker's door in the intro street. */
+int pb_cull_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+                const Nv2aVshOutput *c)
+{
+    float area, w;
+    int cw, front;
+
+    if (!g_pb.cull_enable)
+        return 0;
+    if (g_pb.cull_face == 0x408)                  /* FRONT_AND_BACK */
+        return 1;
+    area = (b->pos[0] - a->pos[0]) * (c->pos[1] - a->pos[1])
+         - (b->pos[1] - a->pos[1]) * (c->pos[0] - a->pos[0]);
+    w = a->pos[3] * b->pos[3] * c->pos[3];
+    if (!(area == area) || area == 0.0f || !(w == w) || w == 0.0f)
+        return 0;                    /* degenerate or NaN: left to the rasteriser */
+    cw = (area > 0.0f) == (w > 0.0f);
+    front = g_pb.front_face == 0x900 ? cw : !cw;
+    return g_pb.cull_face == 0x404 ? front : !front;
+}
+
 /* Points as the square sprites the NV2A draws, a port of what xemu has GL do
  * (pgraph/glsl/vsh.c, psh.c). Size: the program's oPts.x while point params
  * are on, else SET_POINT_SIZE in 1/8 pixels (0 = 1 pixel). A point is drawn
@@ -2916,31 +2943,35 @@ static void raster_xf_prims(uint32_t n)
             raster_xf_triangle(&q[0], &q[2], &q[3]);
         }
         break;
+    /* TRI: one triangle unless culling drops it; a strip's odd triangles
+     * wind the other way, so they are tested with two corners swapped. */
+#define TRI(a, b, c, odd) do {                                                  if (!((odd) ? pb_cull_tri(&s_xf[b], &s_xf[a], &s_xf[c])                             : pb_cull_tri(&s_xf[a], &s_xf[b], &s_xf[c])))                   raster_xf_clipped(&s_xf[a], &s_xf[b], &s_xf[c]);                } while (0)
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            TRI(i, i + 1, i + 2, 0);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
         for (i = 0; i + 2 < n; i++)
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+            TRI(i, i + 1, i + 2, i & 1);
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < n; i++)
-            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
+            TRI(0, i, i + 1, 0);
         break;
     case NV_PRIM_QUADS:
         for (i = 0; i + 3 < n; i += 4) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
+            TRI(i, i + 1, i + 2, 0);
+            TRI(i, i + 2, i + 3, 0);
         }
         break;
     case NV_PRIM_QUAD_STRIP:
         for (i = 0; i + 3 < n; i += 2) {
-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
-            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
+            TRI(i, i + 1, i + 3, 0);
+            TRI(i, i + 3, i + 2, 0);
         }
         break;
+#undef TRI
     default:
         break;
     }

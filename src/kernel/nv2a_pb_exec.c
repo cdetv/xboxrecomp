@@ -1085,6 +1085,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0358:                                  /* SET_COLOR_MASK */
         g_pb.color_mask = param;
         break;
+    case 0x0308: g_pb.cull_enable = param; break; /* SET_CULL_FACE_ENABLE */
+    case 0x039C: g_pb.cull_face = param; break;   /* SET_CULL_FACE */
+    case 0x03A0:                                  /* SET_FRONT_FACE */
+        if (param != g_pb.front_face)
+            fprintf(stderr, "[GPU] front face %X (was %X)\n", param,
+                    g_pb.front_face);
+        g_pb.front_face = param;
+        break;
 
     /* Register combiners. */
     case 0x0288: g_pb.rc.final0 = param; break;  /* SPECULAR_FOG_CW0 */
