@@ -187,6 +187,9 @@ int pb_surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_SET_TEXTURE_BORDER_COLOR    0x1B24
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_MAT    0x1B28   /* 00 01 10 11 */
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_SCALE  0x1B38
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_OFFSET 0x1B3C
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
  * the CRTC reads and which it draws into, advancing the write index and
  * then stalling until the flip has happened. Ignoring these means the
@@ -736,13 +739,22 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
         break;
-    case 0x1B38: case 0x1B3C: case 0x1B40: case 0x1B44:  /* BUMP_ENV_MAT */
-        memcpy(&t->bump_mat[(reg - 0x1B38) / 4], &param, 4);
+    /* The matrix is four floats at +0x28, then scale and offset at +0x38 and
+     * +0x3C, the last two words of the stage's 0x40-byte block. Read 0x10
+     * higher, as they once were, the matrix took scale and offset and the
+     * rest never matched: Conker's water got a zero matrix (it sends 0.1 on
+     * the diagonal) and its ripples moved nothing. */
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 4:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 8:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 12:
+        memcpy(&t->bump_mat[(reg - NV097_SET_TEXTURE_SET_BUMP_ENV_MAT) / 4],
+               &param, 4);
         break;
-    case 0x1B48:                                  /* SET_BUMP_ENV_SCALE */
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_SCALE:
         memcpy(&t->bump_scale, &param, 4);
         break;
-    case 0x1B4C:                                  /* SET_BUMP_ENV_OFFSET */
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_OFFSET:
         memcpy(&t->bump_offset, &param, 4);
         break;
     default:
