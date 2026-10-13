@@ -10,7 +10,9 @@
  * checks that the main thread's fake KPCR/TLS structures (fs:[0x20], fs:[0x28]
  * and the area at [fs:[0x28]+0x28]) come from the heap. They used to sit at
  * fixed addresses around 0x00700000-0x00770000, inside the .data of a large
- * title, which then overwrote them with its own globals.
+ * title, which then overwrote them with its own globals. And that the kernel
+ * data export area lies below 0x00010000, out of every image (0b): at
+ * 0x00740000 it overwrote the title's globals instead.
  *
  *   default       No switch set. Pins what every title gets today, so a change
  *                 that alters the default shows up here.
@@ -243,6 +245,26 @@ int main(int argc, char **argv)
             printf("ordinal %u did not resolve to a bridge entry point\n", ORD[i]);
             return 2;
         }
+    }
+
+    /* 0b. The kernel data area (XboxKrnlVersion, KeTickCount, the keys...)
+     * sits below every possible image, clear of the main TIB, and the bridge
+     * filled it there. At 0x00740000 it was inside Conker's initialised .data
+     * and overwrote character definitions; nothing faulted. Every mode. */
+    {
+        const uint32_t lo = XBOX_KERNEL_DATA_BASE;
+        const uint32_t hi = XBOX_KERNEL_DATA_BASE + XBOX_KERNEL_DATA_SIZE;
+
+        snprintf(d, sizeof d, "area 0x%08X..0x%08X", lo, hi);
+        check(hi <= XBOX_BASE_ADDRESS && lo >= XBOX_TIB_MAIN + 0x1000,
+              "kernel data area is below every image and clear of the TIB", d);
+        snprintf(d, sizeof d, "image 0x%08X..0x%08X", g_xbox_image_lo, g_xbox_image_hi);
+        check(hi <= g_xbox_image_lo || lo >= g_xbox_image_hi,
+              "kernel data area does not overlap the loaded image", d);
+        snprintf(d, sizeof d, "XboxKrnlVersion build %u",
+                 *(uint16_t *)((uint8_t *)G(lo + 0x10) + 4));
+        check(*(uint16_t *)((uint8_t *)G(lo + 0x10) + 4) == 5849,
+              "the bridge filled the area at its new address", d);
     }
 
     /* 1. A small request after a large free. */

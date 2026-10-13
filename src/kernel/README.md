@@ -33,11 +33,12 @@ The Xbox has 64 MB of unified RAM. We reproduce the exact address layout using `
 ```
 Xbox VA Range          Purpose                  Size
 ─────────────────────────────────────────────────────
+0x00004000-0x0000403F  Main thread TIB          64 B
+0x00008000-0x00008FFF  Kernel data exports      4 KB  (below every image)
 0x00010000-0x00010BCC  XBE header               ~3 KB
 0x00011000-0x002BBFFF  .text (code)             2.73 MB
 0x0036B7C0-0x003B2363  .rdata (constants)       283 KB
 0x003B2360-0x0076FFFF  .data (globals + BSS)    3.8 MB
-0x00740000-0x0077FFFF  Kernel data exports      256 KB
 0x00780000-0x00F7FFFF  Stack (8 MB, grows down) 8 MB
 0x00F80000-0x03FFFFFF  Heap (bump allocator)    ~49 MB
                        (also the main thread's fake Prcb, TLS and
@@ -130,7 +131,7 @@ xbox_kernel_bridge_init();  // Write thunk entries into Xbox memory, set up kern
 Some kernel ordinals are data exports (not functions). We allocate a kernel data area:
 
 ```c
-#define XBOX_KERNEL_DATA_BASE  0x00740000
+#define XBOX_KERNEL_DATA_BASE  0x00008000   // below 0x10000: never inside an image
 
 // Offsets within the data area
 #define KDATA_HARDWARE_INFO     0x000  // XBOX_HARDWARE_INFO struct

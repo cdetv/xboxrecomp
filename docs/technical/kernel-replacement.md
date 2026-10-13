@@ -76,7 +76,7 @@ mov eax, [0x0036B800]    ; read thunk entry for KeTickCount
 mov ecx, [eax]           ; dereference to get the tick count value
 ```
 
-For data exports, the thunk entry must point to actual readable memory containing the expected structure. A "kernel data area" is allocated at 0x00740000 with the necessary structures:
+For data exports, the thunk entry must point to actual readable memory containing the expected structure. A "kernel data area" is allocated at 0x00008000 (below every XBE image, which starts at 0x00010000) with the necessary structures:
 
 ```c
 // XboxHardwareInfo at kernel data area

@@ -218,7 +218,9 @@ MEM32(thunk_slot_156) = KDATA_TICK_COUNT;
 MEM32(KDATA_TICK_COUNT) = GetTickCount();
 ```
 
-The kernel data area is a 4 KB block at `0x00740000` that holds all data exports.
+The kernel data area is a 4 KB block at `0x00008000` that holds all data exports.
+It sits below `0x00010000` so it can never overlap an XBE image; at its old
+address, `0x00740000`, it overwrote part of Conker's initialised `.data`.
 
 ## D3D8-to-D3D11 Bridge
 
