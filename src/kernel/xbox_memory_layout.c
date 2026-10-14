@@ -1228,6 +1228,21 @@ int xbox_Nv2aTakeFlipRelease(DWORD wait_ms)
     }
 }
 
+/* Do nothing for about ms milliseconds on the executor thread, keeping the
+ * handshakes going as every other wait here does: the GPU is stalled (a host
+ * overlay holding a flip, nv2a_draw_d3d11.c), not gone, and D3D's vblank DPC
+ * still spins until this thread clears the vblank's PMC_INTR_0 bit. Sleeps
+ * between passes rather than spinning, since a held flip lasts seconds. */
+void xbox_Nv2aIdle(DWORD ms)
+{
+    ULONGLONG t0 = GetTickCount64();
+    do {
+        if (s_ack_regs)
+            nv2a_handshake_pass(s_ack_regs, 1);
+        Sleep(1);
+    } while (GetTickCount64() - t0 < ms);
+}
+
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
