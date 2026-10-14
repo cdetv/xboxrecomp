@@ -1372,6 +1372,92 @@ static struct {
     ID3D11ShaderResourceView *srv;
 } s_zcopy[4];
 
+/* RECOMP_FTRACE_DUMP=<prefix>: while a frame is traced (RECOMP_FRAME_TRACE),
+ * textures and targets of interest are written as <prefix>NNNN_<what>.bmp
+ * and named in an [FTRACE] line: a zeta surface read as a texture (its
+ * alpha as grey, then its colour), and after a draw its target when that is
+ * a small one (draws within 256x256 pixels or fewer), read a zeta surface, or adds to a big
+ * one (dfactor ONE; also dumped before). For following a post-effect chain
+ * such as Conker's glare. mode 1: alpha as grey. */
+static int s_ftdump_zeta;
+
+static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
+                       uint32_t h, int mode)
+{
+    static int seq;
+    const char *pre = getenv("RECOMP_FTRACE_DUMP");
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *staging = NULL;
+    uint32_t row_bytes, pad, filesz, r, c;
+    uint8_t hdr[54], px[3], zero[3] = {0, 0, 0};
+    char path[512];
+    FILE *f;
+
+    if (g_pb_ftrace != 2 || !pre || !tex || !w || !h)
+        return;
+    ID3D11Texture2D_GetDesc(tex, &d);
+    if (w > d.Width) w = d.Width;
+    if (h > d.Height) h = d.Height;
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    if (d.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        || FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &staging)))
+        return;
+    {
+        D3D11_BOX box = {0, 0, 0, w, h, 1};
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                (ID3D11Resource *)staging, 0, 0, 0, 0,
+                (ID3D11Resource *)tex, 0, &box);
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging, 0,
+                                       D3D11_MAP_READ, 0, &m))) {
+        ID3D11Texture2D_Release(staging);
+        return;
+    }
+    snprintf(path, sizeof path, "%s%04d_%s.bmp", pre, seq++, what);
+    row_bytes = w * 3;
+    pad = (4 - (row_bytes & 3)) & 3;
+    filesz = 54 + (row_bytes + pad) * h;
+    f = fopen(path, "wb");
+    if (f) {
+        memset(hdr, 0, sizeof hdr);
+        hdr[0] = 'B'; hdr[1] = 'M';
+        memcpy(hdr + 2, &filesz, 4);
+        hdr[10] = 54;
+        hdr[14] = 40;
+        memcpy(hdr + 18, &w, 4);
+        memcpy(hdr + 22, &h, 4);
+        hdr[26] = 1;
+        hdr[28] = 24;
+        fwrite(hdr, 1, sizeof hdr, f);
+        for (r = h; r-- > 0; ) {
+            const uint8_t *row = (const uint8_t *)m.pData
+                                 + (size_t)r * m.RowPitch;
+            for (c = 0; c < w; c++) {
+                if (mode == 1)
+                    px[0] = px[1] = px[2] = row[c * 4 + 3];
+                else
+                    memcpy(px, row + c * 4, 3);
+                fwrite(px, 1, 3, f);
+            }
+            if (pad)
+                fwrite(zero, 1, pad, f);
+        }
+        fclose(f);
+        fprintf(stderr, "[FTRACE]     dumped %s (%ux%u)%c", path, w, h, 10);
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)staging, 0);
+    ID3D11Texture2D_Release(staging);
+}
+
 static ID3D11ShaderResourceView *texture_from_zeta(int st)
 {
     const Texture *t = &g_pb.texs[st];
@@ -1474,6 +1560,9 @@ static ID3D11ShaderResourceView *texture_from_zeta(int st)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 4, 2, srv);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
     s_stat.zeta_reads++;
+    ftdump_tex("zeta_alpha", s_zcopy[st].tex, tw, th, 1);
+    ftdump_tex("zeta_rgb", s_zcopy[st].tex, tw, th, 0);
+    s_ftdump_zeta = 1;
     return s_zcopy[st].srv;
 }
 
@@ -1998,6 +2087,8 @@ static void consts_combiners(GpuConsts *k)
 static void heavy_note(const Nv2aVshOutput *verts, uint32_t n, uint32_t tris);
 static void heavy_report(void);
 static void vis_note_scale(float area);
+static void vis_note_batch(const Nv2aVshOutput *v, uint32_t n, uint32_t nidx);
+static void vis_note_target(int si, int zi);
 
 /* Pixels outside the depth range. NV2A drops a pixel whose depth lies
  * outside [CLIP_MIN, CLIP_MAX] when SET_ZMIN_MAX_CONTROL says cull (bits
@@ -2225,6 +2316,7 @@ static void d3d_draw(void)
     }
 
     nidx = build_triangles(verts, n);
+    vis_note_batch(verts, n, nidx);
     if (g_pb_ftrace == 2) {
         /* What this batch draws where, from which textures: the GPU-side
          * counterpart of sw_draw's trace, for runs without the software
@@ -2464,6 +2556,7 @@ static void d3d_draw(void)
     sc.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
     blend_constant(bf);
     vis_note_scale(surf_sx(si) * surf_sy(si));
+    vis_note_target(si, zi);
 
     ct_draw0 = ct_now();
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
@@ -2488,7 +2581,30 @@ static void d3d_draw(void)
             g_pb.stencil_ref & 0xFFu);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
             zi >= 0 ? s_zeta[zi].dsv : NULL);
-    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    if (g_pb_ftrace == 2) {
+        uint32_t dw = to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
+        uint32_t dh = to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
+        int tiny = g_pb.clip_w * g_pb.clip_h <= 256u * 256u;
+        int adds = g_pb.blend_enable && g_pb.blend_dfactor == 1 && !tiny;
+        char what[64];
+        if (adds) {
+            snprintf(what, sizeof what, "%08X_before_add", g_pb.color_offset);
+            ftdump_tex(what, s_surf[si].tex, dw, dh, 0);
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
+                    zi >= 0 ? s_zeta[zi].dsv : NULL);
+        }
+        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        if (tiny || adds || s_ftdump_zeta) {
+            snprintf(what, sizeof what, "%08X%s", g_pb.color_offset,
+                     s_ftdump_zeta ? "_reads_zeta" : adds ? "_after_add" : "");
+            ftdump_tex(what, s_surf[si].tex, dw, dh, 0);
+            if (tiny)
+                ftdump_tex(strcat(what, "_alpha"), s_surf[si].tex, dw, dh, 1);
+        }
+        s_ftdump_zeta = 0;
+    } else {
+        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    }
     if (zi >= 0)
         s_stat.zeta_draws++;
     /* Unbound again, so a later batch may draw into a texture this one
@@ -2910,6 +3026,18 @@ static float s_vis_open_area = 1.0f;  /* host pixels per guest pixel in it */
 static ID3D11Query *s_vis_since[VIS_STRETCHES];
 static float s_vis_since_area[VIS_STRETCHES];
 static int s_vis_nsince, s_vis_overflow;
+/* RECOMP_VIS_LOG=1: a [VIS] line per report, with what was drawn while it
+ * counted (since the last clear): batches, triangles, the screen box and
+ * depth range of their vertices (guest pixels and depth units), the depth
+ * test, and whether a depth buffer was bound. For finding which test reads
+ * "visible" when it should not. */
+typedef struct {
+    uint32_t batches, tris, empty, zbound, nozeta, func, test, mask, cmask;
+    uint32_t sw, sh, zoff;
+    float x0, y0, x1, y1, z0, z1, w0, w1;
+} VisInfo;
+static int s_vis_log = -1;
+static VisInfo s_vis_info;
 static struct {
     uint32_t at;
     uint64_t stamp;
@@ -2918,7 +3046,57 @@ static struct {
     int nq, overflow;
     LONGLONG since;                   /* QPC when queued, to flush once */
     int flushed;
+    VisInfo info;
+    uint32_t frame;
 } s_vis_pend[VIS_PENDING];
+
+/* A batch drawn (nidx indices built) while counting; RECOMP_VIS_LOG only. */
+static void vis_note_batch(const Nv2aVshOutput *v, uint32_t n, uint32_t nidx)
+{
+    VisInfo *f = &s_vis_info;
+    uint32_t i;
+    if (s_vis_log < 0)
+        s_vis_log = getenv("RECOMP_VIS_LOG") != NULL;
+    if (!s_vis_log || !s_vis_open)
+        return;
+    if (!f->batches) {
+        f->x0 = f->y0 = f->z0 = f->w0 = 3.0e38f;
+        f->x1 = f->y1 = f->z1 = f->w1 = -3.0e38f;
+    }
+    f->batches++;
+    f->tris += nidx / 3;
+    if (!nidx)
+        f->empty++;
+    for (i = 0; i < n; i++) {
+        const float *p = v[i].pos;
+        if (p[0] < f->x0) f->x0 = p[0];
+        if (p[0] > f->x1) f->x1 = p[0];
+        if (p[1] < f->y0) f->y0 = p[1];
+        if (p[1] > f->y1) f->y1 = p[1];
+        if (p[2] < f->z0) f->z0 = p[2];
+        if (p[2] > f->z1) f->z1 = p[2];
+        if (p[3] < f->w0) f->w0 = p[3];
+        if (p[3] > f->w1) f->w1 = p[3];
+    }
+    f->func = g_pb.depth_func;
+    f->test = g_pb.depth_test;
+    f->mask = g_pb.depth_mask;
+    f->cmask = g_pb.color_mask;
+    f->zoff = g_pb.zeta_offset;
+}
+
+/* The same batch's target: surface si, depth buffer zi (-1: none). */
+static void vis_note_target(int si, int zi)
+{
+    if (!s_vis_log || !s_vis_open)
+        return;
+    if (zi >= 0)
+        s_vis_info.zbound++;
+    else if (g_pb.depth_test)
+        s_vis_info.nozeta++;
+    s_vis_info.sw = s_surf[si].w;
+    s_vis_info.sh = s_surf[si].h;
+}
 
 static void vis_begin(void)
 {
@@ -2963,6 +3141,7 @@ static void vis_clear(void)
         ID3D11Query_Release(s_vis_since[i]);
     s_vis_nsince = 0;
     s_vis_overflow = 0;
+    memset(&s_vis_info, 0, sizeof s_vis_info);
 }
 
 static void d3d_zpass(int what)
@@ -3027,6 +3206,8 @@ static void d3d_get_report(uint32_t at, uint64_t stamp)
         }
         s_vis_pend[k].since = t.QuadPart;
         s_vis_pend[k].flushed = 0;
+        s_vis_pend[k].info = s_vis_info;
+        s_vis_pend[k].frame = s_stat.presents;
         s_vis_tail++;
     }
     if (counting)
@@ -3079,6 +3260,26 @@ static void d3d_poll(void)
         count = s_vis_pend[k].overflow || sum > 0xFFFFFFFFu ? 0xFFFFFFFFu
                                                             : (uint32_t)sum;
         vis_write(s_vis_pend[k].at, s_vis_pend[k].stamp, count);
+        if (s_vis_log > 0) {
+            const VisInfo *f = &s_vis_pend[k].info;
+            if (f->batches)
+                fprintf(stderr, "[VIS] f%u slot %08X count %u (host %llu,"
+                        " %d stretches): %u batches %u tris (%u empty),"
+                        " box %.1f,%.1f..%.1f,%.1f z %.1f..%.1f w %.4g..%.4g,"
+                        " depth test %u func %X mask %u, zeta %08X %s%s,"
+                        " colour mask %08X, surface %ux%u%c",
+                        s_vis_pend[k].frame, s_vis_pend[k].at, count,
+                        (unsigned long long)sum, s_vis_pend[k].nq,
+                        f->batches, f->tris, f->empty, f->x0, f->y0, f->x1,
+                        f->y1, f->z0, f->z1, f->w0, f->w1, f->test, f->func,
+                        f->mask, f->zoff, f->zbound ? "bound" : "not bound",
+                        f->nozeta ? " (tested without one)" : "", f->cmask,
+                        f->sw, f->sh, 10);
+            else
+                fprintf(stderr, "[VIS] f%u slot %08X count %u: nothing"
+                        " drawn%c", s_vis_pend[k].frame, s_vis_pend[k].at,
+                        count, 10);
+        }
         for (i = 0; i < s_vis_pend[k].nq; i++)
             ID3D11Query_Release(s_vis_pend[k].q[i]);
         s_vis_head++;
