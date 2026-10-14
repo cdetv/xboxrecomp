@@ -956,6 +956,14 @@ int nv2a_pb_exec_semaphore(uint32_t *value)
     return 1;
 }
 
+/* Called every tick of the executor's loop (xbox_memory_layout.c), on its
+ * thread: lets a back end finish work the GPU completes later. */
+void nv2a_pb_exec_poll(void)
+{
+    if (s_be->poll)
+        s_be->poll();
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -1133,9 +1141,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x09C4: memcpy(&g_pb.fog_param[1], &param, 4); break;
     case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
         g_pb.zpass_count = 0;
+        if (s_be->zpass)
+            s_be->zpass(0);
         break;
     case 0x17CC:                                  /* SET_ZPASS_PIXEL_COUNT_ENABLE */
         g_pb.zpass_enable = param;
+        if (s_be->zpass)
+            s_be->zpass(param ? 1 : 2);
         break;
     case 0x17D0: {                                /* GET_REPORT */
         /* The GPU's answer to a visibility test: 16 bytes at the report
@@ -1148,6 +1160,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
         uint32_t at = pb_dma_resolve(param & 0x00FFFFFFu);
         uint64_t stamp = (uint64_t)g_pb.reports++ * 1000u;
+        /* A GPU back end only knows the count once the GPU has drawn the
+         * test (the d3d11 back end counted nothing: every test read "0 pixels
+         * visible" and Conker stopped drawing its characters). */
+        if (s_be->get_report) {
+            s_be->get_report(at, stamp);
+            break;
+        }
         memcpy(mem + at, &stamp, 8);
         memcpy(mem + at + 8, &g_pb.zpass_count, 4);
         memset(mem + at + 12, 0, 4);

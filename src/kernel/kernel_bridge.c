@@ -840,7 +840,9 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+    /* The range is a hard requirement: D3D's visibility report pages must
+     * sit below 8 MB (24-bit report addresses). See xbox_ContiguousAllocEx. */
+    xbox_va = xbox_ContiguousAllocEx(size, align, low, high);
 
     contig_log("allocEx", xbox_va, size, low, high, align);
     if (KERNEL_LOG_ON_HALF()) {

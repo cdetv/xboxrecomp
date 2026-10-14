@@ -30,6 +30,10 @@
  *      the console. Both were no-ops, so the old contents came back.
  *   6. MmFreeContiguousMemory gives a contiguous block back and the next
  *      request of that size reuses it; the default keeps the bump allocator.
+ *   7. MmAllocateContiguousMemoryEx's highest acceptable address is honoured
+ *      from freed memory when the arena has already passed it. It was
+ *      ignored, so D3D's visibility report pages (below 8 MB, 24-bit report
+ *      addresses) landed at 42 MB and every report hit D3D's pushbuffer.
  *
  *   ext-vma       RECOMP_EXT_VMA=1. A title that reserves a specific address
  *                 above the RAM mirrors gets it, can commit inside it and use
@@ -360,6 +364,25 @@ int main(int argc, char **argv)
         } else {
             check(c1 && c2 != c1, "default: contiguous memory is never reused", d);
         }
+    }
+
+    /* 7. A highest acceptable address below the arena's top. */
+    if (!ext) {
+        uint32_t big = xbox_ContiguousAlloc(0x100000, 4096);
+        uint32_t hi = big - XBOX_CONTIG_BASE + 0x80000u - 1u;  /* inside big */
+        uint32_t p, after;
+
+        xbox_ContiguousAlloc(0x1000, 4096);                   /* the arena moves on */
+        xbox_ContiguousFree(big);
+        p = xbox_ContiguousAllocEx(0x1000, 4096, 0, hi);
+        snprintf(d, sizeof d, "freed 0x%08X, got 0x%08X, highest physical 0x%08X",
+                 big, p, hi);
+        check(p >= big && p - XBOX_CONTIG_BASE + 0xFFFu <= hi,
+              "a highest acceptable address is honoured from freed memory", d);
+        after = xbox_ContiguousAlloc(0x1000, 4096);
+        snprintf(d, sizeof d, "got 0x%08X inside the freed 0x%08X", after, big);
+        check(reclaim || after >= big + 0x100000u,
+              "default: an unconstrained request still does not reuse it", d);
     }
 
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
