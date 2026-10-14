@@ -172,6 +172,13 @@ typedef struct Nv2aPbState {
     uint32_t xf_fmt[16];  /* attribute formats seen: type | size<<4 | slot<<8 */
     int xf_nfmt, xf_seeded;
     uint32_t depth_test, depth_func, depth_mask;
+    /* The depth range the GPU keeps (SET_CLIP_MIN/MAX, guest depth units;
+     * D3D's viewport MinZ/MaxZ times the zeta scale) and what it does with
+     * a pixel outside it (SET_ZMIN_MAX_CONTROL bits 4-7: 0 culls it, 1
+     * clamps it). clip_seen: CLIP_MAX has been sent. */
+    float    clip_min, clip_max;
+    uint32_t zminmax_control;
+    int      clip_seen;
     uint32_t zeta_offset, zstencil_clear;
     /* Stencil, as the methods give it: GL enums for the function and ops,
      * STENCIL_MASK the write mask and FUNC_MASK the read mask. */

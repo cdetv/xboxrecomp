@@ -698,7 +698,8 @@ static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
 static ID3D11InputLayout  *s_layout;
 static ID3D11Buffer       *s_cb;
-static ID3D11RasterizerState *s_rs;
+static ID3D11RasterizerState *s_rs;        /* depth clamped to 0..1 */
+static ID3D11RasterizerState *s_rs_zcull;  /* outside 0..1 dropped */
 
 /* The shader's constant buffer; see the cbuffer in nv2a_draw_d3d11_hlsl.h. */
 enum { PATH_FLAT = 0, PATH_MODULATE = 1, PATH_COMBINERS = 2 };
@@ -811,6 +812,10 @@ static int draw_setup(void)
         rd.ScissorEnable = TRUE;
         rd.DepthClipEnable = FALSE;
         hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs);
+        if (SUCCEEDED(hr)) {
+            rd.DepthClipEnable = TRUE;
+            hr = ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_zcull);
+        }
     }
     if (FAILED(hr)) {
         fail("draw pipeline", hr);
@@ -1994,6 +1999,44 @@ static void heavy_note(const Nv2aVshOutput *verts, uint32_t n, uint32_t tris);
 static void heavy_report(void);
 static void vis_note_scale(float area);
 
+/* Pixels outside the depth range. NV2A drops a pixel whose depth lies
+ * outside [CLIP_MIN, CLIP_MAX] when SET_ZMIN_MAX_CONTROL says cull (bits
+ * 4-7 = 0, as D3D sets it), or clamps it into the range (1); xemu discards
+ * the same way. Clamping everything, as this back end did, let a quad beyond
+ * the far plane pass a LESSEQUAL test against the cleared depth: Conker's
+ * light glows measure a light by two visibility tests (ALWAYS, then
+ * LESSEQUAL; visible fraction = second / first), so lights placed past the
+ * far plane read as fully visible and drew beams the console never shows
+ * (Windy beehive, the barn, the rope bridge; 2026-10-14). D3D11's depth
+ * clip drops exactly what lies outside 0..1, which is the range in use when
+ * it is the whole of the zeta format's; any other range is clamped as
+ * before and reported once. */
+static ID3D11RasterizerState *raster_state(void)
+{
+    static uint32_t seen[8][3];
+    static int nseen;
+    float full = 1.0f / zeta_scale();
+    int cull = ((g_pb.zminmax_control >> 4) & 0xF) == 0 && g_pb.clip_seen;
+    int whole = g_pb.clip_min <= 0.5f && g_pb.clip_max >= full - 0.5f;
+    uint32_t key[3], i;
+
+    key[0] = g_pb.zminmax_control;
+    memcpy(&key[1], &g_pb.clip_min, 4);
+    memcpy(&key[2], &g_pb.clip_max, 4);
+    for (i = 0; i < (uint32_t)nseen; i++)
+        if (!memcmp(seen[i], key, sizeof key))
+            break;
+    if (i == (uint32_t)nseen && nseen < 8) {
+        memcpy(seen[nseen++], key, sizeof key);
+        fprintf(stderr, "[GPU] d3d11: depth range %.1f..%.1f (format max"
+                " %.0f), ZMIN_MAX_CONTROL 0x%X: %s%c", g_pb.clip_min,
+                g_pb.clip_max, full, g_pb.zminmax_control,
+                !cull ? "clamped" : whole ? "outside culled"
+                      : "partial range, clamped (not handled)", 10);
+    }
+    return cull && whole && s_rs_zcull ? s_rs_zcull : s_rs;
+}
+
 /* Keep the executor at most PACE_SLOTS x PACE_DRAWS draws ahead of the host
  * GPU. The guest takes a batch as done once it is handed to D3D11, so a
  * title that draws without presenting (Conker's level loads: ~12,000
@@ -2436,7 +2479,7 @@ static void d3d_draw(void)
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
-    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_RSSetState(s_ctx, raster_state());
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(bpp), bf,

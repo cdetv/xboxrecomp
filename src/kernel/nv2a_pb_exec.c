@@ -1352,6 +1352,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x030C: g_pb.depth_test = param; break; /* DEPTH_TEST_ENABLE */
     case 0x0354: g_pb.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: g_pb.depth_mask = param; break; /* DEPTH_MASK */
+    case 0x0394: memcpy(&g_pb.clip_min, &param, 4); break; /* CLIP_MIN */
+    case 0x0398:                                  /* CLIP_MAX */
+        memcpy(&g_pb.clip_max, &param, 4);
+        g_pb.clip_seen = 1;
+        break;
+    case 0x1D78: g_pb.zminmax_control = param; break; /* ZMIN_MAX_CONTROL */
     case 0x0214: g_pb.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: g_pb.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
