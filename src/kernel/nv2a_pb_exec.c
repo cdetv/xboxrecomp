@@ -315,6 +315,21 @@ static void frame_trace_flip(void)
         return;
     }
     if (g_pb_ftrace == 2) {
+        /* RECOMP_FRAME_TRACE_FRAMES=N: N frames in a row (a level load's
+         * long frames come a moment after the press that starts it). */
+        static int frames = -1, left;
+        if (frames < 0) {
+            const char *n = getenv("RECOMP_FRAME_TRACE_FRAMES");
+            frames = n ? atoi(n) : 1;
+            if (frames < 1)
+                frames = 1;
+            left = frames;
+        }
+        if (--left > 0) {
+            fprintf(stderr, "[FTRACE] next frame (flip %u)\n", g_pb.flips);
+            return;
+        }
+        left = frames;
         g_pb_ftrace = 3;
         fprintf(stderr, "[FTRACE] end of frame\n");
         return;
