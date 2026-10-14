@@ -50,6 +50,9 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 Nv2aPbState g_pb;
 int g_pb_ftrace;
+/* F9 in the game window (fb_present.c): trace the next frame now, as if
+ * the RECOMP_FRAME_TRACE flag file had just appeared; again for another. */
+volatile long g_pb_ftrace_key;
 
 /* The back end every batch goes to; chosen at the first method. s_shadow,
  * when set (RECOMP_GPU=both), gets every call too, after s_be: a second back
@@ -304,6 +307,12 @@ static void frame_trace_flip(void)
         flag = getenv("RECOMP_FRAME_TRACE");
     if (!flag)
         return;
+    if (g_pb_ftrace_key && (g_pb_ftrace == 0 || g_pb_ftrace == 3)) {
+        g_pb_ftrace_key = 0;
+        g_pb_ftrace = 2;
+        fprintf(stderr, "[FTRACE] frame begins (flip %u, F9)\n", g_pb.flips);
+        return;
+    }
     if (g_pb_ftrace == 3) {
         /* Deleting the flag file re-arms the trace for the next time it
          * appears, so one run can trace several moments. */

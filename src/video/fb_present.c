@@ -385,6 +385,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 fb_set_fullscreen(h, !s_fullscreen);
             return 0;
         }
+        if (w == VK_F9) {                 /* trace this frame (nv2a_pb_exec.c) */
+            extern volatile long g_pb_ftrace_key;
+            if (!(l & (1L << 30)))
+                g_pb_ftrace_key = 1;
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
