@@ -207,6 +207,47 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* Borderless full screen: F11 or Alt+Enter, or RECOMP_FULLSCREEN=1 at start.
+ *
+ * The window loses its frame and covers the monitor it is on; the picture
+ * keeps its aspect ratio through WM_SIZE like any other window size. Not
+ * DXGI's exclusive full screen (the swap chain says DXGI_MWA_NO_ALT_ENTER):
+ * no display-mode change, so alt-tabbing is instant and the swap chain is
+ * never lost. Leaving it puts back the old style and placement. */
+static int             s_fullscreen;
+static LONG            s_saved_style;
+static WINDOWPLACEMENT s_saved_place;
+
+static void fb_set_fullscreen(HWND h, int on)
+{
+    if (on == s_fullscreen)
+        return;
+    if (on) {
+        MONITORINFO mi;
+        mi.cbSize = sizeof(mi);
+        s_saved_place.length = sizeof(s_saved_place);
+        if (!GetWindowPlacement(h, &s_saved_place) ||
+            !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+            return;
+        s_saved_style = GetWindowLongA(h, GWL_STYLE);
+        SetWindowLongA(h, GWL_STYLE,
+                       (s_saved_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+    } else {
+        SetWindowLongA(h, GWL_STYLE, s_saved_style);
+        SetWindowPlacement(h, &s_saved_place);
+        SetWindowPos(h, NULL, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                     SWP_NOZORDER | SWP_NOOWNERZORDER);
+    }
+    s_fullscreen = on;
+    fprintf(stderr, "  [FBWIN] %s full screen\n", on ? "entered" : "left");
+    fflush(stderr);
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -250,6 +291,15 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        /* The full-screen keys are the window's, not the game's: Enter is
+         * the pad's Start, so Alt+Enter must not also pause. Bit 30 of l
+         * is set on auto-repeat, which would toggle back and forth. */
+        if (w == VK_F11 || (w == VK_RETURN && m == WM_SYSKEYDOWN &&
+                            (HIWORD(l) & KF_ALTDOWN))) {
+            if (!(l & (1L << 30)))
+                fb_set_fullscreen(h, !s_fullscreen);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -275,6 +325,21 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if ((unsigned)w < 256)
             s_key_down[w] = 0;
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
+
+    /* Alt+Enter's character: Windows would beep for it (no menu). */
+    case WM_SYSCHAR:
+        if (w == '\r')
+            return 0;
+        break;
+
+    /* No mouse pointer over the picture in full screen. The GPU view is a
+     * disabled child, so the mouse over it is reported here as client. */
+    case WM_SETCURSOR:
+        if (s_fullscreen && LOWORD(l) == HTCLIENT) {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
@@ -388,6 +453,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
+    if (getenv("RECOMP_FULLSCREEN") && atoi(getenv("RECOMP_FULLSCREEN")))
+        fb_set_fullscreen(hwnd, 1);
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
