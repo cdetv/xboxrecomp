@@ -306,6 +306,17 @@ typedef struct {
     void (*present)(void);
     /* nv2a_pb_exec_report: the back end's own lines of the periodic report. */
     void (*report)(void);
+    /* Visibility counting, for a back end that counts on a real GPU. NULL:
+     * the back end adds to g_pb.zpass_count as it draws (the software
+     * rasteriser) and the front end writes each report at once.
+     * zpass: 0 CLEAR_REPORT_VALUE, 1 counting on, 2 counting off
+     * (SET_ZPASS_PIXEL_COUNT_ENABLE). get_report: GET_REPORT, the 16 bytes
+     * at guest address `at` to be written once the count is known (the
+     * title sees its slot incomplete until then, as with the console's GPU).
+     * poll: called on the executor's thread every tick to finish them. */
+    void (*zpass)(int what);
+    void (*get_report)(uint32_t at, uint64_t stamp);
+    void (*poll)(void);
 } Nv2aPbBackend;
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;

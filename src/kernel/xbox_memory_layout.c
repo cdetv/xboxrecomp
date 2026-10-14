@@ -1263,6 +1263,10 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
         counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
+        {
+            extern void nv2a_pb_exec_poll(void);
+            nv2a_pb_exec_poll();      /* visibility reports the GPU has answered */
+        }
 
         /* Which framebuffer the display would be scanning out.
          *
@@ -3638,41 +3642,119 @@ static void contig_insert(int at, uint32_t addr, uint32_t size, int is_free)
     g_contig_block_count++;
 }
 
-uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+/* Does [a, a + size) lie within physical [low, high]? */
+static int contig_in_range(uint32_t a, uint32_t size, uint32_t low, uint32_t high)
 {
-    uint32_t result = 0;
+    uint64_t p = (uint64_t)a - XBOX_CONTIG_BASE;
+    return p >= low && p + size - 1 <= high;
+}
+
+/* Take [a, a + size) out of free block i; what is left either side stays free. */
+static void contig_carve(int i, uint32_t a, uint32_t size)
+{
+    uint32_t start = g_contig_blocks[i].addr;
+    uint32_t end = start + g_contig_blocks[i].size;
+
+    g_contig_blocks[i].addr = a;
+    g_contig_blocks[i].size = size;
+    g_contig_blocks[i].free = 0;
+    if (end > a + size) contig_insert(i + 1, a + size, end - (a + size), 1);
+    if (a > start)      contig_insert(i, start, a - start, 1);
+}
+
+/* The highest aligned piece of a free block inside physical [low, high], or 0.
+ * Highest, as the console's kernel searches: it serves contiguous memory from
+ * the top down, so low pages stay free for exactly these requests. */
+static uint32_t contig_fit_top(uint32_t size, uint32_t alignment,
+                               uint32_t low, uint32_t high, int *block)
+{
+    uint64_t lo = (uint64_t)XBOX_CONTIG_BASE + low;
+    uint64_t hi = (uint64_t)XBOX_CONTIG_BASE + high + 1;
+    uint32_t best = 0;
+    int i;
+
+    for (i = 0; i < g_contig_block_count; i++) {
+        uint64_t start = g_contig_blocks[i].addr;
+        uint64_t end = start + g_contig_blocks[i].size, a;
+        if (!g_contig_blocks[i].free)
+            continue;
+        if (start < lo) start = lo;
+        if (end > hi) end = hi;
+        if (end < start + size)
+            continue;
+        a = (end - size) & ~(uint64_t)(alignment - 1);
+        if (a >= start && a > best) {
+            best = (uint32_t)a;
+            *block = i;
+        }
+    }
+    return best;
+}
+
+/* Contiguous memory with the physical range MmAllocateContiguousMemoryEx asks
+ * for. low/high are physical; 0 and 0xFFFFFFFF mean anywhere.
+ *
+ * The arena counts upwards, so a request whose highest acceptable address is
+ * below where it has got to cannot be served the normal way. Xbox D3D asks
+ * exactly that for its visibility-test result pages: XMemAlloc(0x1000,
+ * 0xA1800000), highest 0x00800000, because NV097_GET_REPORT carries only 24
+ * bits of address and D3D sends (page & 0x0EFFFFFF) | type << 24. Served at
+ * physical 0x02A73000, every report Conker's intro asked for landed 16 MB
+ * lower, at 0x00A73000 -- in the middle of D3D's own pushbuffer -- and each
+ * one replaced four command words with a report. When the executor reached
+ * them it ran off into stale words and junk: surface pitch, front face,
+ * blend state all wrong for the rest of the scene (Berri's room black,
+ * objects see-through, run 20261014_021145).
+ *
+ * Such a request takes the highest fitting piece of memory the title has
+ * freed (Conker frees a 10 MB block at the bottom early on), as the console
+ * would. Freed blocks are therefore always tracked; without
+ * RECOMP_HEAP_RECLAIM they serve only these requests, so every other
+ * allocation lands exactly where it did before. */
+uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
+                                uint32_t low, uint32_t high)
+{
+    uint32_t result = 0, bump;
     int reclaim = xbox_HeapReclaimEnabled();
     int i;
 
     if (alignment < 4096) alignment = 4096;
-    if (reclaim) {
-        AcquireSRWLockExclusive(&g_contig_lock);
-        size = (size + 4095u) & ~4095u;
-        if (size == 0) size = 4096;
+    if (high == 0 || high < low)       /* no usable range given: anywhere */
+        low = 0, high = 0xFFFFFFFFu;
+    size = (size + 4095u) & ~4095u;
+    if (size == 0) size = 4096;
+    AcquireSRWLockExclusive(&g_contig_lock);
 
+    if (reclaim) {
         /* A freed block first: carve the aligned piece, keep what is left free. */
         for (i = 0; i < g_contig_block_count; i++) {
-            uint32_t a, end, front, back;
+            uint32_t a, end;
             if (!g_contig_blocks[i].free || g_contig_blocks[i].size < size)
                 continue;
             a = (g_contig_blocks[i].addr + alignment - 1) & ~(alignment - 1);
             end = g_contig_blocks[i].addr + g_contig_blocks[i].size;
-            if ((uint64_t)a + size > end)
+            if ((uint64_t)a + size > end || !contig_in_range(a, size, low, high))
                 continue;
-            front = a - g_contig_blocks[i].addr;
-            back = end - (a + size);
-            g_contig_blocks[i].addr = a;
-            g_contig_blocks[i].size = size;
-            g_contig_blocks[i].free = 0;
-            if (back)  contig_insert(i + 1, a + size, back, 1);
-            if (front) contig_insert(i, a - front, front, 1);
+            contig_carve(i, a, size);
             result = a;
             break;
         }
     }
 
+    bump = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    if (!result && !contig_in_range(bump, size, low, high)) {
+        int blk = -1;
+        result = contig_fit_top(size, alignment, low, high, &blk);
+        if (result)
+            contig_carve(blk, result, size);
+        else
+            fprintf(stderr, "  [CONTIG] nothing free in physical 0x%08X-0x%08X"
+                    " for %u bytes; given 0x%08X, outside it\n",
+                    low, high, size, bump);
+    }
+
     if (!result) {
-        result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+        result = bump;
 
         /* Leave the top of the window for GPU instance memory. */
         if ((uint64_t)result + size >
@@ -3682,33 +3764,34 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
                     size, g_contig_next - XBOX_CONTIG_BASE,
                     (unsigned)XBOX_CONTIG_SIZE);
             fflush(stderr);
-            if (reclaim)
-                ReleaseSRWLockExclusive(&g_contig_lock);
+            ReleaseSRWLockExclusive(&g_contig_lock);
             return 0;
         }
-        if (reclaim) {
-            if (result > g_contig_next)    /* the alignment gap stays usable */
-                contig_insert(g_contig_block_count, g_contig_next,
-                              result - g_contig_next, 1);
-            contig_insert(g_contig_block_count, result, size, 0);
-        }
+        if (result > g_contig_next)    /* the alignment gap stays usable */
+            contig_insert(g_contig_block_count, g_contig_next,
+                          result - g_contig_next, 1);
+        contig_insert(g_contig_block_count, result, size, 0);
         g_contig_next = result + size;
     }
-    if (reclaim)
-        ReleaseSRWLockExclusive(&g_contig_lock);
+    ReleaseSRWLockExclusive(&g_contig_lock);
 
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
 }
 
-/* Give a block back (RECOMP_HEAP_RECLAIM only). Returns 0 when the address is
- * not one this arena tracks, so the caller can try the general heap. */
+uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
+{
+    return xbox_ContiguousAllocEx(size, alignment, 0, 0xFFFFFFFFu);
+}
+
+/* Give a block back. Returns 0 when the address is not one this arena
+ * tracks, so the caller can try the general heap. Without
+ * RECOMP_HEAP_RECLAIM a freed block is only reused for a request with a
+ * highest address (xbox_ContiguousAllocEx). */
 int xbox_ContiguousFree(uint32_t addr)
 {
     int i, found = 0;
 
-    if (!xbox_HeapReclaimEnabled())
-        return 0;
     AcquireSRWLockExclusive(&g_contig_lock);
     for (i = 0; i < g_contig_block_count; i++) {
         if (g_contig_blocks[i].addr != addr || g_contig_blocks[i].free)

@@ -2671,6 +2671,10 @@ static void d3d_present(void)
     s_shown_stale = 1;
 }
 
+/* Visibility reports (d3d_get_report, below): FIFO [head, tail) and counts. */
+static uint32_t s_vis_head, s_vis_tail;
+static uint32_t s_vis_reports, s_vis_dropped, s_vis_failed;
+
 static void d3d_report(void)
 {
     fprintf(stderr, "[GPU] d3d11: %u colour clears (%u without a surface),"
@@ -2715,6 +2719,10 @@ static void d3d_report(void)
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
     fprintf(stderr, "[GPU] d3d11: pacing: %u waits for the GPU, %.0f ms%c",
             s_pace_waits, s_pace_wait_ms, 10);
+    fprintf(stderr, "[GPU] d3d11: visibility reports: %u written, %u waiting,"
+            " %u written as visible unmeasured (GPU too far behind), %u"
+            " queries not made%c", s_vis_reports, s_vis_tail - s_vis_head,
+            s_vis_dropped, s_vis_failed, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
@@ -2722,8 +2730,183 @@ static void d3d_report(void)
     ct_report();
 }
 
+/* Visibility tests: NV2A counts the samples that pass the depth and stencil
+ * tests while SET_ZPASS_PIXEL_COUNT_ENABLE is on, from CLEAR_REPORT_VALUE, and
+ * GET_REPORT writes the count. D3D11's occlusion query counts the same thing.
+ * One query per stretch of counting; a report sums the stretches since the
+ * last clear and is written once the GPU has answered all of them, in order.
+ * Until then the title's slot reads incomplete (D3D set it to 0xFFFFFFFF),
+ * as it does on the console while its GPU catches up.
+ *
+ * Without this every report said 0 pixels: harmless while the reports went
+ * astray (they landed in D3D's pushbuffer, fixed in xbox_ContiguousAllocEx),
+ * but once they reached their slots Conker took its characters for hidden
+ * and stopped drawing them (the throne, Berri; 2026-10-14). */
+#define VIS_STRETCHES 8               /* stretches summed into one report */
+#define VIS_PENDING   1024            /* reports waiting for the GPU */
+static ID3D11Query *s_vis_open;       /* counting now */
+static ID3D11Query *s_vis_since[VIS_STRETCHES];
+static int s_vis_nsince, s_vis_overflow;
+static struct {
+    uint32_t at;
+    uint64_t stamp;
+    ID3D11Query *q[VIS_STRETCHES];
+    int nq, overflow;
+    LONGLONG since;                   /* QPC when queued, to flush once */
+    int flushed;
+} s_vis_pend[VIS_PENDING];
+
+static void vis_begin(void)
+{
+    D3D11_QUERY_DESC qd;
+    qd.Query = D3D11_QUERY_OCCLUSION;
+    qd.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_vis_open))) {
+        s_vis_open = NULL;
+        s_vis_failed++;
+        return;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_vis_open);
+}
+
+static void vis_end(void)
+{
+    if (!s_vis_open)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_vis_open);
+    if (s_vis_nsince < VIS_STRETCHES) {
+        s_vis_since[s_vis_nsince++] = s_vis_open;
+    } else {
+        ID3D11Query_Release(s_vis_open);
+        s_vis_overflow = 1;           /* reported as visible, see vis_write */
+    }
+    s_vis_open = NULL;
+}
+
+static void vis_clear(void)
+{
+    int i;
+    for (i = 0; i < s_vis_nsince; i++)
+        ID3D11Query_Release(s_vis_since[i]);
+    s_vis_nsince = 0;
+    s_vis_overflow = 0;
+}
+
+static void d3d_zpass(int what)
+{
+    if (s_shadow)
+        return;
+    if (what == 0) {                  /* clear: a count running now restarts */
+        int was_open = s_vis_open != NULL;
+        if (was_open) {
+            ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_vis_open);
+            ID3D11Query_Release(s_vis_open);
+            s_vis_open = NULL;
+        }
+        vis_clear();
+        if (was_open)
+            vis_begin();
+    } else if (what == 1) {
+        if (!s_vis_open)
+            vis_begin();
+    } else {
+        vis_end();
+    }
+}
+
+static void vis_write(uint32_t at, uint64_t stamp, uint32_t count)
+{
+    volatile uint8_t *slot = (volatile uint8_t *)xbox_GetMemoryOffset() + at;
+    memcpy((void *)slot, &stamp, 8);
+    *(volatile uint32_t *)(slot + 8) = count;
+    MemoryBarrier();                  /* the count before "done" */
+    *(volatile uint32_t *)(slot + 12) = 0;
+    s_vis_reports++;
+}
+
+static void d3d_get_report(uint32_t at, uint64_t stamp)
+{
+    int i, counting = s_vis_open != NULL;
+
+    if (s_shadow)
+        return;
+    if (s_vis_tail - s_vis_head >= VIS_PENDING) {
+        /* The GPU is far behind: say "visible" rather than lose the test. */
+        vis_write(at, stamp, 0xFFFFu);
+        s_vis_dropped++;
+        return;
+    }
+    if (counting) {                   /* a report mid-count: split the stretch */
+        vis_end();
+    }
+    {
+        uint32_t k = s_vis_tail % VIS_PENDING;
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        s_vis_pend[k].at = at;
+        s_vis_pend[k].stamp = stamp;
+        s_vis_pend[k].nq = s_vis_nsince;
+        s_vis_pend[k].overflow = s_vis_overflow;
+        for (i = 0; i < s_vis_nsince; i++) {
+            ID3D11Query_AddRef(s_vis_since[i]);
+            s_vis_pend[k].q[i] = s_vis_since[i];
+        }
+        s_vis_pend[k].since = t.QuadPart;
+        s_vis_pend[k].flushed = 0;
+        s_vis_tail++;
+    }
+    if (counting)
+        vis_begin();
+}
+
+static void d3d_poll(void)
+{
+    static LONGLONG two_ms;
+    if (!two_ms) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        two_ms = f.QuadPart / 500;
+    }
+    while (s_vis_head != s_vis_tail) {
+        uint32_t k = s_vis_head % VIS_PENDING, count = 0;
+        uint64_t sum = 0;
+        int i, ready = 1;
+
+        for (i = 0; i < s_vis_pend[k].nq; i++) {
+            UINT64 n = 0;
+            HRESULT hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_vis_pend[k].q[i], &n, sizeof n,
+                    D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (hr == S_FALSE) {
+                ready = 0;
+                break;
+            }
+            if (SUCCEEDED(hr))
+                sum += n;
+        }
+        if (!ready) {
+            /* Commands sit in the driver's buffer until something flushes
+             * them; a title waiting on this result submits nothing more. */
+            LARGE_INTEGER t;
+            QueryPerformanceCounter(&t);
+            if (!s_vis_pend[k].flushed && t.QuadPart - s_vis_pend[k].since > two_ms) {
+                ID3D11DeviceContext_Flush(s_ctx);
+                s_vis_pend[k].flushed = 1;
+            }
+            return;
+        }
+        count = s_vis_pend[k].overflow || sum > 0xFFFFFFFFu ? 0xFFFFFFFFu
+                                                            : (uint32_t)sum;
+        vis_write(s_vis_pend[k].at, s_vis_pend[k].stamp, count);
+        for (i = 0; i < s_vis_pend[k].nq; i++)
+            ID3D11Query_Release(s_vis_pend[k].q[i]);
+        s_vis_head++;
+    }
+}
+
 static const Nv2aPbBackend s_backend = {
-    "d3d11", d3d_clear, d3d_draw, d3d_present, d3d_report
+    "d3d11", d3d_clear, d3d_draw, d3d_present, d3d_report,
+    d3d_zpass, d3d_get_report, d3d_poll
 };
 
 const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
