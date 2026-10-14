@@ -50,6 +50,9 @@ extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
 Nv2aPbState g_pb;
 int g_pb_ftrace;
+/* F9 in the game window (fb_present.c): trace the next frame now, as if
+ * the RECOMP_FRAME_TRACE flag file had just appeared; again for another. */
+volatile long g_pb_ftrace_key;
 
 /* The back end every batch goes to; chosen at the first method. s_shadow,
  * when set (RECOMP_GPU=both), gets every call too, after s_be: a second back
@@ -304,6 +307,12 @@ static void frame_trace_flip(void)
         flag = getenv("RECOMP_FRAME_TRACE");
     if (!flag)
         return;
+    if (g_pb_ftrace_key && (g_pb_ftrace == 0 || g_pb_ftrace == 3)) {
+        g_pb_ftrace_key = 0;
+        g_pb_ftrace = 2;
+        fprintf(stderr, "[FTRACE] frame begins (flip %u, F9)\n", g_pb.flips);
+        return;
+    }
     if (g_pb_ftrace == 3) {
         /* Deleting the flag file re-arms the trace for the next time it
          * appears, so one run can trace several moments. */
@@ -1352,6 +1361,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x030C: g_pb.depth_test = param; break; /* DEPTH_TEST_ENABLE */
     case 0x0354: g_pb.depth_func = param; break; /* DEPTH_FUNC */
     case 0x035C: g_pb.depth_mask = param; break; /* DEPTH_MASK */
+    case 0x0394: memcpy(&g_pb.clip_min, &param, 4); break; /* CLIP_MIN */
+    case 0x0398:                                  /* CLIP_MAX */
+        memcpy(&g_pb.clip_max, &param, 4);
+        g_pb.clip_seen = 1;
+        break;
+    case 0x1D78: g_pb.zminmax_control = param; break; /* ZMIN_MAX_CONTROL */
     case 0x0214: g_pb.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: g_pb.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
