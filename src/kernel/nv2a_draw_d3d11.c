@@ -1911,6 +1911,62 @@ static void consts_combiners(GpuConsts *k)
 static void heavy_note(const Nv2aVshOutput *verts, uint32_t n, uint32_t tris);
 static void heavy_report(void);
 
+/* Keep the executor at most PACE_SLOTS x PACE_DRAWS draws ahead of the host
+ * GPU. The guest takes a batch as done once it is handed to D3D11, so a
+ * title that draws without presenting (Conker's level loads: ~12,000
+ * full-screen passes, 2026-10-13) queues seconds of GPU work, and the next
+ * ring wrap's discard then waits for all of it while D3D's GPU DPC spins and
+ * no interrupt gets through. An event query every PACE_DRAWS draws; before a
+ * slot is reused, its query must have passed. A frame (~450-1000 draws) is
+ * far inside the window, so ordinary frames never wait. RECOMP_GPU_PACE=0
+ * turns it off. */
+#define PACE_DRAWS 64
+#define PACE_SLOTS 16
+static ID3D11Query *s_pace_q[PACE_SLOTS];
+static uint32_t s_pace_draws, s_pace_slot, s_pace_waits;
+static double s_pace_wait_ms;
+
+static void pace_draw(void)
+{
+    static int on = -1;
+    ID3D11Query **q;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_PACE");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || ++s_pace_draws % PACE_DRAWS)
+        return;
+    q = &s_pace_q[s_pace_slot];
+    s_pace_slot = (s_pace_slot + 1) % PACE_SLOTS;
+    if (!*q) {
+        D3D11_QUERY_DESC qd;
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, q))) {
+            *q = NULL;
+            return;
+        }
+    } else {
+        BOOL done = FALSE;
+        LARGE_INTEGER f, t0, t1;
+        HRESULT hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)*q,
+                                                 &done, sizeof done, 0);
+        if (hr == S_FALSE) {
+            QueryPerformanceCounter(&t0);
+            while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                        (ID3D11Asynchronous *)*q, &done, sizeof done, 0)) == S_FALSE)
+                SwitchToThread();
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            s_pace_waits++;
+            s_pace_wait_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0
+                              / (double)f.QuadPart;
+        }
+    }
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)*q);
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -2308,6 +2364,7 @@ static void d3d_draw(void)
     memset(srv, 0, sizeof srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ct_add(CT_DRAW, ct_draw0);
+    pace_draw();
 
     s_stat.drawn++;
     s_stat.tris += nidx / 3;
@@ -2656,6 +2713,8 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: rings: vertices %u wraps (%u MB), indices"
             " %u wraps (%u MB)%c", s_vb.wraps, s_vb.bytes >> 20,
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
+    fprintf(stderr, "[GPU] d3d11: pacing: %u waits for the GPU, %.0f ms%c",
+            s_pace_waits, s_pace_wait_ms, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
