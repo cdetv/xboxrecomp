@@ -195,6 +195,9 @@ extern Nv2aPbState g_pb;
 /* Frame trace (RECOMP_FRAME_TRACE): 0 idle, 2 tracing this frame, 3 done. */
 extern int g_pb_ftrace;
 
+/* Print the last 64 non-bulk methods with their pushbuffer addresses. */
+void pb_recent_dump(const char *why);
+
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
  * coordinates in texels. Swizzled and block-compressed are both in this group,

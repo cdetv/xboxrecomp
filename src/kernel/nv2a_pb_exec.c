@@ -956,9 +956,50 @@ int nv2a_pb_exec_semaphore(uint32_t *value)
     return 1;
 }
 
+/* The last methods run, less the bulk (vertex data, program and constant
+ * uploads), each with the guest address of its parameter word: when a back
+ * end sees something impossible (a second surface at the frame's address
+ * with another pitch), pb_recent_dump says which words of which pushbuffer
+ * set it up. A few stores per method; printed only on demand. */
+#define PB_RECENT 64
+static struct { uint32_t va, subch, method, param; } s_recent[PB_RECENT];
+static unsigned s_recent_n;
+uint32_t g_pb_method_va;
+
+void pb_recent_dump(const char *why)
+{
+    extern ptrdiff_t xbox_GetMemoryOffset(void);
+    unsigned i, n = s_recent_n < PB_RECENT ? s_recent_n : PB_RECENT;
+    fprintf(stderr, "[GPU] recent methods (%s), flip %u draw %u, oldest"
+            " first:%c", why, g_pb.flips, g_pb.draws, 10);
+    if (n) {
+        /* The raw words before the oldest method: a header that claimed
+         * too many parameters (or a return to the wrong word) sits there. */
+        uint32_t first = s_recent[(s_recent_n - n) % PB_RECENT].va, a;
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        if (first >= 0x80000400u && first < 0x84000000u)
+            for (a = first - 0x180; a < first; a += 4)
+                fprintf(stderr, "[GPU]   raw %08X: %08X%c", a,
+                        *(const uint32_t *)(mem + a), 10);
+    }
+    for (i = s_recent_n - n; i != s_recent_n; i++) {
+        unsigned k = i % PB_RECENT;
+        fprintf(stderr, "[GPU]   @%08X  %u:%04X = %08X%c", s_recent[k].va,
+                s_recent[k].subch, s_recent[k].method, s_recent[k].param, 10);
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    if (!(method >= 0x1800 && method < 0x1A00)
+        && !(method >= 0x0B00 && method < 0x0C00)) {
+        unsigned k = s_recent_n++ % PB_RECENT;
+        s_recent[k].va = g_pb_method_va;
+        s_recent[k].subch = subch;
+        s_recent[k].method = method;
+        s_recent[k].param = param;
+    }
     if (!inited) {
         inited = 1;
         {
@@ -1256,6 +1297,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
 
     case NV097_SET_FLIP_MODULO:
+        /* D3D always sets 2 or 3. Run 20261013_231705 got 0 (with read 0,
+         * write 0 and front face 0) during a scene change's device reset,
+         * and the surface state after it was wrong (a twin of the frame at
+         * pitch 772, the room black): the methods came from zeroed or
+         * half-written words. Say which. */
+        if (param == 0) {
+            static int said;
+            if (said++ < 4)
+                pb_recent_dump("flip modulo 0");
+        }
         g_pb.flip_modulo = param;
         if (s_flip_released || s_flip_timeouts) {
             static unsigned n;

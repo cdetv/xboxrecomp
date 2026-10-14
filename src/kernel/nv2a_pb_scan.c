@@ -52,6 +52,7 @@ static uint32_t s_tot_jumped_chained; /* record found with no NOP code */
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern uint32_t g_pb_method_va;   /* the parameter word's address, for the executor's diagnostics */
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
 static int s_exec_enabled = -1;
@@ -248,9 +249,39 @@ static int pb_is_return_record(const uint8_t *mem, uint32_t va, uint32_t tva,
         && (r[4] & 0x0FFFFFFFu) == (tva & 0x0FFFFFFFu);
 }
 
+/* Diagnostic: the walk took a word for a CALL, or is about to read commands
+ * from the bottom 64 KB of RAM where no pushbuffer lives. Conker never CALLs;
+ * run 20261013_234919 did once, into 0x80000B74, during a scene change's
+ * device reset, and the junk it ran there left the surface state wrong (a
+ * twin of the frame, Berri's room black). The words before the site say
+ * whether the walk was out of step (data read as a header) or the words
+ * were not yet written. */
+extern void pb_recent_dump(const char *why);
+__declspec(dllimport) void __stdcall Sleep(unsigned long ms);
+static int s_wrap_walk;   /* walking on from the last PUT to find the wrap */
+
+static void pb_odd_walk(const char *why, const uint8_t *mem, uint32_t site,
+                        uint32_t seg_va, int mode, uint32_t target)
+{
+    static int said;
+    uint32_t a;
+    if (said++ >= 6)
+        return;
+    fprintf(stderr, "[PB] ODD %s at %08X -> %08X (mode %d, walk from %08X,"
+            " PUT %08X GET %08X); words before:%c", why, site, target, mode,
+            seg_va, *(volatile uint32_t *)(mem + 0xFD800040u),
+            *(volatile uint32_t *)(mem + 0xFD800044u), 10);
+    for (a = site >= seg_va + 64 ? site - 64 : seg_va; a <= site + 16; a += 4)
+        fprintf(stderr, "[PB]   %08X: %08X%s%c", a,
+                *(const uint32_t *)(mem + a), a == site ? "  <--" : "", 10);
+    pb_recent_dump(why);
+    fflush(stderr);
+}
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                         uint32_t *jumps, uint32_t *unknown, uint32_t *exit_va)
 {
+    uint32_t seg_va = va;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
     uint32_t nop_param = 0, nop_end = 0;  /* last NO_OPERATION, and where it ended */
@@ -283,6 +314,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                                              : (w & 0x1FFFFFFCu);
             uint32_t tva = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             (*jumps)++;
+            if (tva < XBOX_CONTIG_BASE + 0x10000u)
+                pb_odd_walk("JUMP to low memory", mem, va - 4, seg_va, mode, tva);
             if (mode == PB_RING) {
                 uint32_t back = 0, site = va - 4, want = va, code = 0;
                 if (!s_ring_hi || pb_in_ring(tva)) {
@@ -370,6 +403,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
         if ((w & 3u) == 2u) {                    /* CALL */
             if (mode != PB_CALL) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                pb_odd_walk("CALL", mem, va - 4, seg_va, mode, sub);
                 s_tot_calls++;
                 words += pb_walk(sub, sub + 0x400000u, PB_CALL,
                                  jumps, unknown, NULL);
@@ -392,9 +426,11 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
-                if (s_exec_enabled)
+                if (s_exec_enabled) {
+                    g_pb_method_va = va;
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));
+                }
                 /* A NOP with a parameter traps to the driver, and the GPU
                  * waits for it (xbox_Nv2aSoftwareMethod). What the driver
                  * does there -- patch the jump back out of a recorded
@@ -418,6 +454,28 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             continue;
         }
         (*unknown)++;
+        if (mode == PB_RING) {
+            /* Diagnostic: a word that is no command at all (the GPU would
+             * raise an error). Run 20261014_002132 met 0x00010D88 22 KB past
+             * the last PUT while looking for the wrap after PUT went back,
+             * and ran the previous lap's words from there. Read the spot
+             * again a moment later: if it has become a JUMP, the walk read
+             * it before the title wrote it. */
+            static int said;
+            if (said++ < 6) {
+                uint32_t a, site = va - 4;
+                fprintf(stderr, "[PB] ODD invalid word %08X at %08X, %u bytes"
+                        " into a walk from %08X (%s); PUT %08X; again after"
+                        " 20 ms:%c", w, site, site - seg_va, seg_va,
+                        s_wrap_walk ? "wrap search" : "segment",
+                        *(volatile uint32_t *)(mem + 0xFD800040u), 10);
+                Sleep(20);
+                for (a = site; a < site + 32; a += 4)
+                    fprintf(stderr, "[PB]   %08X: %08X%c", a,
+                            *(volatile const uint32_t *)(mem + a), 10);
+                fflush(stderr);
+            }
+        }
     }
     return words;
 }
@@ -504,5 +562,9 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
  * PUT is not good enough. */
 uint32_t nv2a_pb_scan_wrap(uint32_t from_va)
 {
-    return pb_scan_segment(from_va, from_va + 0x400000u);
+    uint32_t r;
+    s_wrap_walk = 1;
+    r = pb_scan_segment(from_va, from_va + 0x400000u);
+    s_wrap_walk = 0;
+    return r;
 }

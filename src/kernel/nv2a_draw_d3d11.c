@@ -318,6 +318,25 @@ static int surface_current(void)
                 i = k;
         if (s_surf[i].tex)
             note_evicted(s_surf[i].addr);
+        {
+            /* A second surface at an address that already has one, under
+             * another pitch. Run 20261013_231705: one at the frame's
+             * 0x80BF0000 with pitch 772 (the frame's is 2560), and from
+             * then on the room's walls missed the frame. Say what set it. */
+            static int said;
+            for (k = 0; k < GPU_SURFACES && said < 4; k++)
+                if (k != i && s_surf[k].tex && s_surf[k].addr == addr) {
+                    said++;
+                    fprintf(stderr, "[GPU] d3d11: TWIN surface 0x%08X pitch %u"
+                            " (slot %d has pitch %u) fmt 0x%X clip %ux%u+%u+%u"
+                            " color_offset 0x%08X%c", addr, g_pb.pitch, k,
+                            s_surf[k].pitch, g_pb.format, g_pb.clip_w,
+                            g_pb.clip_h, g_pb.clip_x, g_pb.clip_y,
+                            g_pb.color_offset, 10);
+                    pb_recent_dump("twin surface");
+                    break;
+                }
+        }
         if (s_stat.surfaces++ < 48)
             fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
                     " clip %ux%u+%u+%u fmt 0x%X (slot %d%s)%c",
