@@ -95,6 +95,13 @@ void xbox_InputInit(void);
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
 /**
+ * Take the pads from the title while a host menu is open: 1 = every port
+ * reports nothing pressed; 0 = give them back, each once all its buttons
+ * are released.
+ */
+void xbox_InputSetBlocked(int on);
+
+/**
  * Set controller vibration.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);

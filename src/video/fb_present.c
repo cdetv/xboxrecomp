@@ -294,6 +294,50 @@ static int             s_fullscreen;
 static LONG            s_saved_style;
 static WINDOWPLACEMENT s_saved_place;
 
+/* Full screen from another thread (a settings overlay): posted, because the
+ * style change belongs to the window's own thread. */
+#define FB_WM_SET_FULLSCREEN (WM_APP + 2)
+
+void xbox_FramebufferWindowSetFullscreen(int on)
+{
+    if (s_fb_running && s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_SET_FULLSCREEN, on ? 1 : 0, 0);
+}
+
+int xbox_FramebufferWindowIsFullscreen(void)
+{
+    return s_fullscreen;
+}
+
+/* Where the GPU view sits in the frame window's client area: a host overlay
+ * drawn into the swap chain needs it to turn mouse positions (reported to
+ * the frame window) into back-buffer pixels. 0 while there is no view. */
+int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h)
+{
+    RECT r;
+    if (!s_gpu_view || !s_hwnd || !GetWindowRect(s_gpu_view, &r))
+        return 0;
+    MapWindowPoints(NULL, s_hwnd, (POINT *)&r, 2);
+    *x = r.left;
+    *y = r.top;
+    *w = r.right - r.left;
+    *h = r.bottom - r.top;
+    return *w > 0 && *h > 0;
+}
+
+/* A host-side hook that sees every window message first (a settings
+ * overlay). It returns nonzero when it handled the message, with the
+ * window procedure's result in *result; the window then does nothing else
+ * with it. Runs on the window thread. */
+typedef int (*xbox_WindowMessageHook)(void *hwnd, unsigned msg, uintptr_t w,
+                                      intptr_t l, intptr_t *result);
+static volatile xbox_WindowMessageHook s_msg_hook;
+
+void xbox_SetWindowMessageHook(xbox_WindowMessageHook hook)
+{
+    s_msg_hook = hook;
+}
+
 static void fb_set_fullscreen(HWND h, int on)
 {
     if (on == s_fullscreen)
@@ -326,6 +370,12 @@ static void fb_set_fullscreen(HWND h, int on)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    {
+        xbox_WindowMessageHook hook = s_msg_hook;
+        intptr_t result = 0;
+        if (hook && m != FB_WM_MAKE_GPU_VIEW && hook(h, m, w, l, &result))
+            return (LRESULT)result;
+    }
     switch (m) {
     case WM_CLOSE:
         /* The X button or Alt+F4: quit, as the title's own quit does
@@ -372,6 +422,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_SIZE:
         fb_layout_gpu_view(h);
+        return 0;
+
+    case FB_WM_SET_FULLSCREEN:
+        fb_set_fullscreen(h, w != 0);
         return 0;
 
     case WM_KEYDOWN:
@@ -689,4 +743,9 @@ void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *
 { (void)w; (void)h; *x = *y = 0; *fw = cw; *fh = ch; }
 int xbox_RenderRes(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 int xbox_DisplayShape(unsigned *w, unsigned *h) { *w = 4; *h = 3; return 0; }
+void xbox_FramebufferWindowSetFullscreen(int on) { (void)on; }
+int xbox_FramebufferWindowIsFullscreen(void) { return 0; }
+int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h)
+{ (void)x; (void)y; (void)w; (void)h; return 0; }
+void xbox_SetWindowMessageHook(void *hook) { (void)hook; }
 #endif

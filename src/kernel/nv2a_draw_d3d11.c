@@ -53,6 +53,24 @@ extern void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h);
 extern void xbox_FramebufferWindowGpuOwned(int on);
 
 extern int xbox_RenderRes(unsigned *w, unsigned *h);
+extern void xbox_Nv2aIdle(DWORD ms);
+
+/* A host overlay (a settings menu) drawn over each presented frame: called
+ * on the executor thread with the back buffer bound to nothing, after the
+ * frame is in it and before Present. It must leave the pipeline state as it
+ * found it. Nonzero holds the flip: the executor stays at this frame,
+ * presenting it again with the overlay about 60 times a second, until the
+ * hook returns 0. A held GPU is a paused game -- the title soon waits for
+ * the executor, as it would for a slow GPU -- and every D3D11 call stays on
+ * this thread. */
+typedef int (*xbox_GpuOverlayFn)(void *dev, void *ctx, void *back_rtv,
+                                 unsigned w, unsigned h);
+static volatile xbox_GpuOverlayFn s_overlay;
+
+void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
+{
+    s_overlay = fn;
+}
 
 /* The title's frame. The swap chain is this size times the render scale;
  * DXGI scales it to the window's aspect-keeping view. */
@@ -2857,10 +2875,48 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
                 sw->w, sw->h, 10);
 }
 
-static void d3d_present(void)
+/* The shown frame into the swap chain's back buffer, on black. */
+static void shown_to_back(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    ID3D11Texture2D *back = NULL;
 
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    if (s_shown >= 0
+        && SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0,
+                &IID_ID3D11Texture2D, (void **)&back))) {
+        /* The shown rectangle at its surface's scale, at most the
+         * swap chain's size. An unscaled surface shown while the frame
+         * is scaled would sit small in the corner: said once. */
+        D3D11_BOX box;
+        float sx = surf_sx(s_shown), sy = surf_sy(s_shown);
+        uint32_t bw = to_host(s_shown_x + s_shown_w, sx)
+                    - to_host(s_shown_x, sx);
+        uint32_t bh = to_host(s_shown_y + s_shown_h, sy)
+                    - to_host(s_shown_y, sy);
+        if (s_scale_on && !s_surf[s_shown].scaled) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[GPU] d3d11: presenting unscaled"
+                        " surface 0x%08X pitch %u (%ux%u) while the"
+                        " render scale is on%c", s_surf[s_shown].addr,
+                        s_surf[s_shown].pitch, s_shown_w, s_shown_h, 10);
+        }
+        box.left = to_host(s_shown_x, sx);
+        box.top = to_host(s_shown_y, sy);
+        box.front = 0;
+        box.right = box.left + (bw < s_sc_w ? bw : s_sc_w);
+        box.bottom = box.top + (bh < s_sc_h ? bh : s_sc_h);
+        box.back = 1;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                (ID3D11Resource *)back, 0, 0, 0, 0,
+                (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+        ID3D11Texture2D_Release(back);
+    }
+}
+
+static void d3d_present(void)
+{
     heavy_report();
     {
         /* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a
@@ -2900,45 +2956,23 @@ static void d3d_present(void)
         dump_shown();
     }
     if (!s_shadow && ensure_swap_chain()) {
-        ID3D11Texture2D *back = NULL;
-        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-        if (s_shown >= 0
-            && SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0,
-                    &IID_ID3D11Texture2D, (void **)&back))) {
-            /* The shown rectangle at its surface's scale, at most the
-             * swap chain's size. An unscaled surface shown while the frame
-             * is scaled would sit small in the corner: said once. */
-            D3D11_BOX box;
-            float sx = surf_sx(s_shown), sy = surf_sy(s_shown);
-            uint32_t bw = to_host(s_shown_x + s_shown_w, sx)
-                        - to_host(s_shown_x, sx);
-            uint32_t bh = to_host(s_shown_y + s_shown_h, sy)
-                        - to_host(s_shown_y, sy);
-            if (s_scale_on && !s_surf[s_shown].scaled) {
-                static int said;
-                if (!said++)
-                    fprintf(stderr, "[GPU] d3d11: presenting unscaled"
-                            " surface 0x%08X pitch %u (%ux%u) while the"
-                            " render scale is on%c", s_surf[s_shown].addr,
-                            s_surf[s_shown].pitch, s_shown_w, s_shown_h, 10);
-            }
-            box.left = to_host(s_shown_x, sx);
-            box.top = to_host(s_shown_y, sy);
-            box.front = 0;
-            box.right = box.left + (bw < s_sc_w ? bw : s_sc_w);
-            box.bottom = box.top + (bh < s_sc_h ? bh : s_sc_h);
-            box.back = 1;
-            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-                    (ID3D11Resource *)back, 0, 0, 0, 0,
-                    (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
-            ID3D11Texture2D_Release(back);
-        }
-        /* No vsync: the title paces itself on the vblank the kernel
-         * emulates, as it does with the software path. */
-        uint64_t ct0 = ct_now();
-        IDXGISwapChain1_Present(s_swap, 0, 0);
-        ct_add(CT_PRESENT, ct0);
-        s_stat.presents++;
+        int hold;
+        do {
+            xbox_GpuOverlayFn overlay = s_overlay;
+            /* Redone for every present of a held frame: FLIP_DISCARD
+             * leaves the back buffer undefined after each Present. */
+            shown_to_back();
+            hold = overlay
+                 ? overlay(s_dev, s_ctx, s_back_rtv, s_sc_w, s_sc_h) : 0;
+            /* No vsync: the title paces itself on the vblank the kernel
+             * emulates, as it does with the software path. */
+            uint64_t ct0 = ct_now();
+            IDXGISwapChain1_Present(s_swap, 0, 0);
+            ct_add(CT_PRESENT, ct0);
+            s_stat.presents++;
+            if (hold)
+                xbox_Nv2aIdle(16);
+        } while (hold);
     }
     s_shown_stale = 1;
 }

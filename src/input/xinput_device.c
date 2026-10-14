@@ -166,7 +166,60 @@ void xbox_InputInit(void)
         g_controller_connected[i] = g_slot_of_port[i] != NO_SLOT;
 }
 
+/* ---- input taken by the host (a settings overlay) -------------------------
+ *
+ * While blocked, every connected port reports nothing pressed, so presses
+ * meant for a host menu never reach the title. Unblocking does not let the
+ * pads through at once: a port stays at rest until all its buttons and
+ * triggers are let go, or the button that closed the menu would arrive as
+ * a fresh press (Start on top of a menu closed with Start pauses the game). */
+static volatile LONG g_input_blocked;
+static BOOL          g_port_held[XBOX_MAX_CONTROLLERS];
+
+void xbox_InputSetBlocked(int on)
+{
+    DWORD i;
+    if (on)
+        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+            g_port_held[i] = TRUE;
+    InterlockedExchange(&g_input_blocked, on ? 1 : 0);
+}
+
+/* Anything held: a digital button, an analog button or trigger past a
+ * light touch. Sticks do not count -- one resting off centre would keep
+ * the pad blocked for ever. */
+static BOOL any_held(const XBOX_INPUT_STATE *s)
+{
+    int i;
+    if (s->Gamepad.wButtons)
+        return TRUE;
+    for (i = 0; i < 8; i++)
+        if (s->Gamepad.bAnalogButtons[i] > 30)
+            return TRUE;
+    return FALSE;
+}
+
+static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState);
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    DWORD rc = input_get_state(dwPort, pState);
+
+    if (rc != ERROR_SUCCESS || dwPort >= XBOX_MAX_CONTROLLERS)
+        return rc;
+    if (!InterlockedCompareExchange(&g_input_blocked, 0, 0)
+        && g_port_held[dwPort] && !any_held(pState))
+        g_port_held[dwPort] = FALSE;
+    if (InterlockedCompareExchange(&g_input_blocked, 0, 0)
+        || g_port_held[dwPort]) {
+        DWORD packet = pState->dwPacketNumber;
+        memset(pState, 0, sizeof(*pState));
+        pState->dwPacketNumber = packet;
+    }
+    return ERROR_SUCCESS;
+}
+
+static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state;
     DWORD result, slot;
@@ -322,6 +375,9 @@ void xbox_InputInit(void)
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
 }
+
+/* Host overlays are Windows-only so far. */
+void xbox_InputSetBlocked(int on) { (void)on; }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
