@@ -277,6 +277,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 s_aspect_w = (int)w;
                 s_aspect_h = (int)l;
             }
+            /* RECOMP_WIDESCREEN=1: the title draws a 16:9 view squeezed
+             * into its 4:3 frame (anamorphic, as for a widescreen TV), so
+             * the picture is shown 16:9 whatever the surface size. */
+            if (getenv("RECOMP_WIDESCREEN") && atoi(getenv("RECOMP_WIDESCREEN"))) {
+                s_aspect_w = 16;
+                s_aspect_h = 9;
+            }
             s_gpu_view = CreateWindowExA(0, "XboxRecompGpuView", "",
                                          WS_CHILD | WS_VISIBLE | WS_DISABLED,
                                          0, 0, 1, 1, h, NULL,
