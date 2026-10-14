@@ -162,11 +162,25 @@ static uint64_t ct_now(void)
     return (uint64_t)t.QuadPart;
 }
 
+/* What the last ring Map did (ring_put), named when that Map is slow. */
+static char s_ct_ring_note[96];
+
+/* Any one call group of 50 ms or more is also reported on its own: a level
+ * load holds D3D's GPU DPC for seconds while the executor waits in a driver
+ * call (2026-10-11), and the per-report totals hide which call and why. */
 static void ct_add(int which, uint64_t t0)
 {
     if (s_ct_on > 0) {
-        s_ct_ticks[which] += ct_now() - t0;
+        uint64_t d = ct_now() - t0;
+        LARGE_INTEGER f;
+        s_ct_ticks[which] += d;
         s_ct_count[which]++;
+        QueryPerformanceFrequency(&f);
+        if (d * 20 >= (uint64_t)f.QuadPart)
+            fprintf(stderr, "[GPU] d3d11: slow %s: %.0f ms%s%s%c", CT_NAME[which],
+                    (double)d * 1000.0 / (double)f.QuadPart,
+                    (which == CT_VB || which == CT_IB) ? " " : "",
+                    (which == CT_VB || which == CT_IB) ? s_ct_ring_note : "", 10);
     }
 }
 
@@ -756,6 +770,35 @@ typedef struct {
 
 #define RING_MIN_BYTES (16u << 20)
 
+/* RECOMP_GPU_CALL_TIMES: before a wrap's discard, how long the GPU takes to
+ * finish everything queued so far (an event query, flushed). Tells a GPU
+ * that is really busy from a driver that holds the discard back. -1 when
+ * the query could not be made. */
+static ID3D11Query *s_ct_idle_q;
+static double ct_gpu_idle_ms = -1.0;
+
+static double ct_wait_gpu_idle(void)
+{
+    D3D11_QUERY_DESC qd;
+    LARGE_INTEGER f, t0, t1;
+    BOOL done = FALSE;
+
+    if (!s_ct_idle_q) {
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_ct_idle_q)))
+            return -1.0;
+    }
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t0);
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_ct_idle_q);
+    while (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)s_ct_idle_q,
+                                       &done, sizeof done, 0) != S_OK)
+        SwitchToThread();
+    QueryPerformanceCounter(&t1);
+    return (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart;
+}
+
 static Ring s_vb, s_ib_ring;            /* the batches' vertices, indices */
 
 /* Append pieces a and c back to back; *at gets their byte offset. */
@@ -764,6 +807,7 @@ static int ring_put(Ring *r, UINT bind, const void *a, size_t na,
 {
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    const char *what = "append";
     uint32_t need = (uint32_t)(na + nc);
     uint32_t pos = (r->pos + 15u) & ~15u;
 
@@ -785,12 +829,21 @@ static int ring_put(Ring *r, UINT bind, const void *a, size_t na,
             return 0;
         r->bytes = want;
         how = D3D11_MAP_WRITE_DISCARD;
+        what = "new buffer";
         pos = 0;
     } else if (pos + need > r->bytes) {
         how = D3D11_MAP_WRITE_DISCARD;
         pos = 0;
         r->wraps++;
+        what = "wrap discard";
+        if (s_ct_on > 0)
+            ct_gpu_idle_ms = ct_wait_gpu_idle();
     }
+    if (s_ct_on > 0)
+        snprintf(s_ct_ring_note, sizeof s_ct_ring_note,
+                 "(%s at %u of %u MB, %u bytes, wraps %u; GPU idle after %.0f ms)",
+                 what,
+                 pos, r->bytes >> 20, need, r->wraps, ct_gpu_idle_ms);
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)r->b, 0,
                                        how, 0, &m)))
         return 0;
@@ -1855,6 +1908,65 @@ static void consts_combiners(GpuConsts *k)
     k->fogp[1] = g_pb.fog_param[1];
 }
 
+static void heavy_note(const Nv2aVshOutput *verts, uint32_t n, uint32_t tris);
+static void heavy_report(void);
+
+/* Keep the executor at most PACE_SLOTS x PACE_DRAWS draws ahead of the host
+ * GPU. The guest takes a batch as done once it is handed to D3D11, so a
+ * title that draws without presenting (Conker's level loads: ~12,000
+ * full-screen passes, 2026-10-13) queues seconds of GPU work, and the next
+ * ring wrap's discard then waits for all of it while D3D's GPU DPC spins and
+ * no interrupt gets through. An event query every PACE_DRAWS draws; before a
+ * slot is reused, its query must have passed. A frame (~450-1000 draws) is
+ * far inside the window, so ordinary frames never wait. RECOMP_GPU_PACE=0
+ * turns it off. */
+#define PACE_DRAWS 64
+#define PACE_SLOTS 16
+static ID3D11Query *s_pace_q[PACE_SLOTS];
+static uint32_t s_pace_draws, s_pace_slot, s_pace_waits;
+static double s_pace_wait_ms;
+
+static void pace_draw(void)
+{
+    static int on = -1;
+    ID3D11Query **q;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GPU_PACE");
+        on = !(e && e[0] == '0');
+    }
+    if (!on || ++s_pace_draws % PACE_DRAWS)
+        return;
+    q = &s_pace_q[s_pace_slot];
+    s_pace_slot = (s_pace_slot + 1) % PACE_SLOTS;
+    if (!*q) {
+        D3D11_QUERY_DESC qd;
+        qd.Query = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, q))) {
+            *q = NULL;
+            return;
+        }
+    } else {
+        BOOL done = FALSE;
+        LARGE_INTEGER f, t0, t1;
+        HRESULT hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)*q,
+                                                 &done, sizeof done, 0);
+        if (hr == S_FALSE) {
+            QueryPerformanceCounter(&t0);
+            while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                        (ID3D11Asynchronous *)*q, &done, sizeof done, 0)) == S_FALSE)
+                SwitchToThread();
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            s_pace_waits++;
+            s_pace_wait_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0
+                              / (double)f.QuadPart;
+        }
+    }
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)*q);
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -2252,6 +2364,7 @@ static void d3d_draw(void)
     memset(srv, 0, sizeof srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ct_add(CT_DRAW, ct_draw0);
+    pace_draw();
 
     s_stat.drawn++;
     s_stat.tris += nidx / 3;
@@ -2260,6 +2373,95 @@ static void d3d_draw(void)
     if (path == PATH_COMBINERS)
         s_stat.combined++;
     note_shown(si);
+    if (s_ct_on > 0)
+        heavy_note(verts, n, nidx / 3);
+}
+
+/* RECOMP_GPU_CALL_TIMES: a present after 3000+ batches (a frame is ~1000)
+ * also lists, per surface drawn into, the batches, triangles and screen area
+ * (each batch's vertex box clipped to its scissor, summed). A level load
+ * gives the GPU seconds of work between two presents (2026-10-13). */
+#define HEAVY_SURF 12
+static struct {
+    uint32_t off, w, h, batches, tris, maxn;
+    double area;
+} s_heavy[HEAVY_SURF];
+static uint32_t s_heavy_n, s_heavy_batches, s_heavy_other;
+
+static void heavy_note(const Nv2aVshOutput *verts, uint32_t n, uint32_t tris)
+{
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    double a;
+    uint32_t i;
+
+    s_heavy_batches++;
+    {
+        /* RECOMP_HEAVY_TRACE=1: frame-trace batches 3000-3039 of a heavy
+         * frame (the rest of it would be tens of thousands of lines). */
+        static int on = -1;
+        if (on < 0)
+            on = getenv("RECOMP_HEAVY_TRACE") != NULL;
+        if (on && s_heavy_batches == 3000 && g_pb_ftrace == 0) {
+            fprintf(stderr, "[FTRACE] heavy frame: batches 3001-3040%c", 10);
+            g_pb_ftrace = 2;
+        } else if (on && s_heavy_batches == 3040 && g_pb_ftrace == 2) {
+            fprintf(stderr, "[FTRACE] heavy frame: trace off%c", 10);
+            g_pb_ftrace = 0;
+        }
+    }
+    for (i = 0; i < n; i++) {
+        float x = verts[i].pos[0], y = verts[i].pos[1];
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+    }
+    if (x0 < (float)g_pb.clip_x) x0 = (float)g_pb.clip_x;
+    if (y0 < (float)g_pb.clip_y) y0 = (float)g_pb.clip_y;
+    if (x1 > (float)(g_pb.clip_x + g_pb.clip_w)) x1 = (float)(g_pb.clip_x + g_pb.clip_w);
+    if (y1 > (float)(g_pb.clip_y + g_pb.clip_h)) y1 = (float)(g_pb.clip_y + g_pb.clip_h);
+    a = (x1 > x0 && y1 > y0) ? (double)(x1 - x0) * (double)(y1 - y0) : 0.0;
+    for (i = 0; i < s_heavy_n; i++)
+        if (s_heavy[i].off == g_pb.color_offset && s_heavy[i].w == g_pb.clip_w
+            && s_heavy[i].h == g_pb.clip_h)
+            break;
+    if (i == s_heavy_n) {
+        if (s_heavy_n == HEAVY_SURF) {
+            s_heavy_other++;
+            return;
+        }
+        memset(&s_heavy[i], 0, sizeof s_heavy[i]);
+        s_heavy[i].off = g_pb.color_offset;
+        s_heavy[i].w = g_pb.clip_w;
+        s_heavy[i].h = g_pb.clip_h;
+        s_heavy_n++;
+    }
+    s_heavy[i].batches++;
+    s_heavy[i].tris += tris;
+    s_heavy[i].area += a;
+    if (n > s_heavy[i].maxn)
+        s_heavy[i].maxn = n;
+}
+
+static void heavy_report(void)
+{
+    uint32_t i;
+    if (s_ct_on > 0 && s_heavy_batches >= 3000) {
+        fprintf(stderr, "[GPU] d3d11: heavy frame before flip %u: %u batches%c",
+                g_pb.flips, s_heavy_batches, 10);
+        for (i = 0; i < s_heavy_n; i++)
+            fprintf(stderr, "[GPU]   surf %08X clip %ux%u: %u batches, %u tris,"
+                    " area %.0f px (%.1f screens of it), largest batch %u verts%c",
+                    s_heavy[i].off, s_heavy[i].w, s_heavy[i].h, s_heavy[i].batches,
+                    s_heavy[i].tris, s_heavy[i].area,
+                    s_heavy[i].w && s_heavy[i].h
+                        ? s_heavy[i].area / ((double)s_heavy[i].w * s_heavy[i].h) : 0.0,
+                    s_heavy[i].maxn, 10);
+        if (s_heavy_other)
+            fprintf(stderr, "[GPU]   +%u batches on further surfaces%c",
+                    s_heavy_other, 10);
+    }
+    s_heavy_n = s_heavy_batches = s_heavy_other = 0;
 }
 
 /* RECOMP_FB_DUMP_FLIPS, as in the software path: "1" dumps every presented
@@ -2403,6 +2605,7 @@ static void d3d_present(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 
+    heavy_report();
     {
         /* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a
          * line -- how evenly the title paces its frames once drawing costs
@@ -2510,6 +2713,8 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: rings: vertices %u wraps (%u MB), indices"
             " %u wraps (%u MB)%c", s_vb.wraps, s_vb.bytes >> 20,
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
+    fprintf(stderr, "[GPU] d3d11: pacing: %u waits for the GPU, %.0f ms%c",
+            s_pace_waits, s_pace_wait_ms, 10);
     if (s_shadow)
         fprintf(stderr, "[GPU] d3d11 shadow: %u frames dumped beside the"
                 " software ones (%u from a surface the GPU never made)%c",
