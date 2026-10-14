@@ -82,6 +82,82 @@ void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *
 static HWND s_gpu_view;
 static int  s_aspect_w = 4, s_aspect_h = 3;
 
+/* Per-monitor DPI aware, so a W x H picture is W x H screen pixels. Without
+ * it Windows draws the window at 96 DPI and scales it up on a monitor set to
+ * 125 % or more: a 4K picture would be shrunk and blown up again, blurred.
+ * Only with RECOMP_RENDER_RES, so the default window keeps its size. Looked
+ * up by name: Windows 10 1703 and later. */
+static void fb_dpi_aware(void)
+{
+    typedef BOOL (WINAPI *SetCtx)(HANDLE);
+    HMODULE u = GetModuleHandleA("user32.dll");
+    SetCtx set = u ? (SetCtx)(void *)GetProcAddress(u,
+                         "SetProcessDpiAwarenessContext") : NULL;
+    if (set)
+        set((HANDLE)(INT_PTR)-4);       /* DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 */
+}
+
+/* RECOMP_RENDER_RES=<W>x<H>, or "native" for the primary monitor's size: the
+ * D3D11 back end draws the title's 640x480 frame at W x H, each axis scaled
+ * on its own (1920x1080 is 3 x 2.25), and the window shows it at W:H. 1 and
+ * the size when set; 0 when unset or out of range (the frame stays 640x480).
+ * The upper limits keep a scaled 1024 x 1024 depth buffer inside D3D11's
+ * 16384-texel textures. Every thread computes the same answer, so a race on
+ * the first call only does the work twice. */
+int xbox_RenderRes(unsigned *w, unsigned *h)
+{
+    static volatile LONG done;
+    static unsigned rw, rh;
+
+    if (!done) {
+        const char *e = getenv("RECOMP_RENDER_RES");
+        unsigned a = 0, b = 0;
+        if (e && *e) {
+            fb_dpi_aware();
+            if (_stricmp(e, "native") == 0) {
+                a = (unsigned)GetSystemMetrics(SM_CXSCREEN);
+                b = (unsigned)GetSystemMetrics(SM_CYSCREEN);
+            } else if (sscanf(e, "%ux%u", &a, &b) != 2) {
+                a = b = 0;
+            }
+            if (a < 320 || b < 240 || a > 10240 || b > 7680) {
+                fprintf(stderr, "  [FBWIN] RECOMP_RENDER_RES=%s ignored: want"
+                        " WxH from 320x240 to 10240x7680, or native\n", e);
+                a = b = 0;
+            }
+        }
+        rw = a;
+        rh = b;
+        InterlockedExchange(&done, 1);
+    }
+    if (rw) {
+        *w = rw;
+        *h = rh;
+    }
+    return rw != 0;
+}
+
+/* The shape the picture is shown at, when something other than the frame's
+ * own 4:3 sets it: the render resolution's (any shape: 16:10, 21:9...), or
+ * 16:9 for RECOMP_WIDESCREEN=1 (the title draws a 16:9 view squeezed into
+ * its 4:3 frame, anamorphic, as for a widescreen TV). A title-side hook
+ * widens the title's own view to match (Conker: sub_000645C0_enter). */
+int xbox_DisplayShape(unsigned *w, unsigned *h)
+{
+    const char *e;
+    if (xbox_RenderRes(w, h))
+        return 1;
+    e = getenv("RECOMP_WIDESCREEN");
+    if (e && atoi(e)) {
+        *w = 16;
+        *h = 9;
+        return 1;
+    }
+    *w = 4;
+    *h = 3;
+    return 0;
+}
+
 static void fb_layout_gpu_view(HWND parent)
 {
     RECT c;
@@ -277,12 +353,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 s_aspect_w = (int)w;
                 s_aspect_h = (int)l;
             }
-            /* RECOMP_WIDESCREEN=1: the title draws a 16:9 view squeezed
-             * into its 4:3 frame (anamorphic, as for a widescreen TV), so
-             * the picture is shown 16:9 whatever the surface size. */
-            if (getenv("RECOMP_WIDESCREEN") && atoi(getenv("RECOMP_WIDESCREEN"))) {
-                s_aspect_w = 16;
-                s_aspect_h = 9;
+            {
+                /* RECOMP_RENDER_RES / RECOMP_WIDESCREEN: their shape,
+                 * whatever the surface size. */
+                unsigned sw, sh;
+                if (xbox_DisplayShape(&sw, &sh)) {
+                    s_aspect_w = (int)sw;
+                    s_aspect_h = (int)sh;
+                }
             }
             s_gpu_view = CreateWindowExA(0, "XboxRecompGpuView", "",
                                          WS_CHILD | WS_VISIBLE | WS_DISABLED,
@@ -448,6 +526,27 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         RegisterClassA(&wc);
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    {
+        /* RECOMP_RENDER_RES: a window of the picture's shape, as big as
+         * fits in 80 % of the screen's work area (no bigger than the
+         * picture itself). Also makes the process DPI aware before the
+         * window exists (xbox_RenderRes). */
+        unsigned pw, ph;
+        RECT wa;
+        if (xbox_RenderRes(&pw, &ph)
+            && SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0)) {
+            int x, y, fw, fh;
+            int cw = (int)((wa.right - wa.left) * 4 / 5);
+            int ch = (int)((wa.bottom - wa.top) * 4 / 5);
+            if (cw > (int)pw) cw = (int)pw;
+            if (ch > (int)ph) ch = (int)ph;
+            xbox_FitAspect(cw, ch, (int)pw, (int)ph, &x, &y, &fw, &fh);
+            if (fw > 0 && fh > 0) {
+                r.right = fw;
+                r.bottom = fh;
+            }
+        }
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -582,4 +681,6 @@ void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h) { (void)w; (void)h; 
 void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
 void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
 { (void)w; (void)h; *x = *y = 0; *fw = cw; *fh = ch; }
+int xbox_RenderRes(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
+int xbox_DisplayShape(unsigned *w, unsigned *h) { *w = 4; *h = 3; return 0; }
 #endif
