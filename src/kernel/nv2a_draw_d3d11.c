@@ -2263,6 +2263,80 @@ static void vis_note_scale(float area);
 static void vis_note_batch(const Nv2aVshOutput *v, uint32_t n, uint32_t nidx);
 static void vis_note_target(int si, int zi);
 
+/* Polygon offset (SET_POLY_OFFSET_FILL_ENABLE with the scale factor and
+ * bias), as xemu passes it to glPolygonOffset: depth + factor x the
+ * triangle's depth slope + bias x one depth unit. Without it a decal drawn
+ * on the surface under it fights that surface for every pixel: the floor
+ * cracks the barn boss leaves flickered in and out in pieces (2026-10-15).
+ * D3D11 has the same two terms. DepthBias counts units of the D24 buffer,
+ * which are guest units for Z24 and 256 to a guest unit for Z16; its slope
+ * is per host pixel, and a surface drawn at scale s has 1/s of the guest
+ * pixel's slope, so the factor is multiplied by s. Each combination gets a
+ * state of its own (kept, a handful at most) and is reported once.
+ * RECOMP_POLY_OFFSET=0 turns it off. */
+#define OFFSET_STATES 16
+static struct {
+    int zcull;
+    INT bias;
+    float slope;
+    ID3D11RasterizerState *rs;
+} s_offset[OFFSET_STATES];
+static int s_noffset;
+
+static ID3D11RasterizerState *offset_state(int zcull, float scale)
+{
+    static int on = -1, reported;
+    ID3D11RasterizerState *base = zcull ? s_rs_zcull : s_rs;
+    D3D11_RASTERIZER_DESC rd;
+    float units = g_pb.poly_offset_bias
+                * (zeta_format() == 1 ? 256.0f : 1.0f);
+    INT bias;
+    float slope;
+    int i;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_POLY_OFFSET");
+        on = !(e && e[0] == '0');
+    }
+    if ((g_pb.poly_offset_point || g_pb.poly_offset_line) && !(reported & 1)) {
+        reported |= 1;
+        fprintf(stderr, "[GPU] d3d11: polygon offset for points/lines"
+                " enabled (not handled)%c", 10);
+    }
+    if (!on || !g_pb.poly_offset_fill
+        || (g_pb.poly_offset_factor == 0.0f && g_pb.poly_offset_bias == 0.0f))
+        return base;
+    bias = (INT)(units < 0.0f ? units - 0.5f : units + 0.5f);
+    slope = g_pb.poly_offset_factor * scale;
+    for (i = 0; i < s_noffset; i++)
+        if (s_offset[i].zcull == zcull && s_offset[i].bias == bias
+            && s_offset[i].slope == slope)
+            return s_offset[i].rs;
+    if (s_noffset == OFFSET_STATES) {
+        if (!(reported & 2)) {
+            reported |= 2;
+            fprintf(stderr, "[GPU] d3d11: more than %d polygon offset states;"
+                    " the rest draw without%c", OFFSET_STATES, 10);
+        }
+        return base;
+    }
+    ID3D11RasterizerState_GetDesc(base, &rd);
+    rd.DepthBias = bias;
+    rd.SlopeScaledDepthBias = slope;
+    rd.DepthBiasClamp = 0.0f;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd,
+                                                  &s_offset[s_noffset].rs)))
+        return base;
+    s_offset[s_noffset].zcull = zcull;
+    s_offset[s_noffset].bias = bias;
+    s_offset[s_noffset].slope = slope;
+    fprintf(stderr, "[GPU] d3d11: polygon offset factor %g bias %g (Z%d,"
+            " scale %g): DepthBias %d, slope %g%c", g_pb.poly_offset_factor,
+            g_pb.poly_offset_bias, zeta_format() == 1 ? 16 : 24, scale, bias,
+            slope, 10);
+    return s_offset[s_noffset++].rs;
+}
+
 /* Pixels outside the depth range. NV2A drops a pixel whose depth lies
  * outside [CLIP_MIN, CLIP_MAX] when SET_ZMIN_MAX_CONTROL says cull (bits
  * 4-7 = 0, as D3D sets it), or clamps it into the range (1); xemu discards
@@ -2275,7 +2349,7 @@ static void vis_note_target(int si, int zi);
  * clip drops exactly what lies outside 0..1, which is the range in use when
  * it is the whole of the zeta format's; any other range is clamped as
  * before and reported once. */
-static ID3D11RasterizerState *raster_state(void)
+static ID3D11RasterizerState *raster_state(float scale)
 {
     static uint32_t seen[8][3];
     static int nseen;
@@ -2298,7 +2372,7 @@ static ID3D11RasterizerState *raster_state(void)
                 !cull ? "clamped" : whole ? "outside culled"
                       : "partial range, clamped (not handled)", 10);
     }
-    return cull && whole && s_rs_zcull ? s_rs_zcull : s_rs;
+    return offset_state(cull && whole && s_rs_zcull, scale);
 }
 
 /* Keep the executor at most PACE_SLOTS x PACE_DRAWS draws ahead of the host
@@ -2746,7 +2820,7 @@ static void d3d_draw(void)
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
-    ID3D11DeviceContext_RSSetState(s_ctx, raster_state());
+    ID3D11DeviceContext_RSSetState(s_ctx, raster_state(surf_sx(si)));
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(bpp), bf,

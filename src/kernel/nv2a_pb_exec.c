@@ -1379,6 +1379,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         g_pb.clip_seen = 1;
         break;
     case 0x1D78: g_pb.zminmax_control = param; break; /* ZMIN_MAX_CONTROL */
+    case 0x0330: g_pb.poly_offset_point = param; break; /* POLY_OFFSET_... */
+    case 0x0334: g_pb.poly_offset_line = param; break;
+    case 0x0338: g_pb.poly_offset_fill = param; break;
+    case 0x0384:                          /* SET_POLYGON_OFFSET_SCALE_FACTOR */
+        memcpy(&g_pb.poly_offset_factor, &param, 4);
+        break;
+    case 0x0388:                          /* SET_POLYGON_OFFSET_BIAS */
+        memcpy(&g_pb.poly_offset_bias, &param, 4);
+        break;
     case 0x0214: g_pb.zeta_offset = param; break;/* SURFACE_ZETA_OFFSET */
     case 0x1D8C: g_pb.zstencil_clear = param; break; /* ZSTENCIL_CLEAR_VALUE */
 
