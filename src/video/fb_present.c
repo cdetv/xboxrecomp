@@ -103,13 +103,25 @@ static void fb_dpi_aware(void)
  * the size when set; 0 when unset or out of range (the frame stays 640x480).
  * The upper limits keep a scaled 1024 x 1024 depth buffer inside D3D11's
  * 16384-texel textures. Every thread computes the same answer, so a race on
- * the first call only does the work twice. */
+ * the first call only does the work twice.
+ *
+ * xbox_SetRenderRes changes it while the title runs (a settings menu): the
+ * D3D11 back end follows at its next present (nv2a_draw_d3d11.c,
+ * apply_render_res), and anything asking here sees the new size at once.
+ * Width and height live in one 64-bit word, so no reader sees half of a
+ * change; 0 = unset. */
+static volatile LONG64 s_render_res = -1;   /* -1: environment not read yet */
+
+static int render_res_ok(unsigned a, unsigned b)
+{
+    return a >= 320 && b >= 240 && a <= 10240 && b <= 7680;
+}
+
 int xbox_RenderRes(unsigned *w, unsigned *h)
 {
-    static volatile LONG done;
-    static unsigned rw, rh;
+    LONG64 v = s_render_res;
 
-    if (!done) {
+    if (v < 0) {
         const char *e = getenv("RECOMP_RENDER_RES");
         unsigned a = 0, b = 0;
         if (e && *e) {
@@ -120,21 +132,35 @@ int xbox_RenderRes(unsigned *w, unsigned *h)
             } else if (sscanf(e, "%ux%u", &a, &b) != 2) {
                 a = b = 0;
             }
-            if (a < 320 || b < 240 || a > 10240 || b > 7680) {
+            if (!render_res_ok(a, b)) {
                 fprintf(stderr, "  [FBWIN] RECOMP_RENDER_RES=%s ignored: want"
                         " WxH from 320x240 to 10240x7680, or native\n", e);
                 a = b = 0;
             }
         }
-        rw = a;
-        rh = b;
-        InterlockedExchange(&done, 1);
+        v = (LONG64)a << 32 | b;
+        /* A change made before the first read wins over the environment. */
+        InterlockedCompareExchange64(&s_render_res, v, -1);
+        v = s_render_res;
     }
-    if (rw) {
-        *w = rw;
-        *h = rh;
+    if (v) {
+        *w = (unsigned)(v >> 32);
+        *h = (unsigned)(v & 0xFFFFFFFF);
     }
-    return rw != 0;
+    return v != 0;
+}
+
+/* w x h from now on, or 0 x 0 for none (the title's own 640x480). 1 when
+ * taken, 0 when out of range (nothing changes). A process that started
+ * without RECOMP_RENDER_RES is not DPI aware (fb_dpi_aware must come before
+ * the window), so there a bigger picture is scaled up by Windows on a
+ * monitor set above 100 %. */
+int xbox_SetRenderRes(unsigned w, unsigned h)
+{
+    if ((w || h) && !render_res_ok(w, h))
+        return 0;
+    InterlockedExchange64(&s_render_res, (LONG64)w << 32 | h);
+    return 1;
 }
 
 /* The shape the picture is shown at, when something other than the frame's
@@ -183,6 +209,17 @@ void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h)
 void xbox_FramebufferWindowGpuOwned(int on)
 {
     InterlockedExchange(&s_gpu_owned, on ? 1 : 0);
+}
+
+/* The picture's shape changed (xbox_SetRenderRes, applied by the GPU back
+ * end): the view takes xbox_DisplayShape's new shape, or w:h when that has
+ * none. Posted: the view belongs to the window's own thread. */
+#define FB_WM_SET_SHAPE (WM_APP + 3)
+
+void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h)
+{
+    if (s_fb_running && s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_SET_SHAPE, (WPARAM)w, (LPARAM)h);
 }
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
@@ -423,6 +460,19 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SIZE:
         fb_layout_gpu_view(h);
         return 0;
+
+    case FB_WM_SET_SHAPE: {
+        unsigned sw, sh;
+        if (xbox_DisplayShape(&sw, &sh)) {
+            s_aspect_w = (int)sw;
+            s_aspect_h = (int)sh;
+        } else if (w && l) {
+            s_aspect_w = (int)w;
+            s_aspect_h = (int)l;
+        }
+        fb_layout_gpu_view(h);
+        return 0;
+    }
 
     case FB_WM_SET_FULLSCREEN:
         fb_set_fullscreen(h, w != 0);
@@ -742,6 +792,8 @@ void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
 void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
 { (void)w; (void)h; *x = *y = 0; *fw = cw; *fh = ch; }
 int xbox_RenderRes(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
+int xbox_SetRenderRes(unsigned w, unsigned h) { (void)w; (void)h; return 0; }
+void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h) { (void)w; (void)h; }
 int xbox_DisplayShape(unsigned *w, unsigned *h) { *w = 4; *h = 3; return 0; }
 void xbox_FramebufferWindowSetFullscreen(int on) { (void)on; }
 int xbox_FramebufferWindowIsFullscreen(void) { return 0; }

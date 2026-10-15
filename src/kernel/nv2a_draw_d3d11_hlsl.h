@@ -356,6 +356,16 @@ static const char s_hlsl[] =
 "  else a = d;\n"
 "  return float4((a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF, a >> 24)\n"
 "         / 255.0;\n"
+"}\n"
+"\n"
+"/* The stretch copy (blit_stretch), on zvs: a rectangle of bt sampled\n"
+"   bilinearly over the viewport. bk.xy: texture units per target pixel,\n"
+"   bk.zw: the rectangle's corner in texture units, bo.xy: the viewport's\n"
+"   corner in target pixels. */\n"
+"Texture2D bt : register(t6); SamplerState bsm : register(s4);\n"
+"cbuffer Bc : register(b2) { float4 bk; float4 bo; };\n"
+"float4 bps(float4 p : SV_Position) : SV_Target {\n"
+"  return bt.Sample(bsm, (p.xy - bo.xy) * bk.xy + bk.zw);\n"
 "}\n";
 
 #endif
