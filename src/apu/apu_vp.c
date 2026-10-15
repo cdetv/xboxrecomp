@@ -272,6 +272,58 @@ static void prof_event(MCPXAPUState *d, const char *what, unsigned int v,
             (now - t0) / 1000.0, what, v, arg);
 }
 
+/* RECOMP_APU_VOICE_LOG=1: voices (buffer and stream) from VOICE_ON to their
+ * end. [VOICE] on = the whole 128-byte voice struct as the title set it up;
+ * [VOICE] rel / end = frames processed, source frames fetched, CBO/EBO and
+ * envelope states, and what ended it (title's VOICE_OFF, end of buffer,
+ * forced release, a non-persist stream before its release, an empty SSL). For sounds that stop at once (Conker's running
+ * footsteps): who stops them, and after how much. */
+static int s_vlog = -1;
+static unsigned int s_vlog_lines;
+static uint32_t s_vlog_frames[MCPX_HW_MAX_VOICES];
+static uint32_t s_vlog_fetched[MCPX_HW_MAX_VOICES];
+
+static bool vlog_wanted(MCPXAPUState *d, unsigned int v)
+{
+    if (s_vlog < 0)
+        s_vlog = getenv("RECOMP_APU_VOICE_LOG") != NULL;
+    (void)d;
+    return s_vlog && s_vlog_lines < 20000 && v < MCPX_HW_MAX_VOICES;
+}
+
+static void vlog_on(MCPXAPUState *d, unsigned int v, uint32_t argument)
+{
+    if (!vlog_wanted(d, v))
+        return;
+    s_vlog_frames[v] = 0;
+    s_vlog_fetched[v] = 0;
+    s_vlog_lines++;
+    hwaddr voice = d->regs[NV_PAPU_VPVADDR] + v * NV_PAVS_SIZE;
+    fprintf(stderr, "[VOICE] %lld on  v%-3u arg=%08X:",
+            (long long)qemu_clock_get_ms(QEMU_CLOCK_REALTIME), v, argument);
+    for (int i = 0; i < NV_PAVS_SIZE / 4; i++)
+        fprintf(stderr, " %08X", ldl_le_phys(address_space_memory, voice + i * 4));
+    fprintf(stderr, "\n");
+}
+
+static void vlog_event(MCPXAPUState *d, unsigned int v, const char *what)
+{
+    if (!vlog_wanted(d, v))
+        return;
+    s_vlog_lines++;
+    fprintf(stderr, "[VOICE] %lld %-4s v%-3u frames=%u fetched=%u cbo=%u ebo=%u "
+            "state=%08X active=%u\n",
+            (long long)qemu_clock_get_ms(QEMU_CLOCK_REALTIME), what, v,
+            s_vlog_frames[v], s_vlog_fetched[v],
+            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
+                           NV_PAVS_VOICE_PAR_OFFSET_CBO),
+            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_NEXT,
+                           NV_PAVS_VOICE_PAR_NEXT_EBO),
+            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE, 0xFFFFFFFFu),
+            voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
+                           NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE));
+}
+
 /* ============================================================
  * Voice off / lock
  * ============================================================ */
@@ -430,6 +482,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_resample_reset((uint16_t)selected_handle);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE, 1);
+        vlog_on(d, selected_handle, argument);
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
@@ -458,6 +511,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
                        NV_PAVS_VOICE_PAR_STATE_EFCUR,
                        NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE);
+        vlog_event(d, selected_handle, "rel");
 
         if (!locked) voice_lock(d, (uint16_t)selected_handle, false);
         break;
@@ -465,6 +519,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
 
     case NV1BA0_PIO_VOICE_OFF:
         prof_event(d, "off", argument & NV1BA0_PIO_VOICE_OFF_HANDLE, argument);
+        vlog_event(d, argument & NV1BA0_PIO_VOICE_OFF_HANDLE, "OFF");
         voice_off(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_OFF_HANDLE));
         break;
 
@@ -882,6 +937,7 @@ static float voice_step_envelope(MCPXAPUState *d, uint16_t v, uint32_t reg_0,
 
     case NV_PAVS_VOICE_PAR_STATE_EFCUR_FORCE_RELEASE:
         if (count_mask == NV_PAVS_VOICE_CUR_ECNT_EACOUNT) {
+            vlog_event(d, v, "frel");
             voice_off(d, v);
         }
         return 0.0f;
@@ -949,6 +1005,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             int eacur = voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_STATE,
                                        NV_PAVS_VOICE_PAR_STATE_EACUR);
             if (eacur < NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE) {
+                vlog_event(d, v, "npst");
                 voice_off(d, (uint16_t)v);
                 return -1;
             }
@@ -971,6 +1028,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             d->vp.ssl[v].ssl_seg = 0;
             if (!persist) {
                 d->vp.ssl[v].ssl_index = 0;
+                vlog_event(d, v, "mpty");
                 voice_off(d, (uint16_t)v);
             } else {
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE +
@@ -1096,6 +1154,8 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         if (sample_count) s_prof_was_empty[v] = 0;
     }
 
+    s_vlog_fetched[v] += (uint32_t)sample_count;
+
     if (cbo >= ebo) {
         if (stream) {
             d->vp.ssl[v].ssl_seg += 1;
@@ -1116,6 +1176,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 cbo = lbo;
             } else {
                 cbo = ebo;
+                vlog_event(d, v, "end");
                 voice_off(d, (uint16_t)v);
             }
         }
@@ -1296,6 +1357,7 @@ static void voice_process(MCPXAPUState *d,
         }
     } else {
         int empty = 0;
+        s_vlog_frames[v]++;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
