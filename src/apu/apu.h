@@ -31,6 +31,11 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
 
+/* Hold the APU while a host pause holds the title (a host menu's pause
+ * key): 1 = the frame thread stops advancing voices and the output stops
+ * where it is; 0 = both carry on from there. Any thread. */
+void xbox_ApuSetPaused(int on);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *
