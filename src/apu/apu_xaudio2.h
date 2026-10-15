@@ -23,4 +23,8 @@ int xa2_get_buffer_size(void);
 /* Buffers XAudio2 still has queued (0 = it ran dry), or -1 if inactive. */
 int xa2_queued_buffers(void);
 
+/* Stop the output where it is (1), keeping what is queued, or start it
+ * again from there (0). */
+void xa2_set_paused(int on);
+
 #endif /* APU_XAUDIO2_H */

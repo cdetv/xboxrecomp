@@ -48,6 +48,9 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
+/* xbox_ApuSetPaused: the frame thread idles while this is set. */
+static volatile LONG g_host_paused = 0;
+
 /* ============================================================
  * RECOMP_APU_PROFILE
  *
@@ -797,6 +800,17 @@ static void *mcpx_apu_frame_thread(void *arg)
             continue;
         }
 
+        /* A host pause (xbox_ApuSetPaused): no voice advances, no
+         * interrupt is raised, so every sound carries on from the same
+         * sample afterwards. The title is held too and does not notice.
+         * The clock restarts after it rather than catching up. Polled: the
+         * caller does not take d->lock. */
+        if (qatomic_read(&g_host_paused)) {
+            qemu_cond_timedwait(&d->cond, &d->lock, 10);
+            d->next_frame_time_us = 0;
+            continue;
+        }
+
         /* Always run the audio output loop — the software mixer and test tone
          * need continuous frame delivery regardless of APU register state.
          * The VP/DSP pipeline (se_frame) only runs when registers allow it. */
@@ -889,6 +903,20 @@ static void mcpx_apu_resume(MCPXAPUState *d)
 {
     d->pause_requested = false;
     qemu_cond_signal(&d->cond);
+}
+
+void xbox_ApuSetPaused(int on)
+{
+    if (InterlockedExchange(&g_host_paused, on ? 1 : 0) == (on ? 1 : 0))
+        return;
+    /* The output keeps what it has queued and plays it on resume. */
+    if (xa2_is_active())
+        xa2_set_paused(on);
+    else if (g_waveout.initialized && on)
+        waveOutPause(g_waveout.hwo);
+    else if (g_waveout.initialized)
+        waveOutRestart(g_waveout.hwo);
+    fprintf(stderr, "[APU] host pause %s\n", on ? "on" : "off");
 }
 
 /* ============================================================

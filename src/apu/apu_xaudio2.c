@@ -169,6 +169,15 @@ int xa2_queued_buffers(void)
     return (int)state.BuffersQueued;
 }
 
+void xa2_set_paused(int on)
+{
+    if (!g_xa2_initialized || !g_xa2_source) return;
+    if (on)
+        IXAudio2SourceVoice_Stop(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+    else
+        IXAudio2SourceVoice_Start(g_xa2_source, 0, XAUDIO2_COMMIT_NOW);
+}
+
 #else /* !_WIN32 -- POSIX stubs (no audio output yet) */
 
 int  xa2_init(void)                                   { return 0; }
@@ -177,5 +186,6 @@ int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
 int  xa2_queued_buffers(void)                         { return -1; }
+void xa2_set_paused(int on)                           { (void)on; }
 
 #endif /* _WIN32 */
