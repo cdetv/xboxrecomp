@@ -53,6 +53,8 @@ extern void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h);
 extern void xbox_FramebufferWindowGpuOwned(int on);
 
 extern int xbox_RenderRes(unsigned *w, unsigned *h);
+extern int xbox_SetRenderRes(unsigned w, unsigned h);
+extern void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h);
 extern void xbox_Nv2aIdle(DWORD ms);
 
 /* A host overlay (a settings menu) drawn over each presented frame: called
@@ -86,10 +88,32 @@ void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
  * onto the bigger texture, scissors and clears are scaled here, textures
  * are sampled through guest-sized coordinates, and visibility counts are
  * divided back down (d3d_poll). Off: every scale is exactly 1 and every
- * size the same as before. ponytail: assumes a 640x480 title frame. */
+ * size the same as before. ponytail: assumes a 640x480 title frame.
+ *
+ * The size can change while the title runs (xbox_SetRenderRes): at a present
+ * apply_render_res resizes the swap chain, drops the scaled depth buffers
+ * and bumps s_scale_gen. Colour surfaces keep the scale they were made at
+ * (GpuSurface sx, sy) until next drawn into, then are remade at the new one
+ * with their picture stretched across (surface_current); a frame shown in
+ * between is stretched to the new back buffer (shown_to_back). */
 static int      s_scale_on;
 static float    s_rsx = 1.0f, s_rsy = 1.0f;
 static uint32_t s_sc_w = SC_W, s_sc_h = SC_H;
+static uint32_t s_scale_gen;
+
+/* The render scale for a w x h picture (0 x 0: the title's own size). */
+static void set_render_scale(uint32_t w, uint32_t h)
+{
+    if (!w || !h) {
+        w = SC_W;
+        h = SC_H;
+    }
+    s_scale_on = w != SC_W || h != SC_H;
+    s_sc_w = w;
+    s_sc_h = h;
+    s_rsx = (float)w / (float)SC_W;
+    s_rsy = (float)h / (float)SC_H;
+}
 
 /* A guest-pixel coordinate on a surface of scale s, in host pixels. Edges
  * round to the nearest, so rectangles that touch in the guest still touch. */
@@ -119,6 +143,8 @@ typedef struct {
     uint32_t w, h;                      /* in guest pixels */
     uint32_t tw, th;                    /* the texture, in host pixels */
     uint32_t scaled;                    /* drawn at the render scale */
+    float    sx, sy;                    /* host pixels per guest pixel */
+    uint32_t gen;                       /* s_scale_gen when made */
     uint32_t bpp, swz;                  /* guest pixel size, swizzled */
     uint32_t used;                      /* s_surf_tick at the last use */
     uint32_t drawn_flip;                /* g_pb.flips when last drawn on */
@@ -138,8 +164,8 @@ typedef struct {
 static GpuSurface s_surf[GPU_SURFACES];
 static uint32_t   s_surf_tick;
 
-static float surf_sx(int i) { return s_surf[i].scaled ? s_rsx : 1.0f; }
-static float surf_sy(int i) { return s_surf[i].scaled ? s_rsy : 1.0f; }
+static float surf_sx(int i) { return s_surf[i].sx; }
+static float surf_sy(int i) { return s_surf[i].sy; }
 
 /* Whether a surface made now for the current colour target is drawn at the
  * render scale: a linear one at least as wide as the frame (640 pixels), so
@@ -330,12 +356,28 @@ static int ensure_swap_chain(void)
     return 1;
 }
 
+static int blit_stretch(ID3D11Texture2D *src, float sx0, float sy0, float sw,
+                        float sh, ID3D11RenderTargetView *dst, float dx0,
+                        float dy0, float dw, float dh);
+
+/* Surface i was made before the render scale last changed and is not at the
+ * scale a surface made for the current target now would get. */
+static int surface_stale(int i)
+{
+    float want_x, want_y;
+    if (s_surf[i].gen == s_scale_gen)
+        return 0;
+    want_x = surface_scaled_now() ? s_rsx : 1.0f;
+    want_y = surface_scaled_now() ? s_rsy : 1.0f;
+    return s_surf[i].sx != want_x || s_surf[i].sy != want_y;
+}
+
 /* The GPU texture for the current colour surface, made or grown to cover the
  * current clip: its index, or -1 when there is no surface to speak of. */
 static int surface_current(void)
 {
     uint32_t addr, w, h, scaled;
-    int i;
+    int i, stale;
 
     if (!g_pb.color_offset || !g_pb.pitch || !g_pb.clip_w || !g_pb.clip_h)
         return -1;
@@ -359,16 +401,19 @@ static int surface_current(void)
         if (s_surf[i].tex && s_surf[i].addr == addr
             && s_surf[i].pitch == g_pb.pitch)
             break;
-    if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h) {
+    stale = i < GPU_SURFACES && surface_stale(i);
+    if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h && !stale) {
         s_surf[i].bpp = pb_surface_bpp();
         s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
         s_surf[i].used = s_surf_tick;
         s_surf[i].drawn_flip = g_pb.flips;
+        s_surf[i].gen = s_scale_gen;
         return i;
     }
-    /* A grown surface keeps the scale it was made with. */
-    scaled = i < GPU_SURFACES ? s_surf[i].scaled
-                              : (uint32_t)surface_scaled_now();
+    /* A grown surface keeps the scale it was made with; one made at an old
+     * render scale is remade at the current one. */
+    scaled = i < GPU_SURFACES && !stale ? s_surf[i].scaled
+                                        : (uint32_t)surface_scaled_now();
     if (i == GPU_SURFACES) {
         /* An empty slot, or the one unused longest. Conker's menu room
          * draws into new render-target addresses every frame; a round
@@ -400,10 +445,11 @@ static int surface_current(void)
         D3D11_TEXTURE2D_DESC d;
         HRESULT hr;
         int shown = s_shown == i;
+        float sx = scaled ? s_rsx : 1.0f, sy = scaled ? s_rsy : 1.0f;
         memset(&s_surf[i], 0, sizeof s_surf[i]);
         memset(&d, 0, sizeof d);
-        d.Width = to_host(w, scaled ? s_rsx : 1.0f);
-        d.Height = to_host(h, scaled ? s_rsy : 1.0f);
+        d.Width = to_host(w, sx);
+        d.Height = to_host(h, sy);
         d.MipLevels = 1;
         d.ArraySize = 1;
         d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -415,10 +461,17 @@ static int surface_current(void)
             hr = ID3D11Device_CreateRenderTargetView(s_dev,
                     (ID3D11Resource *)s_surf[i].tex, NULL, &s_surf[i].rtv);
         if (SUCCEEDED(hr) && old.tex && old.addr == addr
-            && old.pitch == g_pb.pitch)
-            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-                    (ID3D11Resource *)s_surf[i].tex, 0, 0, 0, 0,
-                    (ID3D11Resource *)old.tex, 0, NULL);
+            && old.pitch == g_pb.pitch) {
+            if (old.sx == sx && old.sy == sy)
+                ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                        (ID3D11Resource *)s_surf[i].tex, 0, 0, 0, 0,
+                        (ID3D11Resource *)old.tex, 0, NULL);
+            else        /* the render scale changed: the picture stretched */
+                blit_stretch(old.tex, 0.0f, 0.0f, (float)old.tw,
+                             (float)old.th, s_surf[i].rtv, 0.0f, 0.0f,
+                             (float)to_host(old.w, sx),
+                             (float)to_host(old.h, sy));
+        }
         if (old.rtv) ID3D11RenderTargetView_Release(old.rtv);
         if (old.tex) ID3D11Texture2D_Release(old.tex);
         if (FAILED(hr)) {
@@ -436,6 +489,8 @@ static int surface_current(void)
             s_shown = -1;
         s_surf[i].tw = d.Width;
         s_surf[i].th = d.Height;
+        s_surf[i].sx = sx;
+        s_surf[i].sy = sy;
     }
     s_surf[i].addr = addr;
     s_surf[i].pitch = g_pb.pitch;
@@ -446,6 +501,7 @@ static int surface_current(void)
     s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
     s_surf[i].used = s_surf_tick;
     s_surf[i].drawn_flip = g_pb.flips;
+    s_surf[i].gen = s_scale_gen;
     return i;
 }
 
@@ -740,6 +796,12 @@ static ID3D11VertexShader *s_zvs;
 static ID3D11PixelShader  *s_zps;
 static ID3D11Buffer       *s_zcb;
 
+/* The stretch copy pass (blit_stretch): its pixel shader, constants and
+ * bilinear sampler; the vertex shader is the zeta pass's. */
+static ID3D11PixelShader  *s_bps;
+static ID3D11Buffer       *s_bcb;
+static ID3D11SamplerState *s_bsamp;
+
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
@@ -821,6 +883,35 @@ static int draw_setup(void)
             s_zcb = NULL;
         }
     }
+    if (SUCCEEDED(hr) && s_zvs) {
+        /* The stretch copy (blit_stretch), on the zeta pass's vertex
+         * shader. Without it a render-scale change shows a frame or two
+         * of a surface at its old size. */
+        ID3DBlob *bps = compile("bps", "ps_4_0");
+        D3D11_SAMPLER_DESC sd;
+        HRESULT bh = bps ? S_OK : E_FAIL;
+        if (SUCCEEDED(bh))
+            bh = ID3D11Device_CreatePixelShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(bps),
+                    ID3D10Blob_GetBufferSize(bps), NULL, &s_bps);
+        if (SUCCEEDED(bh)) {
+            bd.ByteWidth = 32;
+            bh = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_bcb);
+        }
+        if (SUCCEEDED(bh)) {
+            memset(&sd, 0, sizeof sd);
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+            sd.AddressU = sd.AddressV = sd.AddressW
+                        = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            bh = ID3D11Device_CreateSamplerState(s_dev, &sd, &s_bsamp);
+        }
+        if (bps) ID3D10Blob_Release(bps);
+        if (FAILED(bh)) {
+            fail("stretch copy pass", bh);
+            if (s_bps) { ID3D11PixelShader_Release(s_bps); s_bps = NULL; }
+        }
+    }
     if (SUCCEEDED(hr)) {
         /* No culling here: build_triangles drops culled faces on the CPU
          * (pb_cull_tri), as the software path does. */
@@ -851,6 +942,70 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
         return 0;
     memcpy(m.pData, src, bytes);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    return 1;
+}
+
+/* The rectangle sx0,sy0 sw x sh (host pixels) of texture src, sampled
+ * bilinearly over the rectangle dx0,dy0 dw x dh of target dst: a surface
+ * made at an old render scale onto its remade texture or the back buffer.
+ * Only around a render-scale change. Leaves no target or view bound; every
+ * batch sets the rest of the state it uses. 1 when drawn. */
+static int blit_stretch(ID3D11Texture2D *src, float sx0, float sy0, float sw,
+                        float sh, ID3D11RenderTargetView *dst, float dx0,
+                        float dy0, float dw, float dh)
+{
+    D3D11_TEXTURE2D_DESC td;
+    ID3D11ShaderResourceView *srv = NULL, *none = NULL;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+    float bk[8];
+
+    if (!s_bps || !s_bcb || !s_bsamp || !src || !dst || dw < 1.0f
+        || dh < 1.0f || sw <= 0.0f || sh <= 0.0f)
+        return 0;
+    ID3D11Texture2D_GetDesc(src, &td);
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+            (ID3D11Resource *)src, NULL, &srv)))
+        return 0;
+    bk[0] = sw / (dw * (float)td.Width);
+    bk[1] = sh / (dh * (float)td.Height);
+    bk[2] = sx0 / (float)td.Width;
+    bk[3] = sy0 / (float)td.Height;
+    bk[4] = dx0;
+    bk[5] = dy0;
+    bk[6] = bk[7] = 0.0f;
+    if (!buf_fill(s_bcb, bk, sizeof bk)) {
+        ID3D11ShaderResourceView_Release(srv);
+        return 0;
+    }
+    vp.TopLeftX = dx0;
+    vp.TopLeftY = dy0;
+    vp.Width = dw;
+    vp.Height = dh;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    sc.left = (LONG)dx0;
+    sc.top = (LONG)dy0;
+    sc.right = (LONG)(dx0 + dw + 0.5f);
+    sc.bottom = (LONG)(dy0 + dh + 0.5f);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &dst, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_bps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_bcb);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 4, 1, &s_bsamp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11ShaderResourceView_Release(srv);
     return 1;
 }
 
@@ -2765,9 +2920,10 @@ static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
     FILE *f;
 
     if (i >= 0 && s_surf[i].scaled) {
-        uint32_t x1 = to_host(x + w, s_rsx), y1 = to_host(y + h, s_rsy);
-        x = to_host(x, s_rsx);
-        y = to_host(y, s_rsy);
+        float sx = surf_sx(i), sy = surf_sy(i);
+        uint32_t x1 = to_host(x + w, sx), y1 = to_host(y + h, sy);
+        x = to_host(x, sx);
+        y = to_host(y, sy);
         w = x1 - x;
         h = y1 - y;
     }
@@ -2908,11 +3064,119 @@ static void shown_to_back(void)
         box.right = box.left + (bw < s_sc_w ? bw : s_sc_w);
         box.bottom = box.top + (bh < s_sc_h ? bh : s_sc_h);
         box.back = 1;
-        ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-                (ID3D11Resource *)back, 0, 0, 0, 0,
-                (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+        if (s_surf[s_shown].gen != s_scale_gen
+            && (sx != s_rsx || sy != s_rsy)) {
+            /* Drawn before the render scale changed (a held frame, or the
+             * one presented right after the change): stretched to the new
+             * size instead of copied at the old one. */
+            uint32_t dw = to_host(s_shown_w, s_rsx);
+            uint32_t dh = to_host(s_shown_h, s_rsy);
+            blit_stretch(s_surf[s_shown].tex, (float)box.left,
+                         (float)box.top, (float)bw, (float)bh, s_back_rtv,
+                         0.0f, 0.0f, (float)(dw < s_sc_w ? dw : s_sc_w),
+                         (float)(dh < s_sc_h ? dh : s_sc_h));
+        } else {
+            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                    (ID3D11Resource *)back, 0, 0, 0, 0,
+                    (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+        }
         ID3D11Texture2D_Release(back);
     }
+}
+
+/* RECOMP_RES_FILE=<path> (debug): about once a second the present looks for
+ * that file; when it is there, its first line ("WxH", or "off" for the
+ * title's own size) goes to xbox_SetRenderRes and the file is deleted. Tests
+ * render-size changes without a settings menu. */
+static void res_file_poll(void)
+{
+    static const char *path = (const char *)-1;
+    static unsigned n;
+    char line[64];
+    unsigned w = 0, h = 0;
+    FILE *f;
+
+    if (path == (const char *)-1)
+        path = getenv("RECOMP_RES_FILE");
+    if (!path || ++n % 60)
+        return;
+    f = fopen(path, "rb");
+    if (!f)
+        return;
+    if (!fgets(line, sizeof line, f))
+        line[0] = 0;
+    fclose(f);
+    remove(path);
+    line[strcspn(line, "\r\n")] = 0;
+    if (_strnicmp(line, "off", 3) != 0 && sscanf(line, "%ux%u", &w, &h) != 2)
+        w = h = 1;                      /* refused below */
+    fprintf(stderr, "[GPU] d3d11: RECOMP_RES_FILE asks for %s%s%c",
+            w ? line : "off", xbox_SetRenderRes(w, h) ? "" : " (refused)", 10);
+}
+
+/* The render size changed (xbox_SetRenderRes): swap chain, scale and depth
+ * buffers follow, between two frames. Called before each present, held ones
+ * too, so a change made while the game is paused shows at once. Colour
+ * surfaces follow when next drawn into (surface_current). */
+static void apply_render_res(void)
+{
+    unsigned w = 0, h = 0;
+    ID3D11Texture2D *back = NULL;
+    HRESULT hr;
+    int i;
+
+    if (s_shadow || !s_swap)
+        return;
+    if (!xbox_RenderRes(&w, &h) || !w || !h) {
+        w = SC_W;
+        h = SC_H;
+    }
+    if (w == s_sc_w && h == s_sc_h)
+        return;
+    set_render_scale(w, h);
+    s_scale_gen++;
+    /* Scaled depth buffers are remade at the new scale when next used; a
+     * title clears its depth buffer every frame, so nothing is lost. */
+    for (i = 0; i < GPU_ZETAS; i++)
+        if (s_zeta[i].tex && s_zeta[i].scaled) {
+            if (s_zeta[i].srv_s) ID3D11ShaderResourceView_Release(s_zeta[i].srv_s);
+            if (s_zeta[i].srv_z) ID3D11ShaderResourceView_Release(s_zeta[i].srv_z);
+            if (s_zeta[i].dsv) ID3D11DepthStencilView_Release(s_zeta[i].dsv);
+            ID3D11Texture2D_Release(s_zeta[i].tex);
+            memset(&s_zeta[i], 0, sizeof s_zeta[i]);
+        }
+    /* The back buffer must have no view left for ResizeBuffers. */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_back_rtv) {
+        ID3D11RenderTargetView_Release(s_back_rtv);
+        s_back_rtv = NULL;
+    }
+    ID3D11DeviceContext_Flush(s_ctx);
+    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    if (FAILED(hr))
+        fail("ResizeBuffers", hr);
+    if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                            (void **)&back))) {
+        D3D11_TEXTURE2D_DESC d;
+        ID3D11Texture2D_GetDesc(back, &d);
+        if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)back, NULL, &s_back_rtv)))
+            fail("back buffer view", E_FAIL);
+        if (d.Width != w || d.Height != h) {
+            /* Still the old size: draw and present at what it is. */
+            set_render_scale(d.Width, d.Height);
+        }
+        ID3D11Texture2D_Release(back);
+    }
+    if (!s_back_rtv) {
+        s_swap_failed = 1;              /* nothing to present into */
+        IDXGISwapChain1_Release(s_swap);
+        s_swap = NULL;
+        return;
+    }
+    xbox_FramebufferWindowShapeChanged(s_sc_w, s_sc_h);
+    fprintf(stderr, "[GPU] d3d11: render resolution now %ux%u (frame scaled"
+            " %.3g x %.3g)%c", s_sc_w, s_sc_h, s_rsx, s_rsy, 10);
 }
 
 static void d3d_present(void)
@@ -2959,6 +3223,10 @@ static void d3d_present(void)
         int hold;
         do {
             xbox_GpuOverlayFn overlay = s_overlay;
+            res_file_poll();
+            apply_render_res();
+            if (!s_swap)
+                break;
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             shown_to_back();
@@ -3376,11 +3644,7 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
          * 640x480 pixel for pixel. */
         unsigned w, h;
         if (!shadow && xbox_RenderRes(&w, &h) && (w != SC_W || h != SC_H)) {
-            s_scale_on = 1;
-            s_sc_w = w;
-            s_sc_h = h;
-            s_rsx = (float)w / (float)SC_W;
-            s_rsy = (float)h / (float)SC_H;
+            set_render_scale(w, h);
             fprintf(stderr, "[GPU] d3d11: render resolution %ux%u (frame"
                     " scaled %.3g x %.3g)%c", w, h, s_rsx, s_rsy, 10);
         }
