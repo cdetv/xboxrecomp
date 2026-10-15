@@ -736,6 +736,13 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->cube = (param >> 2) & 1;
         t->border_from_color = (param >> 3) & 1;
         t->levels = (param >> 16) & 0xF;
+        /* DIMENSIONALITY (bits 4-7) 3 is a volume texture, BASE_SIZE_P
+         * (bits 28-31) its depth as log2. Its slices are interleaved with
+         * one another (sample_tex), so read as a 2D image it is garbage:
+         * Conker's barn floor light map is a 256x256x2 DXT1, which came out
+         * as bars of every other block. */
+        t->depth = ((param >> 4) & 0xF) == 3 ? 1u << ((param >> 28) & 0xF)
+                                              : 1u;
         /* A swizzled texture carries its own dimensions here, as log2 in
          * BASE_SIZE_U/V. It has to: IMAGE_RECT describes a linear image, and
          * a title that only uses swizzled textures never sends one. */
