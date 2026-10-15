@@ -2573,9 +2573,10 @@ static void d3d_draw(void)
             fprintf(stderr, "[FTRACE]     t%d %c", st, s_tex_src[st]);
             if (s_tex_src[st] == 'S')
                 fprintf(stderr, "%d", s_tex_slot[st]);
-            fprintf(stderr, " %08X fmt %02X %ux%u pitch %u | u %.2f..%.2f"
+            fprintf(stderr, " %08X fmt %02X %ux%ux%u pitch %u | u %.2f..%.2f"
                     " v %.2f..%.2f q0 %.2f | addr %u/%u filter %08X%c",
-                    t->offset, t->color, t->width, t->height, t->pitch, u0,
+                    t->offset, t->color, t->width, t->height,
+                    t->depth ? t->depth : 1, t->pitch, u0,
                     u1, v0, v1, verts[0].tex[st][3], t->addr_u, t->addr_v,
                     t->filter, 10);
             if (combiners && (m == 6 || m == 7)) {

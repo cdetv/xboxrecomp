@@ -601,7 +601,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
                         uint32_t px[16]; } cache[4096];
         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        /* A compressed volume texture keeps the blocks of up to four
+         * slices together, slice after slice, for each 4x4 spot (xemu's
+         * s3tc 3D decoder; Conker's 256x256x2 light map is exactly 64 KB
+         * laid out so). Only slice 0 is read: every stage here samples in
+         * 2D, and Conker's two slices are the same image. */
+        uint32_t zgroup = t->depth > 4 ? 4 : (t->depth ? t->depth : 1);
+        const uint8_t *blk = mem + base
+                             + ((size_t)by * bw + bx) * zgroup * bb;
         uintptr_t key = (uintptr_t)blk;
         size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
         uint64_t raw[2] = {0, 0};
@@ -609,9 +616,8 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         if (cache[slot].key != key || cache[slot].fmt != fmt
             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
             uint32_t i;
-            for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
-                                      by * 4 + (i >> 2), t->width,
+            for (i = 0; i < 16; i++)       /* the block as a 4x4 image */
+                d3d8_dxt_decode_texel(blk, fmt, i & 3, i >> 2, 4,
                                       &cache[slot].px[i]);
             cache[slot].key = key;
             cache[slot].fmt = fmt;
@@ -628,7 +634,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * index for every one of them. */
         fmt = linear_twin(fmt);
         p = mem + base;
-        u = swizzle_offset(u, v, t->width, t->height);
+        /* A volume texture's Morton order takes z bits too; slice 0. */
+        u = t->depth > 1
+            ? xbox_swizzle_offset_3d(u, v, 0, t->width, t->height, t->depth)
+            : swizzle_offset(u, v, t->width, t->height);
     } else {
         p = mem + base + (size_t)v * t->pitch;
     }
@@ -3339,11 +3348,12 @@ int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 uint32_t pb_tex_bytes(const Texture *t)
 {
     uint32_t block = d3d8_format_dxt_block_bytes(t->color);
+    uint32_t depth = t->depth ? t->depth : 1;  /* all slices: they interleave */
 
     if (block)
-        return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block;
+        return ((t->width + 3) / 4) * ((t->height + 3) / 4) * block * depth;
     if (d3d8_format_is_swizzled(t->color))
-        return t->width * t->height * tex_texel_bytes(t->color);
+        return t->width * t->height * tex_texel_bytes(t->color) * depth;
     return t->pitch * t->height;
 }
 

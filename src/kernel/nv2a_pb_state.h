@@ -84,6 +84,8 @@ typedef struct {
     int      border_from_color;         /* FORMAT bit 3: border is the colour,
                                          * not texels stored with the image */
     int      cube;                      /* FORMAT: six faces, not one    */
+    uint32_t depth;                     /* FORMAT: slices of a volume (3D)
+                                         * texture, 1 for a 2D one       */
     int      valid;
     /* SET_TEXTURE_SET_BUMP_ENV_MAT/SCALE/OFFSET (stages 1-3): how a bump-env
      * stage turns the previous stage's (du, dv) into a coordinate offset,
