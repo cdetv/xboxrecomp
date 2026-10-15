@@ -198,6 +198,13 @@ typedef struct Nv2aPbState {
      * and SET_FRONT_FACE (GL CW 0x900 / CCW 0x901; 0 = never sent, which
      * pb_cull_tri reads as GL's default CCW). */
     uint32_t cull_enable, cull_face, front_face;
+    /* Polygon offset, as xemu passes it to glPolygonOffset: SET_POLY_OFFSET_
+     * FILL_ENABLE and the two floats of SET_POLYGON_OFFSET_SCALE_FACTOR /
+     * _BIAS (the bias in guest depth units). Decals lift themselves off the
+     * surface under them with it (Conker's barn boss floor cracks); the
+     * point and line enables are kept only to report them. */
+    uint32_t poly_offset_fill, poly_offset_point, poly_offset_line;
+    float    poly_offset_factor, poly_offset_bias;
 } Nv2aPbState;
 extern Nv2aPbState g_pb;
 
