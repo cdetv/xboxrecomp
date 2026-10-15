@@ -520,6 +520,10 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
 
+/* XGSCNT, the global sample counter: advanced by the frame thread, one
+ * frame's samples at a time (apu_core.c). */
+void mcpx_apu_xgscnt_advance(MCPXAPUState *d, uint32_t samples);
+
 /* DSP functions (stubbed) */
 void mcpx_apu_dsp_init(MCPXAPUState *d);
 void mcpx_apu_update_dsp_preference(MCPXAPUState *d);

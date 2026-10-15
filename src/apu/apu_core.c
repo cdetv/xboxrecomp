@@ -347,6 +347,33 @@ static void apu_deliver_irq(MCPXAPUState *d)
  * MMIO Read / Write
  * ============================================================ */
 
+/* NV_PAPU_XGSCNT counts output samples at 48 kHz while the sample engine runs:
+ * DirectSound zeroes it at reset (0x004CDABD and dsound_ep_reset in Conker),
+ * XACT turns it into its clock as count * 10^7 / 48000 (100 ns units), and
+ * the XPP voice code takes 48 counts per 1 ms USB frame. xemu returns
+ * ns / 100 (a 10 MHz tick, marked "???" there) and ignores the write; with
+ * that, XACT's clock ran ~208 times fast and the 32-bit count wrapped every
+ * 7 minutes, and an interactive cue's transition never came due: Conker's
+ * barn pit music (AD_CUE_windy_wires_inter) kept its next variation waiting
+ * and so never acted on its stop. Counted by the frame thread, so it follows
+ * the samples the VP actually produced, and stands still while the APU does.
+ *
+ * RECOMP_APU_XGSCNT=wall: the old ns / 100 read, for A/B. */
+void mcpx_apu_xgscnt_advance(MCPXAPUState *d, uint32_t samples)
+{
+    qatomic_fetch_add(&d->regs[NV_PAPU_XGSCNT], samples);
+}
+
+static int xgscnt_wall(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_XGSCNT");
+        on = e && !strcmp(e, "wall");
+    }
+    return on;
+}
+
 uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 {
     MCPXAPUState *d = (MCPXAPUState *)opaque;
@@ -354,7 +381,10 @@ uint64_t mcpx_apu_read(void *opaque, hwaddr addr, unsigned int size)
 
     switch (addr) {
     case NV_PAPU_XGSCNT:
-        r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        if (xgscnt_wall())
+            r = (uint64_t)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 100);
+        else
+            r = qatomic_read(&d->regs[NV_PAPU_XGSCNT]);
         break;
     default:
         if (addr < 0x20000) {
@@ -768,6 +798,7 @@ static void se_frame(MCPXAPUState *d)
         double t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
         mcpx_apu_vp_frame(d, mixbins);
         mcpx_apu_dsp_frame(d, mixbins);
+        mcpx_apu_xgscnt_advance(d, NUM_SAMPLES_PER_FRAME);
         double t1 = g_apu_prof_on ? prof_now_ms() : 0.0;
         mcpx_apu_monitor_frame(d);
         if (g_apu_prof_on) {
