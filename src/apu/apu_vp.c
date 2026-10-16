@@ -101,13 +101,19 @@ static void prof_voice_clicks(uint16_t v, float samples[][2], uint32_t fmt,
  * what the guest routed (dialogue to the centre bin, 3D sends, reverb). */
 static float         s_route_gain[MCPX_HW_MAX_VOICES][NUM_MIXBINS];
 static float         s_route_peak[MCPX_HW_MAX_VOICES];
+/* Stereo voices: which sample columns feed each bin (bit 0 = column 0 from
+ * the even slots, bit 1 = column 1 from the odd), printed as /0, /1, /01. */
+static uint8_t       s_route_cols[MCPX_HW_MAX_VOICES][NUM_MIXBINS];
 
 static void prof_voice_route(uint16_t v, const int bin[8], const float gain[8],
                              float samples[][2], unsigned int channels)
 {
-    for (int b = 0; b < 8; b++)
+    for (int b = 0; b < 8; b++) {
         if (gain[b] > s_route_gain[v][bin[b]])
             s_route_gain[v][bin[b]] = gain[b];
+        if (channels == 2 && gain[b] > 0.0f)
+            s_route_cols[v][bin[b]] |= (uint8_t)(1u << (b & 1));
+    }
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
         for (unsigned int c = 0; c < channels; c++)
             if (fabsf(samples[i][c]) > s_route_peak[v])
@@ -127,9 +133,12 @@ static void prof_voices_routing(void)
                                 v, v < MCPX_HW_MAX_3D_VOICES ? "/3d" : "",
                                 s_route_peak[v]);
         for (int b = 0; b < NUM_MIXBINS && len < sizeof(line); b++)
-            if (s_route_gain[v][b] > 0.0f)
-                len += (size_t)snprintf(line + len, sizeof(line) - len, " %d:%.0f",
-                                        b, 20.0f * log10f(s_route_gain[v][b]));
+            if (s_route_gain[v][b] > 0.0f) {
+                static const char *const cols[4] = { "", "/0", "/1", "/01" };
+                len += (size_t)snprintf(line + len, sizeof(line) - len, " %d:%.0f%s",
+                                        b, 20.0f * log10f(s_route_gain[v][b]),
+                                        cols[s_route_cols[v][b] & 3]);
+            }
         if (len < sizeof(line))
             len += (size_t)snprintf(line + len, sizeof(line) - len, " |");
         shown++;
@@ -144,6 +153,7 @@ static void prof_voices_routing(void)
             line[0] ? line : " none");
     memset(s_route_gain, 0, sizeof(s_route_gain));
     memset(s_route_peak, 0, sizeof(s_route_peak));
+    memset(s_route_cols, 0, sizeof(s_route_cols));
 }
 
 /* Printed by prof_report every 5 s: the voices that clicked most. */
@@ -1465,21 +1475,81 @@ static void voice_process(MCPXAPUState *d,
      * channels; a voice in the MP list skips the bin the next multipass voice
      * reads, as xemu does, so a submix is not heard twice. */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
-        float g = 0.0f;
         int mp_bin = -1;
         if (voice_list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_MP_TOP - 1)
             mp_bin = peek_ahead_multipass_bin(d, v);
+        float raw[8], place[2][2];
         for (int b = 0; b < 8; b++) {
-            if (bin[b] == mp_bin)
-                continue;
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
-            float bg = attenuate(vol[b]) / hr;
-            if (bg > g) g = bg;
+            raw[b] = attenuate(vol[b]) / hr;
         }
-        g *= ea_value;
+        /* An HRTF voice's columns are ears, not source channels. */
+        mcpx_apu_monitor_place(bin, raw, hrtf_on ? 1 : channels, mp_bin, place);
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            sample_buf[i][0] += g * samples[i][0];
-            sample_buf[i][1] += g * samples[i][1];
+            float s0 = ea_value * samples[i][0], s1 = ea_value * samples[i][1];
+            sample_buf[i][0] += place[0][0] * s0 + place[1][0] * s1;
+            sample_buf[i][1] += place[0][1] * s0 + place[1][1] * s1;
+        }
+    }
+}
+
+/* RECOMP_APU_MONITOR_STEREO=old: stereo voices as xemu plays them (A/B). */
+static bool monitor_stereo_old(void)
+{
+    static int old = -1;
+    if (old < 0) {
+        const char *e = getenv("RECOMP_APU_MONITOR_STEREO");
+        old = (e && !strcmp(e, "old")) ? 1 : 0;
+        if (old)
+            fprintf(stderr, "[APU] monitor mix: stereo voices as xemu "
+                            "(centre channel on the left)\n");
+    }
+    return old != 0;
+}
+
+/* xemu's monitor mix plays every voice at its loudest bin gain, sample
+ * column 0 on the left and column 1 on the right. For a mono voice (both
+ * columns the same) that is the centre, and it stays so. A title's 5.1
+ * music, though, is three stereo voices: front L/R to bins 0/1, centre +
+ * LFE to bins 2/3, back L/R to bins 4/5 (Conker's Great Mighty Poo song,
+ * vocals on the centre). xemu put the centre on the left only and the LFE,
+ * whose bin the title keeps silent, on the right at the centre's gain. Here
+ * each column of a stereo voice takes the loudest gain of its own slots
+ * (even slots column 0, odd column 1, as the bin mix reads them) and goes
+ * to the side of that bin: 0/4 left, 1/5 right, centre/LFE (2/3) both at
+ * -3 dB (same power), anything else (effect sends) by its column as xemu. */
+void mcpx_apu_monitor_place(const int bin[8], const float gain[8],
+                            unsigned int channels, int skip_bin,
+                            float out[2][2])
+{
+    float g[2] = { 0.0f, 0.0f };
+    int gb[2] = { -1, -1 };
+    if (channels < 1) channels = 1;
+    if (channels > 2) channels = 2;
+    for (int b = 0; b < 8; b++) {
+        if (bin[b] == skip_bin)
+            continue;
+        unsigned int c = (unsigned int)b % channels;
+        if (gain[b] > g[c]) {
+            g[c] = gain[b];
+            gb[c] = bin[b];
+        }
+    }
+    memset(out, 0, sizeof(float) * 4);
+    if (channels == 1 || monitor_stereo_old()) {
+        float m = g[0] > g[1] ? g[0] : g[1];
+        out[0][0] = m;
+        out[1][1] = m;
+        return;
+    }
+    for (int c = 0; c < 2; c++) {
+        switch (gb[c]) {
+        case 0: case 4: out[c][0] = g[c]; break;
+        case 1: case 5: out[c][1] = g[c]; break;
+        case 2: case 3:
+            out[c][0] = out[c][1] = g[c] * 0.70710678f;
+            break;
+        default: out[c][c] = g[c]; break;
         }
     }
 }
