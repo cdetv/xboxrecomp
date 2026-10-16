@@ -38,16 +38,32 @@ matched within 0.5 dB. The table above is still selectable
 (`RECOMP_APU_MIXDOWN=speakers`) and is what these tests exercise: the
 speakers arm sets it explicitly.
 
+## Then: the monitor mix's centre channel
+
+xemu's monitor mix puts a voice's sample column 0 on the left and column 1 on
+the right. Conker's 5.1 music (the Great Mighty Poo song) is three stereo
+voices: front L/R to bins 0/1, centre + LFE to bins 2/3, back L/R to bins
+4/5. The vocals, on the centre column, came out on the left only, and the LFE
+column (its bin silent) on the right at the centre's gain. Now each column of
+a stereo voice takes its own slots' gain and goes to its bin's side, centre
+and LFE to both at -3 dB (`mcpx_apu_monitor_place`); mono voices and plain
+left/right stereo are unchanged. `RECOMP_APU_MONITOR_STEREO=old` brings
+xemu's placement back.
+
 ## Running
 
     cmake -S tests/apu_mixdown -B build/apu-mixdown
     cmake --build build/apu-mixdown
     ctest --test-dir build/apu-mixdown
 
-Three tests. `apu_mixdown_speakers` puts a signal in single bins and checks
+Five tests. `apu_mixdown_speakers` puts a signal in single bins and checks
 each lands where the table says (3D bins 6..10 on both channels, centre equal
 on both sides, XTLK left/right on their side, LFE and I3DL2 silent by
 default). `apu_mixdown_evenodd` requires the old sum to put the centre on the
 left only, and `apu_mixdown_two_bins` requires bins 6..10 to be *lost* with
 `RECOMP_APU_MIXDOWN_ALL=0`. Without those controls, a mixdown that ignored
-its own switch would pass.
+its own switch would pass. `apu_mixdown_monitor` checks the monitor mix's
+placement (a stereo voice's centre column equal on both sides at the same
+power, its silent LFE column silent, front L/R columns on their side, mono
+voices as before); `apu_mixdown_monitor_old` is its negative control and
+requires xemu's placement to show the defect.

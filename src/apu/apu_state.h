@@ -520,6 +520,14 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
 
+/* VP monitor mix (RECOMP_APU_MIXDOWN=xemu): where one voice's two sample
+ * columns go. gain[b] is volume slot b's linear gain (headroom applied),
+ * skip_bin a bin left out (-1: none). out[col][side]: column col's gain on
+ * side 0 (left) / 1 (right). See apu_vp.c. */
+void mcpx_apu_monitor_place(const int bin[8], const float gain[8],
+                            unsigned int channels, int skip_bin,
+                            float out[2][2]);
+
 /* XGSCNT, the global sample counter: advanced by the frame thread, one
  * frame's samples at a time (apu_core.c). */
 void mcpx_apu_xgscnt_advance(MCPXAPUState *d, uint32_t samples);

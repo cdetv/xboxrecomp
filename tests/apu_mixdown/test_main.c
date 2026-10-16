@@ -89,6 +89,39 @@ int main(void)
          * signal must be lost, or the speakers arm proves nothing. */
         run(EFFECT_BIN_LO, EFFECT_BIN_HI, &l, &r);
         check(!l && !r, "bins 0/1 only: 3D bins discarded", l, r);
+    } else if (!strcmp(arm, "monitor") || !strcmp(arm, "monitor_old")) {
+        /* The VP monitor mix's placement (mcpx_apu_monitor_place). Conker's
+         * 5.1 boss song: the centre + LFE pair is one stereo voice, column 0
+         * (vocals) to bin 2 at -10 dB, column 1 to bin 3, silent. */
+        static const int c_bin[8] = { 2, 3, 2, 3, 2, 3, 2, 3 };
+        static const int lr_bin[8] = { 0, 1, 0, 1, 0, 1, 0, 1 };
+        float c_gain[8] = { 0.316f, 0, 0, 0, 0, 0, 0, 0 };
+        float lr_gain[8] = { 0.5f, 0.5f, 0, 0, 0, 0, 0, 0 };
+        float out[2][2];
+        mcpx_apu_monitor_place(c_bin, c_gain, 2, -1, out);
+        l = (int)(out[0][0] * 1000); r = (int)(out[0][1] * 1000);
+        if (!strcmp(arm, "monitor_old")) {
+            /* The negative control: xemu's placement must show the defect. */
+            check(l && !r, "xemu: centre column on the left only", l, r);
+            l = (int)(out[1][0] * 1000); r = (int)(out[1][1] * 1000);
+            check(!l && r, "xemu: silent LFE column on the right at the centre's gain", l, r);
+        } else {
+            check(l && l == r, "centre column of a stereo voice on both sides", l, r);
+            check(fabsf(out[0][0] * out[0][0] * 2 - 0.316f * 0.316f) < 1e-4f,
+                  "centre keeps its power", l, r);
+            l = (int)(out[1][0] * 1000); r = (int)(out[1][1] * 1000);
+            check(!l && !r, "LFE column the title left silent stays silent", l, r);
+            mcpx_apu_monitor_place(lr_bin, lr_gain, 2, -1, out);
+            l = (int)(out[0][0] * 1000); r = (int)(out[0][1] * 1000);
+            check(l == 500 && !r, "front-left column stays left", l, r);
+            l = (int)(out[1][0] * 1000); r = (int)(out[1][1] * 1000);
+            check(!l && r == 500, "front-right column stays right", l, r);
+            /* Mono voices unchanged: the loudest bin's gain, both sides. */
+            mcpx_apu_monitor_place(c_bin, c_gain, 1, -1, out);
+            l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+            check(l == 316 && r == 316 && !out[0][1] && !out[1][0],
+                  "mono voice at its loudest gain, columns to their sides as xemu", l, r);
+        }
     } else {
         fprintf(stderr, "unknown APU_MIXDOWN_ARM %s\n", arm);
         fails++;
