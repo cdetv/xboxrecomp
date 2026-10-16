@@ -385,7 +385,11 @@ static void draw_primitive(void)
     if (s_shadow)
         s_shadow->draw();
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    /* Read once: ~1,000 draws a frame made getenv ~7% of the executor. */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
