@@ -268,6 +268,8 @@ int pb_probe_frame(void);
  * array or the SET_VERTEX_DATA constant; 0 when there is neither (white).
  * pb_tex_texel: texel (u, v) of level 0 of t as 0xAARRGGBB, through the
  * software sampler's own decoder; 0 for a format it cannot read.
+ * pb_tex_texel3: the same for slice w of a volume texture (pb_tex_texel is
+ * slice 0).
  * pb_tex_bytes: how many guest bytes level 0 of t covers, palette aside. */
 int pb_batch_screen_space(void);
 /* pb_transform_batch: every vertex of the current batch through the title's
@@ -281,6 +283,8 @@ const Nv2aVshOutput *pb_transform_batch(void);
 void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out);
 int pb_fetch_color(uint32_t index, float c[4]);
 int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb);
+int pb_tex_texel3(const Texture *t, uint32_t u, uint32_t v, uint32_t w,
+                  uint32_t *argb);
 uint32_t pb_tex_bytes(const Texture *t);
 /* pb_rc_input_stage: the earlier stage a bump-env stage (1-3) reads its
  * du/dv from: stage 0 for stage 1, SHADER_OTHER_STAGE_INPUT for 2 and 3. */
