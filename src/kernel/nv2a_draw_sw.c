@@ -1992,16 +1992,28 @@ static void triq_rows(int k, int n, XfCount *cnt)
     }
 }
 
-/* The pool runs one job at a time on all its threads: job(k, n) for k in
- * 0..n-1, the caller taking k = n-1, and returns when every part is done. */
+/* The pool runs one job at a time on m of its threads: job(k, m) for k in
+ * 0..m-1, the caller taking k = m-1, and returns when every part is done.
+ *
+ * Waking is the expensive part, not the work: Conker's busiest scenes are
+ * ~1,000 vertex batches a frame, and an event for every worker per batch
+ * plus the caller's own sleep cost the executor ~22% (2026-10-16, Uga Buga
+ * bomb run). So a job wakes only the workers it needs (pool_run_n; see
+ * RECOMP_VSH_MT_CHUNK in transform_batch), and the caller, once its own
+ * part is done, spins on the count before sleeping on the done event:
+ * RECOMP_POOL_SPIN=<pauses> (default 20000, 0 = off). Workers that spin for
+ * the next job instead of sleeping were slower (they share cores with the
+ * title on an 8-core/16-thread CPU). */
 typedef void (*PoolJob)(int k, int n);
 
 #if defined(_WIN32)
 static struct {
     int n;                                  /* threads incl. the caller */
+    int m;                                  /* threads in the current job */
     HANDLE start[NV_RASTER_MAX_THREADS], done;
     volatile LONG pending;
     PoolJob job;
+    long spin;
 } s_pool;
 
 static DWORD WINAPI raster_worker(LPVOID arg)
@@ -2009,7 +2021,7 @@ static DWORD WINAPI raster_worker(LPVOID arg)
     int k = (int)(intptr_t)arg;
     for (;;) {
         WaitForSingleObject(s_pool.start[k], INFINITE);
-        s_pool.job(k, s_pool.n);
+        s_pool.job(k, s_pool.m);
         if (InterlockedDecrement(&s_pool.pending) == 0)
             SetEvent(s_pool.done);
     }
@@ -2029,6 +2041,10 @@ static int raster_pool_size(void)
         if (n < 1) n = 1;
         if (n > NV_RASTER_MAX_THREADS) n = NV_RASTER_MAX_THREADS;
         s_pool.n = n;
+        {
+            const char *sp = getenv("RECOMP_POOL_SPIN");
+            s_pool.spin = sp ? atol(sp) : 20000;
+        }
         if (n > 1) {
             s_pool.done = CreateEventA(NULL, FALSE, FALSE, NULL);
             for (k = 0; k < n - 1; k++) {
@@ -2041,19 +2057,32 @@ static int raster_pool_size(void)
     return s_pool.n;
 }
 
-static void pool_run(PoolJob job)
+/* job on m threads (1..s_pool.n), the caller included. */
+static void pool_run_n(PoolJob job, int m)
 {
-    int n = s_pool.n, k;
+    int k;
+    long i;
 
+    if (m > s_pool.n) m = s_pool.n;
+    if (m <= 1) {
+        job(0, 1);
+        return;
+    }
     s_pool.job = job;
-    s_pool.pending = n - 1;
-    for (k = 0; k < n - 1; k++)
+    s_pool.m = m;
+    s_pool.pending = m - 1;
+    for (k = 0; k < m - 1; k++)
         SetEvent(s_pool.start[k]);
-    job(n - 1, n);
-    WaitForSingleObject(s_pool.done, INFINITE);
+    job(m - 1, m);
+    for (i = 0; i < s_pool.spin && s_pool.pending; i++)
+        YieldProcessor();
+    WaitForSingleObject(s_pool.done, INFINITE);  /* set once pending is 0 */
 }
+
+static void pool_run(PoolJob job) { pool_run_n(job, s_pool.n); }
 #else
 static int raster_pool_size(void) { return 1; }
+static void pool_run_n(PoolJob job, int m) { (void)m; job(0, 1); }
 static void pool_run(PoolJob job) { job(0, 1); }
 #endif
 
@@ -2593,6 +2622,7 @@ static void raster_xf_prims(uint32_t n);
  * logging is not thread-safe. */
 #define NV_VCACHE_SIZE 65536u
 #define NV_VSH_MT_MIN  64           /* program runs worth waking the pool */
+#define NV_VSH_MT_CHUNK 32          /* program runs per thread (one lane set) */
 static uint32_t s_vc_stamp[NV_VCACHE_SIZE], s_vc_index[NV_VCACHE_SIZE];
 static uint32_t s_vc_slot[NV_VCACHE_SIZE], s_vc_now;
 static uint32_t s_xf_from[NV_MAX_INDICES];  /* slot to copy, or itself */
@@ -2652,7 +2682,7 @@ static int transform_batch(uint32_t n)
     int cache = !nv2a_vsh_cxt_write();
     uint32_t i;
 
-    static long mt_min = -1;
+    static long mt_min = -1, mt_chunk = -1;
     if (vsh_debug < 0)
         vsh_debug = getenv("RECOMP_VSH_DUMP") || getenv("RECOMP_VSH_STEP");
     if (lanes < 0) {
@@ -2664,6 +2694,14 @@ static int transform_batch(uint32_t n)
         const char *e = getenv("RECOMP_VSH_MT_MIN");
         mt_min = e ? atol(e) : NV_VSH_MT_MIN;
         if (mt_min < 2) mt_min = 2;
+        /* RECOMP_VSH_MT_CHUNK=<runs>: threads per batch = runs / chunk
+         * (rounded up), so a small batch wakes a few workers, not all.
+         * 0 = every thread for every batch over mt_min. Uga Buga bomb
+         * run, 1080p, with the pool spin: 0 ~25 fps (dips to 16), 128
+         * 26.6, 64 26.9, 32 27.2. */
+        e = getenv("RECOMP_VSH_MT_CHUNK");
+        mt_chunk = e ? atol(e) : NV_VSH_MT_CHUNK;
+        if (mt_chunk < 0) mt_chunk = 0;
     }
     if (!cache) {
         for (i = 0; i < n; i++)
@@ -2694,7 +2732,9 @@ static int transform_batch(uint32_t n)
             return 0;
         if (s_xf_nrun >= (uint32_t)mt_min && raster_pool_size() > 1
                 && !one_thread)
-            pool_run(xf_lanes_job);
+            pool_run_n(xf_lanes_job, mt_chunk
+                       ? (int)((s_xf_nrun + mt_chunk - 1) / mt_chunk)
+                       : raster_pool_size());
         else
             xf_lanes_job(0, 1);
     } else {
