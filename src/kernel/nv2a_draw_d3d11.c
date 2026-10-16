@@ -1314,10 +1314,11 @@ static ID3D11DepthStencilState *ds_state(void)
 #define TEX_BUCKETS  1024
 typedef struct {
     uint32_t addr, fmt, w, h, pitch, palette;
+    uint32_t d;                         /* slices uploaded: 1, or a volume's depth */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
-    ID3D11Texture2D *tex;
+    ID3D11Resource *tex;                /* Texture2D, or Texture3D when d > 1 */
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
 static GpuTexture s_tex[GPU_TEXTURES];
@@ -1379,6 +1380,7 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
 
 #define RTT_ALPHA_ONE 1u
 #define RTT_SWAP_RB   2u
+#define TEX_VOLUME    4u    /* a Texture3D view: bind it to the stage's 3D slot */
 
 /* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
  * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
@@ -1800,8 +1802,11 @@ static void note_stale_read(int st, uint32_t bytes)
 }
 
 /* A shader view of stage st's texture as it is now, or NULL when it cannot
- * be read; RTT_* flags in *flags. */
-static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
+ * be read; RTT_* / TEX_VOLUME flags in *flags. `volume`: the stage samples
+ * in 3D (PROJECT3D) and its texture is a volume, so upload every slice as a
+ * Texture3D; otherwise a volume is read as its slice 0, as before. */
+static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
+                                               int volume)
 {
     const Texture *t = &g_pb.texs[st];
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1810,6 +1815,8 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
     int i, lru = 0;
+    uint32_t d3 = volume && t->depth > 1 ? t->depth : 1, z;
+    size_t slice = (size_t)t->width * t->height;
 
     *flags = 0;
     s_tex_src[st] = '-';
@@ -1846,7 +1853,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         GpuTexture *c = &s_tex[i - 1];
         if (c->addr == t->offset && c->fmt == t->color
             && c->w == t->width && c->h == t->height && c->pitch == t->pitch
-            && c->palette == palette) {
+            && c->palette == palette && c->d == d3) {
             e = c;
             break;
         }
@@ -1856,6 +1863,8 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
      * each one each time was a quarter of the executor's time (Conker's first
      * field). ponytail: a texture the title rewrites between two binds in
      * the same frame keeps the first bind's contents until the next flip. */
+    if (e && d3 > 1)
+        *flags |= TEX_VOLUME;
     if (e && e->hashed_flip == g_pb.flips) {
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -1873,9 +1882,9 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
 
     /* New or changed: decode level 0. A format the sampler cannot read
      * comes out NULL, as the software sampler's fallback. */
-    if ((size_t)t->width * t->height > s_texels_cap) {
+    if (slice * d3 > s_texels_cap) {
         free(s_texels);
-        s_texels_cap = (size_t)t->width * t->height;
+        s_texels_cap = slice * d3;
         s_texels = (uint32_t *)malloc(s_texels_cap * 4);
         if (!s_texels) {
             s_texels_cap = 0;
@@ -1883,16 +1892,31 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         }
     }
     if (!pb_tex_texel(t, 0, 0, &s_texels[0])) {
+        /* Once per format: which one the sampler is missing (it draws as
+         * white, so a missing grime/detail layer just looks clean). */
+        static uint32_t seen[8];
+        uint32_t f = t->color & 0xFF;
+        if (!(seen[f >> 5] & (1u << (f & 31)))) {
+            seen[f >> 5] |= 1u << (f & 31);
+            fprintf(stderr, "[GPU] d3d11: texture format 0x%02X unreadable (first: stage %d,"
+                    " %ux%u depth %u, at 0x%08X, pitch %u, flip %u)%c", f, st, t->width,
+                    t->height, t->depth, t->offset, t->pitch, g_pb.flips, 10);
+        }
         s_stat.tex_unreadable++;
         return NULL;
     }
-    for (y = 0; y < t->height; y++)
-        for (x = 0; x < t->width; x++)
-            if (!pb_tex_texel(t, x, y, &s_texels[(size_t)y * t->width + x]))
-                s_texels[(size_t)y * t->width + x] = 0xFFFFFFFFu;
+    for (z = 0; z < d3; z++)
+        for (y = 0; y < t->height; y++)
+            for (x = 0; x < t->width; x++) {
+                uint32_t *o = &s_texels[z * slice + (size_t)y * t->width + x];
+                if (!pb_tex_texel3(t, x, y, z, o))
+                    *o = 0xFFFFFFFFu;
+            }
 
     if (!e) {
         D3D11_TEXTURE2D_DESC d;
+        D3D11_TEXTURE3D_DESC d3d;
+        HRESULT hr;
         for (i = 0; i < GPU_TEXTURES; i++)
             if (!s_tex[i].tex
                 || (s_tex[lru].tex && s_tex[i].used < s_tex[lru].used))
@@ -1901,21 +1925,36 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         if (e->tex)
             tex_unlink(lru);
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
-        if (e->tex) ID3D11Texture2D_Release(e->tex);
+        if (e->tex) ID3D11Resource_Release(e->tex);
         memset(e, 0, sizeof *e);
-        memset(&d, 0, sizeof d);
-        d.Width = t->width;
-        d.Height = t->height;
-        d.MipLevels = 1;
-        d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &e->tex))
+        if (d3 > 1) {
+            memset(&d3d, 0, sizeof d3d);
+            d3d.Width = t->width;
+            d3d.Height = t->height;
+            d3d.Depth = d3;
+            d3d.MipLevels = 1;
+            d3d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d3d.Usage = D3D11_USAGE_DEFAULT;
+            d3d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            hr = ID3D11Device_CreateTexture3D(s_dev, &d3d, NULL,
+                                              (ID3D11Texture3D **)&e->tex);
+        } else {
+            memset(&d, 0, sizeof d);
+            d.Width = t->width;
+            d.Height = t->height;
+            d.MipLevels = 1;
+            d.ArraySize = 1;
+            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            hr = ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                              (ID3D11Texture2D **)&e->tex);
+        }
+        if (FAILED(hr)
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
-                    (ID3D11Resource *)e->tex, NULL, &e->srv))) {
-            if (e->tex) ID3D11Texture2D_Release(e->tex);
+                    e->tex, NULL, &e->srv))) {
+            if (e->tex) ID3D11Resource_Release(e->tex);
             memset(e, 0, sizeof *e);
             return NULL;
         }
@@ -1925,12 +1964,16 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags)
         e->h = t->height;
         e->pitch = t->pitch;
         e->palette = palette;
+        e->d = d3;
+        if (d3 > 1)
+            *flags |= TEX_VOLUME;
         s_tex_next[lru] = s_tex_head[tex_bucket(e->addr)];
         s_tex_head[tex_bucket(e->addr)] = (uint16_t)(lru + 1);
         s_stat.tex_made++;
     }
-    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)e->tex, 0,
-                                          NULL, s_texels, t->width * 4, 0);
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, 0, NULL, s_texels,
+                                          t->width * 4,
+                                          (UINT)(slice * 4));
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
     e->used = s_tex_tick;
@@ -2438,6 +2481,9 @@ static void d3d_draw(void)
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
     ID3D11ShaderResourceView *srv[4] = {NULL, NULL, NULL, NULL};
+    /* Volume textures go to t7-t10 (Texture3D in the shader); mode.y bits
+     * 4-7 say which stages read there. */
+    ID3D11ShaderResourceView *vsrv[4] = {NULL, NULL, NULL, NULL};
     ID3D11SamplerState *samp[4] = {NULL, NULL, NULL, NULL};
     const Nv2aVshOutput *verts = s_bv;
     float bf[4];
@@ -2503,13 +2549,18 @@ static void d3d_draw(void)
                 k.bsc[st][1] = t->bump_offset;
                 k.bsc[st][2] = (float)pb_rc_input_stage(st);
             }
-            srv[st] = texture_stage(st, &rtt);
+            srv[st] = texture_stage(st, &rtt, combiners && m == 2);
             samp[st] = srv[st] ? sampler_stage(st, combiners) : NULL;
             if (!samp[st]) {
                 srv[st] = NULL;
                 continue;
             }
             bound |= 1u << st;
+            if (rtt & TEX_VOLUME) {
+                vsrv[st] = srv[st];
+                srv[st] = NULL;
+                bound |= 16u << st;
+            }
             k.tscale[st][0] = tex_size_from_format(t->color)
                               ? 1.0f : 1.0f / (float)t->width;
             k.tscale[st][1] = tex_size_from_format(t->color)
@@ -2548,7 +2599,7 @@ static void d3d_draw(void)
         }
         path = PATH_FLAT;
         if (textured) {
-            srv[0] = texture_stage(0, &rtt);
+            srv[0] = texture_stage(0, &rtt, 0);
             samp[0] = srv[0] ? sampler_stage(0, 0) : NULL;
             if (samp[0]) {
                 bound = 1;
@@ -2819,6 +2870,7 @@ static void d3d_draw(void)
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, vsrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     ID3D11DeviceContext_RSSetState(s_ctx, raster_state(surf_sx(si)));
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
@@ -2859,6 +2911,8 @@ static void d3d_draw(void)
      * sampled without D3D refusing the overlap. */
     memset(srv, 0, sizeof srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    if (bound & 0xF0u)
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, srv);
     ct_add(CT_DRAW, ct_draw0);
     pace_draw();
 

@@ -560,17 +560,27 @@ static uint32_t linear_twin(uint32_t fmt)
     case 0x1A: return 0x20;                /* A8L8      -> LIN_A8L8      */
     case 0x28: return 0x17;                /* G8B8      -> LIN_G8B8      */
     case 0x29: return 0x16;                /* R8B8      -> LIN_R8B8      */
+    /* Conker's grime/blood layer (stage 1, a 64x64x16 volume) is A8B8G8R8;
+     * unmapped, it read as white and every dirty wall came out clean. */
+    case 0x3A: return 0x3F;                /* A8B8G8R8  -> LIN_A8B8G8R8  */
+    case 0x3B: return 0x40;                /* B8G8R8A8  -> LIN_B8G8R8A8  */
+    case 0x3C: return 0x41;                /* R8G8B8A8  -> LIN_R8G8B8A8  */
     default:   return fmt;                 /* already linear, or unhandled */
     }
 }
 
-/* Sample texel (u, v) of stage texture `t`; `face` offsets a cube map. */
-static int sample_tex(const Texture *t, uint32_t face_offset,
-                      uint32_t u, uint32_t v, uint32_t *argb)
+/* Sample texel (u, v) of slice w of stage texture `t` (w 0 unless it is a
+ * volume); `face` offsets a cube map. */
+static int sample_tex3(const Texture *t, uint32_t face_offset,
+                       uint32_t u, uint32_t v, uint32_t w, uint32_t *argb)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
     uint32_t fmt, base = t->offset + face_offset;
+    uint32_t depth = t->depth ? t->depth : 1;
+
+    if (w >= depth)
+        w = depth - 1;
 
     if (!t->valid)
         return 0;
@@ -604,11 +614,12 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
         /* A compressed volume texture keeps the blocks of up to four
          * slices together, slice after slice, for each 4x4 spot (xemu's
          * s3tc 3D decoder; Conker's 256x256x2 light map is exactly 64 KB
-         * laid out so). Only slice 0 is read: every stage here samples in
-         * 2D, and Conker's two slices are the same image. */
-        uint32_t zgroup = t->depth > 4 ? 4 : (t->depth ? t->depth : 1);
+         * laid out so); deeper ones repeat that per group of four slices. */
+        uint32_t zgroup = depth > 4 ? 4 : depth;
+        uint32_t bh = (t->height + 3) >> 2;
         const uint8_t *blk = mem + base
-                             + ((size_t)by * bw + bx) * zgroup * bb;
+                             + (size_t)(w >> 2) * bw * bh * zgroup * bb
+                             + (((size_t)by * bw + bx) * zgroup + (w & 3)) * bb;
         uintptr_t key = (uintptr_t)blk;
         size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
         uint64_t raw[2] = {0, 0};
@@ -634,12 +645,12 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * index for every one of them. */
         fmt = linear_twin(fmt);
         p = mem + base;
-        /* A volume texture's Morton order takes z bits too; slice 0. */
-        u = t->depth > 1
-            ? xbox_swizzle_offset_3d(u, v, 0, t->width, t->height, t->depth)
+        /* A volume texture's Morton order takes z bits too. */
+        u = depth > 1
+            ? xbox_swizzle_offset_3d(u, v, w, t->width, t->height, depth)
             : swizzle_offset(u, v, t->width, t->height);
     } else {
-        p = mem + base + (size_t)v * t->pitch;
+        p = mem + base + ((size_t)w * t->height + v) * t->pitch;
     }
 
     switch (fmt) {
@@ -784,6 +795,14 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     default:
         return 0;
     }
+}
+
+/* Slice 0: what every 2D read of a texture means (a volume included; the
+ * software renderer samples volumes in 2D). */
+static int sample_tex(const Texture *t, uint32_t face_offset,
+                      uint32_t u, uint32_t v, uint32_t *argb)
+{
+    return sample_tex3(t, face_offset, u, v, 0, argb);
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
@@ -3343,6 +3362,12 @@ void pb_fixed_vertex(uint32_t index, Nv2aVshOutput *out)
 int pb_tex_texel(const Texture *t, uint32_t u, uint32_t v, uint32_t *argb)
 {
     return sample_tex(t, 0, u, v, argb);
+}
+
+int pb_tex_texel3(const Texture *t, uint32_t u, uint32_t v, uint32_t w,
+                  uint32_t *argb)
+{
+    return sample_tex3(t, 0, u, v, w, argb);
 }
 
 uint32_t pb_tex_bytes(const Texture *t)
