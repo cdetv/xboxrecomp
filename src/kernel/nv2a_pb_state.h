@@ -80,6 +80,7 @@ typedef struct {
     uint32_t palette;                   /* guest address of the CLUT, P8 */
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
+    uint32_t control0;                  /* SET_TEXTURE_CONTROL0: LOD clamps */
     uint32_t border_color;              /* SET_TEXTURE_BORDER_COLOR, ARGB */
     int      border_from_color;         /* FORMAT bit 3: border is the colour,
                                          * not texels stored with the image */
@@ -272,6 +273,9 @@ int pb_probe_frame(void);
  * slice 0).
  * pb_tex_face_texel: the same for face `face` (0-5: +X -X +Y -Y +Z -Z) of
  * a cube map; pb_tex_face_stride: the bytes between two of its faces.
+ * pb_tex_level: mip level `level` of a swizzled/DXT 2D texture as a texture
+ * of its own (offset past the bigger levels, size halved per level), for
+ * pb_tex_texel; 0 when t has no such level.
  * pb_tex_bytes: how many guest bytes level 0 of t covers, palette aside. */
 int pb_batch_screen_space(void);
 /* pb_transform_batch: every vertex of the current batch through the title's
@@ -290,6 +294,7 @@ int pb_tex_texel3(const Texture *t, uint32_t u, uint32_t v, uint32_t w,
 int pb_tex_face_texel(const Texture *t, uint32_t face, uint32_t u,
                       uint32_t v, uint32_t *argb);
 uint32_t pb_tex_face_stride(const Texture *t);
+int pb_tex_level(const Texture *t, uint32_t level, Texture *out);
 uint32_t pb_tex_bytes(const Texture *t);
 /* pb_rc_input_stage: the earlier stage a bump-env stage (1-3) reads its
  * du/dv from: stage 0 for stage 1, SHADER_OTHER_STAGE_INPUT for 2 and 3. */

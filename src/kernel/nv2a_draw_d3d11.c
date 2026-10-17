@@ -199,6 +199,7 @@ static struct {
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
     uint32_t cube_binds, cube_drawn;
+    uint32_t mip_binds, mip_unused;
 } s_stat;
 
 /* Diagnostic: addresses of surfaces thrown out of the table, so a texture
@@ -1304,9 +1305,14 @@ static ID3D11DepthStencilState *ds_state(void)
  * render target sampled later is rewritten in place.
  * A cube map is its six faces as a Texture2DArray (slices +X -X +Y -Y +Z
  * -Z); the shader picks the face as rc_stage_fetch does (TEX_CUBE).
- * ponytail: no mip levels, so a minified texture shimmers. A cube map is
- * read from guest memory only: faces the GPU drew (a title rendering its
- * own reflections) would read stale; logged once per address.
+ * A swizzled/DXT 2D texture brings its whole mip chain (FORMAT's level
+ * count, pb_tex_level), and the shader samples with the coordinates'
+ * screen derivatives, so a minified texture reads a smaller level instead
+ * of shimmering; which levels and how is the sampler's (sampler_stage).
+ * ponytail: cube maps and volumes are level 0 only. A cube map is read
+ * from guest memory only: faces the GPU drew (a title rendering its own
+ * reflections) would read stale; logged once per address. Only level 0 is
+ * hashed: a title that rewrote a smaller level alone would keep the old one.
  * ponytail: the bytes are hashed at every bind, which is a full read of the
  * texture per batch; a dirty-page scheme would avoid it. */
 
@@ -1320,6 +1326,7 @@ typedef struct {
     uint32_t addr, fmt, w, h, pitch, palette;
     uint32_t d;                         /* slices uploaded: 1, a volume's depth, 6 a cube */
     uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
+    uint32_t lv;                        /* mip levels uploaded (2D only) */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
@@ -1393,6 +1400,9 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
  * '-' nothing bound. Set by texture_stage. */
 static char s_tex_src[4];
 static int  s_tex_slot[4];
+/* Mip levels of each stage's texture as bound (1 for a surface or zeta
+ * copy), for sampler_stage. Set by texture_stage. */
+static uint32_t s_tex_levels[4];
 static int  s_rtt_slot;
 
 static struct {
@@ -1857,8 +1867,11 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
 
+    uint32_t lv = 1, total;
+
     *flags = 0;
     s_tex_src[st] = '-';
+    s_tex_levels[st] = 1;
     if (!t->valid || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
@@ -1888,6 +1901,11 @@ guest:
         bytes += 5 * face_stride;       /* all six faces, mips between */
     else
         note_stale_read(st, bytes);
+    if (!cube && d3 == 1 && t->levels > 1 && tex_size_from_format(t->color)) {
+        uint32_t big = t->width > t->height ? t->width : t->height;
+        while ((1u << lv) <= big && lv < t->levels)
+            lv++;                       /* down to 1x1 at most */
+    }
     if (s_nevicted && was_evicted(t->offset & 0x0FFFFFFFu)
         && s_stat.evicted_reads++ < 8)
         fprintf(stderr, "[GPU] d3d11: stage %d texture 0x%08X fmt 0x%02X"
@@ -1901,7 +1919,8 @@ guest:
         GpuTexture *c = &s_tex[i - 1];
         if (c->addr == t->offset && c->fmt == t->color
             && c->w == t->width && c->h == t->height && c->pitch == t->pitch
-            && c->palette == palette && c->d == d3 && c->cube == cube) {
+            && c->palette == palette && c->d == d3 && c->cube == cube
+            && c->lv == lv) {
             e = c;
             break;
         }
@@ -1913,6 +1932,8 @@ guest:
      * the same frame keeps the first bind's contents until the next flip. */
     if (e && d3 > 1)
         *flags |= cube ? TEX_CUBE : TEX_VOLUME;
+    if (e)
+        s_tex_levels[st] = lv;
     if (e && e->hashed_flip == g_pb.flips) {
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -1930,9 +1951,14 @@ guest:
 
     /* New or changed: decode level 0. A format the sampler cannot read
      * comes out NULL, as the software sampler's fallback. */
-    if (slice * d3 > s_texels_cap) {
+    total = (uint32_t)(slice * d3);
+    for (z = 1; z < lv; z++) {
+        uint32_t w = t->width >> z, h = t->height >> z;
+        total += (w ? w : 1) * (h ? h : 1);
+    }
+    if (total > s_texels_cap) {
         free(s_texels);
-        s_texels_cap = slice * d3;
+        s_texels_cap = total;
         s_texels = (uint32_t *)malloc(s_texels_cap * 4);
         if (!s_texels) {
             s_texels_cap = 0;
@@ -1961,6 +1987,20 @@ guest:
                            : pb_tex_texel3(t, x, y, z, o)))
                     *o = 0xFFFFFFFFu;
             }
+    {
+        uint32_t *o = s_texels + slice, l;
+        for (l = 1; l < lv; l++) {
+            Texture m;
+            if (!pb_tex_level(t, l, &m)) {
+                lv = l;                 /* not there after all: stop here */
+                break;
+            }
+            for (y = 0; y < m.height; y++)
+                for (x = 0; x < m.width; x++, o++)
+                    if (!pb_tex_texel(&m, x, y, o))
+                        *o = 0xFFFFFFFFu;
+        }
+    }
 
     if (!e) {
         D3D11_TEXTURE2D_DESC d;
@@ -1991,7 +2031,7 @@ guest:
             memset(&d, 0, sizeof d);
             d.Width = t->width;
             d.Height = t->height;
-            d.MipLevels = 1;
+            d.MipLevels = lv;
             d.ArraySize = d3;           /* 6 for a cube: a Texture2DArray view */
             d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             d.SampleDesc.Count = 1;
@@ -2015,6 +2055,7 @@ guest:
         e->palette = palette;
         e->d = d3;
         e->cube = cube;
+        e->lv = lv;
         if (d3 > 1)
             *flags |= cube ? TEX_CUBE : TEX_VOLUME;
         s_tex_next[lru] = s_tex_head[tex_bucket(e->addr)];
@@ -2027,91 +2068,137 @@ guest:
                                                   s_texels + z * slice,
                                                   t->width * 4,
                                                   (UINT)(slice * 4));
-    else
-        ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, 0, NULL,
-                                              s_texels, t->width * 4,
-                                              (UINT)(slice * 4));
+    else {
+        const uint32_t *src = s_texels;
+        uint32_t l, w = t->width, h = t->height;
+        for (l = 0; l < e->lv && l < lv; l++) {
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, l, NULL, src,
+                                                  w * 4, (UINT)(w * h * 4));
+            src += l ? (size_t)w * h : slice * d3;
+            w = w > 1 ? w / 2 : 1;
+            h = h > 1 ? h / 2 : 1;
+        }
+    }
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
     e->used = s_tex_tick;
     s_stat.tex_uploads++;
+    s_tex_levels[st] = e->lv;
     return e->srv;
 }
 
-/* Sampler states: point or bilinear, wrap or clamp per axis. */
-static ID3D11SamplerState *s_samp[8];
-
-/* Border mode (address 4 with FORMAT's border-from-colour bit), as the
+/* Sampler states: point or bilinear, wrap, clamp or border per axis, and
+ * the stage's mip settings, as xemu reads them (texture.c):
+ *  - FILTER bits 16-23, the minification filter: 1/2/7 read level 0 only,
+ *    3/4 the nearest level, 5/6 a blend of the two nearest;
+ *  - FILTER bits 0-12, the LOD bias, signed with 8 fraction bits;
+ *  - CONTROL0 MIN/MAX_LOD_CLAMP (bits 18-29 / 6-17, 4.8 fixed point): the
+ *    first and last level used, whole levels (xemu: >> 8).
+ * Point or bilinear within a level follows the software path (rc_texel):
+ * bilinear only in the combiner path, when the title asks for a tent.
+ *
+ * Border mode (address 4 with FORMAT's border-from-colour bit), as the
  * software sampler does it: outside the image the texture reads the border
  * colour. Conker projects its room light maps with a white border, so a
  * character outside the map is fully lit; clamped, it took the map's edge
- * texels and came out darker. Few distinct border colours exist, so these
- * are cached by key and colour in a short list. */
-static struct { int k; uint32_t color; ID3D11SamplerState *s; } s_samp_border[16];
-
-static ID3D11SamplerState *sampler_border(int lin, int bu, int bv,
-                                          int wu, int wv, uint32_t argb)
-{
-    int k = lin | bu << 1 | bv << 2 | wu << 3 | wv << 4, i;
-    D3D11_SAMPLER_DESC d;
-
-    for (i = 0; i < 16 && s_samp_border[i].s; i++)
-        if (s_samp_border[i].k == k && s_samp_border[i].color == argb)
-            return s_samp_border[i].s;
-    if (i == 16)
-        return NULL;                    /* full: caller falls back to clamp */
-    memset(&d, 0, sizeof d);
-    d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                   : D3D11_FILTER_MIN_MAG_MIP_POINT;
-    d.AddressU = bu ? D3D11_TEXTURE_ADDRESS_BORDER
-               : wu ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.AddressV = bv ? D3D11_TEXTURE_ADDRESS_BORDER
-               : wv ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    d.BorderColor[0] = ((argb >> 16) & 0xFF) / 255.0f;
-    d.BorderColor[1] = ((argb >>  8) & 0xFF) / 255.0f;
-    d.BorderColor[2] = ( argb        & 0xFF) / 255.0f;
-    d.BorderColor[3] = ((argb >> 24) & 0xFF) / 255.0f;
-    d.MaxLOD = D3D11_FLOAT32_MAX;
-    if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp_border[i].s)))
-        return NULL;
-    s_samp_border[i].k = k;
-    s_samp_border[i].color = argb;
-    return s_samp_border[i].s;
-}
+ * texels and came out darker.
+ *
+ * Few distinct states exist, so they are cached by their description in a
+ * short list, searched from the front. */
+typedef struct {
+    uint32_t key;                       /* lin, address modes, mip mode */
+    uint32_t bias;                      /* FILTER bits 0-12 */
+    uint32_t lods;                      /* min level | max level << 8 */
+    uint32_t color;                     /* border colour, when bordered */
+    ID3D11SamplerState *s;
+} SampEntry;
+#define SAMP_CACHE 64
+static SampEntry s_samp[SAMP_CACHE];
+static int s_nsamp;
 
 static ID3D11SamplerState *sampler_stage(int st, int combiners)
 {
     const Texture *t = &g_pb.texs[st];
     uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
-    /* Bilinear only where the software path filters: in the combiner path,
-     * when the title asks for a tent (rc_texel); the other paths always
-     * take the nearest texel. */
     int lin = combiners && (mag == 2 || min == 2 || min == 4 || min == 6);
-    int k = lin | (t->addr_u == 1) << 1 | (t->addr_v == 1) << 2;
+    int border = t->border_from_color && (t->addr_u == 4 || t->addr_v == 4);
+    int bu = border && t->addr_u == 4, bv = border && t->addr_v == 4;
+    int wu = t->addr_u == 1, wv = t->addr_v == 1;
+    /* 0 level 0 only, 1 nearest level, 2 blend of two levels */
+    uint32_t mip = min == 3 || min == 4 ? 1u : min == 5 || min == 6 ? 2u : 0u;
+    uint32_t lmin = ((t->control0 >> 18) & 0xFFF) >> 8;
+    uint32_t lmax = ((t->control0 >> 6) & 0xFFF) >> 8;
+    uint32_t key, bias, lods, color;
+    int32_t sbias;
+    D3D11_SAMPLER_DESC d;
+    int i;
 
-    if (t->border_from_color && (t->addr_u == 4 || t->addr_v == 4)) {
-        ID3D11SamplerState *b = sampler_border(lin, t->addr_u == 4,
-                                               t->addr_v == 4, t->addr_u == 1,
-                                               t->addr_v == 1, t->border_color);
-        if (b)
-            return b;
+    if (s_tex_levels[st] <= 1)
+        mip = 0;                        /* nothing to pick from */
+    if (lmin > s_tex_levels[st] - 1)
+        lmin = s_tex_levels[st] - 1;
+    if (lmax < lmin || !mip)
+        lmax = lmin;
+    bias = mip ? t->filter & 0x1FFF : 0;
+    lods = lmin | lmax << 8;
+    color = border ? t->border_color : 0;
+    key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5;
+    if (mip)
+        s_stat.mip_binds++;
+    else if (s_tex_levels[st] > 1)
+        s_stat.mip_unused++;
+    if (s_tex_levels[st] > 1) {
+        /* What the title asks of its mipped textures: first few kinds. */
+        static uint64_t seen[16];
+        static int nseen;
+        uint64_t kind = min | (t->filter & 0x1FFF) << 8 | (uint64_t)lods << 24
+                        | (uint64_t)s_tex_levels[st] << 40;
+        int k;
+        for (k = 0; k < nseen && seen[k] != kind; k++)
+            ;
+        if (k == nseen && nseen < 16) {
+            seen[nseen++] = kind;
+            fprintf(stderr, "[GPU] d3d11: mip kind: min filter %u, %u levels"
+                    " %ux%u fmt 0x%02X, CONTROL0 %08X (levels %u-%u), bias"
+                    " %d/256 (flip %u)%c", min, s_tex_levels[st], t->width,
+                    t->height, t->color, t->control0, lmin, lmax,
+                    (int32_t)((t->filter & 0x1FFF) << 19) >> 19, g_pb.flips, 10);
+        }
     }
-    if (!s_samp[k]) {
-        D3D11_SAMPLER_DESC d;
-        memset(&d, 0, sizeof d);
-        d.Filter = lin ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
-                       : D3D11_FILTER_MIN_MAG_MIP_POINT;
-        d.AddressU = (k & 2) ? D3D11_TEXTURE_ADDRESS_WRAP
-                             : D3D11_TEXTURE_ADDRESS_CLAMP;
-        d.AddressV = (k & 4) ? D3D11_TEXTURE_ADDRESS_WRAP
-                             : D3D11_TEXTURE_ADDRESS_CLAMP;
-        d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        d.MaxLOD = D3D11_FLOAT32_MAX;
-        if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp[k])))
-            return NULL;
+    for (i = 0; i < s_nsamp; i++)
+        if (s_samp[i].key == key && s_samp[i].bias == bias
+            && s_samp[i].lods == lods && s_samp[i].color == color)
+            return s_samp[i].s;
+    if (s_nsamp == SAMP_CACHE) {        /* full: start over */
+        for (i = 0; i < s_nsamp; i++)
+            ID3D11SamplerState_Release(s_samp[i].s);
+        s_nsamp = 0;
     }
-    return s_samp[k];
+    memset(&d, 0, sizeof d);
+    d.Filter = lin ? (mip == 2 ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+                               : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT)
+                   : (mip == 2 ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR
+                               : D3D11_FILTER_MIN_MAG_MIP_POINT);
+    d.AddressU = bu ? D3D11_TEXTURE_ADDRESS_BORDER
+               : wu ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.AddressV = bv ? D3D11_TEXTURE_ADDRESS_BORDER
+               : wv ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    d.BorderColor[0] = ((color >> 16) & 0xFF) / 255.0f;
+    d.BorderColor[1] = ((color >>  8) & 0xFF) / 255.0f;
+    d.BorderColor[2] = ( color        & 0xFF) / 255.0f;
+    d.BorderColor[3] = ((color >> 24) & 0xFF) / 255.0f;
+    sbias = (int32_t)(bias << 19) >> 19;    /* sign-extend 13 bits */
+    d.MipLODBias = (float)sbias / 256.0f;
+    d.MinLOD = (float)lmin;
+    d.MaxLOD = (float)lmax;
+    if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp[s_nsamp].s)))
+        return NULL;
+    s_samp[s_nsamp].key = key;
+    s_samp[s_nsamp].bias = bias;
+    s_samp[s_nsamp].lods = lods;
+    s_samp[s_nsamp].color = color;
+    return s_samp[s_nsamp++].s;
 }
 
 /* Near-plane clipping, a port of raster_xf_clipped (nv2a_draw_sw.c): a
@@ -3470,6 +3557,9 @@ static void d3d_report(void)
             " unchanged, %u binds of a format the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_reused,
             s_stat.tex_unreadable, 10);
+    fprintf(stderr, "[GPU] d3d11: mip levels: %u binds sampled through the"
+            " chain, %u binds of a texture with levels under a level-0 filter%c",
+            s_stat.mip_binds, s_stat.mip_unused, 10);
     fprintf(stderr, "[GPU] d3d11: cube maps: %u binds, %u cube addresses with"
             " a GPU-drawn face (read stale from guest memory)%c",
             s_stat.cube_binds, s_stat.cube_drawn, 10);

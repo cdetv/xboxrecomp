@@ -3421,6 +3421,29 @@ uint32_t pb_tex_face_stride(const Texture *t)
     return tex_face_stride(t);
 }
 
+/* Levels follow one another, each swizzled (or DXT-blocked) at its own size,
+ * as tex_face_stride counts them. */
+int pb_tex_level(const Texture *t, uint32_t level, Texture *out)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(t->color), lv, off = 0;
+
+    if (!tex_size_from_format(t->color) || level >= (t->levels ? t->levels : 1u)
+        || ((t->width >> level) == 0 && (t->height >> level) == 0))
+        return 0;
+    for (lv = 0; lv < level; lv++) {
+        uint32_t lw = (t->width >> lv) ? (t->width >> lv) : 1;
+        uint32_t lh = (t->height >> lv) ? (t->height >> lv) : 1;
+        off += block ? ((lw + 3) / 4) * ((lh + 3) / 4) * block
+                     : lw * lh * tex_texel_bytes(t->color);
+    }
+    *out = *t;
+    out->offset = t->offset + off;
+    out->width = (t->width >> level) ? (t->width >> level) : 1;
+    out->height = (t->height >> level) ? (t->height >> level) : 1;
+    out->levels = 1;
+    return 1;
+}
+
 uint32_t pb_tex_bytes(const Texture *t)
 {
     uint32_t block = d3d8_format_dxt_block_bytes(t->color);
