@@ -617,12 +617,22 @@ static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
 
 #define VL NV2A_VSH_LANES
 typedef float VshRows[4][VL];
+/* An operand: one row pointer per component. A register source without a
+ * negate points straight at the register's rows (the swizzle is only which
+ * row), so reading it copies nothing. Every row is a whole VL-float row of
+ * some VshRows, so copies can always move VL floats: fixed-size copies the
+ * compiler inlines, where n-float memcpys were each a call into the CRT's
+ * memmove (~20% of the GPU thread with read_lanes, Spooky mansion,
+ * 2026-10-16). Lanes from n on hold zeroes or copies; no maths reads them. */
+typedef const float *VshView[4];
 
 typedef struct {
     VshRows in[NV2A_VSH_INPUTS];
     VshRows temp[12], opos, outregs[13];
     int a0[VL];
 } VshLanes;
+
+#define ROW_COPY(dst, src) memcpy((dst), (src), sizeof(float) * VL)
 
 static int s_check = -1;                 /* RECOMP_VSH_CHECK */
 static unsigned long long s_check_runs, s_check_bad;
@@ -638,8 +648,12 @@ int nv2a_vsh_prepare(uint32_t *inputs_used)
     return s_dec_final;
 }
 
+/* Source `which` of I as a view. `r` is this source's own scratch, used
+ * when the values have to be made: a negate, or a constant (spread over the
+ * lanes, one row per component the swizzle uses), or a relative constant
+ * (one per lane). */
 static void read_lanes(const VshIns *I, int which, const VshLanes *S, int n,
-                       VshRows r)
+                       VshRows r, VshView v)
 {
     const VshSrc *d = &I->src[which];
     int j, l;
@@ -648,14 +662,29 @@ static void read_lanes(const VshIns *I, int which, const VshLanes *S, int n,
         const float (*s)[VL] = d->mux == 2 ? S->in[I->iidx]
                              : d->reg == 12 ? S->opos
                              : S->temp[d->reg < 12 ? d->reg : 0];
-        for (j = 0; j < 4; j++)
-            memcpy(r[j], s[d->sw[j]], (size_t)n * sizeof(float));
+        if (!d->neg) {
+            for (j = 0; j < 4; j++)
+                v[j] = s[d->sw[j]];
+            return;
+        }
+        for (j = 0; j < 4; j++) {
+            const float *q = s[d->sw[j]];
+            for (l = 0; l < VL; l++)
+                r[j][l] = -q[l];
+            v[j] = r[j];
+        }
     } else if (!I->rel) {
         const float *c = s_const[I->cidx < NV2A_VSH_CONSTANTS ? I->cidx : 0];
+        unsigned made = 0;
         for (j = 0; j < 4; j++) {
-            float f = c[d->sw[j]];
-            for (l = 0; l < n; l++)
-                r[j][l] = f;
+            int k = d->sw[j];
+            if (!(made & (1u << k))) {
+                float f = d->neg ? -c[k] : c[k];
+                for (l = 0; l < VL; l++)
+                    r[k][l] = f;
+                made |= 1u << k;
+            }
+            v[j] = r[k];
         }
     } else {
         for (l = 0; l < n; l++) {
@@ -665,32 +694,36 @@ static void read_lanes(const VshIns *I, int which, const VshLanes *S, int n,
                 ci = 0;
             c = s_const[ci];
             for (j = 0; j < 4; j++)
-                r[j][l] = c[d->sw[j]];
+                r[j][l] = d->neg ? -c[d->sw[j]] : c[d->sw[j]];
         }
-    }
-    if (d->neg)
         for (j = 0; j < 4; j++)
-            for (l = 0; l < n; l++)
-                r[j][l] = -r[j][l];
+            v[j] = r[j];
+    }
 }
 
-static void mac_lanes(uint32_t op, VshRows a, VshRows b, VshRows c, VshRows r,
-                      int *a0, int n)
+static void mac_lanes(uint32_t op, const VshView a, const VshView b,
+                      const VshView c, VshRows r, int *a0, int n)
 {
     int j, l;
 
     switch (op) {
     case 2:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] * b[j][l];
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] * y[l];
+        }
         return;
     case 3:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] + c[j][l];
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *z = c[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] + z[l];
+        }
         return;
     case 4:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] * b[j][l] + c[j][l];
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j], *z = c[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] * y[l] + z[l];
+        }
         return;
     case 5:
         for (l = 0; l < n; l++)
@@ -713,40 +746,50 @@ static void mac_lanes(uint32_t op, VshRows a, VshRows b, VshRows c, VshRows r,
         }
         return;
     case 9:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] < b[j][l] ? a[j][l] : b[j][l];
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] < y[l] ? x[l] : y[l];
+        }
         return;
     case 10:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] >= b[j][l] ? a[j][l] : b[j][l];
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] >= y[l] ? x[l] : y[l];
+        }
         return;
     case 11:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] < b[j][l] ? 1.0f : 0.0f;
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] < y[l] ? 1.0f : 0.0f;
+        }
         return;
     case 12:
-        for (j = 0; j < 4; j++) for (l = 0; l < n; l++)
-            r[j][l] = a[j][l] >= b[j][l] ? 1.0f : 0.0f;
+        for (j = 0; j < 4; j++) {
+            const float *x = a[j], *y = b[j]; float *o = r[j];
+            for (l = 0; l < n; l++) o[l] = x[l] >= y[l] ? 1.0f : 0.0f;
+        }
         return;
     case 13:                                                   /* arl */
         for (l = 0; l < n; l++)
             a0[l] = (int)floorf(a[0][l] + 0.001f);
         /* fall through: the result is A, as run_mac leaves it */
     default:                                                   /* mov etc. */
-        memcpy(r, a, sizeof(VshRows));
+        for (j = 0; j < 4; j++)
+            ROW_COPY(r[j], a[j]);
         return;
     }
     /* dp3 / dph / dp4: x spread to all four */
     for (j = 1; j < 4; j++)
-        memcpy(r[j], r[0], (size_t)n * sizeof(float));
+        ROW_COPY(r[j], r[0]);
 }
 
-static void ilu_lanes(uint32_t op, VshRows c, VshRows r, int n)
+static void ilu_lanes(uint32_t op, const VshView c, VshRows r, int n)
 {
     int j, l;
 
     if (op == 1) {                                             /* mov */
-        memcpy(r, c, sizeof(VshRows));
+        for (j = 0; j < 4; j++)
+            ROW_COPY(r[j], c[j]);
         return;
     }
     for (l = 0; l < n; l++) {
@@ -794,15 +837,15 @@ static void ilu_lanes(uint32_t op, VshRows c, VshRows r, int n)
     }
     if (op >= 2 && op <= 4)                        /* rcp rcc rsq: splat x */
         for (j = 1; j < 4; j++)
-            memcpy(r[j], r[0], (size_t)n * sizeof(float));
+            ROW_COPY(r[j], r[0]);
 }
 
-static void write_lanes(float (*dst)[VL], VshRows src, uint32_t mask, int n)
+static void write_lanes(float (*dst)[VL], VshRows src, uint32_t mask)
 {
-    if (mask & 8) memcpy(dst[0], src[0], (size_t)n * sizeof(float));
-    if (mask & 4) memcpy(dst[1], src[1], (size_t)n * sizeof(float));
-    if (mask & 2) memcpy(dst[2], src[2], (size_t)n * sizeof(float));
-    if (mask & 1) memcpy(dst[3], src[3], (size_t)n * sizeof(float));
+    if (mask & 8) ROW_COPY(dst[0], src[0]);
+    if (mask & 4) ROW_COPY(dst[1], src[1]);
+    if (mask & 2) ROW_COPY(dst[2], src[2]);
+    if (mask & 1) ROW_COPY(dst[3], src[3]);
 }
 
 
@@ -810,7 +853,8 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
                        Nv2aVshOutput *const *out, int count)
 {
     VshLanes S;
-    VshRows a, b, c, mres, ires;
+    VshRows sa, sb, sc, mres, ires;     /* scratch for the three sources */
+    VshView a, b, c;
     uint32_t i, used;
     int n, l, j;
 
@@ -829,7 +873,11 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
     memset(S.opos, 0, sizeof S.opos);
     memset(S.outregs, 0, sizeof S.outregs);
     memset(S.a0, 0, sizeof S.a0);
-    for (l = 0; l < n; l++) {
+    /* All of every row starts set (see VshView), scratch included. */
+    memset(sa, 0, sizeof sa); memset(sb, 0, sizeof sb);
+    memset(sc, 0, sizeof sc);
+    memset(mres, 0, sizeof mres); memset(ires, 0, sizeof ires);
+    for (l = 0; l < VL; l++) {
         S.outregs[3][3][l] = S.outregs[4][3][l] = 1.0f;
         S.outregs[9][3][l] = S.outregs[10][3][l] = 1.0f;
         S.outregs[11][3][l] = S.outregs[12][3][l] = 1.0f;
@@ -839,17 +887,21 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
             for (j = 0; j < 4; j++) {
                 for (l = 0; l < count; l++)
                     S.in[i][j][l] = in[l][i][j];
-                for (; l < n; l++)
+                for (; l < VL; l++)
                     S.in[i][j][l] = 0.0f;
             }
+    /* Sources an instruction does not need are never read; they start at
+     * zeroes so the pointers are valid all the same. */
+    for (j = 0; j < 4; j++)
+        a[j] = b[j] = c[j] = sa[j];
 
     for (i = 0; i < s_dec_count; i++) {
         const VshIns *I = &s_dec[i];
         uint32_t mac = I->mac, ilu = I->ilu;
 
-        if (I->need & VSH_NEED_A) read_lanes(I, 0, &S, n, a);
-        if (I->need & VSH_NEED_B) read_lanes(I, 1, &S, n, b);
-        if (I->need & VSH_NEED_C) read_lanes(I, 2, &S, n, c);
+        if (I->need & VSH_NEED_A) read_lanes(I, 0, &S, n, sa, a);
+        if (I->need & VSH_NEED_B) read_lanes(I, 1, &S, n, sb, b);
+        if (I->need & VSH_NEED_C) read_lanes(I, 2, &S, n, sc, c);
         if (mac)
             mac_lanes(mac, a, b, c, mres, S.a0, n);
         if (ilu)
@@ -858,12 +910,12 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
         if (mac && mac != 13 && I->mac_mask) {
             uint32_t t = I->tdst;
             if (t <= 12)
-                write_lanes(t == 12 ? S.opos : S.temp[t], mres, I->mac_mask, n);
+                write_lanes(t == 12 ? S.opos : S.temp[t], mres, I->mac_mask);
         }
         if (ilu && I->ilu_mask) {
             uint32_t t = mac ? 1u : I->tdst;      /* see run_program */
             if (t <= 12)
-                write_lanes(t == 12 ? S.opos : S.temp[t], ires, I->ilu_mask, n);
+                write_lanes(t == 12 ? S.opos : S.temp[t], ires, I->ilu_mask);
         }
         if (I->omask) {
             /* An unused unit's result is zero, as in run_program. */
@@ -878,10 +930,10 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
                     write_masked(s_const[I->oaddr], &t, I->omask);
                 }
             } else if (I->oaddr == 0) {
-                write_lanes(S.opos, from_ilu ? ires : mres, I->omask, n);
+                write_lanes(S.opos, from_ilu ? ires : mres, I->omask);
             } else if (I->oaddr < 13) {
                 write_lanes(S.outregs[I->oaddr], from_ilu ? ires : mres,
-                            I->omask, n);
+                            I->omask);
             }
         }
     }
