@@ -187,6 +187,7 @@ int pb_surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 #define NV097_SET_TEXTURE_FORMAT          0x1B04
 #define NV097_SET_TEXTURE_PALETTE         0x1B20   /* offset | size<<2 | dma */
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
+#define NV097_SET_TEXTURE_CONTROL0        0x1B0C   /* LOD clamps, enable */
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
 #define NV097_SET_TEXTURE_BORDER_COLOR    0x1B24
@@ -775,6 +776,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         t->rect_w = param >> 16;
         t->rect_h = param & 0xFFFF;
         tex_pick_size(t);
+        break;
+    case NV097_SET_TEXTURE_CONTROL0:
+        t->control0 = param;            /* mip LOD clamps (d3d11 sampler) */
         break;
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
