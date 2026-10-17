@@ -2105,8 +2105,58 @@ guest:
  *
  * Few distinct states exist, so they are cached by their description in a
  * short list, searched from the front. */
+/* Texture filtering, the player's choice (settings.ini texture_filter, the
+ * F2 menu; RECOMP_TEX_FILTER): 0 off = level 0 only, as before mip levels
+ * (sharpest, shimmers in the distance); 1 original = the title's own mip
+ * settings, as on the Xbox; 2/4/8/16 = original plus anisotropic filtering
+ * of that degree, where the title blends inside a level and has levels
+ * (sharp at a grazing angle without the shimmer). Read from the environment
+ * once, then changed only by xbox_SetTextureFilter (no getenv per draw);
+ * the sampler cache keys on it, so a change applies from the next draw. */
+static volatile LONG s_tex_filter = -1;
+
+static LONG tex_filter_parse(const char *v)
+{
+    if (!v || !*v || !_stricmp(v, "original"))
+        return 1;
+    if (!_stricmp(v, "off"))
+        return 0;
+    if (!_stricmp(v, "aniso2"))  return 2;
+    if (!_stricmp(v, "aniso4"))  return 4;
+    if (!_stricmp(v, "aniso8"))  return 8;
+    if (!_stricmp(v, "aniso16")) return 16;
+    fprintf(stderr, "[GPU] d3d11: RECOMP_TEX_FILTER=%s not known (off, original,"
+            " aniso2/4/8/16); original%c", v, 10);
+    return 1;
+}
+
+static int tex_filter(void)
+{
+    if (s_tex_filter < 0)
+        InterlockedCompareExchange(&s_tex_filter,
+                tex_filter_parse(getenv("RECOMP_TEX_FILTER")), -1);
+    return (int)s_tex_filter;
+}
+
+/* For a settings menu: 0, 1, 2, 4, 8 or 16 as above. 1 on success. */
+int xbox_SetTextureFilter(int mode)
+{
+    if (mode != 0 && mode != 1 && mode != 2 && mode != 4 && mode != 8
+        && mode != 16)
+        return 0;
+    InterlockedExchange(&s_tex_filter, mode);
+    if (mode > 1)
+        fprintf(stderr, "[GPU] d3d11: texture filtering anisotropic x%d%c",
+                mode, 10);
+    else
+        fprintf(stderr, "[GPU] d3d11: texture filtering %s%c",
+                mode ? "original" : "off", 10);
+    return 1;
+}
+
 typedef struct {
-    uint32_t key;                       /* lin, address modes, mip mode */
+    uint32_t key;                       /* lin, address modes, mip mode,
+                                         * anisotropy */
     uint32_t bias;                      /* FILTER bits 0-12 */
     uint32_t lods;                      /* min level | max level << 8 */
     uint32_t color;                     /* border colour, when bordered */
@@ -2128,13 +2178,16 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     uint32_t mip = min == 3 || min == 4 ? 1u : min == 5 || min == 6 ? 2u : 0u;
     uint32_t lmin = ((t->control0 >> 18) & 0xFFF) >> 8;
     uint32_t lmax = ((t->control0 >> 6) & 0xFFF) >> 8;
-    uint32_t key, bias, lods, color;
+    uint32_t key, bias, lods, color, aniso;
+    int filt = tex_filter();
     int32_t sbias;
     D3D11_SAMPLER_DESC d;
     int i;
 
-    if (s_tex_levels[st] <= 1)
-        mip = 0;                        /* nothing to pick from */
+    if (s_tex_levels[st] <= 1 || filt == 0)
+        mip = 0;                        /* nothing to pick from, or off */
+    if (filt == 0)
+        lmin = 0;                       /* off: level 0, as before mips */
     if (lmin > s_tex_levels[st] - 1)
         lmin = s_tex_levels[st] - 1;
     if (lmax < lmin || !mip)
@@ -2142,7 +2195,9 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     bias = mip ? t->filter & 0x1FFF : 0;
     lods = lmin | lmax << 8;
     color = border ? t->border_color : 0;
-    key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5;
+    aniso = filt >= 2 && mip && lin ? (uint32_t)filt : 0u;
+    key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5
+          | aniso << 7;
     if (mip)
         s_stat.mip_binds++;
     else if (s_tex_levels[st] > 1)
@@ -2175,10 +2230,12 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
         s_nsamp = 0;
     }
     memset(&d, 0, sizeof d);
-    d.Filter = lin ? (mip == 2 ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
+    d.Filter = aniso ? D3D11_FILTER_ANISOTROPIC
+             : lin ? (mip == 2 ? D3D11_FILTER_MIN_MAG_MIP_LINEAR
                                : D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT)
                    : (mip == 2 ? D3D11_FILTER_MIN_MAG_POINT_MIP_LINEAR
                                : D3D11_FILTER_MIN_MAG_MIP_POINT);
+    d.MaxAnisotropy = aniso ? aniso : 1;
     d.AddressU = bu ? D3D11_TEXTURE_ADDRESS_BORDER
                : wu ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressV = bv ? D3D11_TEXTURE_ADDRESS_BORDER
