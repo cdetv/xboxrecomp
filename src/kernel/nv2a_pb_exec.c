@@ -354,6 +354,8 @@ static void frame_trace_flip(void)
     }
 }
 
+static int s_draw_lines = -1;          /* RECOMP_NV2A_TRACE */
+
 static void draw_primitive(void)
 {
     float v[4];
@@ -362,7 +364,11 @@ static void draw_primitive(void)
     if (!g_pb.prim || !g_pb.idx_count)
         return;
     g_pb.draws++;
-    if ((g_pb.draws % 200) == 0)
+    /* A progress line every 200 draws: ~250 a second in a 3D scene, so only
+     * with RECOMP_NV2A_TRACE (the [GPU] reports count draws anyway). */
+    if (s_draw_lines < 0)
+        s_draw_lines = getenv("RECOMP_NV2A_TRACE") != NULL;
+    if ((g_pb.draws % 200) == 0 && s_draw_lines)
         fprintf(stderr, "  [GPU] draw #%u\n", g_pb.draws);
     g_pb.verts += g_pb.idx_count;
 

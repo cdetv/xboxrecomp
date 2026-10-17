@@ -825,6 +825,11 @@ static void fence_mirrors_tick(void)
 }
 
 static int s_nv2a_trace = 0;
+/* The per-kick DMA_PUT and PCRTC_START lines: only with RECOMP_NV2A_TRACE
+ * itself. RECOMP_PB_EXEC (a built-in default) arms the poll above too, and
+ * with it these lines were ~150 unbuffered writes a second from the GPU
+ * thread, ~5% of it in Conker's Spooky mansion (2026-10-16). */
+static int s_nv2a_trace_lines = 0;
 
 /* The display framebuffer, as reported by AvSetDisplayMode. Checksummed once a
  * second so a run can answer the only question that matters before building a
@@ -1453,7 +1458,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * in its device struct rather than assuming 0xFD800000, and
                  * mirroring the wrong block leaves it spinning on a GET that
                  * never moves. */
-                if (s_nv2a_trace) {
+                if (s_nv2a_trace_lines) {
                     uint32_t g = *(volatile uint32_t *)
                                  ((char *)regs + NV2A_USER_DMA_GET);
                     fprintf(stderr, "  [NV2A] DMA_PUT = 0x%08X  DMA_GET = "
@@ -1463,7 +1468,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 fflush(stderr);
             }
         }
-        if (s_nv2a_trace) {
+        if (s_nv2a_trace_lines) {
             static uint32_t last_start = 0xFFFFFFFFu;
             uint32_t start = *(volatile uint32_t *)((char *)regs + 0x600800);
             if (start != last_start) {
@@ -2876,7 +2881,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         /* The pushbuffer survey rides on the same poll, so either
          * variable arms it. */
-        s_nv2a_trace = getenv("RECOMP_NV2A_TRACE") != NULL
+        s_nv2a_trace_lines = getenv("RECOMP_NV2A_TRACE") != NULL;
+        s_nv2a_trace = s_nv2a_trace_lines
                     || getenv("RECOMP_PB_SCAN") != NULL
                     || getenv("RECOMP_PB_EXEC") != NULL;
         if (g_nv2a_memory) {
