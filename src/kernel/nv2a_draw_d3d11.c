@@ -198,6 +198,7 @@ static struct {
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
+    uint32_t cube_binds, cube_drawn;
 } s_stat;
 
 /* Diagnostic: addresses of surfaces thrown out of the table, so a texture
@@ -1301,8 +1302,11 @@ static ID3D11DepthStencilState *ds_state(void)
  * format, size, pitch and palette, and re-decoded when the guest bytes
  * change: a movie keeps one address and rewrites it every frame, and a
  * render target sampled later is rewritten in place.
- * ponytail: no mip levels, so a minified texture shimmers; a cube map is
- * not bound (its stage reads white).
+ * A cube map is its six faces as a Texture2DArray (slices +X -X +Y -Y +Z
+ * -Z); the shader picks the face as rc_stage_fetch does (TEX_CUBE).
+ * ponytail: no mip levels, so a minified texture shimmers. A cube map is
+ * read from guest memory only: faces the GPU drew (a title rendering its
+ * own reflections) would read stale; logged once per address.
  * ponytail: the bytes are hashed at every bind, which is a full read of the
  * texture per batch; a dirty-page scheme would avoid it. */
 
@@ -1314,11 +1318,12 @@ static ID3D11DepthStencilState *ds_state(void)
 #define TEX_BUCKETS  1024
 typedef struct {
     uint32_t addr, fmt, w, h, pitch, palette;
-    uint32_t d;                         /* slices uploaded: 1, or a volume's depth */
+    uint32_t d;                         /* slices uploaded: 1, a volume's depth, 6 a cube */
+    uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
-    ID3D11Resource *tex;                /* Texture2D, or Texture3D when d > 1 */
+    ID3D11Resource *tex;                /* Texture2D, Texture3D when d > 1 (not cube) */
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
 static GpuTexture s_tex[GPU_TEXTURES];
@@ -1381,6 +1386,7 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
 #define RTT_ALPHA_ONE 1u
 #define RTT_SWAP_RB   2u
 #define TEX_VOLUME    4u    /* a Texture3D view: bind it to the stage's 3D slot */
+#define TEX_CUBE      8u    /* a cube map's faces: bind to the stage's cube slot */
 
 /* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
  * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
@@ -1801,10 +1807,42 @@ static void note_stale_read(int st, uint32_t bytes)
         }
 }
 
+/* Diagnostic for the cube-map ponytail (Textures, above): a face that starts
+ * where a GPU surface does was drawn by the GPU, and guest memory, which is
+ * what the faces are read from, does not have those pixels. Logged once per
+ * cube address. */
+static void cube_surface_check(const Texture *t, uint32_t face_stride)
+{
+    static uint32_t seen[64];
+    static int nseen;
+    uint32_t f;
+    int i, k;
+
+    for (k = 0; k < nseen; k++)
+        if (seen[k] == t->offset)
+            return;
+    if (nseen < 64)
+        seen[nseen++] = t->offset;
+    for (f = 0; f < 6; f++) {
+        uint32_t a = (t->offset + f * face_stride) & 0x0FFFFFFFu;
+        for (i = 0; i < GPU_SURFACES; i++)
+            if (s_surf[i].tex && (s_surf[i].addr & 0x0FFFFFFFu) == a) {
+                s_stat.cube_drawn++;
+                fprintf(stderr, "[GPU] d3d11: cube map 0x%08X fmt 0x%02X %ux%u"
+                        " face %u is GPU surface slot %d: read from guest"
+                        " memory, which the GPU did not write (flip %u)%c",
+                        t->offset, t->color, t->width, t->height, f, i,
+                        g_pb.flips, 10);
+                return;
+            }
+    }
+}
+
 /* A shader view of stage st's texture as it is now, or NULL when it cannot
- * be read; RTT_* / TEX_VOLUME flags in *flags. `volume`: the stage samples
- * in 3D (PROJECT3D) and its texture is a volume, so upload every slice as a
- * Texture3D; otherwise a volume is read as its slice 0, as before. */
+ * be read; RTT_* / TEX_VOLUME / TEX_CUBE flags in *flags. `volume`: the
+ * stage samples in 3D (PROJECT3D) and its texture is a volume, so upload
+ * every slice as a Texture3D; otherwise a volume is read as its slice 0, as
+ * before. A cube map always comes as its six faces (TEX_CUBE). */
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
                                                int volume)
 {
@@ -1815,15 +1853,21 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
     int i, lru = 0;
-    uint32_t d3 = volume && t->depth > 1 ? t->depth : 1, z;
+    uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
+    uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
 
     *flags = 0;
     s_tex_src[st] = '-';
-    if (!t->valid || t->cube || !t->offset || !t->width || !t->height
+    if (!t->valid || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return NULL;
+    if (cube) {
+        face_stride = pb_tex_face_stride(t);
+        cube_surface_check(t, face_stride);
+        goto guest;
+    }
     rtt = texture_from_zeta(st);
     if (rtt) {
         s_tex_src[st] = 'Z';
@@ -1835,11 +1879,15 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
         s_tex_slot[st] = s_rtt_slot;
         return rtt;
     }
+guest:
     s_tex_src[st] = 'G';
     bytes = pb_tex_bytes(t);
     if (!bytes)
         return NULL;
-    note_stale_read(st, bytes);
+    if (cube)
+        bytes += 5 * face_stride;       /* all six faces, mips between */
+    else
+        note_stale_read(st, bytes);
     if (s_nevicted && was_evicted(t->offset & 0x0FFFFFFFu)
         && s_stat.evicted_reads++ < 8)
         fprintf(stderr, "[GPU] d3d11: stage %d texture 0x%08X fmt 0x%02X"
@@ -1853,7 +1901,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
         GpuTexture *c = &s_tex[i - 1];
         if (c->addr == t->offset && c->fmt == t->color
             && c->w == t->width && c->h == t->height && c->pitch == t->pitch
-            && c->palette == palette && c->d == d3) {
+            && c->palette == palette && c->d == d3 && c->cube == cube) {
             e = c;
             break;
         }
@@ -1864,7 +1912,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
      * field). ponytail: a texture the title rewrites between two binds in
      * the same frame keeps the first bind's contents until the next flip. */
     if (e && d3 > 1)
-        *flags |= TEX_VOLUME;
+        *flags |= cube ? TEX_CUBE : TEX_VOLUME;
     if (e && e->hashed_flip == g_pb.flips) {
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -1909,7 +1957,8 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
         for (y = 0; y < t->height; y++)
             for (x = 0; x < t->width; x++) {
                 uint32_t *o = &s_texels[z * slice + (size_t)y * t->width + x];
-                if (!pb_tex_texel3(t, x, y, z, o))
+                if (!(cube ? pb_tex_face_texel(t, z, x, y, o)
+                           : pb_tex_texel3(t, x, y, z, o)))
                     *o = 0xFFFFFFFFu;
             }
 
@@ -1927,7 +1976,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
         if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
         if (e->tex) ID3D11Resource_Release(e->tex);
         memset(e, 0, sizeof *e);
-        if (d3 > 1) {
+        if (d3 > 1 && !cube) {
             memset(&d3d, 0, sizeof d3d);
             d3d.Width = t->width;
             d3d.Height = t->height;
@@ -1943,7 +1992,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
             d.Width = t->width;
             d.Height = t->height;
             d.MipLevels = 1;
-            d.ArraySize = 1;
+            d.ArraySize = d3;           /* 6 for a cube: a Texture2DArray view */
             d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
             d.SampleDesc.Count = 1;
             d.Usage = D3D11_USAGE_DEFAULT;
@@ -1965,15 +2014,23 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
         e->pitch = t->pitch;
         e->palette = palette;
         e->d = d3;
+        e->cube = cube;
         if (d3 > 1)
-            *flags |= TEX_VOLUME;
+            *flags |= cube ? TEX_CUBE : TEX_VOLUME;
         s_tex_next[lru] = s_tex_head[tex_bucket(e->addr)];
         s_tex_head[tex_bucket(e->addr)] = (uint16_t)(lru + 1);
         s_stat.tex_made++;
     }
-    ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, 0, NULL, s_texels,
-                                          t->width * 4,
-                                          (UINT)(slice * 4));
+    if (cube)
+        for (z = 0; z < 6; z++)
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, z, NULL,
+                                                  s_texels + z * slice,
+                                                  t->width * 4,
+                                                  (UINT)(slice * 4));
+    else
+        ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, 0, NULL,
+                                              s_texels, t->width * 4,
+                                              (UINT)(slice * 4));
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
     e->used = s_tex_tick;
@@ -2484,6 +2541,7 @@ static void d3d_draw(void)
     /* Volume textures go to t7-t10 (Texture3D in the shader); mode.y bits
      * 4-7 say which stages read there. */
     ID3D11ShaderResourceView *vsrv[4] = {NULL, NULL, NULL, NULL};
+    ID3D11ShaderResourceView *csrv[4] = {NULL, NULL, NULL, NULL};
     ID3D11SamplerState *samp[4] = {NULL, NULL, NULL, NULL};
     const Nv2aVshOutput *verts = s_bv;
     float bf[4];
@@ -2551,8 +2609,11 @@ static void d3d_draw(void)
             }
             srv[st] = texture_stage(st, &rtt, combiners && m == 2);
             samp[st] = srv[st] ? sampler_stage(st, combiners) : NULL;
-            if (!samp[st]) {
+            /* A cube map is read by the combiner path only (stage_fetch);
+             * elsewhere it stays unbound and reads white, as before. */
+            if (!samp[st] || ((rtt & TEX_CUBE) && !combiners)) {
                 srv[st] = NULL;
+                samp[st] = NULL;
                 continue;
             }
             bound |= 1u << st;
@@ -2560,6 +2621,12 @@ static void d3d_draw(void)
                 vsrv[st] = srv[st];
                 srv[st] = NULL;
                 bound |= 16u << st;
+            }
+            if (rtt & TEX_CUBE) {
+                csrv[st] = srv[st];
+                srv[st] = NULL;
+                bound |= 256u << st;
+                s_stat.cube_binds++;
             }
             k.tscale[st][0] = tex_size_from_format(t->color)
                               ? 1.0f : 1.0f / (float)t->width;
@@ -2600,7 +2667,7 @@ static void d3d_draw(void)
         path = PATH_FLAT;
         if (textured) {
             srv[0] = texture_stage(0, &rtt, 0);
-            samp[0] = srv[0] ? sampler_stage(0, 0) : NULL;
+            samp[0] = srv[0] && !(rtt & TEX_CUBE) ? sampler_stage(0, 0) : NULL;
             if (samp[0]) {
                 bound = 1;
                 k.tscale[0][0] = 1.0f / (float)g_pb.texs[0].width;
@@ -2871,6 +2938,8 @@ static void d3d_draw(void)
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, vsrv);
+    if (bound & 0xF00u)
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     ID3D11DeviceContext_RSSetState(s_ctx, raster_state(surf_sx(si)));
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
@@ -2913,6 +2982,8 @@ static void d3d_draw(void)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     if (bound & 0xF0u)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, srv);
+    if (bound & 0xF00u)
+        ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, srv);
     ct_add(CT_DRAW, ct_draw0);
     pace_draw();
 
@@ -3399,6 +3470,9 @@ static void d3d_report(void)
             " unchanged, %u binds of a format the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_reused,
             s_stat.tex_unreadable, 10);
+    fprintf(stderr, "[GPU] d3d11: cube maps: %u binds, %u cube addresses with"
+            " a GPU-drawn face (read stale from guest memory)%c",
+            s_stat.cube_binds, s_stat.cube_drawn, 10);
     fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
             " surface, %u of a surface in a reading not handled (guest"
             " memory used)%c", s_stat.rtt_binds, s_stat.rtt_unhandled, 10);

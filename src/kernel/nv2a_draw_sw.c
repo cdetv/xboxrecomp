@@ -3410,6 +3410,17 @@ int pb_tex_texel3(const Texture *t, uint32_t u, uint32_t v, uint32_t w,
     return sample_tex3(t, 0, u, v, w, argb);
 }
 
+int pb_tex_face_texel(const Texture *t, uint32_t face, uint32_t u,
+                      uint32_t v, uint32_t *argb)
+{
+    return sample_tex(t, face * tex_face_stride(t), u, v, argb);
+}
+
+uint32_t pb_tex_face_stride(const Texture *t)
+{
+    return tex_face_stride(t);
+}
+
 uint32_t pb_tex_bytes(const Texture *t)
 {
     uint32_t block = d3d8_format_dxt_block_bytes(t->color);
