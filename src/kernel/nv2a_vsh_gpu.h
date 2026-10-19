@@ -8,9 +8,11 @@
  * The plan (game repo, docs/handoff-notes.md "vertex programs on the GPU"):
  * step 1, this -- translate, compile, check; step 2 attribute fetch on the
  * GPU (nv2a_vsh_gpu_inputs, checked with nv2a_vsh_gpu_fetch); step 3
- * drawing with them.
+ * drawing with them (nv2a_vsh_gpu_draw_shader; the back end's draw call is
+ * in nv2a_draw_d3d11.c).
  *
- * Windows only. Not thread-safe: the executor thread (or one test thread).
+ * Windows only. Not thread-safe: the executor thread (or one test thread)
+ * calls everything here; the drawing shaders' compile threads are internal.
  */
 #ifndef XBOXRECOMP_NV2A_VSH_GPU_H
 #define XBOXRECOMP_NV2A_VSH_GPU_H
@@ -24,9 +26,11 @@ struct ID3D11DeviceContext;
 /* 0 if the buffers cannot be made; everything below then returns 0. */
 int nv2a_vsh_gpu_init(struct ID3D11Device *dev, struct ID3D11DeviceContext *ctx);
 
-/* The current program (nv2a_vsh_decoded), translated and compiled the first
- * time it is seen; *is_new (may be NULL) says that was now. 0: no program,
- * or it did not translate or compile (logged once per program). */
+/* The current program (nv2a_vsh_decoded), found by its hash or entered the
+ * first time it is seen; *is_new (may be NULL) says that was now. 0: no
+ * program, or it is known not to translate (logged once per program).
+ * Nothing is compiled here: nv2a_vsh_gpu_run and nv2a_vsh_gpu_draw_shader
+ * compile what each needs. */
 int nv2a_vsh_gpu_prepare(int *is_new);
 
 /* Uploads the constants written since the last upload. 0 on failure. */
@@ -74,5 +78,32 @@ int nv2a_vsh_gpu_fetch(const uint32_t *idx, uint32_t count,
  * ring was started again from the top (each one a D3D11 DISCARD). */
 void nv2a_vsh_gpu_input_stats(uint64_t *batches, uint64_t *bytes,
                               uint64_t *wraps);
+
+/* ---- step 3: drawing with them ----------------------------------------- */
+
+struct ID3D11VertexShader;
+
+/* The back end's HLSL around each program's drawing shader: head before
+ * the fetch and the program (its constant buffer, the vertex its pixel
+ * shader takes), tail after them, holding the entry point `entry`, which
+ * calls vsh_inputs(SV_VertexID, v) (the program's inputs, fetched:
+ * nv2a_vsh_hlsl_inputs) and vsh_prog(v). Kept by pointer: static
+ * strings. Before the first nv2a_vsh_gpu_draw_shader. */
+void nv2a_vsh_gpu_draw_source(const char *head, const char *tail,
+                              const char *entry);
+
+/* The drawing vertex shader of the program last prepared. The first call
+ * for a program hands its compile to a worker thread (RECOMP_VSH_GPU_THREADS,
+ * default 2); until it is done this returns NULL -- draw that batch on the
+ * CPU -- unless wait, which waits for it (tests). NULL as well when it
+ * failed, the program does not translate or the cache is full. The checks
+ * (nv2a_vsh_gpu_run) compile shaders of their own, on this thread, the
+ * first time they run a program. */
+struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait);
+
+/* Drawing shaders made, failed, waiting for a thread; their compile time
+ * (summed over the threads). */
+void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
+                             uint32_t *queued, double *ms);
 
 #endif
