@@ -193,6 +193,7 @@ static struct {
     uint32_t drawn, tris, skip_program, skip_not_screen, skip_surface;
     uint32_t verts_need_clip, tris_clipped, tris_behind, combined, tris_culled;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
+    uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t zeta_reads, zeta_unhandled;
@@ -1309,6 +1310,11 @@ static ID3D11DepthStencilState *ds_state(void)
  * count, pb_tex_level), and the shader samples with the coordinates'
  * screen derivatives, so a minified texture reads a smaller level instead
  * of shimmering; which levels and how is the sampler's (sampler_stage).
+ * A DXT1/3/5 2D texture or cube map (sides a multiple of 4) skips the decode: its
+ * blocks go up as they are, as BC1/BC2/BC3, which have the same layout,
+ * and the GPU decodes them (as xemu does). Decoding texel by texel took
+ * 300+ ms for a frame that brought a few big new ones (Conker's "It's War"
+ * cutscene, 2026-10-18). RECOMP_TEX_BC=0 decodes them as before, for A/B.
  * ponytail: cube maps and volumes are level 0 only. A cube map is read
  * from guest memory only: faces the GPU drew (a title rendering its own
  * reflections) would read stale; logged once per address. Only level 0 is
@@ -1853,6 +1859,26 @@ static void cube_surface_check(const Texture *t, uint32_t face_stride)
  * stage samples in 3D (PROJECT3D) and its texture is a volume, so upload
  * every slice as a Texture3D; otherwise a volume is read as its slice 0, as
  * before. A cube map always comes as its six faces (TEX_CUBE). */
+/* The BC format a DXT 2D texture goes up as, unchanged, or UNKNOWN (0) when
+ * it is decoded instead: not DXT1/3/5, a side that is not a multiple of 4
+ * (D3D11 wants whole blocks at level 0), or RECOMP_TEX_BC=0. */
+static DXGI_FORMAT tex_bc_format(const Texture *t)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_TEX_BC");
+        off = e && !strcmp(e, "0");
+    }
+    if (off || (t->width & 3) || (t->height & 3))
+        return DXGI_FORMAT_UNKNOWN;
+    switch (t->color) {
+    case 0x0C: return DXGI_FORMAT_BC1_UNORM;
+    case 0x0E: return DXGI_FORMAT_BC2_UNORM;
+    case 0x0F: return DXGI_FORMAT_BC3_UNORM;
+    default:   return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
                                                int volume)
 {
@@ -1868,6 +1894,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     size_t slice = (size_t)t->width * t->height;
 
     uint32_t lv = 1, total;
+    DXGI_FORMAT bc;
 
     *flags = 0;
     s_tex_src[st] = '-';
@@ -1949,7 +1976,19 @@ guest:
         return e->srv;
     }
 
-    /* New or changed: decode level 0. A format the sampler cannot read
+    /* New or changed. DXT goes up as it is (tex_bc_format): only check
+     * which levels are there. */
+    bc = d3 > 1 && !cube ? DXGI_FORMAT_UNKNOWN : tex_bc_format(t);
+    if (bc) {
+        Texture m;
+        for (z = 1; z < lv; z++)
+            if (!pb_tex_level(t, z, &m)) {
+                lv = z;
+                break;
+            }
+        goto make;
+    }
+    /* Otherwise decode level 0. A format the sampler cannot read
      * comes out NULL, as the software sampler's fallback. */
     total = (uint32_t)(slice * d3);
     for (z = 1; z < lv; z++) {
@@ -2002,6 +2041,7 @@ guest:
         }
     }
 
+make:
     if (!e) {
         D3D11_TEXTURE2D_DESC d;
         D3D11_TEXTURE3D_DESC d3d;
@@ -2033,7 +2073,7 @@ guest:
             d.Height = t->height;
             d.MipLevels = lv;
             d.ArraySize = d3;           /* 6 for a cube: a Texture2DArray view */
-            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            d.Format = bc ? bc : DXGI_FORMAT_B8G8R8A8_UNORM;
             d.SampleDesc.Count = 1;
             d.Usage = D3D11_USAGE_DEFAULT;
             d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -2062,13 +2102,36 @@ guest:
         s_tex_head[tex_bucket(e->addr)] = (uint16_t)(lru + 1);
         s_stat.tex_made++;
     }
-    if (cube)
+    if (cube && bc) {
+        /* Each face's level 0, face_stride apart. */
+        uint32_t row = ((t->width + 3) / 4) * d3d8_format_dxt_block_bytes(t->color);
+        for (z = 0; z < 6; z++)
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, z, NULL,
+                                                  mem + t->offset + z * face_stride,
+                                                  row,
+                                                  row * ((t->height + 3) / 4));
+        s_stat.tex_bc++;
+    } else if (cube)
         for (z = 0; z < 6; z++)
             ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, z, NULL,
                                                   s_texels + z * slice,
                                                   t->width * 4,
                                                   (UINT)(slice * 4));
-    else {
+    else if (bc) {
+        /* Straight from guest memory: the levels' blocks in BC order. */
+        uint32_t l, bb = d3d8_format_dxt_block_bytes(t->color);
+        for (l = 0; l < e->lv && l < lv; l++) {
+            Texture m;
+            uint32_t row;
+            if (!pb_tex_level(t, l, &m))
+                break;
+            row = ((m.width + 3) / 4) * bb;
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, l, NULL,
+                                                  mem + m.offset, row,
+                                                  row * ((m.height + 3) / 4));
+        }
+        s_stat.tex_bc++;
+    } else {
         const uint32_t *src = s_texels;
         uint32_t l, w = t->width, h = t->height;
         for (l = 0; l < e->lv && l < lv; l++) {
@@ -3610,10 +3673,11 @@ static void d3d_report(void)
             s_stat.verts_need_clip, s_stat.tris_clipped, s_stat.tris_behind,
             s_stat.tris_culled,
             10);
-    fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads, %u binds"
-            " unchanged, %u binds of a format the sampler cannot read%c",
-            s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_reused,
-            s_stat.tex_unreadable, 10);
+    fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads (%u of them"
+            " DXT kept compressed), %u binds unchanged, %u binds of a format"
+            " the sampler cannot read%c",
+            s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_bc,
+            s_stat.tex_reused, s_stat.tex_unreadable, 10);
     fprintf(stderr, "[GPU] d3d11: mip levels: %u binds sampled through the"
             " chain, %u binds of a texture with levels under a level-0 filter%c",
             s_stat.mip_binds, s_stat.mip_unused, 10);
