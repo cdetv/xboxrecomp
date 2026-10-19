@@ -69,6 +69,30 @@ int  nv2a_vsh_prepare(uint32_t *inputs_used);  /* decode; 0 = no program */
 int  nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
                         Nv2aVshOutput *const *out, int count);
 
+/* The current program as decoded once from the start slot to its FINAL,
+ * for the HLSL translator (nv2a_vsh_hlsl.c). Fields as in the encoding
+ * table at the top of nv2a_vsh_interp.c; `need` says which of the sources
+ * A, B, C (bits 0-2) the ops read. */
+typedef struct {
+    uint8_t mux, reg, neg, sw[4];
+} Nv2aVshSrc;
+
+typedef struct {
+    Nv2aVshSrc src[3];
+    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask;
+    uint8_t out_o, out_ilu, rel, final, need;
+    uint16_t oaddr, cidx, iidx;
+} Nv2aVshIns;
+
+/* NULL if there is no program to run (no FINAL); else the instructions,
+ * their number and a 64-bit hash of the instruction words (by content:
+ * titles reload different programs into the same slot). */
+const Nv2aVshIns *nv2a_vsh_decoded(uint32_t *count, uint64_t *hash);
+
+/* The range of constants written since the last call, inclusive: 1 and
+ * lo/hi set if any, else 0. For uploading them to the GPU. */
+int nv2a_vsh_constants_take_dirty(uint32_t *lo, uint32_t *hi);
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

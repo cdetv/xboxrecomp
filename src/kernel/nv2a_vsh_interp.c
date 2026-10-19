@@ -50,26 +50,28 @@ static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
  * read all three sources whether the ops used them or not; in Conker that
  * made it the largest single cost of the GPU thread. Any upload or a new
  * start slot invalidates the decoded copy. */
-typedef struct {
-    uint8_t mux, reg, neg, sw[4];
-} VshSrc;
+typedef Nv2aVshSrc VshSrc;             /* nv2a_vsh_interp.h */
+typedef Nv2aVshIns VshIns;
 
 #define VSH_NEED_A 1
 #define VSH_NEED_B 2
 #define VSH_NEED_C 4
-
-typedef struct {
-    VshSrc src[3];
-    uint8_t mac, ilu, mac_mask, ilu_mask, tdst, omask;
-    uint8_t out_o, out_ilu, rel, final, need;
-    uint16_t oaddr, cidx, iidx;
-} VshIns;
 
 static VshIns s_dec[NV2A_VSH_SLOTS];
 static uint32_t s_dec_count;            /* instructions from s_start_slot */
 static int s_dec_valid;
 static int s_dec_final;                 /* a FINAL was found */
 static uint32_t s_dec_inputs;           /* bit i: the program reads v[i] */
+static uint64_t s_dec_hash;             /* FNV-1a of those instructions */
+
+/* Constants written since nv2a_vsh_constants_take_dirty: lo > hi = none. */
+static uint32_t s_cdirty_lo = NV2A_VSH_CONSTANTS, s_cdirty_hi;
+
+static void const_dirty(uint32_t i)
+{
+    if (i < s_cdirty_lo) s_cdirty_lo = i;
+    if (i > s_cdirty_hi) s_cdirty_hi = i;
+}
 
 /* ---- uploads ------------------------------------------------------------ */
 
@@ -107,8 +109,10 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
-    if (s_const_load < NV2A_VSH_CONSTANTS)
+    if (s_const_load < NV2A_VSH_CONSTANTS) {
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
+        const_dirty(s_const_load);
+    }
     if (++s_const_word == 4) {
         s_const_word = 0;
         s_const_load++;
@@ -117,8 +121,21 @@ void nv2a_vsh_constant_word(uint32_t word)
 
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
-    if (index < NV2A_VSH_CONSTANTS)
+    if (index < NV2A_VSH_CONSTANTS) {
         memcpy(s_const[index], v, sizeof s_const[index]);
+        const_dirty(index);
+    }
+}
+
+int nv2a_vsh_constants_take_dirty(uint32_t *lo, uint32_t *hi)
+{
+    if (s_cdirty_lo > s_cdirty_hi)
+        return 0;
+    *lo = s_cdirty_lo;
+    *hi = s_cdirty_hi;
+    s_cdirty_lo = NV2A_VSH_CONSTANTS;
+    s_cdirty_hi = 0;
+    return 1;
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
@@ -200,8 +217,10 @@ const float *nv2a_vsh_constant(uint32_t index)
 
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
-    if (index < NV2A_VSH_CONSTANTS && comp < 4)
+    if (index < NV2A_VSH_CONSTANTS && comp < 4) {
         memcpy(&s_const[index][comp], &word, 4);
+        const_dirty(index);
+    }
 }
 
 /* ---- execution ----------------------------------------------------------- */
@@ -429,6 +448,7 @@ static void decode_src(VshSrc *d, const uint32_t *ins, int which)
 static void decode_program(void)
 {
     uint32_t s, n = 0;
+    uint64_t h = 14695981039346656037ull;
 
     s_dec_final = 0;
     s_dec_inputs = 0;
@@ -437,6 +457,8 @@ static void decode_program(void)
         VshIns *I = &s_dec[n];
         int k;
 
+        for (k = 1; k < 4; k++)                     /* dword 0 is unused */
+            h = (h ^ ins[k]) * 1099511628211ull;
         for (k = 0; k < 3; k++)
             decode_src(&I->src[k], ins, k);
         I->mac = (uint8_t)field(ins, 1, 21, 4);
@@ -470,7 +492,19 @@ static void decode_program(void)
         }
     }
     s_dec_count = n;
+    s_dec_hash = h;
     s_dec_valid = 1;
+}
+
+const Nv2aVshIns *nv2a_vsh_decoded(uint32_t *count, uint64_t *hash)
+{
+    if (!s_dec_valid)
+        decode_program();
+    if (!s_dec_final)
+        return NULL;
+    *count = s_dec_count;
+    *hash = s_dec_hash;
+    return s_dec;
 }
 
 static vec4 read_dsrc(const VshIns *I, int which,
@@ -573,8 +607,10 @@ static int run_program(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out,
         if (omask) {
             const vec4 *src = I->out_ilu ? &ires : &mres;
             if (!I->out_o) {                              /* to c[] */
-                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS)
+                if (s_cxt_write && oaddr < NV2A_VSH_CONSTANTS) {
                     write_masked(s_const[oaddr], src, omask);
+                    const_dirty(oaddr);
+                }
             } else if (oaddr == 0) {
                 write_masked(opos.v, src, omask);
             } else if (oaddr < 13) {
@@ -928,6 +964,7 @@ int nv2a_vsh_run_lanes(const float (*in)[NV2A_VSH_INPUTS][4],
                     for (j = 0; j < 4; j++)
                         t.v[j] = (from_ilu ? ires : mres)[j][count - 1];
                     write_masked(s_const[I->oaddr], &t, I->omask);
+                    const_dirty(I->oaddr);
                 }
             } else if (I->oaddr == 0) {
                 write_lanes(S.opos, from_ilu ? ires : mres, I->omask);

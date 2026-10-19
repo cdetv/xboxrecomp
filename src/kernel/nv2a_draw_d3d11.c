@@ -761,6 +761,8 @@ static void d3d_clear(uint32_t param)
  * (clip_triangle, as raster_xf_clipped does). */
 
 #include "nv2a_draw_d3d11_hlsl.h"
+#include "nv2a_vsh_gpu.h"
+#include "nv2a_vsh_hlsl.h"
 
 #define NV_CLIP_W 1e-3f                 /* as in nv2a_draw_sw.c */
 enum { BV_OK = 1, BV_CLIP = 2 };        /* s_bv_ok; 0: not usable */
@@ -2738,6 +2740,82 @@ static void pace_draw(void)
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)*q);
 }
 
+/* RECOMP_VSH_GPU_CHECK=<N>: every Nth program batch (1 = all), and the
+ * first batch of every program seen for the first time, also runs through
+ * the program translated to HLSL (nv2a_vsh_hlsl.c, nv2a_vsh_gpu.c) on the
+ * same inputs; the GPU's results come back through stream-out and are
+ * compared with what the interpreter made ([VSHGPU] lines). Step 1 of
+ * vertex programs on the GPU: nothing is drawn from them yet. Up to the
+ * first 1024 vertices of a batch; each check waits for the GPU. Programs
+ * that may write constants (CXT_WRITE_EN) stay CPU-only and are skipped. */
+static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
+{
+    static long every = -1;
+    static int ok;
+    static uint32_t since, printed;
+    static unsigned long long batches, vertices, bad_verts, bad_batches;
+    static unsigned long long unprepared;
+    static float in[1024][NV2A_VSH_INPUTS][4];
+    static Nv2aVshOutput out[1024];
+    uint32_t i, a, m, bad = 0, count;
+    uint64_t hash;
+    int is_new;
+
+    if (every < 0) {
+        const char *e = getenv("RECOMP_VSH_GPU_CHECK");
+        every = e ? atol(e) : 0;
+        if (every > 0)
+            ok = nv2a_vsh_gpu_init((struct ID3D11Device *)s_dev,
+                                   (struct ID3D11DeviceContext *)s_ctx);
+    }
+    if (every <= 0 || !ok || nv2a_vsh_cxt_write())
+        return;
+    if (!nv2a_vsh_gpu_prepare(&is_new)) {
+        unprepared++;
+        return;
+    }
+    if (!is_new && ++since < (uint32_t)every)
+        return;
+    since = 0;
+    m = n < 1024 ? n : 1024;
+    for (i = 0; i < m; i++)
+        for (a = 0; a < NV2A_VSH_INPUTS; a++)
+            pb_fetch_attr(&g_pb.attr[a], g_pb.idx[i], in[i][a]);
+    if (!nv2a_vsh_gpu_run((const float (*)[NV2A_VSH_INPUTS][4])in, m, out)) {
+        unprepared++;
+        return;
+    }
+    nv2a_vsh_decoded(&count, &hash);
+    for (i = 0; i < m; i++) {
+        int f = nv2a_vsh_outputs_close(&verts[i], &out[i]);
+        if (f < 0)
+            continue;
+        bad++;
+        if (printed < 32) {
+            printed++;
+            fprintf(stderr, "[VSHGPU] check: program %016llX (%u instructions)"
+                    " draw %u vertex %u (index %u): %s cpu %g gpu %g%c",
+                    (unsigned long long)hash, count, g_pb.draws, i, g_pb.idx[i],
+                    nv2a_vsh_output_name(f), ((const float *)&verts[i])[f],
+                    ((const float *)&out[i])[f], 10);
+        }
+    }
+    batches++;
+    vertices += m;
+    bad_verts += bad;
+    bad_batches += bad != 0;
+    if (batches % 500 == 0) {
+        uint32_t compiled, failed;
+        double ms;
+        nv2a_vsh_gpu_stats(&compiled, &failed, &ms);
+        fprintf(stderr, "[VSHGPU] check: %llu batches, %llu vertices, %llu"
+                " differ (in %llu batches); %u programs compiled, %u failed,"
+                " %.0f ms compiling; %llu batches not run%c", batches,
+                vertices, bad_verts, bad_batches, compiled, failed, ms,
+                unprepared, 10);
+    }
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -2793,6 +2871,7 @@ static void d3d_draw(void)
                 s_stat.skip_program++;
                 return;
             }
+            vsh_gpu_check(verts, n);
         } else {
             for (i = 0; i < n; i++)
                 pb_fixed_vertex(g_pb.idx[i], &s_bv[i]);
