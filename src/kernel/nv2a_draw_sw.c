@@ -28,6 +28,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_attr.h"
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -119,7 +120,6 @@ int pb_fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     const uint8_t *p;
-    uint32_t i;
 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
@@ -140,43 +140,7 @@ int pb_fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
         p = mem + a->offset + (size_t)index * a->stride;
     }
 
-    switch (a->type) {
-    case 0:                                  /* D3DCOLOR */
-        /* A DWORD 0xAARRGGBB, so little-endian bytes are B,G,R,A -- not the
-         * component order of every other format here. Returned as R,G,B,A so
-         * callers need not know which format the title chose. */
-        out[0] = (float)p[2] / 255.0f;
-        out[1] = (float)p[1] / 255.0f;
-        out[2] = (float)p[0] / 255.0f;
-        out[3] = (float)p[3] / 255.0f;
-        return 1;
-    case 2:                                  /* float */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = ((const float *)p)[i];
-        return 1;
-    case 4:                                  /* unsigned byte, normalised */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)p[i] / 255.0f;
-        return 1;
-    /* The formats 3D geometry uses and screen-space quads never did. */
-    case 1:                                  /* signed short, normalised */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)((const int16_t *)p)[i] / 32767.0f;
-        return 1;
-    case 5:                                  /* signed short, as is */
-        for (i = 0; i < a->size && i < 4; i++)
-            out[i] = (float)((const int16_t *)p)[i];
-        return 1;
-    case 6: {                                /* packed 11:11:10 normal */
-        uint32_t v = *(const uint32_t *)p;
-        out[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
-        out[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
-        out[2] = (float)((int32_t)v >> 22) / 511.0f;
-        return 1;
-    }
-    default:
-        return 0;
-    }
+    return nv2a_attr_decode(p, a->type, a->size, out);
 }
 
 static void note_drawn(void)

@@ -271,6 +271,87 @@ size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
     return o.full ? 0 : o.len;
 }
 
+/* ---- vertex inputs ----------------------------------------------------- */
+
+/* nv2a_attr_decode in HLSL. Elements need not be 4-byte aligned (a ubyte or
+ * short attribute at an odd offset), so every read is of the dword at a byte
+ * address, from the two aligned ones around it; bytes past the end of the
+ * copy read as zeroes and are masked off. The normalising divides are
+ * divides, as the C's: no multiply by a reciprocal. */
+static const char k_fetch[] =
+"ByteAddressBuffer vin : register(t0);\n"
+"cbuffer VshA : register(b4) { uint4 va[16]; };\n"
+"uint vsh_ld(uint a) {\n"
+"  uint s = (a & 3u) * 8u, b = a & ~3u, lo = vin.Load(b);\n"
+"  return s == 0u ? lo : (lo >> s) | (vin.Load(b + 4u) << (32u - s));\n"
+"}\n"
+"float vsh_s16(uint x) { return (float)((int)(x << 16) >> 16); }\n"
+"float4 vsh_fetch(uint k, uint i) {\n"
+"  uint4 d = va[k];\n"
+"  uint kind = d.z & 0xFFu, n = min(d.z >> 8, 4u), a = d.x + i * d.y;\n"
+"  float4 r = float4(0, 0, 0, 1);\n"
+"  if (kind == 0u || i > d.w) return r;\n"
+"  if (kind == 1u) {                          /* D3DCOLOR: B,G,R,A bytes */\n"
+"    uint c = vsh_ld(a);\n"
+"    return float4((float)((c >> 16) & 255u) / 255.0,\n"
+"                  (float)((c >> 8) & 255u) / 255.0,\n"
+"                  (float)(c & 255u) / 255.0, (float)(c >> 24) / 255.0);\n"
+"  }\n"
+"  if (kind == 7u) {                          /* packed 11:11:10 */\n"
+"    uint c = vsh_ld(a);\n"
+"    r.x = (float)((int)(c << 21) >> 21) / 1023.0;\n"
+"    r.y = (float)((int)(c << 10) >> 21) / 1023.0;\n"
+"    r.z = (float)((int)c >> 22) / 511.0;\n"
+"    return r;\n"
+"  }\n"
+"  [unroll] for (uint j = 0; j < 4u; j++) {\n"
+"    if (j < n) {\n"
+"      if (kind == 3u) r[j] = asfloat(vsh_ld(a + 4u * j));\n"
+"      else if (kind == 5u) r[j] = (float)(vsh_ld(a + j) & 255u) / 255.0;\n"
+"      else if (kind == 2u) r[j] = vsh_s16(vsh_ld(a + 2u * j)) / 32767.0;\n"
+"      else if (kind == 6u) r[j] = vsh_s16(vsh_ld(a + 2u * j));\n"
+"    }\n"
+"  }\n"
+"  return r;\n"
+"}\n";
+
+static const char k_fetch_check[] =
+"struct VshFetched {\n"
+"  float4 a0 : TEXCOORD0; float4 a1 : TEXCOORD1; float4 a2 : TEXCOORD2;\n"
+"  float4 a3 : TEXCOORD3; float4 a4 : TEXCOORD4; float4 a5 : TEXCOORD5;\n"
+"  float4 a6 : TEXCOORD6; float4 a7 : TEXCOORD7; float4 a8 : TEXCOORD8;\n"
+"  float4 a9 : TEXCOORD9; float4 a10 : TEXCOORD10; float4 a11 : TEXCOORD11;\n"
+"  float4 a12 : TEXCOORD12; float4 a13 : TEXCOORD13;\n"
+"  float4 a14 : TEXCOORD14; float4 a15 : TEXCOORD15;\n"
+"};\n"
+"VshFetched vs_fetch(uint i : SV_VertexID) {\n"
+"  VshFetched o;\n"
+"  o.a0 = vsh_fetch(0, i); o.a1 = vsh_fetch(1, i); o.a2 = vsh_fetch(2, i);\n"
+"  o.a3 = vsh_fetch(3, i); o.a4 = vsh_fetch(4, i); o.a5 = vsh_fetch(5, i);\n"
+"  o.a6 = vsh_fetch(6, i); o.a7 = vsh_fetch(7, i); o.a8 = vsh_fetch(8, i);\n"
+"  o.a9 = vsh_fetch(9, i); o.a10 = vsh_fetch(10, i);\n"
+"  o.a11 = vsh_fetch(11, i); o.a12 = vsh_fetch(12, i);\n"
+"  o.a13 = vsh_fetch(13, i); o.a14 = vsh_fetch(14, i);\n"
+"  o.a15 = vsh_fetch(15, i);\n"
+"  return o;\n"
+"}\n";
+
+size_t nv2a_vsh_hlsl_fetch(char *buf, size_t cap)
+{
+    Out o;
+
+    if (!cap)
+        return 0;
+    o.buf = buf;
+    o.cap = cap;
+    o.len = 0;
+    o.full = 0;
+    buf[0] = 0;
+    put(&o, "%s", k_fetch);
+    put(&o, "%s", k_fetch_check);
+    return o.full ? 0 : o.len;
+}
+
 /* ---- comparing results ------------------------------------------------- */
 
 int nv2a_vsh_outputs_close(const Nv2aVshOutput *a, const Nv2aVshOutput *b)

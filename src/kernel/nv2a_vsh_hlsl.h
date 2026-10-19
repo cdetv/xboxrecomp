@@ -33,6 +33,23 @@
 size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
                      size_t cap);
 
+/* The vertex inputs read on the GPU (step 2): the batch's attribute bytes in
+ * `ByteAddressBuffer vin : register(t0)`, and per input k one row of
+ * `cbuffer VshA : register(b4) { uint4 va[16]; }` -- x the byte address of
+ * element 0 (modulo 2^32: the copy holds only the indices in use), y the
+ * stride, z the kind | size << 8 (kind = NV097 type + 1, 0 = absent), w the
+ * highest index that may be read (an INLINE_ARRAY's end). An absent input
+ * or an index past w reads 0,0,0,1, as pb_fetch_attr. */
+#define NV2A_VSH_HLSL_FETCH_SRV     0
+#define NV2A_VSH_HLSL_FETCH_CBUFFER 4
+#define NV2A_VSH_HLSL_FETCH_KIND(type) ((type) + 1)
+
+/* Writes the fetch definitions -- `float4 vsh_fetch(uint k, uint i)`, input
+ * k of vertex index i in nv2a_attr_decode's formats -- and the stream-out
+ * entry vs_fetch (SV_VertexID in, the 16 inputs out as TEXCOORD0..15, 64
+ * floats). Returns the length, or 0 if buf is too small. */
+size_t nv2a_vsh_hlsl_fetch(char *buf, size_t cap);
+
 /* Whether a GPU result b matches the interpreter's a, field by field (33
  * floats): both NaN, or the same infinity, or within a relative 1e-4 plus
  * an absolute 1e-3. Returns -1 when they match, else the first field that

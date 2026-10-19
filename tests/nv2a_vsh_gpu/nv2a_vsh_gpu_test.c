@@ -17,6 +17,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_vsh_hlsl.h"
 #include "nv2a_vsh_gpu.h"
+#include "nv2a_attr.h"
 
 #define COBJMACROS
 #include <windows.h>
@@ -91,6 +92,138 @@ static void print_diff(const char *what, const Nv2aVshOutput *want,
 static float s_in[1024][NV2A_VSH_INPUTS][4];
 static Nv2aVshOutput s_got[1024];
 
+/* ---- step 2: the GPU's vertex fetch against nv2a_attr_decode ----------- */
+
+static uint8_t s_mem[4 << 20];
+static uint32_t s_idx[1024];
+static float s_fetched[1024][NV2A_VSH_INPUTS][4];
+
+/* pb_fetch_attr, on a host array. */
+static void fetch_ref(const Nv2aVshArray *a, uint32_t i, float out[4])
+{
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (!a->src || !a->size || !a->stride || i > a->last)
+        return;
+    if (!nv2a_attr_decode(a->src + (size_t)i * a->stride, a->type, a->size,
+                          out))
+        out[0] = out[1] = out[2] = 0.0f, out[3] = 1.0f;
+}
+
+/* How far apart two floats are in units in the last place; both NaN = 0. */
+static uint32_t ulps(float x, float y)
+{
+    int32_t a, b;
+    int64_t d;
+    if (x != x || y != y)
+        return x != x && y != y ? 0 : 0xFFFFFFFFu;
+    memcpy(&a, &x, 4);
+    memcpy(&b, &y, 4);
+    d = (a < 0 ? (int64_t)INT32_MIN - a : a) - (b < 0 ? (int64_t)INT32_MIN - b : b);
+    d = d < 0 ? -d : d;
+    return d > 0xFFFFFFFF ? 0xFFFFFFFFu : (uint32_t)d;
+}
+
+/* Random batches: interleaved vertices of 4..80 bytes with attributes at
+ * any byte offset in them (so unaligned ubyte, short and even float reads),
+ * separate arrays, every format and some no decoder knows, sizes 0..5,
+ * INLINE_ARRAY-style ends, absent and unused inputs, indices anywhere in a
+ * range. Floats are compared to the bit (they are copied, not converted);
+ * the normalising divides may differ by an ulp. */
+static int fetch_test(int hw)
+{
+    static const uint32_t types[] = {0, 1, 2, 4, 5, 6, 3, 7};
+    long values = 0, inexact = 0, worst = 0;
+    int b, k, l, c;
+    uint32_t i;
+
+    for (i = 0; i < sizeof s_mem; i++)
+        s_mem[i] = (uint8_t)rnd();
+    for (b = 0; b < 400; b++) {
+        Nv2aVshArray a[NV2A_VSH_INPUTS];
+        uint32_t stride = 4 + rnd() % 77, used = rnd() & 0xFFFFu;
+        uint32_t count = 1 + rnd() % 1024, range = 1 + rnd() % 4000;
+        uint32_t base = rnd() % 100000, lo = ~0u, hi = 0;
+        uint8_t *vtx = s_mem + 1024 + rnd() % (1u << 20);
+
+        if (b % 50 == 0)
+            used = 0xFFFFu;
+        memset(a, 0, sizeof a);
+        for (k = 0; k < NV2A_VSH_INPUTS; k++) {
+            uint32_t r = rnd() % 16;
+            a[k].type = types[rnd() % (r < 2 ? 8 : 6)];
+            a[k].size = r == 3 ? 0 : r == 4 ? 5 : 1 + rnd() % 4;
+            a[k].last = r == 5 ? base + rnd() % (range + 1) : UINT32_MAX;
+            if (r == 6) {
+                continue;                       /* absent */
+            } else if (r < 10) {                /* interleaved */
+                a[k].stride = stride;
+                a[k].src = vtx + rnd() % stride;
+            } else {                            /* an array of its own */
+                a[k].stride = nv2a_attr_bytes(a[k].type, a[k].size);
+                a[k].stride += rnd() % 3;
+                if (!a[k].stride)
+                    a[k].stride = 4;
+                a[k].src = s_mem + 1024 + (1u << 20) + rnd() % (1u << 20);
+            }
+            /* Element 0 lies `base` elements back: the copy must not need
+             * it. Floats get values a program would see, mostly. */
+            a[k].src -= (size_t)base * a[k].stride;
+            if (a[k].type == 2 && rnd() % 4)
+                for (i = base; i < base + range; i++)
+                    for (c = 0; c < (int)a[k].size && c < 4; c++) {
+                        float f = rndf();
+                        memcpy((uint8_t *)a[k].src + (size_t)i * a[k].stride
+                               + 4 * c, &f, 4);
+                    }
+        }
+        for (l = 0; l < (int)count; l++) {
+            s_idx[l] = base + rnd() % range;
+            if (s_idx[l] < lo) lo = s_idx[l];
+            if (s_idx[l] > hi) hi = s_idx[l];
+        }
+        if (!nv2a_vsh_gpu_inputs(a, used, lo, hi)
+            || !nv2a_vsh_gpu_fetch(s_idx, count, s_fetched)) {
+            printf("FAIL: fetch batch %d did not run\n", b);
+            return 0;
+        }
+        for (l = 0; l < (int)count; l++)
+            for (k = 0; k < NV2A_VSH_INPUTS; k++) {
+                float want[4];
+                if (!(used >> k & 1))
+                    continue;
+                fetch_ref(&a[k], s_idx[l], want);
+                for (c = 0; c < 4; c++) {
+                    uint32_t u = ulps(want[c], s_fetched[l][k][c]);
+                    int exact = !memcmp(&want[c], &s_fetched[l][k][c], 4);
+                    values++;
+                    if (exact)
+                        continue;
+                    inexact++;
+                    if ((long)u > worst)
+                        worst = (long)u;
+                    if (u > 1 || a[k].type == 2 || a[k].type == 5) {
+                        printf("FAIL: fetch batch %d vertex %d (index %u)"
+                               " input %d type %u size %u stride %u: %c cpu"
+                               " %.9g gpu %.9g\n", b, l, s_idx[l], k,
+                               a[k].type, a[k].size, a[k].stride, "xyzw"[c],
+                               want[c], s_fetched[l][k][c]);
+                        return 0;
+                    }
+                }
+            }
+    }
+    {
+        uint64_t batches, bytes, wraps;
+        nv2a_vsh_gpu_input_stats(&batches, &bytes, &wraps);
+        printf("fetch: %d batches, %ld values, %ld not to the bit (at most"
+               " %ld ulp); %llu bytes copied, %llu ring restarts%s\n", b,
+               values, inexact, worst, (unsigned long long)bytes,
+               (unsigned long long)wraps, hw ? " (hw)" : "");
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     ID3D11Device *dev = NULL;
@@ -149,6 +282,9 @@ int main(int argc, char **argv)
             return 1;
         }
     }
+
+    if (!fetch_test(hw))
+        return 1;
 
     for (prog = 0; prog < 1500; prog++) {
         int len = 1 + (int)(rnd() % 24), count = 1 + (int)(rnd() % 64);
