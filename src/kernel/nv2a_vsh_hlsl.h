@@ -50,6 +50,16 @@ size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
  * floats). Returns the length, or 0 if buf is too small. */
 size_t nv2a_vsh_hlsl_fetch(char *buf, size_t cap);
 
+/* vsh_fetch and what it reads, without vs_fetch: for a drawing shader that
+ * puts the fetch, the program and an entry point of its own together. */
+size_t nv2a_vsh_hlsl_fetch_only(char *buf, size_t cap);
+
+/* `void vsh_inputs(uint i, out float4 v[16])`: the inputs in `used` (bit k
+ * = input k, nv2a_vsh_prepare's mask) fetched, the rest 0,0,0,1 without a
+ * fetch. Written per program: fxc spends its time on the fetches, unread
+ * ones included (all 16: ~300 ms for a 4-instruction program, 2026-10-18). */
+size_t nv2a_vsh_hlsl_inputs(uint32_t used, char *buf, size_t cap);
+
 /* Whether a GPU result b matches the interpreter's a, field by field (33
  * floats): both NaN, or the same infinity, or within a relative 1e-4 plus
  * an absolute 1e-3. Returns -1 when they match, else the first field that

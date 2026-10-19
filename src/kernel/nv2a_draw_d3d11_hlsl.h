@@ -30,6 +30,51 @@
 #ifndef NV2A_DRAW_D3D11_HLSL_H
 #define NV2A_DRAW_D3D11_HLSL_H
 
+/* What both vertex shaders need -- this one (vs) and the one compiled per
+ * vertex program (vs_gpu, s_hlsl_vsh_draw) -- and the pixel shader reads:
+ * the constant buffer, the vertex the pixel shader takes, the fog unit. */
+#define NV2A_D3D11_HLSL_COMMON \
+"cbuffer C : register(b0) {\n" \
+"  float4 rt;          /* x*rt.x+rt.z, y*rt.y+rt.w: pixels to NDC */\n" \
+"  float4 tscale[4];   /* per stage: xy coordinates to normalised;\n" \
+"                         z alpha reads 1, w red/blue swap (a surface\n" \
+"                         sampled in another format, RTT_* flags) */\n" \
+"  uint4  mode;        /* path, bound-stage bits, alpha func, alpha ref */\n" \
+"  uint4  stage;       /* stage program, clip-plane mode, control, fog */\n" \
+"  uint4  icw[8];      /* colour ICW, alpha ICW, colour OCW, alpha OCW */\n" \
+"  float4 cf0[8];      /* FACTOR0 per stage */\n" \
+"  float4 cf1[8];      /* FACTOR1 per stage */\n" \
+"  uint4  fin;         /* final combiner words 0, 1 */\n" \
+"  float4 fc0, fc1;    /* final combiner constants */\n" \
+"  float4 fogc;        /* fog colour, r g b */\n" \
+"  float4 fogp;        /* fog parameters 0, 1 */\n" \
+"  float4 zsc;         /* x: guest depth units to 0..1 (1/0xFFFFFF Z24) */\n" \
+"  float4 bmat[4];     /* per stage: bump-env matrix 00 01 10 11 */\n" \
+"  float4 bsc[4];      /* per stage: bump scale, offset, input stage */\n" \
+"};\n" \
+"struct V {\n" \
+"  float4 p : SV_Position;\n" \
+"  nointerpolation float4 cf : COLOR0;\n" \
+"  noperspective float4 d0 : COLOR1;\n" \
+"  noperspective float4 d1 : COLOR2;\n" \
+"  noperspective float fog : FOG;\n" \
+"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n" \
+"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+"};\n" \
+"\n" \
+"/* fog_factor (nv2a_draw_sw.c): the fog unit, per vertex. */\n" \
+"float fog_factor(float d) {\n" \
+"  uint m = stage.w & 0xFFFF; float f;\n" \
+"  if (!(stage.w & 0x10000)) return 1.0;\n" \
+"  if (m == 0x800 || m == 0x802) f = fogp.x + exp2(d * fogp.y * 16.0) - 1.5;\n" \
+"  else if (m == 0x801 || m == 0x803)\n" \
+"    f = fogp.x + exp2(-d * d * fogp.y * fogp.y * 32.0) - 1.5;\n" \
+"  else f = fogp.x + d * fogp.y - 1.0;\n" \
+"  if (m == 0x802 || m == 0x803 || m == 0x804) f = abs(f);\n" \
+"  if (!(f == f)) f = 1.0;\n" \
+"  return saturate(f);\n" \
+"}\n"
+
 static const char s_hlsl[] =
 "Texture2D t0 : register(t0); Texture2D t1 : register(t1);\n"
 "Texture2D t2 : register(t2); Texture2D t3 : register(t3);\n"
@@ -42,52 +87,13 @@ static const char s_hlsl[] =
 "Texture2DArray c2 : register(t13); Texture2DArray c3 : register(t14);\n"
 "SamplerState s0 : register(s0); SamplerState s1 : register(s1);\n"
 "SamplerState s2 : register(s2); SamplerState s3 : register(s3);\n"
-"cbuffer C : register(b0) {\n"
-"  float4 rt;          /* x*rt.x+rt.z, y*rt.y+rt.w: pixels to NDC */\n"
-"  float4 tscale[4];   /* per stage: xy coordinates to normalised;\n"
-"                         z alpha reads 1, w red/blue swap (a surface\n"
-"                         sampled in another format, RTT_* flags) */\n"
-"  uint4  mode;        /* path, bound-stage bits, alpha func, alpha ref */\n"
-"  uint4  stage;       /* stage program, clip-plane mode, control, fog */\n"
-"  uint4  icw[8];      /* colour ICW, alpha ICW, colour OCW, alpha OCW */\n"
-"  float4 cf0[8];      /* FACTOR0 per stage */\n"
-"  float4 cf1[8];      /* FACTOR1 per stage */\n"
-"  uint4  fin;         /* final combiner words 0, 1 */\n"
-"  float4 fc0, fc1;    /* final combiner constants */\n"
-"  float4 fogc;        /* fog colour, r g b */\n"
-"  float4 fogp;        /* fog parameters 0, 1 */\n"
-"  float4 zsc;         /* x: guest depth units to 0..1 (1/0xFFFFFF Z24) */\n"
-"  float4 bmat[4];     /* per stage: bump-env matrix 00 01 10 11 */\n"
-"  float4 bsc[4];      /* per stage: bump scale, offset, input stage */\n"
-"};\n"
+NV2A_D3D11_HLSL_COMMON
 "struct VI {\n"
 "  float4 p : POSITION; float4 d0 : COLOR0; float4 d1 : COLOR1;\n"
 "  float4 fog : TEXCOORD4;\n"
 "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
 "};\n"
-"struct V {\n"
-"  float4 p : SV_Position;\n"
-"  nointerpolation float4 cf : COLOR0;\n"
-"  noperspective float4 d0 : COLOR1;\n"
-"  noperspective float4 d1 : COLOR2;\n"
-"  noperspective float fog : FOG;\n"
-"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
-"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-"};\n"
-"\n"
-"/* fog_factor (nv2a_draw_sw.c): the fog unit, per vertex. */\n"
-"float fog_factor(float d) {\n"
-"  uint m = stage.w & 0xFFFF; float f;\n"
-"  if (!(stage.w & 0x10000)) return 1.0;\n"
-"  if (m == 0x800 || m == 0x802) f = fogp.x + exp2(d * fogp.y * 16.0) - 1.5;\n"
-"  else if (m == 0x801 || m == 0x803)\n"
-"    f = fogp.x + exp2(-d * d * fogp.y * fogp.y * 32.0) - 1.5;\n"
-"  else f = fogp.x + d * fogp.y - 1.0;\n"
-"  if (m == 0x802 || m == 0x803 || m == 0x804) f = abs(f);\n"
-"  if (!(f == f)) f = 1.0;\n"
-"  return saturate(f);\n"
-"}\n"
 "\n"
 "V vs(VI i) {\n"
 "  V o; float w = i.p.w;\n"
@@ -436,6 +442,52 @@ static const char s_hlsl[] =
 "cbuffer Bc : register(b2) { float4 bk; float4 bo; };\n"
 "float4 bps(float4 p : SV_Position) : SV_Target {\n"
 "  return bt.Sample(bsm, (p.xy - bo.xy) * bk.xy + bk.zw);\n"
+"}\n";
+
+/* Vertex programs on the GPU (RECOMP_VSH_GPU, nv2a_vsh_gpu.c): each
+ * program's vertex shader is s_hlsl_vsh_head, the fetch and the program
+ * (nv2a_vsh_hlsl.c), then this. vs_gpu reads the vertex at SV_VertexID (the
+ * batch's own index: the draw is indexed with no base), runs the program and
+ * maps its screen-space position to clip space as vs does. The GPU then
+ * clips; the two clip distances are clip_triangle's planes, w past NV_CLIP_W
+ * and z in front of the viewport's near plane (c[58], c[59] as the Xbox D3D
+ * epilogue leaves them), so a triangle loses what the CPU path cut off
+ * whether or not the depth clip is on. A vertex that is not finite goes to
+ * NaN everywhere, which the rasteriser drops with its triangles, as
+ * mark_unclipped drops them. The position is precise: two programs that
+ * compute it the same way must give the same depth (layered passes test
+ * LEQUAL against the base pass), so no fusing or reordering. */
+static const char s_hlsl_vsh_head[] = NV2A_D3D11_HLSL_COMMON;
+static const char s_hlsl_vsh_draw[] =
+"struct VG {\n"
+"  float4 p : SV_Position;\n"
+"  nointerpolation float4 cf : COLOR0;\n"
+"  noperspective float4 d0 : COLOR1;\n"
+"  noperspective float4 d1 : COLOR2;\n"
+"  noperspective float fog : FOG;\n"
+"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
+"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
+"  float2 cd : SV_ClipDistance0;\n"
+"};\n"
+"VG vs_gpu(uint id : SV_VertexID) {\n"
+"  float4 v[16]; VshOut r; VG o;\n"
+"  vsh_inputs(id, v);\n"
+"  r = vsh_prog(v);\n"
+"  {\n"
+"    precise float w = r.pos.w;\n"
+"    precise float4 p = float4((r.pos.x * rt.x + rt.z) * w,\n"
+"                              (r.pos.y * rt.y + rt.w) * w,\n"
+"                              r.pos.z * zsc.x * w, w);\n"
+"    o.p = p;\n"
+"    o.cd.x = w - 1e-3;\n"
+"    o.cd.y = vc[58].z != 0.0 ? (r.pos.z - vc[59].z) / vc[58].z * w : 0.0;\n"
+"    if (!all(isfinite(r.pos))) {\n"
+"      o.p = asfloat(0x7FC00000u).xxxx; o.cd = asfloat(0x7FC00000u).xx;\n"
+"    }\n"
+"  }\n"
+"  o.cf = r.d0; o.d0 = r.d0; o.d1 = r.d1; o.fog = fog_factor(r.fog.x);\n"
+"  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2; o.t3 = r.t3;\n"
+"  return o;\n"
 "}\n";
 
 #endif

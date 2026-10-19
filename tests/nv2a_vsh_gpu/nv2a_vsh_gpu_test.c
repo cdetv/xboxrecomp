@@ -224,6 +224,332 @@ static int fetch_test(int hw)
     return 1;
 }
 
+/* ---- step 3: drawing with the program on the GPU ---------------------- */
+
+/* The back end's shaders, as nv2a_draw_d3d11.c compiles them. */
+#include "nv2a_draw_d3d11_hlsl.h"
+#include <d3dcompiler.h>
+
+#define DT_W 256
+#define DT_H 256
+#define DT_TRIS 200
+
+static ID3DBlob *dt_compile(const char *entry, const char *target)
+{
+    ID3DBlob *code = NULL, *err = NULL;
+    if (FAILED(D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_draw_d3d11", NULL,
+                          NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                          0, &code, &err))) {
+        printf("FAIL: draw test shader %s: %s\n", entry,
+               err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        code = NULL;
+    }
+    if (err) ID3D10Blob_Release(err);
+    return code;
+}
+
+typedef struct {
+    ID3D11Texture2D *rt, *ds, *rt_stage, *ds_stage;
+    ID3D11RenderTargetView *rtv;
+    ID3D11DepthStencilView *dsv;
+} DtTarget;
+
+static int dt_target(ID3D11Device *dev, DtTarget *t)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd;
+    memset(&td, 0, sizeof td);
+    td.Width = DT_W;
+    td.Height = DT_H;
+    td.MipLevels = td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &t->rt))
+        || FAILED(ID3D11Device_CreateRenderTargetView(dev,
+                  (ID3D11Resource *)t->rt, NULL, &t->rtv)))
+        return 0;
+    td.Format = DXGI_FORMAT_R24G8_TYPELESS;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    memset(&dd, 0, sizeof dd);
+    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &t->ds))
+        || FAILED(ID3D11Device_CreateDepthStencilView(dev,
+                  (ID3D11Resource *)t->ds, &dd, &t->dsv)))
+        return 0;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &td, NULL, &t->ds_stage)))
+        return 0;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    return SUCCEEDED(ID3D11Device_CreateTexture2D(dev, &td, NULL,
+                                                  &t->rt_stage));
+}
+
+static void dt_read(ID3D11DeviceContext *ctx, ID3D11Texture2D *from,
+                    ID3D11Texture2D *stage, uint32_t *out)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    int y;
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource *)stage,
+                                     (ID3D11Resource *)from);
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)stage, 0,
+                                       D3D11_MAP_READ, 0, &m))) {
+        memset(out, 0, DT_W * DT_H * 4);
+        return;
+    }
+    for (y = 0; y < DT_H; y++)
+        memcpy(out + y * DT_W, (const uint8_t *)m.pData + y * m.RowPitch,
+               DT_W * 4);
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource *)stage, 0);
+}
+
+/* A program of the Xbox D3D epilogue plus mov oD0, v3, drawn twice into
+ * 256 x 256 with depth: through vs_gpu (the batch's bytes fetched on the
+ * GPU, the program run there), and as the back end draws it today, the
+ * interpreter's vertices through vs. Same pixel shader (ps, path 1 with
+ * nothing bound: the interpolated colour). Triangles lie wholly in front,
+ * where the CPU path does no clipping, and must give the same picture and
+ * depth but for edge pixels. Then triangles wholly behind the eye or the
+ * near plane, which vs_gpu's clip distances must drop. */
+static int draw_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
+{
+    static uint32_t a_rgb[DT_W * DT_H], a_z[DT_W * DT_H];
+    static uint32_t b_rgb[DT_W * DT_H], b_z[DT_W * DT_H];
+    static Nv2aVshOutput xf[DT_TRIS * 3];
+    static const D3D11_INPUT_ELEMENT_DESC el[] = {
+#define EL(name, idx, off) { name, idx, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, \
+                             off, D3D11_INPUT_PER_VERTEX_DATA, 0 }
+        EL("POSITION", 0, 0), EL("COLOR", 0, 16), EL("COLOR", 1, 32),
+        EL("TEXCOORD", 4, 48), EL("TEXCOORD", 0, 64), EL("TEXCOORD", 1, 80),
+        EL("TEXCOORD", 2, 96), EL("TEXCOORD", 3, 112),
+#undef EL
+    };
+    struct { float pos[4]; uint32_t col; } vtx[DT_TRIS * 3];
+    uint32_t idx[DT_TRIS * 3], k[180], used, i, pass, bad_rgb = 0, bad_z = 0;
+    uint32_t covered = 0, worst_z = 0, w0[4] = {0}, w1[4] = {0}, w2[4] = {0};
+    uint32_t w3[4] = {0};
+    const float c58[4] = {DT_W / 2.0f, -DT_H / 2.0f, 16777215.0f, 0};
+    const float c59[4] = {DT_W / 2.0f, DT_H / 2.0f, 0, 0};
+    ID3DBlob *vsb = dt_compile("vs", "vs_4_0"), *psb = dt_compile("ps", "ps_4_0");
+    ID3D11VertexShader *cpu_vs = NULL, *gvs;
+    ID3D11PixelShader *ps = NULL;
+    ID3D11InputLayout *layout = NULL;
+    ID3D11Buffer *cb = NULL, *vb = NULL, *ib = NULL;
+    ID3D11RasterizerState *rs = NULL;
+    ID3D11DepthStencilState *dss = NULL;
+    D3D11_BUFFER_DESC bd;
+    D3D11_SUBRESOURCE_DATA init;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    D3D11_VIEWPORT vp = {0, 0, DT_W, DT_H, 0, 1};
+    Nv2aVshArray arr[NV2A_VSH_INPUTS];
+    DtTarget t;
+    double t0;
+    UINT stride = sizeof(Nv2aVshOutput), zero = 0;
+
+    if (!vsb || !psb)
+        return 0;
+    memset(&t, 0, sizeof t);
+    if (FAILED(ID3D11Device_CreateVertexShader(dev,
+            ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb),
+            NULL, &cpu_vs))
+        || FAILED(ID3D11Device_CreatePixelShader(dev,
+            ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb),
+            NULL, &ps))
+        || FAILED(ID3D11Device_CreateInputLayout(dev, el, 8,
+            ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb),
+            &layout))
+        || !dt_target(dev, &t)) {
+        puts("FAIL: draw test objects");
+        return 0;
+    }
+
+    /* mov oPos, v0; mov oD0, v3; mul oPos.xyz, R12, c58 + rcc R1.x, R12.w;
+     * mad oPos.xyz, R12, R1.x, c59 (the epilogue as in main). */
+    w0[1] = (1u << 21);
+    src(w0, 0, V, 0, XYZW);
+    w0[3] |= (0xFu << 12) | (1u << 11);
+    w1[1] = (1u << 21) | (3u << 9);
+    src(w1, 0, V, 3, XYZW);
+    w1[3] |= (0xFu << 12) | (1u << 11) | (3u << 3);
+    w2[1] = (3u << 25) | (2u << 21) | (58u << 13);
+    src(w2, 0, T, 12, XYZW); src(w2, 1, C, 0, XYZW); src(w2, 2, T, 12, WWWW);
+    w2[3] |= (7u << 20) | (8u << 16) | (0xEu << 12) | (1u << 11);
+    w3[1] = (4u << 21) | (59u << 13);
+    src(w3, 0, T, 12, XYZW); src(w3, 1, T, 1, XXXX); src(w3, 2, C, 0, XYZW);
+    w3[3] |= (0xEu << 12) | (1u << 11) | 1u;
+    nv2a_vsh_set_instruction(0, w0);
+    nv2a_vsh_set_instruction(1, w1);
+    nv2a_vsh_set_instruction(2, w2);
+    nv2a_vsh_set_instruction(3, w3);
+    nv2a_vsh_set_start_slot(1);
+    nv2a_vsh_set_start_slot(0);
+    nv2a_vsh_set_constant(58, c58);
+    nv2a_vsh_set_constant(59, c59);
+    nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw, "vs_gpu");
+    t0 = (double)GetTickCount64();
+    if (!nv2a_vsh_gpu_prepare(NULL) || !(gvs = nv2a_vsh_gpu_draw_shader(1))) {
+        puts("FAIL: draw shader did not compile");
+        return 0;
+    }
+    printf("draw: shader ready after %.0f ms\n",
+           (double)GetTickCount64() - t0);
+    nv2a_vsh_prepare(&used);
+
+    /* cbuffer C (nv2a_draw_d3d11_hlsl.h): rt, mode (path 1), zsc. */
+    memset(k, 0, sizeof k);
+    {
+        float rt[4] = {2.0f / DT_W, -2.0f / DT_H, -1.0f, 1.0f};
+        float zsc = 1.0f / 16777215.0f;
+        memcpy(&k[0], rt, sizeof rt);
+        k[20] = 1;
+        memcpy(&k[144], &zsc, 4);
+    }
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = sizeof k;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    init.pSysMem = k;
+    init.SysMemPitch = init.SysMemSlicePitch = 0;
+    ID3D11Device_CreateBuffer(dev, &bd, &init, &cb);
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    ID3D11Device_CreateRasterizerState(dev, &rd, &rs);
+    memset(&dsd, 0, sizeof dsd);
+    dsd.DepthEnable = TRUE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dsd.DepthFunc = D3D11_COMPARISON_LESS;
+    ID3D11Device_CreateDepthStencilState(dev, &dsd, &dss);
+
+    for (pass = 0; pass < 2; pass++) {
+        uint32_t n = DT_TRIS * 3, v;
+        float clear[4] = {0, 0, 0, 0};
+        /* pass 0: in front; pass 1: wholly behind the eye or the near
+         * plane, so nothing may be drawn. */
+        for (v = 0; v < n; v++) {
+            float w = 0.5f + (float)(rnd() % 3500) / 1000.0f;
+            float nx = ((float)(rnd() % 2401) - 1200.0f) / 1000.0f;
+            float ny = ((float)(rnd() % 2401) - 1200.0f) / 1000.0f;
+            float nz = (float)(rnd() % 1000) / 1000.0f;
+            if (pass == 1) {
+                if ((v / 3) & 1) w = -w;        /* behind the eye */
+                else nz = -0.01f - nz;          /* before the near plane */
+            }
+            vtx[v].pos[0] = nx * w;
+            vtx[v].pos[1] = ny * w;
+            vtx[v].pos[2] = nz * w;
+            vtx[v].pos[3] = w;
+            vtx[v].col = rnd() | 0xFF000000u;
+            idx[v] = n - 1 - v;                 /* not 0..n-1 in order */
+        }
+        memset(arr, 0, sizeof arr);
+        arr[0].src = (const uint8_t *)vtx[0].pos;
+        arr[0].type = 2; arr[0].size = 4; arr[0].stride = sizeof vtx[0];
+        arr[0].last = UINT32_MAX;
+        arr[3].src = (const uint8_t *)&vtx[0].col;
+        arr[3].type = 0; arr[3].size = 4; arr[3].stride = sizeof vtx[0];
+        arr[3].last = UINT32_MAX;
+        for (v = 0; v < n; v++) {
+            float in[NV2A_VSH_INPUTS][4];
+            memset(in, 0, sizeof in);
+            for (i = 0; i < NV2A_VSH_INPUTS; i++) in[i][3] = 1.0f;
+            memcpy(in[0], vtx[idx[v]].pos, 16);
+            nv2a_attr_decode((const uint8_t *)&vtx[idx[v]].col, 0, 4, in[3]);
+            nv2a_vsh_run((const float (*)[4])in, &xf[v]);
+        }
+        if (vb) ID3D11Buffer_Release(vb);
+        if (ib) ID3D11Buffer_Release(ib);
+        bd.ByteWidth = n * sizeof(Nv2aVshOutput);
+        bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        init.pSysMem = xf;
+        ID3D11Device_CreateBuffer(dev, &bd, &init, &vb);
+        bd.ByteWidth = n * 4;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        init.pSysMem = idx;
+        ID3D11Device_CreateBuffer(dev, &bd, &init, &ib);
+
+        ID3D11DeviceContext_RSSetState(ctx, rs);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, dss, 0);
+        ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &t.rtv, t.dsv);
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx,
+                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &cb);
+        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &cb);
+
+        /* A: the program on the GPU, indexed by the batch's own indices. */
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, t.rtv, clear);
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, t.dsv,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        if (!nv2a_vsh_gpu_inputs(arr, used, 0, n - 1)
+            || !nv2a_vsh_gpu_constants()) {
+            puts("FAIL: draw test inputs");
+            return 0;
+        }
+        ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+        ID3D11DeviceContext_IASetIndexBuffer(ctx, ib, DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_VSSetShader(ctx, gvs, NULL, 0);
+        ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0);
+        dt_read(ctx, t.rt, t.rt_stage, a_rgb);
+        dt_read(ctx, t.ds, t.ds_stage, a_z);
+        if (pass == 1) {
+            for (i = 0; i < DT_W * DT_H; i++)
+                if (a_rgb[i] || (a_z[i] & 0xFFFFFFu) != 0xFFFFFFu) {
+                    printf("FAIL: draw: a triangle behind the eye or the near"
+                           " plane drew pixel %u,%u\n", i % DT_W, i / DT_W);
+                    return 0;
+                }
+            break;
+        }
+
+        /* B: today's path, the interpreter's vertices through vs. */
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, t.rtv, clear);
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, t.dsv,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        ID3D11DeviceContext_IASetInputLayout(ctx, layout);
+        ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &zero);
+        ID3D11DeviceContext_VSSetShader(ctx, cpu_vs, NULL, 0);
+        ID3D11DeviceContext_Draw(ctx, n, 0);
+        dt_read(ctx, t.rt, t.rt_stage, b_rgb);
+        dt_read(ctx, t.ds, t.ds_stage, b_z);
+
+        for (i = 0; i < DT_W * DT_H; i++) {
+            uint32_t za = a_z[i] & 0xFFFFFFu, zb = b_z[i] & 0xFFFFFFu, c;
+            uint32_t dz = za > zb ? za - zb : zb - za;
+            if (b_rgb[i])
+                covered++;
+            for (c = 0; c < 32; c += 8) {
+                int d = (int)(a_rgb[i] >> c & 255) - (int)(b_rgb[i] >> c & 255);
+                if (d > 2 || d < -2) {
+                    bad_rgb++;
+                    break;
+                }
+            }
+            if (dz > 16)
+                bad_z++;
+            else if (dz > worst_z)
+                worst_z = dz;
+        }
+    }
+    printf("draw: %u of %u pixels covered; %u differ in colour, %u in depth"
+           " by more than 16 units (2^-24), otherwise at most %u%s\n",
+           covered, DT_W * DT_H, bad_rgb, bad_z, worst_z, hw ? " (hw)" : "");
+    /* Edge pixels may go either way between two positions a few ulps
+     * apart: at most 1% of the covered ones. */
+    if (covered < DT_W * DT_H / 2 || bad_rgb * 100 > covered
+        || bad_z * 100 > covered) {
+        puts("FAIL: draw");
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     ID3D11Device *dev = NULL;
@@ -285,6 +611,8 @@ int main(int argc, char **argv)
 
     if (!fetch_test(hw))
         return 1;
+    if (!draw_test(dev, ctx, hw))
+        return 1;
 
     for (prog = 0; prog < 1500; prog++) {
         int len = 1 + (int)(rnd() % 24), count = 1 + (int)(rnd() % 64);
@@ -313,6 +641,14 @@ int main(int argc, char **argv)
         if (!nv2a_vsh_gpu_prepare(NULL)) {
             printf("FAIL: program %d (%d instructions) did not compile\n",
                    prog, len);
+            return 1;
+        }
+        /* VSH_TEST_DRAW_TIMES=1: every program's drawing shader is made
+         * too, for its compile times (the last line); the first 400 (the
+         * cache holds 512, and nothing draws from programs past it). */
+        if (getenv("VSH_TEST_DRAW_TIMES") && prog < 400
+            && !nv2a_vsh_gpu_draw_shader(1)) {
+            printf("FAIL: program %d: no draw shader\n", prog);
             return 1;
         }
         if (!nv2a_vsh_gpu_run((const float (*)[NV2A_VSH_INPUTS][4])s_in,
@@ -361,6 +697,14 @@ int main(int argc, char **argv)
     printf("%d programs (%u compiled, %.0f ms), %ld vertices, %ld differ"
            " (%.3f%%)\n", prog, compiled, ms, checked, differ,
            100.0 * (double)differ / (double)checked);
+    {
+        uint32_t made, dfailed, queued;
+        double dms;
+        nv2a_vsh_gpu_draw_stats(&made, &dfailed, &queued, &dms);
+        printf("draw shaders: %u made (%u failed), %.0f ms compiling, %.1f ms"
+               " each\n", made, dfailed, dms, made ? dms / made : 0.0);
+        failed += dfailed;
+    }
     if (failed || (hw ? differ * 200 > checked : differ > 0)) {
         puts("FAIL");
         return 1;

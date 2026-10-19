@@ -201,6 +201,10 @@ static struct {
     uint32_t evictions, evicted_reads;
     uint32_t cube_binds, cube_drawn;
     uint32_t mip_binds, mip_unused;
+    /* RECOMP_VSH_GPU: program batches drawn with the program on the GPU;
+     * on the CPU while its shader compiled, kept there (vsh_gpu_begin), or
+     * with inputs too big for the ring. */
+    uint32_t vsh_gpu, vsh_cpu_waiting, vsh_cpu_kept, vsh_cpu_inputs;
 } s_stat;
 
 /* Diagnostic: addresses of surfaces thrown out of the table, so a texture
@@ -2913,6 +2917,167 @@ static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
     }
 }
 
+/* RECOMP_VSH_GPU=1: step 3, program batches drawn with the program on the
+ * GPU. The batch's vertex bytes and the constants go up (step 2, step 1),
+ * the index list is the batch's own indices cut into triangles
+ * (vsh_gpu_index_list), and the program's drawing shader (vs_gpu in
+ * nv2a_draw_d3d11_hlsl.h) fetches, runs the program and maps to clip space;
+ * the GPU then clips and culls. Everything after the vertex shader -- the
+ * pixel shader, textures, blending, depth -- is the CPU path's.
+ *
+ * Kept on the CPU: a program that may write constants (CXT_WRITE_EN: one
+ * vertex can change what the next computes), points (pb_point_quad builds
+ * each sprite from the transformed point) and lines (not drawn either way),
+ * FRONT_AND_BACK culling (nothing to draw), frame-trace batches and
+ * RECOMP_VIS_LOG (both report the transformed vertices), RECOMP_GPU=both
+ * (the two back ends share pb_transform_batch's results), and a program
+ * whose shader is still compiling (nv2a_vsh_gpu_draw_shader). The vertex
+ * shader, or NULL: draw this batch the CPU way. */
+static int s_vsh_gpu = -1;
+
+static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
+{
+    Nv2aVshArray arr[NV2A_VSH_INPUTS];
+    ID3D11VertexShader *vs;
+    uint32_t used, lo = UINT32_MAX, hi = 0, i;
+    static int vis_log;
+
+    if (s_vsh_gpu < 0) {
+        const char *e = getenv("RECOMP_VSH_GPU");
+        s_vsh_gpu = e && e[0] && e[0] != '0' && !s_shadow;
+        vis_log = getenv("RECOMP_VIS_LOG") != NULL;
+        if (s_vsh_gpu) {
+            s_vsh_gpu = nv2a_vsh_gpu_init((struct ID3D11Device *)s_dev,
+                                          (struct ID3D11DeviceContext *)s_ctx);
+            nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw,
+                                     "vs_gpu");
+        }
+        fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s%c",
+                s_vsh_gpu ? "GPU" : "CPU", 10);
+    }
+    if (!s_vsh_gpu)
+        return NULL;
+    switch (g_pb.prim) {
+    case NV_PRIM_TRIANGLES: case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_FAN: case NV_PRIM_QUADS: case NV_PRIM_QUAD_STRIP:
+    case NV_PRIM_POLYGON:
+        break;
+    default:
+        s_stat.vsh_cpu_kept++;
+        return NULL;
+    }
+    if (nv2a_vsh_cxt_write() || g_pb_ftrace == 2 || vis_log
+        || (g_pb.cull_enable && g_pb.cull_face == 0x408)
+        || !nv2a_vsh_gpu_prepare(NULL) || !nv2a_vsh_prepare(&used)) {
+        s_stat.vsh_cpu_kept++;
+        return NULL;
+    }
+    if (!(vs = nv2a_vsh_gpu_draw_shader(0))) {
+        s_stat.vsh_cpu_waiting++;
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        if (g_pb.idx[i] < lo) lo = g_pb.idx[i];
+        if (g_pb.idx[i] > hi) hi = g_pb.idx[i];
+    }
+    vsh_gpu_arrays(arr);
+    if (!nv2a_vsh_gpu_inputs(arr, used, lo, hi) || !nv2a_vsh_gpu_constants()) {
+        s_stat.vsh_cpu_inputs++;
+        return NULL;
+    }
+    return vs;
+}
+
+/* build_triangles' triangles for the GPU path, as the batch's own indices
+ * (the drawing shader's SV_VertexID): the same cut of each primitive, with
+ * a strip's odd triangles turned round to (i, i+2, i+1) so the rasteriser's
+ * culling sees the winding pb_cull_tri tests. Returns the index count. */
+static uint32_t vsh_gpu_index_list(uint32_t n)
+{
+    const uint32_t *x = g_pb.idx;
+    uint32_t i, out = 0;
+
+#define PUT(a, b, c) do { s_ib[out++] = x[a]; s_ib[out++] = x[b];        \
+                          s_ib[out++] = x[c]; } while (0)
+    switch (g_pb.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) PUT(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) PUT(i, i + 2, i + 1);
+            else PUT(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) PUT(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            PUT(i, i + 1, i + 2);
+            PUT(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            PUT(i, i + 1, i + 3);
+            PUT(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef PUT
+    return out;
+}
+
+/* base with pb_cull_tri's face culling, for the GPU path (the CPU path
+ * culls before the draw). On the render target, as on the guest's screen,
+ * y runs down, so the winding there is the one pb_cull_tri measures:
+ * SET_FRONT_FACE CW (0x900) is D3D's default front. FRONT_AND_BACK never
+ * gets here (vsh_gpu_begin). A few states at most; kept. */
+#define CULL_STATES 32
+static struct {
+    ID3D11RasterizerState *base, *rs;
+    D3D11_CULL_MODE mode;
+    BOOL ccw;
+} s_cull[CULL_STATES];
+static int s_ncull;
+
+static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
+{
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_CULL_MODE mode;
+    BOOL ccw;
+    int i;
+
+    if (!g_pb.cull_enable)
+        return base;
+    mode = g_pb.cull_face == 0x404 ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
+    ccw = g_pb.front_face != 0x900;
+    for (i = 0; i < s_ncull; i++)
+        if (s_cull[i].base == base && s_cull[i].mode == mode
+            && s_cull[i].ccw == ccw)
+            return s_cull[i].rs;
+    ID3D11RasterizerState_GetDesc(base, &rd);
+    rd.CullMode = mode;
+    rd.FrontCounterClockwise = ccw;
+    if (s_ncull == CULL_STATES
+        || FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd,
+                                                     &s_cull[s_ncull].rs))) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[VSHGPU] no culling state (%d made): batches"
+                    " drawn unculled%c", s_ncull, 10);
+        return base;
+    }
+    s_cull[s_ncull].base = base;
+    s_cull[s_ncull].mode = mode;
+    s_cull[s_ncull].ccw = ccw;
+    return s_cull[s_ncull++].rs;
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -2931,6 +3096,8 @@ static void d3d_draw(void)
     uint32_t offset = 0, ib_offset = 0, path, rtt;
     int si, st, combiners, program, zi;
     ID3D11DepthStencilState *ds;
+    ID3D11RasterizerState *rs;
+    ID3D11VertexShader *gvs = NULL;     /* the program on the GPU */
     uint64_t ct_draw0;
 
     s_stat.batches++;
@@ -2962,7 +3129,9 @@ static void d3d_draw(void)
          * built the way the combiner path takes it. Every stage the program
          * samples is bound; coordinates are normalised for swizzled and DXT
          * formats and texels otherwise (rc_texel). */
-        if (program) {
+        if (program && (gvs = vsh_gpu_begin(n)) != NULL) {
+            verts = NULL;
+        } else if (program) {
             verts = pb_transform_batch();
             if (!verts) {
                 s_stat.skip_program++;
@@ -2974,7 +3143,8 @@ static void d3d_draw(void)
                 pb_fixed_vertex(g_pb.idx[i], &s_bv[i]);
         }
         uint64_t ct0;
-        mark_unclipped(verts, n);
+        if (!gvs)
+            mark_unclipped(verts, n);
         path = combiners ? PATH_COMBINERS : PATH_MODULATE;
         ct0 = ct_now();
         for (st = 0; st < 4; st++) {
@@ -3063,9 +3233,13 @@ static void d3d_draw(void)
         }
     }
 
-    nidx = build_triangles(verts, n);
-    vis_note_batch(verts, n, nidx);
-    if (g_pb_ftrace == 2) {
+    if (gvs) {
+        nidx = vsh_gpu_index_list(n);
+    } else {
+        nidx = build_triangles(verts, n);
+        vis_note_batch(verts, n, nidx);
+    }
+    if (!gvs && g_pb_ftrace == 2) {
         /* What this batch draws where, from which textures: the GPU-side
          * counterpart of sw_draw's trace, for runs without the software
          * path. Screen box and texture coordinate ranges are over the
@@ -3243,7 +3417,7 @@ static void d3d_draw(void)
         return;
     {
         uint64_t ct0 = ct_now();
-        int ok = ring_put(&s_vb, D3D11_BIND_VERTEX_BUFFER,
+        int ok = gvs || ring_put(&s_vb, D3D11_BIND_VERTEX_BUFFER,
                           verts, (size_t)n * sizeof(Nv2aVshOutput),
                           s_cv, (size_t)s_cv_n * sizeof(Nv2aVshOutput),
                           &offset);
@@ -3308,14 +3482,16 @@ static void d3d_draw(void)
     vis_note_target(si, zi);
 
     ct_draw0 = ct_now();
-    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
+    /* The GPU path reads no vertex buffer: vs_gpu fetches by index. */
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, gvs ? NULL : s_layout);
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb.b, &stride,
-                                           &offset);
+    if (!gvs)
+        ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb.b, &stride,
+                                               &offset);
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
@@ -3324,7 +3500,8 @@ static void d3d_draw(void)
     if (bound & 0xF00u)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
-    ID3D11DeviceContext_RSSetState(s_ctx, raster_state(surf_sx(si)));
+    rs = raster_state(surf_sx(si));
+    ID3D11DeviceContext_RSSetState(s_ctx, gvs ? cull_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(bpp), bf,
@@ -3376,9 +3553,11 @@ static void d3d_draw(void)
         s_stat.textured++;
     if (path == PATH_COMBINERS)
         s_stat.combined++;
+    if (gvs)
+        s_stat.vsh_gpu++;
     note_shown(si);
-    if (s_ct_on > 0)
-        heavy_note(verts, n, nidx / 3);
+    if (s_ct_on > 0)                    /* no screen box on the GPU path */
+        heavy_note(verts, gvs ? 0 : n, nidx / 3);
 }
 
 /* RECOMP_GPU_CALL_TIMES: a present after 3000+ batches (a frame is ~1000)
@@ -3849,6 +4028,17 @@ static void d3d_report(void)
             s_stat.verts_need_clip, s_stat.tris_clipped, s_stat.tris_behind,
             s_stat.tris_culled,
             10);
+    if (s_vsh_gpu > 0) {
+        uint32_t made, failed, queued;
+        double ms;
+        nv2a_vsh_gpu_draw_stats(&made, &failed, &queued, &ms);
+        fprintf(stderr, "[VSHGPU] %u program batches drawn with the program"
+                " on the GPU; on the CPU: %u while its shader compiled, %u"
+                " kept there, %u with inputs too big; %u draw shaders made"
+                " (%u failed, %u waiting), %.0f ms compiling%c",
+                s_stat.vsh_gpu, s_stat.vsh_cpu_waiting, s_stat.vsh_cpu_kept,
+                s_stat.vsh_cpu_inputs, made, failed, queued, ms, 10);
+    }
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads (%u of them"
             " DXT kept compressed), %u binds unchanged, %u binds of a format"
             " the sampler cannot read%c",

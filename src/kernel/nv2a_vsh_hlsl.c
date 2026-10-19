@@ -64,7 +64,11 @@ static const char k_prelude[] =
 "     an rcc of it -1.9e19), strictness or not. */\n"
 "  float4 z = vc[192];\n"
 "  float4 r0 = z, r1 = z, r2 = z, r3 = z, r4 = z, r5 = z;\n"
-"  float4 r6 = z, r7 = z, r8 = z, r9 = z, r10 = z, r11 = z, opos = z;\n"
+"  float4 r6 = z, r7 = z, r8 = z, r9 = z, r10 = z, r11 = z;\n"
+"  /* precise: everything that feeds the position runs as written, no\n"
+"     fused multiply-adds or reordering, so two programs that compute a\n"
+"     position the same way get the same depth, as on the CPU. */\n"
+"  precise float4 opos = z;\n"
 "  float4 o3 = float4(0, 0, 0, 1), o4 = float4(0, 0, 0, 1), o5 = 0, o6 = 0;\n"
 "  float4 o9 = float4(0, 0, 0, 1), o10 = float4(0, 0, 0, 1);\n"
 "  float4 o11 = float4(0, 0, 0, 1), o12 = float4(0, 0, 0, 1);\n"
@@ -274,45 +278,47 @@ size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
 /* ---- vertex inputs ----------------------------------------------------- */
 
 /* nv2a_attr_decode in HLSL. Elements need not be 4-byte aligned (a ubyte or
- * short attribute at an odd offset), so every read is of the dword at a byte
- * address, from the two aligned ones around it; bytes past the end of the
- * copy read as zeroes and are masked off. The normalising divides are
- * divides, as the C's: no multiply by a reciprocal. */
+ * short attribute at an odd offset), so the element's first 16 bytes are
+ * put together from the five aligned dwords around them, then decoded by
+ * format; bytes past the element or the copy are masked off (a read past
+ * the buffer gives zeroes). The normalising divides are divides, as the C's:
+ * no multiply by a reciprocal. Written flat, with no loop over components:
+ * an unrolled loop with every format in it made fxc take ~35 ms per input
+ * read, in every program's drawing shader (2026-10-18). */
 static const char k_fetch[] =
 "ByteAddressBuffer vin : register(t0);\n"
 "cbuffer VshA : register(b4) { uint4 va[16]; };\n"
-"uint vsh_ld(uint a) {\n"
-"  uint s = (a & 3u) * 8u, b = a & ~3u, lo = vin.Load(b);\n"
-"  return s == 0u ? lo : (lo >> s) | (vin.Load(b + 4u) << (32u - s));\n"
-"}\n"
-"float vsh_s16(uint x) { return (float)((int)(x << 16) >> 16); }\n"
 "float4 vsh_fetch(uint k, uint i) {\n"
-"  uint4 d = va[k];\n"
+"  uint4 d = va[k], w, lo;\n"
 "  uint kind = d.z & 0xFFu, n = min(d.z >> 8, 4u), a = d.x + i * d.y;\n"
-"  float4 r = float4(0, 0, 0, 1);\n"
+"  uint s = (a & 3u) * 8u, b = a & ~3u, c, hi;\n"
+"  float4 r = float4(0, 0, 0, 1), f;\n"
 "  if (kind == 0u || i > d.w) return r;\n"
-"  if (kind == 1u) {                          /* D3DCOLOR: B,G,R,A bytes */\n"
-"    uint c = vsh_ld(a);\n"
+"  lo = vin.Load4(b);\n"
+"  hi = vin.Load(b + 16u);\n"
+"  w = s == 0u ? lo : (lo >> s) | (uint4(lo.yzw, hi) << (32u - s));\n"
+"  c = w.x;\n"
+"  if (kind == 1u)                            /* D3DCOLOR: B,G,R,A bytes */\n"
 "    return float4((float)((c >> 16) & 255u) / 255.0,\n"
 "                  (float)((c >> 8) & 255u) / 255.0,\n"
 "                  (float)(c & 255u) / 255.0, (float)(c >> 24) / 255.0);\n"
-"  }\n"
 "  if (kind == 7u) {                          /* packed 11:11:10 */\n"
-"    uint c = vsh_ld(a);\n"
 "    r.x = (float)((int)(c << 21) >> 21) / 1023.0;\n"
 "    r.y = (float)((int)(c << 10) >> 21) / 1023.0;\n"
 "    r.z = (float)((int)c >> 22) / 511.0;\n"
 "    return r;\n"
 "  }\n"
-"  [unroll] for (uint j = 0; j < 4u; j++) {\n"
-"    if (j < n) {\n"
-"      if (kind == 3u) r[j] = asfloat(vsh_ld(a + 4u * j));\n"
-"      else if (kind == 5u) r[j] = (float)(vsh_ld(a + j) & 255u) / 255.0;\n"
-"      else if (kind == 2u) r[j] = vsh_s16(vsh_ld(a + 2u * j)) / 32767.0;\n"
-"      else if (kind == 6u) r[j] = vsh_s16(vsh_ld(a + 2u * j));\n"
-"    }\n"
-"  }\n"
-"  return r;\n"
+"  if (kind == 3u)                            /* float */\n"
+"    f = asfloat(w);\n"
+"  else if (kind == 5u)                       /* ubyte, normalised */\n"
+"    f = (float4)((uint4(c, c, c, c) >> uint4(0u, 8u, 16u, 24u)) & 255u)\n"
+"        / 255.0;\n"
+"  else if (kind == 2u || kind == 6u) {       /* short: normalised, or not */\n"
+"    float4 h = (float4)((int4)uint4(c << 16, c, w.y << 16, w.y) >> 16);\n"
+"    f = kind == 2u ? h / 32767.0 : h;\n"
+"  } else\n"
+"    return r;\n"
+"  return uint4(0u, 1u, 2u, 3u) < n ? f : r;   /* components past size */\n"
 "}\n";
 
 static const char k_fetch_check[] =
@@ -349,6 +355,41 @@ size_t nv2a_vsh_hlsl_fetch(char *buf, size_t cap)
     buf[0] = 0;
     put(&o, "%s", k_fetch);
     put(&o, "%s", k_fetch_check);
+    return o.full ? 0 : o.len;
+}
+
+size_t nv2a_vsh_hlsl_inputs(uint32_t used, char *buf, size_t cap)
+{
+    Out o;
+    uint32_t k;
+
+    if (!cap)
+        return 0;
+    o.buf = buf;
+    o.cap = cap;
+    o.len = 0;
+    o.full = 0;
+    buf[0] = 0;
+    put(&o, "void vsh_inputs(uint i, out float4 v[16]) {\n");
+    for (k = 0; k < NV2A_VSH_INPUTS; k++)
+        put(&o, (used >> k & 1) ? "  v[%u] = vsh_fetch(%u, i);\n"
+                                : "  v[%u] = float4(0, 0, 0, 1);\n", k, k);
+    put(&o, "}\n");
+    return o.full ? 0 : o.len;
+}
+
+size_t nv2a_vsh_hlsl_fetch_only(char *buf, size_t cap)
+{
+    Out o;
+
+    if (!cap)
+        return 0;
+    o.buf = buf;
+    o.cap = cap;
+    o.len = 0;
+    o.full = 0;
+    buf[0] = 0;
+    put(&o, "%s", k_fetch);
     return o.full ? 0 : o.len;
 }
 
