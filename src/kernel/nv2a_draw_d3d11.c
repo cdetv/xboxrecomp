@@ -2744,10 +2744,106 @@ static void pace_draw(void)
  * first batch of every program seen for the first time, also runs through
  * the program translated to HLSL (nv2a_vsh_hlsl.c, nv2a_vsh_gpu.c) on the
  * same inputs; the GPU's results come back through stream-out and are
- * compared with what the interpreter made ([VSHGPU] lines). Step 1 of
- * vertex programs on the GPU: nothing is drawn from them yet. Up to the
+ * compared with what the interpreter made ([VSHGPU] lines), and the inputs
+ * are read again on the GPU from the batch's own bytes ([VSHGPU] fetch
+ * lines). Steps 1 and 2 of vertex programs on the GPU: nothing is drawn
+ * from them yet. Up to the
  * first 1024 vertices of a batch; each check waits for the GPU. Programs
  * that may write constants (CXT_WRITE_EN) stay CPU-only and are skipped. */
+/* The batch's vertex arrays as the GPU fetch takes them: guest memory, or
+ * INLINE_ARRAY's payload with its end as pb_fetch_attr tests it (an element
+ * whose first dword lies past the payload reads as absent). */
+static void vsh_gpu_arrays(Nv2aVshArray arr[NV2A_VSH_INPUTS])
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    size_t end = (size_t)g_pb.inline_count * 4;
+    uint32_t a;
+
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        const VertexAttr *v = &g_pb.attr[a];
+        Nv2aVshArray *x = &arr[a];
+        x->src = NULL;
+        x->type = v->type;
+        x->size = v->size;
+        x->stride = v->stride;
+        x->last = UINT32_MAX;
+        if (g_pb.inline_active) {
+            if (v->stride && (size_t)v->offset + 4 <= end) {
+                x->src = (const uint8_t *)g_pb.inline_buf + v->offset;
+                x->last = (uint32_t)((end - 4 - v->offset) / v->stride);
+            }
+        } else if (v->offset) {
+            x->src = mem + v->offset;
+        }
+    }
+}
+
+/* Step 2 of the check: the inputs pb_fetch_attr gave the interpreter (in),
+ * read again on the GPU from a copy of the batch's own bytes. Floats and
+ * shorts are copied and must match to the bit; the normalising divides of a
+ * hardware driver may be an ulp out (tests/nv2a_vsh_gpu), more is a fault. */
+static void vsh_gpu_fetch_check(const float (*in)[NV2A_VSH_INPUTS][4],
+                                uint32_t m)
+{
+    static float got[1024][NV2A_VSH_INPUTS][4];
+    static unsigned long long batches, values, inexact, bad, not_run;
+    static uint32_t printed;
+    Nv2aVshArray arr[NV2A_VSH_INPUTS];
+    uint32_t used, lo = UINT32_MAX, hi = 0, i, a, c;
+
+    if (!nv2a_vsh_prepare(&used))
+        return;
+    vsh_gpu_arrays(arr);
+    for (i = 0; i < m; i++) {
+        if (g_pb.idx[i] < lo) lo = g_pb.idx[i];
+        if (g_pb.idx[i] > hi) hi = g_pb.idx[i];
+    }
+    if (!nv2a_vsh_gpu_inputs(arr, used, lo, hi)
+        || !nv2a_vsh_gpu_fetch(g_pb.idx, m, got)) {
+        not_run++;
+        return;
+    }
+    for (i = 0; i < m; i++)
+        for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+            if (!(used >> a & 1))
+                continue;
+            for (c = 0; c < 4; c++) {
+                float x = in[i][a][c], y = got[i][a][c];
+                int32_t p, q;
+                values++;
+                if (!memcmp(&x, &y, 4) || (x != x && y != y))
+                    continue;
+                inexact++;
+                memcpy(&p, &x, 4);
+                memcpy(&q, &y, 4);
+                if ((p ^ q) >= 0 && (p - q == 1 || q - p == 1)
+                    && g_pb.attr[a].type != 2 && g_pb.attr[a].type != 5)
+                    continue;
+                bad++;
+                if (printed < 32) {
+                    printed++;
+                    fprintf(stderr, "[VSHGPU] fetch: draw %u vertex %u (index"
+                            " %u) input %u type %u size %u stride %u%s: %c"
+                            " cpu %.9g gpu %.9g%c", g_pb.draws, i, g_pb.idx[i],
+                            a, g_pb.attr[a].type, g_pb.attr[a].size,
+                            g_pb.attr[a].stride,
+                            g_pb.inline_active ? " inline" : "", "xyzw"[c],
+                            x, y, 10);
+                }
+            }
+        }
+    if (++batches % 500 == 0) {
+        uint64_t nb, bytes, wraps;
+        nv2a_vsh_gpu_input_stats(&nb, &bytes, &wraps);
+        fprintf(stderr, "[VSHGPU] fetch: %llu batches, %llu values, %llu not"
+                " to the bit, %llu wrong; %llu batches not run; %.1f KB"
+                " copied per batch, %llu ring restarts%c", batches, values,
+                inexact, bad, not_run,
+                nb ? (double)bytes / 1024.0 / (double)nb : 0.0,
+                (unsigned long long)wraps, 10);
+    }
+}
+
 static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
 {
     static long every = -1;
@@ -2800,6 +2896,7 @@ static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
                     ((const float *)&out[i])[f], 10);
         }
     }
+    vsh_gpu_fetch_check((const float (*)[NV2A_VSH_INPUTS][4])in, m);
     batches++;
     vertices += m;
     bad_verts += bad;
