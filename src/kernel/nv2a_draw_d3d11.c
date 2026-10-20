@@ -1583,6 +1583,7 @@ static struct {
  * one (dfactor ONE; also dumped before). For following a post-effect chain
  * such as Conker's glare. mode 1: alpha as grey. */
 static int s_ftdump_zeta;
+static int s_ftdump_big;    /* RECOMP_FTRACE_DUMP_BIG: this batch is big */
 
 static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
                        uint32_t h, int mode)
@@ -3013,12 +3014,15 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
     Nv2aVshArray arr[NV2A_VSH_INPUTS];
     ID3D11VertexShader *vs;
     uint32_t used, lo = UINT32_MAX, hi = 0, i;
-    static int vis_log;
+    static int vis_log, ftrace_gpu;
 
     if (s_vsh_gpu < 0) {
         const char *e = getenv("RECOMP_VSH_GPU");
         s_vsh_gpu = e && e[0] && e[0] != '0' && !s_shadow;
         vis_log = getenv("RECOMP_VIS_LOG") != NULL;
+        /* RECOMP_FTRACE_GPU=1: traced batches stay on the GPU, so the
+         * trace shows what GPU runs draw. */
+        ftrace_gpu = getenv("RECOMP_FTRACE_GPU") != NULL;
         if (s_vsh_gpu) {
             s_vsh_gpu = nv2a_vsh_gpu_init((struct ID3D11Device *)s_dev,
                                           (struct ID3D11DeviceContext *)s_ctx);
@@ -3039,7 +3043,7 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
         s_stat.vsh_cpu_kept++;
         return NULL;
     }
-    if (nv2a_vsh_cxt_write() || g_pb_ftrace == 2 || vis_log
+    if (nv2a_vsh_cxt_write() || (g_pb_ftrace == 2 && !ftrace_gpu) || vis_log
         || (g_pb.cull_enable && g_pb.cull_face == 0x408)
         || !nv2a_vsh_gpu_prepare(NULL) || !nv2a_vsh_prepare(&used)) {
         s_stat.vsh_cpu_kept++;
@@ -3182,6 +3186,31 @@ static void d3d_draw(void)
         no_vsh = getenv("RECOMP_NO_VSH") != NULL;
     if (!ready || g_pb.idx_count < (g_pb.prim == NV_PRIM_POINTS ? 1u : 3u))
         return;
+    /* RECOMP_SKIP_TEX=<addr>[,<addr>...] (hex): leave out every batch whose
+     * combiner stages sample one of those textures, to see which batch
+     * draws something on screen. Debug only. */
+    {
+        static uint32_t skip[8];
+        static int nskip = -1;
+        if (nskip < 0) {
+            const char *e = getenv("RECOMP_SKIP_TEX");
+            nskip = 0;
+            while (e && *e && nskip < 8) {
+                char *end;
+                skip[nskip++] = (uint32_t)strtoul(e, &end, 16);
+                e = *end == ',' ? end + 1 : end;
+                if (end == e && *e) break;
+            }
+        }
+        for (st = 0; nskip && st < 4; st++) {
+            int j;
+            if (!((g_pb.rc.stage_program >> (st * 5)) & 0x1F))
+                continue;
+            for (j = 0; j < nskip; j++)
+                if (g_pb.texs[st].offset == skip[j])
+                    return;
+        }
+    }
     program = (g_pb.xf_mode & 3) == 2 && !no_vsh;
     if (!program && !pb_batch_screen_space()) {
         s_stat.skip_not_screen++;
@@ -3202,15 +3231,25 @@ static void d3d_draw(void)
          * built the way the combiner path takes it. Every stage the program
          * samples is bound; coordinates are normalised for swizzled and DXT
          * formats and texels otherwise (rc_texel). */
+        const Nv2aVshOutput *ftv = NULL;
+        if (program && g_pb_ftrace == 2 && getenv("RECOMP_FTRACE_GPU")) {
+            /* A traced frame with RECOMP_FTRACE_GPU draws on the GPU; the
+             * CPU's vertices are for the trace's lines and, with
+             * RECOMP_VSH_GPU_CHECK, the CPU/GPU comparison. */
+            ftv = pb_transform_batch();
+            if (ftv)
+                vsh_gpu_check(ftv, n);
+        }
         if (program && (gvs = vsh_gpu_begin(n)) != NULL) {
-            verts = NULL;
+            verts = ftv;
         } else if (program) {
-            verts = pb_transform_batch();
+            verts = ftv ? ftv : pb_transform_batch();
             if (!verts) {
                 s_stat.skip_program++;
                 return;
             }
-            vsh_gpu_check(verts, n);
+            if (!ftv)
+                vsh_gpu_check(verts, n);
         } else {
             for (i = 0; i < n; i++)
                 pb_fixed_vertex(g_pb.idx[i], &s_bv[i]);
@@ -3312,7 +3351,7 @@ static void d3d_draw(void)
         nidx = build_triangles(verts, n);
         vis_note_batch(verts, n, nidx);
     }
-    if (!gvs && g_pb_ftrace == 2) {
+    if ((!gvs || verts) && g_pb_ftrace == 2) {
         /* What this batch draws where, from which textures: the GPU-side
          * counterpart of sw_draw's trace, for runs without the software
          * path. Screen box and texture coordinate ranges are over the
@@ -3326,10 +3365,41 @@ static void d3d_draw(void)
             if (y < y0) y0 = y;
             if (y > y1) y1 = y;
         }
+        /* RECOMP_FTRACE_DUMP_BIG=1: a blended batch whose drawn triangles
+         * (after clipping) cover more than 200x150 surface pixels gets its
+         * target dumped before and after (ftdump_big), to find which batch
+         * paints something large. */
+        s_ftdump_big = 0;
+        if (g_pb.blend_enable && getenv("RECOMP_FTRACE_DUMP_BIG")) {
+            float d0 = 1e30f, d1 = -1e30f, e0 = 1e30f, e1 = -1e30f;
+            /* On the GPU path s_ib holds the batch's own indices and the
+             * GPU clips: the whole batch's box stands in. */
+            if (gvs) {
+                d0 = x0; d1 = x1; e0 = y0; e1 = y1;
+            }
+            for (i = 0; !gvs && i < nidx; i++) {
+                const Nv2aVshOutput *p = s_ib[i] < n ? &verts[s_ib[i]]
+                                                     : &s_cv[s_ib[i] - n];
+                if (p->pos[0] < d0) d0 = p->pos[0];
+                if (p->pos[0] > d1) d1 = p->pos[0];
+                if (p->pos[1] < e0) e0 = p->pos[1];
+                if (p->pos[1] > e1) e1 = p->pos[1];
+            }
+            if (d0 < 0) d0 = 0;
+            if (e0 < 0) e0 = 0;
+            if (d1 > (float)g_pb.clip_w) d1 = (float)g_pb.clip_w;
+            if (e1 > (float)g_pb.clip_h) e1 = (float)g_pb.clip_h;
+            if (d1 - d0 > 200.0f && e1 - e0 > 150.0f) {
+                s_ftdump_big = 1;
+                fprintf(stderr, "[FTRACE] big draw: x %.0f..%.0f y %.0f..%.0f%c",
+                        d0, d1, e0, e1, 10);
+            }
+        }
         fprintf(stderr, "[FTRACE] d3d %s n %u surf %08X slot %d %ux%u+%u+%u"
                 " | box x %.1f..%.1f y %.1f..%.1f | blend %u %X/%X eq %X"
                 " | z %u st %u at %u | tris %u prim %u%c",
-                path == PATH_FLAT ? "FLAT" : program ? "PRG" : "RC", n,
+                path == PATH_FLAT ? "FLAT" : gvs ? "PRG/GPU" : program ? "PRG"
+                                                                     : "RC", n,
                 g_pb.color_offset, si, g_pb.clip_w, g_pb.clip_h,
                 g_pb.clip_x, g_pb.clip_y, x0, x1, y0, y1, g_pb.blend_enable,
                 g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
@@ -3482,6 +3552,18 @@ static void d3d_draw(void)
                     for (at = 0; at < NV2A_VSH_INPUTS; at++)
                         pb_fetch_attr(&g_pb.attr[at], g_pb.idx[top], in[at]);
                     nv2a_vsh_trace((const float (*)[4])in);
+                    /* And every vertex as it came out (pos, w, the first
+                     * two texture coordinates): enough to see where a
+                     * strip leaves the screen or crosses the eye. */
+                    for (i = 0; i < n; i++)
+                        fprintf(stderr, "[FTRACE]     v%u pos %g %g %g w %g"
+                                " | t0 %g %g %g %g | t1 %g %g %g %g%c", i,
+                                verts[i].pos[0], verts[i].pos[1],
+                                verts[i].pos[2], verts[i].pos[3],
+                                verts[i].tex[0][0], verts[i].tex[0][1],
+                                verts[i].tex[0][2], verts[i].tex[0][3],
+                                verts[i].tex[1][0], verts[i].tex[1][1],
+                                verts[i].tex[1][2], verts[i].tex[1][3], 10);
                     break;
                 }
         }
@@ -3587,7 +3669,8 @@ static void d3d_draw(void)
         uint32_t dw = to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
         uint32_t dh = to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
         int tiny = g_pb.clip_w * g_pb.clip_h <= 256u * 256u;
-        int adds = g_pb.blend_enable && g_pb.blend_dfactor == 1 && !tiny;
+        int adds = (g_pb.blend_enable && g_pb.blend_dfactor == 1 && !tiny)
+                   || s_ftdump_big;
         char what[64];
         if (adds) {
             snprintf(what, sizeof what, "%08X_before_add", g_pb.color_offset);
@@ -3604,6 +3687,7 @@ static void d3d_draw(void)
                 ftdump_tex(strcat(what, "_alpha"), s_surf[si].tex, dw, dh, 1);
         }
         s_ftdump_zeta = 0;
+        s_ftdump_big = 0;
     } else {
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
