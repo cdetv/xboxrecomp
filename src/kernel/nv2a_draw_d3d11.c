@@ -2691,6 +2691,55 @@ static ID3D11RasterizerState *raster_state(float scale)
     return offset_state(cull && whole && s_rs_zcull, scale);
 }
 
+/* Time between two presents of a new frame, as a histogram per report:
+ * what the player sees. The fps line averages flips over the report, so a
+ * 66 ms frame next to a short one still reads 30 (It's War, 2026-10-20);
+ * [HITCH] marks the title's own frame (audio_update), which may run ahead
+ * of the screen. Buckets at 25/40/55/75 ms: at 30 fps a frame is 33 ms,
+ * one vblank late 50, two late 66. */
+static const double s_gap_edge[] = { 25.0, 40.0, 55.0, 75.0 };
+static uint32_t s_gap_hist[5], s_gap_n;
+static double s_gap_max;
+static int64_t s_gap_last;
+
+static void present_gap_note(void)
+{
+    static double tick_ms;
+    LARGE_INTEGER now;
+    double ms;
+    int b = 0;
+
+    QueryPerformanceCounter(&now);
+    if (!tick_ms) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        tick_ms = 1000.0 / (double)f.QuadPart;
+    }
+    if (s_gap_last) {
+        ms = (double)(now.QuadPart - s_gap_last) * tick_ms;
+        while (b < 4 && ms >= s_gap_edge[b])
+            b++;
+        s_gap_hist[b]++;
+        s_gap_n++;
+        if (ms > s_gap_max)
+            s_gap_max = ms;
+    }
+    s_gap_last = now.QuadPart;
+}
+
+static void present_gap_report(void)
+{
+    if (!s_gap_n)
+        return;
+    fprintf(stderr, "[GPU] d3d11: present gaps: %u | <25 ms %u <40 %u <55 %u"
+            " <75 %u >=75 %u | worst %.0f ms%c", s_gap_n, s_gap_hist[0],
+            s_gap_hist[1], s_gap_hist[2], s_gap_hist[3], s_gap_hist[4],
+            s_gap_max, 10);
+    memset(s_gap_hist, 0, sizeof s_gap_hist);
+    s_gap_n = 0;
+    s_gap_max = 0;
+}
+
 /* Keep the host GPU at most RECOMP_GPU_PACE ms (default 100) behind the
  * executor. The guest takes a batch as done once it is handed to D3D11, so a
  * title that draws without presenting (Conker's level loads: ~12,000
@@ -4024,6 +4073,8 @@ static void d3d_present(void)
             IDXGISwapChain1_Present(s_swap, 0, 0);
             ct_add(CT_PRESENT, ct0);
             s_stat.presents++;
+            if (!hold)
+                present_gap_note();
             if (hold)
                 xbox_Nv2aIdle(16);
         } while (hold);
@@ -4098,6 +4149,7 @@ static void d3d_report(void)
             s_ib_ring.wraps, s_ib_ring.bytes >> 20, 10);
     fprintf(stderr, "[GPU] d3d11: pacing: %u waits for the GPU, %.0f ms%c",
             s_pace_waits, s_pace_wait_ms, 10);
+    present_gap_report();
     fprintf(stderr, "[GPU] d3d11: visibility reports: %u written, %u waiting,"
             " %u written as visible unmeasured (GPU too far behind), %u"
             " queries not made%c", s_vis_reports, s_vis_tail - s_vis_head,
