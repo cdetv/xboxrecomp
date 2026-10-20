@@ -56,7 +56,28 @@ typedef struct {
     VshProg *p;
     char    *src;
     size_t   len;
+    uint64_t key;                       /* src_key(src): the disk cache's name */
 } DrawJob;
+
+/* RECOMP_VSH_GPU_CACHE=<folder>: every drawing shader compiled is kept
+ * there as <key>.vso (its bytecode), and all of them are loaded on a
+ * thread of their own when drawing starts, so a program compiles once per
+ * machine instead of once per run. Worker threads alone did not hide a
+ * compile: a new program's batches go the CPU way until its shader is
+ * ready, and a burst of new effects -- It's War's boat opening, 27
+ * programs in 4 s -- drew ~83,000 batches that way, 30 -> 22 fps
+ * (2026-10-20). The key hashes the whole source and the compile options,
+ * so a changed translator or head names new files and never loads an old
+ * shader. Unset: no disk cache. */
+#define VSH_DISK_MAX 1024
+typedef struct {
+    uint64_t key;
+    ID3D11VertexShader *vs;
+} DiskShader;
+static DiskShader s_disk[VSH_DISK_MAX];  /* under s_q_cs */
+static uint32_t s_ndisk;
+static char s_cache_dir[MAX_PATH];
+static int s_cache_on = -1;
 static const char *s_dhead, *s_dtail, *s_dentry;
 static CRITICAL_SECTION   s_q_cs;
 static CONDITION_VARIABLE s_q_work, s_q_done;
@@ -424,6 +445,155 @@ void nv2a_vsh_gpu_stats(uint32_t *compiled, uint32_t *failed, double *ms)
 
 /* ---- step 3: drawing with them ----------------------------------------- */
 
+/* The options compile_draw passes to D3DCompile, as part of every key. */
+#define VSH_DRAW_PROFILE "vs_5_0"
+#define VSH_DRAW_FLAGS   (D3DCOMPILE_OPTIMIZATION_LEVEL3 \
+                          | D3DCOMPILE_IEEE_STRICTNESS)
+
+static uint64_t src_key(const char *s, size_t n)
+{
+    static const char tag[] = "nv2a_vsh_draw v1 " VSH_DRAW_PROFILE;
+    uint64_t h = 0xCBF29CE484222325ull;
+    uint32_t flags = VSH_DRAW_FLAGS;
+    size_t i;
+
+    for (i = 0; i < sizeof tag; i++)
+        h = (h ^ (uint8_t)tag[i]) * 0x100000001B3ull;
+    for (i = 0; i < sizeof flags; i++)
+        h = (h ^ ((flags >> (8 * i)) & 0xFF)) * 0x100000001B3ull;
+    for (i = 0; i < n; i++)
+        h = (h ^ (uint8_t)s[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static int cache_on(void)
+{
+    if (s_cache_on < 0) {
+        const char *e = getenv("RECOMP_VSH_GPU_CACHE");
+        s_cache_on = e && e[0] && strcmp(e, "0") != 0
+                     && strlen(e) < sizeof s_cache_dir - 32;
+        if (s_cache_on) {
+            strcpy(s_cache_dir, e);
+            CreateDirectoryA(s_cache_dir, NULL);
+        }
+    }
+    return s_cache_on;
+}
+
+static void cache_path(char *out, size_t cap, uint64_t key)
+{
+    snprintf(out, cap, "%s\\%016llX.vso", s_cache_dir,
+             (unsigned long long)key);
+}
+
+/* Callers hold s_q_cs. */
+static ID3D11VertexShader *disk_find(uint64_t key)
+{
+    uint32_t i;
+    for (i = 0; i < s_ndisk; i++)
+        if (s_disk[i].key == key)
+            return s_disk[i].vs;
+    return NULL;
+}
+
+/* Callers hold s_q_cs. The shader kept for key: vs, or the one already
+ * there (vs is then released). Shaders are never freed, as draw_vs. */
+static ID3D11VertexShader *disk_add(uint64_t key, ID3D11VertexShader *vs)
+{
+    ID3D11VertexShader *had = disk_find(key);
+    if (had) {
+        if (had != vs)
+            ID3D11VertexShader_Release(vs);
+        return had;
+    }
+    if (s_ndisk < VSH_DISK_MAX) {
+        s_disk[s_ndisk].key = key;
+        s_disk[s_ndisk++].vs = vs;
+    }
+    return vs;
+}
+
+/* <key>.vso as a shader, or NULL (absent, unreadable or rejected). */
+static ID3D11VertexShader *cache_load_file(uint64_t key)
+{
+    char path[MAX_PATH];
+    ID3D11VertexShader *vs = NULL;
+    FILE *f;
+    long n;
+    void *buf;
+
+    cache_path(path, sizeof path, key);
+    if (fopen_s(&f, path, "rb") || !f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    buf = n > 0 && n < (1 << 20) ? malloc((size_t)n) : NULL;
+    if (buf && fread(buf, 1, (size_t)n, f) == (size_t)n
+        && FAILED(ID3D11Device_CreateVertexShader(s_dev, buf, (SIZE_T)n,
+                                                  NULL, &vs)))
+        vs = NULL;
+    free(buf);
+    fclose(f);
+    return vs;
+}
+
+/* Written beside its final name and renamed, so a run that stops halfway
+ * never leaves a short file to be loaded next time. */
+static void cache_save(uint64_t key, const void *code, size_t n)
+{
+    char path[MAX_PATH], tmp[MAX_PATH + 16];
+    FILE *f;
+    int ok;
+
+    cache_path(path, sizeof path, key);
+    snprintf(tmp, sizeof tmp, "%s.%lu", path, GetCurrentThreadId());
+    if (fopen_s(&f, tmp, "wb") || !f)
+        return;
+    ok = fwrite(code, 1, n, f) == n;
+    ok = !fclose(f) && ok;
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+        DeleteFileA(tmp);
+}
+
+/* Loads every <key>.vso in the folder, once, beside the compile threads. */
+static DWORD WINAPI cache_loader(LPVOID arg)
+{
+    char pattern[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    uint32_t loaded = 0, bad = 0;
+    double t0 = now_ms();
+
+    (void)arg;
+    snprintf(pattern, sizeof pattern, "%s\\*.vso", s_cache_dir);
+    h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            unsigned long long key;
+            ID3D11VertexShader *vs;
+            char end;
+            if (sscanf_s(fd.cFileName, "%16llX.vs%c", &key, &end, 1) != 2
+                || end != 'o')
+                continue;
+            vs = cache_load_file((uint64_t)key);
+            if (!vs) {
+                bad++;
+                continue;
+            }
+            EnterCriticalSection(&s_q_cs);
+            disk_add((uint64_t)key, vs);
+            LeaveCriticalSection(&s_q_cs);
+            loaded++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    fprintf(stderr, "[VSHGPU] shader cache: %u loaded from %s in %.0f ms"
+            "%s\n", loaded, s_cache_dir, now_ms() - t0,
+            bad ? " (some files unreadable, compiled again when seen)" : "");
+    return 0;
+}
+
 static void compile_draw(DrawJob *j)
 {
     ID3DBlob *code = NULL, *err = NULL;
@@ -431,15 +601,39 @@ static void compile_draw(DrawJob *j)
     double t0 = now_ms(), ms;
     HRESULT hr;
 
+    /* The loader may not have reached this one yet: its file first. */
+    if (cache_on() && (vs = cache_load_file(j->key)) != NULL) {
+        EnterCriticalSection(&s_q_cs);
+        vs = disk_add(j->key, vs);
+        LeaveCriticalSection(&s_q_cs);
+        fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
+                " cache file in %.1f ms\n", (unsigned long long)j->p->hash,
+                now_ms() - t0);
+        free(j->src);
+        EnterCriticalSection(&s_q_cs);
+        j->p->draw_vs = vs;
+        j->p->draw_state = DRAW_READY;
+        s_dcompiled++;
+        WakeAllConditionVariable(&s_q_done);
+        LeaveCriticalSection(&s_q_cs);
+        return;
+    }
+
     /* Optimisation levels 0, 1 and 3 took the same time (tests/nv2a_vsh_gpu,
      * 400 programs, 2026-10-18): the cost is in the source, not the level. */
     hr = D3DCompile(j->src, j->len, "nv2a_vsh_draw", NULL, NULL, s_dentry,
-                    "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3
-                    | D3DCOMPILE_IEEE_STRICTNESS, 0, &code, &err);
+                    VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, &code, &err);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateVertexShader(s_dev,
                 ID3D10Blob_GetBufferPointer(code),
                 ID3D10Blob_GetBufferSize(code), NULL, &vs);
+    if (SUCCEEDED(hr) && cache_on()) {
+        cache_save(j->key, ID3D10Blob_GetBufferPointer(code),
+                   ID3D10Blob_GetBufferSize(code));
+        EnterCriticalSection(&s_q_cs);
+        vs = disk_add(j->key, vs);
+        LeaveCriticalSection(&s_q_cs);
+    }
     ms = now_ms() - t0;
     if (FAILED(hr)) {
         fprintf(stderr, "[VSHGPU] program %016llX: draw shader failed"
@@ -531,21 +725,35 @@ static int start_workers(void)
     InitializeConditionVariable(&s_q_done);
     if (s_dump < 0)
         s_dump = getenv("RECOMP_VSH_GPU_DUMP") != NULL;
-    /* RECOMP_VSH_GPU_THREADS=<n>: compile threads (default 2). A level
-     * start brings a few dozen new programs at once. */
+    /* RECOMP_VSH_GPU_THREADS=<n>: compile threads. A level start or a burst
+     * of new effects brings a few dozen new programs at once, and each
+     * one's batches go the CPU way until it is ready. Default: half the
+     * logical processors less two, 2 to 6 (6 on 16; 2 until 2026-10-20),
+     * below normal priority so a burst does not take the executor's or the
+     * title's time. */
     e = getenv("RECOMP_VSH_GPU_THREADS");
-    want = e ? atoi(e) : 2;
-    if (want < 1) want = 1;
+    want = e ? atoi(e)
+             : (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) / 2 - 2;
+    if (!e && want > 6) want = 6;
+    if (want < (e ? 1 : 2)) want = e ? 1 : 2;
     if (want > 8) want = 8;
     for (i = 0; i < want; i++) {
         HANDLE h = CreateThread(NULL, 0, draw_worker, NULL, 0, NULL);
         if (!h)
             break;
+        SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
         CloseHandle(h);
     }
     s_workers = i ? i : -1;
     fprintf(stderr, "[VSHGPU] %d draw shader compile thread%s\n", i,
             i == 1 ? "" : "s");
+    if (i && cache_on()) {
+        HANDLE h = CreateThread(NULL, 0, cache_loader, NULL, 0, NULL);
+        if (h) {
+            SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(h);
+        }
+    }
     return i > 0;
 }
 
@@ -580,7 +788,18 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
             p->failed = 1;
             return NULL;
         }
+        j.key = src_key(j.src, j.len);
         EnterCriticalSection(&s_q_cs);
+        if (cache_on() && (p->draw_vs = disk_find(j.key)) != NULL) {
+            /* Loaded at startup: drawn on the GPU from its first batch. */
+            p->draw_state = DRAW_READY;
+            s_dcompiled++;
+            LeaveCriticalSection(&s_q_cs);
+            free(j.src);
+            fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
+                    " cache\n", (unsigned long long)p->hash);
+            return p->draw_vs;
+        }
         p->draw_state = DRAW_QUEUED;
         s_q[s_q_tail++ % VSH_CACHE] = j;
         WakeConditionVariable(&s_q_work);
