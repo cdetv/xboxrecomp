@@ -540,6 +540,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, (uint16_t)(argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE),
                        NV_PAVS_VOICE_PAR_STATE, NV_PAVS_VOICE_PAR_STATE_PAUSED,
                        (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) != 0);
+        vlog_event(d, argument & NV1BA0_PIO_VOICE_PAUSE_HANDLE,
+                   (argument & NV1BA0_PIO_VOICE_PAUSE_ACTION) ? "paus" : "resm");
         break;
 
     case NV1BA0_PIO_SET_CURRENT_HRTF_ENTRY:
