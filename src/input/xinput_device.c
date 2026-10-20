@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -40,6 +41,37 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 static DWORD     g_slot_of_port[XBOX_MAX_CONTROLLERS];
 static ULONGLONG g_next_scan;
 
+/* RECOMP_PAD_FOLLOW=1: port 0 is the pad last used, not the first one
+ * connected. Made for a single-player title played from more than one
+ * place: a PC with DS4Windows' virtual pad (a PlayStation pad paired over
+ * Bluetooth) took slot 0, and Parsec's pad for the same player, connected
+ * later, became port 1, which a single-player game never reads
+ * (2026-10-20). Pressing a button, a trigger or a stick on another pad
+ * makes it port 0 once the current one has nothing held; the rest follow in
+ * slot order. Off by default: with several players, ports must stay put. */
+static DWORD g_active_slot = NO_SLOT;
+
+static BOOL pad_follow(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_PAD_FOLLOW");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
+/* A deliberate touch: a button, a trigger or a stick well past its dead
+ * zone (a resting stick drifts, and must not steal port 0). */
+static BOOL pad_touched(const XINPUT_GAMEPAD *g)
+{
+    return g->wButtons || g->bLeftTrigger > 30 || g->bRightTrigger > 30
+        || g->sThumbLX > 16000 || g->sThumbLX < -16000
+        || g->sThumbLY > 16000 || g->sThumbLY < -16000
+        || g->sThumbRX > 16000 || g->sThumbRX < -16000
+        || g->sThumbRY > 16000 || g->sThumbRY < -16000;
+}
+
 static void scan_slots(void)
 {
     DWORD i, n = 0;
@@ -48,9 +80,44 @@ static void scan_slots(void)
         if (XInputGetState(i, &s) == ERROR_SUCCESS)
             g_slot_of_port[n++] = i;
     }
-    for (; n < XBOX_MAX_CONTROLLERS; n++)
-        g_slot_of_port[n] = NO_SLOT;
+    for (i = n; i < XBOX_MAX_CONTROLLERS; i++)
+        g_slot_of_port[i] = NO_SLOT;
+    /* The pad last used goes first; the others keep their order. */
+    for (i = 1; pad_follow() && i < n; i++)
+        if (g_slot_of_port[i] == g_active_slot) {
+            memmove(&g_slot_of_port[1], &g_slot_of_port[0],
+                    i * sizeof(g_slot_of_port[0]));
+            g_slot_of_port[0] = g_active_slot;
+            break;
+        }
     g_next_scan = GetTickCount64() + 1000;
+}
+
+/* RECOMP_PAD_FOLLOW: before port 0 is read, look at the other connected
+ * pads (slots that answered the last scan, so no slow empty-slot calls) and
+ * hand port 0 to one that is being touched while port 0's pad is not. */
+static void follow_active_pad(void)
+{
+    XINPUT_STATE s;
+    DWORD i, cur = g_slot_of_port[0];
+
+    if (cur == NO_SLOT)
+        return;
+    if (XInputGetState(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad))
+        return;
+    for (i = 1; i < XBOX_MAX_CONTROLLERS; i++) {
+        DWORD slot = g_slot_of_port[i];
+        if (slot == NO_SLOT)
+            break;
+        if (XInputGetState(slot, &s) == ERROR_SUCCESS
+            && pad_touched(&s.Gamepad)) {
+            g_active_slot = slot;
+            fprintf(stderr, "[INPUT] pad in XInput slot %lu is now port 0"
+                    " (last used)\n", (unsigned long)slot);
+            scan_slots();
+            return;
+        }
+    }
 }
 
 static DWORD slot_of_port(DWORD port)
@@ -221,13 +288,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
 static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XINPUT_STATE xi_state;
+    XINPUT_STATE xi_state = { 0 };
     DWORD result, slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     slot = slot_of_port(dwPort);
+    if (dwPort == 0 && pad_follow()) {
+        follow_active_pad();
+        slot = g_slot_of_port[0];
+    }
     result = slot == NO_SLOT ? ERROR_DEVICE_NOT_CONNECTED
                              : XInputGetState(slot, &xi_state);
     if (result != ERROR_SUCCESS) {
