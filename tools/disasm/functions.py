@@ -162,6 +162,13 @@ class FunctionDetector:
 
         self._build_alias_entries()
 
+        # Branches that leave a final body for an address nothing made an
+        # entry of. Iterate: an alias built here can branch out again.
+        for _round in range(8):
+            if not self._pass_body_exit_aliases():
+                break
+            self._build_alias_entries()
+
         # Populate call graph
         self._build_call_graph()
 
@@ -868,6 +875,71 @@ class FunctionDetector:
         if added:
             print("  conditional-branch orphans recovered as alias entries")
         return added
+
+    def _pass_body_exit_aliases(self) -> bool:
+        """
+        Every jmp or jcc that leaves its final body must land on an entry.
+
+        The translator lifts a branch outside [start, end) as a tail call to
+        the target, and a target that is no function becomes a stub that only
+        pops the return address. The tail-jump pass covers unconditional jumps
+        and the orphan pass jccs into gaps, but both run on the bodies of
+        their time. Later passes (immediate refs, gap prologues) add starts
+        and rebuild, which turns branches that were internal into exits, and
+        an alias body has exits of its own (a loop head before its start). A
+        jcc into another function's middle had no pass at all.
+
+        Conker had 309 such stubs standing for real code -- loop heads,
+        epilogues, jump-table dispatch. 0x00305CD0 was split at a gap prologue
+        at 0x00305D5C; its "jz 0x00305D9C" (pop ebp; pop esi; pop ebx; ret)
+        went to a stub, so when the call before it returned 1 the three
+        registers stayed pushed and the caller crashed later.
+
+        Run after the bodies and aliases are final. A target inside a body
+        becomes an alias to the furthest end of the bodies holding it; one in
+        a gap has to pass the orphan pass's probes. Returns True if any was
+        added.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        added = 0
+        for func in list(self.functions.values()):
+            for insn in self.engine.get_instructions_in_range(func.start,
+                                                              func.end):
+                if not (insn.is_jump or insn.is_cond_jump):
+                    continue                # is_jump is jmp only
+                target = insn.jump_target
+                if target is None or func.start <= target < func.end:
+                    continue
+                if target in self.functions or target in self._alias_entries:
+                    continue
+                if target not in self.engine.instructions:
+                    continue
+                section = self.image.get_section_at_va(target)
+                if section is None or not section.executable:
+                    continue
+                # Bodies overlap (aliases share their owner's tail), so look
+                # back over every start at or below the target.
+                end = 0
+                k = bisect.bisect_right(starts, target) - 1
+                while k >= 0 and target - bodies[k][0] < 0x10000:
+                    if bodies[k][0] < target < bodies[k][1]:
+                        end = max(end, bodies[k][1])
+                    k -= 1
+                if not end:
+                    if not (self.engine.probes_as_returning_body(target,
+                                                                  max_insns=256)
+                            or self.engine.probes_as_vcall_thunk(target)
+                            or self.engine.block_tail_jump(target) is not None):
+                        continue
+                    k = bisect.bisect_right(starts, target)
+                    end = starts[k] if k < len(starts) else (
+                        section.virtual_addr + section.virtual_size)
+                self._alias_entries[target] = end
+                added += 1
+        if added:
+            print(f"  {added} branch target(s) outside their body made aliases")
+        return added > 0
 
     def _build_alias_entries(self) -> None:
         """
