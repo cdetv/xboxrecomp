@@ -1932,8 +1932,6 @@ guest:
         return NULL;
     if (cube)
         bytes += 5 * face_stride;       /* all six faces, mips between */
-    else
-        note_stale_read(st, bytes);
     if (!cube && d3 == 1 && t->levels > 1 && tex_size_from_format(t->color)) {
         uint32_t big = t->width > t->height ? t->width : t->height;
         while ((1u << lv) <= big && lv < t->levels)
@@ -1972,6 +1970,11 @@ guest:
         s_stat.tex_reused++;
         return e->srv;
     }
+    /* Once per texture per flip, as the hash: checking every bind against
+     * all GPU_SURFACES surfaces was ~9% of the executor in It's War
+     * (~15,000 batches a frame, 2026-10-20). */
+    if (!cube)
+        note_stale_read(st, bytes);
     hash = hash_bytes(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
         hash = hash_bytes(mem + palette, 256 * 4, hash);
@@ -2688,34 +2691,69 @@ static ID3D11RasterizerState *raster_state(float scale)
     return offset_state(cull && whole && s_rs_zcull, scale);
 }
 
-/* Keep the executor at most PACE_SLOTS x PACE_DRAWS draws ahead of the host
- * GPU. The guest takes a batch as done once it is handed to D3D11, so a
+/* Keep the host GPU at most RECOMP_GPU_PACE ms (default 100) behind the
+ * executor. The guest takes a batch as done once it is handed to D3D11, so a
  * title that draws without presenting (Conker's level loads: ~12,000
  * full-screen passes, 2026-10-13) queues seconds of GPU work, and the next
  * ring wrap's discard then waits for all of it while D3D's GPU DPC spins and
- * no interrupt gets through. An event query every PACE_DRAWS draws; before a
- * slot is reused, its query must have passed. A frame (~450-1000 draws) is
- * far inside the window, so ordinary frames never wait. RECOMP_GPU_PACE=0
- * turns it off. */
+ * no interrupt gets through. An event query every PACE_DRAWS draws, stamped
+ * with the time it was issued; while the oldest one still pending is older
+ * than the limit (or all PACE_SLOTS are pending), the executor waits for it.
+ * Time, not a draw count: It's War draws ~15,000 cheap batches a frame, and
+ * a window of 1,024 draws (the first version) made the executor wait ~16% of
+ * the time, 24 fps on the beach where unpaced gave 30 (2026-10-20). Queries
+ * younger than the limit are polled without a flush, so the driver still
+ * batches its submissions. RECOMP_GPU_PACE=0 turns it off. */
 #define PACE_DRAWS 64
-#define PACE_SLOTS 16
+#define PACE_SLOTS 256
 static ID3D11Query *s_pace_q[PACE_SLOTS];
-static uint32_t s_pace_draws, s_pace_slot, s_pace_waits;
+static int64_t s_pace_t[PACE_SLOTS];
+static uint32_t s_pace_draws, s_pace_head, s_pace_n, s_pace_waits;
 static double s_pace_wait_ms;
 
 static void pace_draw(void)
 {
-    static int on = -1;
+    static int64_t lag = -1;
+    static double tick_ms;
+    LARGE_INTEGER now;
     ID3D11Query **q;
 
-    if (on < 0) {
+    if (lag < 0) {
         const char *e = getenv("RECOMP_GPU_PACE");
-        on = !(e && e[0] == '0');
+        LARGE_INTEGER f;
+        int ms = e && e[0] ? atoi(e) : 100;
+        QueryPerformanceFrequency(&f);
+        tick_ms = 1000.0 / (double)f.QuadPart;
+        lag = ms > 0 ? (int64_t)ms * f.QuadPart / 1000 : 0;
+        fprintf(stderr, "[GPU] d3d11: pacing: the GPU may fall %d ms behind%s%c",
+                ms > 0 ? ms : 0, ms > 0 ? "" : " (off: any distance)", 10);
     }
-    if (!on || ++s_pace_draws % PACE_DRAWS)
+    if (!lag || ++s_pace_draws % PACE_DRAWS)
         return;
-    q = &s_pace_q[s_pace_slot];
-    s_pace_slot = (s_pace_slot + 1) % PACE_SLOTS;
+    QueryPerformanceCounter(&now);
+    while (s_pace_n) {
+        ID3D11Asynchronous *a = (ID3D11Asynchronous *)s_pace_q[s_pace_head];
+        int must = s_pace_n == PACE_SLOTS
+                   || now.QuadPart - s_pace_t[s_pace_head] > lag;
+        BOOL done = FALSE;
+        HRESULT hr = ID3D11DeviceContext_GetData(s_ctx, a, &done, sizeof done,
+                         must ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        if (hr == S_FALSE) {
+            LARGE_INTEGER t1;
+            if (!must)
+                break;
+            while ((hr = ID3D11DeviceContext_GetData(s_ctx, a, &done,
+                                                     sizeof done, 0)) == S_FALSE)
+                SwitchToThread();
+            QueryPerformanceCounter(&t1);
+            s_pace_waits++;
+            s_pace_wait_ms += (double)(t1.QuadPart - now.QuadPart) * tick_ms;
+            now = t1;
+        }
+        s_pace_head = (s_pace_head + 1) % PACE_SLOTS;
+        s_pace_n--;
+    }
+    q = &s_pace_q[(s_pace_head + s_pace_n) % PACE_SLOTS];
     if (!*q) {
         D3D11_QUERY_DESC qd;
         qd.Query = D3D11_QUERY_EVENT;
@@ -2724,24 +2762,10 @@ static void pace_draw(void)
             *q = NULL;
             return;
         }
-    } else {
-        BOOL done = FALSE;
-        LARGE_INTEGER f, t0, t1;
-        HRESULT hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)*q,
-                                                 &done, sizeof done, 0);
-        if (hr == S_FALSE) {
-            QueryPerformanceCounter(&t0);
-            while ((hr = ID3D11DeviceContext_GetData(s_ctx,
-                        (ID3D11Asynchronous *)*q, &done, sizeof done, 0)) == S_FALSE)
-                SwitchToThread();
-            QueryPerformanceCounter(&t1);
-            QueryPerformanceFrequency(&f);
-            s_pace_waits++;
-            s_pace_wait_ms += (double)(t1.QuadPart - t0.QuadPart) * 1000.0
-                              / (double)f.QuadPart;
-        }
     }
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)*q);
+    s_pace_t[(s_pace_head + s_pace_n) % PACE_SLOTS] = now.QuadPart;
+    s_pace_n++;
 }
 
 /* RECOMP_VSH_GPU_CHECK=<N>: every Nth program batch (1 = all), and the
@@ -4059,8 +4083,9 @@ static void d3d_report(void)
             " handled (guest memory used)%c", s_stat.zeta_made,
             s_stat.zeta_clears, s_stat.zeta_draws, s_stat.zeta_too_big,
             s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
-    fprintf(stderr, "[GPU] d3d11: %u texture binds read from guest memory"
-            " inside a GPU surface or zeta buffer (stale); surface binds:"
+    fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
+            " flip) from guest memory inside a GPU surface or zeta buffer"
+            " (stale); surface binds:"
             " %u of a surface not drawn for 2+ flips, %u with a twin at the"
             " same address%c", s_stat.stale_reads, s_stat.rtt_old,
             s_stat.rtt_twin, 10);
