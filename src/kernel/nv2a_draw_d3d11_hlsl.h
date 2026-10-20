@@ -52,12 +52,18 @@
 "  float4 bmat[4];     /* per stage: bump-env matrix 00 01 10 11 */\n" \
 "  float4 bsc[4];      /* per stage: bump scale, offset, input stage */\n" \
 "};\n" \
+"/* Colours and fog interpolate with perspective, as xemu's smooth ones do.\n" \
+"   Not noperspective: the GPU path leaves near-plane clipping to the\n" \
+"   rasteriser, and a strip running from behind the eye (Conker's bullet\n" \
+"   smoke, w -777 to 720) came out as opaque bands across the screen:\n" \
+"   the cut vertices' screen-linear colours are not clip_triangle's\n" \
+"   (2026-10-20). The software path still interpolates them linearly. */\n" \
 "struct V {\n" \
 "  float4 p : SV_Position;\n" \
 "  nointerpolation float4 cf : COLOR0;\n" \
-"  noperspective float4 d0 : COLOR1;\n" \
-"  noperspective float4 d1 : COLOR2;\n" \
-"  noperspective float fog : FOG;\n" \
+"  float4 d0 : COLOR1;\n" \
+"  float4 d1 : COLOR2;\n" \
+"  float fog : FOG;\n" \
 "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n" \
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
 "};\n" \
@@ -462,9 +468,9 @@ static const char s_hlsl_vsh_draw[] =
 "struct VG {\n"
 "  float4 p : SV_Position;\n"
 "  nointerpolation float4 cf : COLOR0;\n"
-"  noperspective float4 d0 : COLOR1;\n"
-"  noperspective float4 d1 : COLOR2;\n"
-"  noperspective float fog : FOG;\n"
+"  float4 d0 : COLOR1;\n"
+"  float4 d1 : COLOR2;\n"
+"  float fog : FOG;\n"
 "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
 "  float2 cd : SV_ClipDistance0;\n"
