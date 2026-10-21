@@ -18,7 +18,8 @@ int postfx_active(void);
 
 /* The rectangle sx0,sy0 sw x sh (host pixels) of texture src, filtered,
  * over the rectangle dx0,dy0 dw x dh of target dst. Same size: pixel for
- * pixel; otherwise sampled bilinearly. Sets every piece of pipeline state it
+ * pixel; otherwise sampled bilinearly (sharpening still at the source's
+ * size, before the stretch). Sets every piece of pipeline state it
  * uses and leaves no target or view bound. 1 when drawn; 0 when the chain
  * could not be made (said once), and the caller copies as before. */
 int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,

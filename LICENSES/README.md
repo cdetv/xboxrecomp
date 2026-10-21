@@ -10,3 +10,6 @@ and remaining the copyright of espes, Jannik Vogel and Matt Borgerson.
 
 Shipping the verbatim text alongside those files is an LGPL requirement, not
 a courtesy.
+
+`FidelityFX-CAS.txt` is AMD's MIT licence and copyright notice for FidelityFX
+CAS, whose sharpening filter `src/kernel/postfx_d3d11.c` ports (see NOTICE).
