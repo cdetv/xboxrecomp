@@ -2247,6 +2247,9 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     int border = t->border_from_color && (t->addr_u == 4 || t->addr_v == 4);
     int bu = border && t->addr_u == 4, bv = border && t->addr_v == 4;
     int wu = t->addr_u == 1, wv = t->addr_v == 1;
+    /* Mirror (2) needs its own mode: clamped, a mirrored floor shows one
+     * tile and then streaks of its edge texels. */
+    int mu = t->addr_u == 2, mv = t->addr_v == 2;
     /* 0 level 0 only, 1 nearest level, 2 blend of two levels */
     uint32_t mip = min == 3 || min == 4 ? 1u : min == 5 || min == 6 ? 2u : 0u;
     uint32_t lmin = ((t->control0 >> 18) & 0xFFF) >> 8;
@@ -2270,7 +2273,7 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     color = border ? t->border_color : 0;
     aniso = filt >= 2 && mip && lin ? (uint32_t)filt : 0u;
     key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5
-          | aniso << 7;
+          | aniso << 7 | mu << 12 | mv << 13;
     if (mip)
         s_stat.mip_binds++;
     else if (s_tex_levels[st] > 1)
@@ -2310,9 +2313,11 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
                                : D3D11_FILTER_MIN_MAG_MIP_POINT);
     d.MaxAnisotropy = aniso ? aniso : 1;
     d.AddressU = bu ? D3D11_TEXTURE_ADDRESS_BORDER
-               : wu ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+               : wu ? D3D11_TEXTURE_ADDRESS_WRAP
+               : mu ? D3D11_TEXTURE_ADDRESS_MIRROR : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressV = bv ? D3D11_TEXTURE_ADDRESS_BORDER
-               : wv ? D3D11_TEXTURE_ADDRESS_WRAP : D3D11_TEXTURE_ADDRESS_CLAMP;
+               : wv ? D3D11_TEXTURE_ADDRESS_WRAP
+               : mv ? D3D11_TEXTURE_ADDRESS_MIRROR : D3D11_TEXTURE_ADDRESS_CLAMP;
     d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     d.BorderColor[0] = ((color >> 16) & 0xFF) / 255.0f;
     d.BorderColor[1] = ((color >>  8) & 0xFF) / 255.0f;
