@@ -46,6 +46,20 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
+MIT — ported from AMD FidelityFX CAS
+------------------------------------
+
+  https://github.com/GPUOpen-Effects/FidelityFX-CAS
+
+  src/kernel/postfx_d3d11.c   the sharpen stage (shader cps) is CasFilter
+                              from ffx_cas.h 1.20190610, sharpen-only,
+                              ported to plain HLSL
+                              (c) 2017-2019 Advanced Micro Devices, Inc.
+
+  Licensed under the MIT licence; the full text, with AMD's copyright
+  notice, is in LICENSES/FidelityFX-CAS.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
