@@ -48,6 +48,7 @@ static uint32_t s_tot_jumped, s_tot_jumped_back, s_tot_jumped_lost;
 static uint32_t s_tot_jumped_stale;   /* buffer's return was another run's */
 static uint32_t s_tot_jumped_open;    /* buffer ran off with no jump back */
 static uint32_t s_tot_jumped_chained; /* record found with no NOP code */
+static uint32_t s_tot_jumped_skipped; /* failed the dry run, not executed */
 
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
@@ -152,10 +153,11 @@ void nv2a_pb_scan_report(void)
         nv2a_pb_exec_report();
         fprintf(stderr, "[PB] %u pushbuffer calls followed; %u jumps to recorded"
                         " pushbuffers: %u came back, %u lost (%u held another"
-                        " run's return, %u had none, %u chained records)\n",
+                        " run's return, %u had none, %u chained records),"
+                        " %u skipped as not commands\n",
                 s_tot_calls, s_tot_jumped, s_tot_jumped_back,
                 s_tot_jumped_lost, s_tot_jumped_stale, s_tot_jumped_open,
-                s_tot_jumped_chained);
+                s_tot_jumped_chained, s_tot_jumped_skipped);
     }
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -248,6 +250,64 @@ static int pb_is_return_record(const uint8_t *mem, uint32_t va, uint32_t tva,
         && (r[4] & 0x0FFFFFFFu) == (tva & 0x0FFFFFFFu);
 }
 
+/* Dry run of a recorded pushbuffer before it is executed: decode it as
+ * pb_walk would, executing nothing, and say whether it gets back to the ring
+ * cleanly -- every word a command, every jump and call inside RAM, and, when
+ * RunPushBuffer's record says where the buffer's last dword is, the jump back
+ * found right there. Returns 0 if so, else the VA where it went wrong.
+ *
+ * Conker's multiplayer character select loads the next character into its
+ * own memory pool on top of a model it still draws for a few frames: the old
+ * buffer reads as zeros, then fills with texture bytes (2026-10-21). Zeros
+ * are harmless count-0 headers, but texture bytes are not: walked as
+ * commands, ~1M of them set a fixed-function transform that stayed (every
+ * later batch skipped, a black screen) or wrote reports and fences into
+ * random guest memory (crashes). Executing only buffers that pass, and
+ * skipping the rest like a draw that drew nothing, keeps all of that out. */
+static uint32_t pb_check_jumped(const uint8_t *mem, uint32_t va, uint32_t last,
+                                uint32_t ram_end)
+{
+    uint32_t end_va = va + 0x400000u, words = 0;
+
+    if (end_va > ram_end)
+        end_va = ram_end;
+    while (va < end_va) {
+        uint32_t w = *(const uint32_t *)(mem + va);
+        if (++words > 0x100000u)
+            return va;
+        if ((w & 3u) == 1u || (w & 0xE0000003u) == 0x20000000u) {
+            uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
+                                             : (w & 0x1FFFFFFCu);
+            uint32_t tva = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+            if (pb_in_ring(tva))
+                return (!last || va == last) ? 0 : va;
+            if (tva >= ram_end)
+                return va;
+            va = tva;
+            end_va = va + 0x400000u;
+            if (end_va > ram_end)
+                end_va = ram_end;
+            continue;
+        }
+        if ((w & 0xFFFF0003u) == 0x00020000u) {  /* RETURN */
+            va += 4;
+            continue;
+        }
+        if ((w & 3u) == 2u) {                    /* CALL */
+            if ((XBOX_CONTIG_BASE | (w & 0x0FFFFFFCu)) >= ram_end)
+                return va;
+            va += 4;
+            continue;
+        }
+        if ((w & 0x00030003u) == 0u) {
+            va += 4 + ((w >> 18) & 0x7FFu) * 4u;
+            continue;
+        }
+        return va;                               /* not a command */
+    }
+    return va;
+}
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                         uint32_t *jumps, uint32_t *unknown, uint32_t *exit_va)
 {
@@ -285,6 +345,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             (*jumps)++;
             if (mode == PB_RING) {
                 uint32_t back = 0, site = va - 4, want = va, code = 0;
+                uint32_t last = 0, bad;   /* buffer's last dword, if known */
                 if (!s_ring_hi || pb_in_ring(tva)) {
                     /* Forward within the words still to walk: D3D jumps
                      * over the rest of a reserved block (often just to
@@ -310,6 +371,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                     if ((code == 0xCu || code == 0xEu) && rec == va) {
                         want = XBOX_CONTIG_BASE
                              | (*(const uint32_t *)(mem + rec) & 0x0FFFFFFFu);
+                        last = XBOX_CONTIG_BASE
+                             | (*(const uint32_t *)(mem + rec + 8) & 0x0FFFFFFFu);
                     }
                 }
                 /* A record after the JUMP with no code naming it: D3D
@@ -321,11 +384,26 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 if (want == va && pb_is_return_record(mem, va, tva,
                                                       ram_end)) {
                     want = va + PB_RECORD_BYTES;
+                    last = XBOX_CONTIG_BASE
+                         | (*(const uint32_t *)(mem + va + 8) & 0x0FFFFFFFu);
                     s_tot_jumped_chained++;
                 }
+                if (last && (last < tva || last >= ram_end))
+                    last = 0;
                 s_tot_jumped++;
-                words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
-                                 jumps, unknown, &back);
+                bad = pb_check_jumped(mem, tva, last, ram_end);
+                if (bad) {
+                    s_tot_jumped_skipped++;
+                    if (s_tot_jumped_skipped <= 8)
+                        fprintf(stderr, "[PB] jump at %08X to %08X: not"
+                                " commands at %08X (%08X; last dword %08X),"
+                                " skipped\n", site, tva, bad,
+                                bad < ram_end ? *(const uint32_t *)(mem + bad)
+                                              : 0u, last);
+                    back = want;                 /* as if it drew nothing */
+                } else
+                    words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
+                                     jumps, unknown, &back);
                 if (!back) {
                     s_tot_jumped_open++;
                     if (s_tot_jumped_open <= 8)
