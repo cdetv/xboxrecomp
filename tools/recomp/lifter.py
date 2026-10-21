@@ -1610,7 +1610,8 @@ class Lifter:
                  "setl", "setge", "setle", "setg", "sets", "setns"):
             return self._lift_setcc(insn, ops, m)
         if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
+                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns",
+                 "cmovp", "cmovnp"):
             return self._lift_cmovcc(insn, ops, m)
 
         # ── SSE (scalar float) ──
@@ -3988,9 +3989,14 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # cmovp/cmovnp: MSVC's branchless float test, `ucomiss; lahf; test ah,
+        # 0x44; cmovnp`. Left out, they lifted to RECOMP_UNIMPL (no move), so
+        # "x != -1.0f" was always true (Conker: every multiplayer round ended
+        # as soon as it began, a "no countdown" timer read as running).
         if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
                               "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns")
+                              "cmovle", "cmovg", "cmovs", "cmovns",
+                              "cmovp", "cmovnp")
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
