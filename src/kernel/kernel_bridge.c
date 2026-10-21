@@ -3893,6 +3893,99 @@ static int bridge_async_io_enabled(void)
     return on;
 }
 
+/* RECOMP_IO_LATENCY_MS=N: a read on an asynchronous handle stays pending
+ * for N ms, as a disc read does. The data is read at once; only the status
+ * block (and the event) are written later, by a timer thread. Without it
+ * every such read is finished before NtReadFile returns, and code that polls
+ * "still pending?" never sees a read in flight: Conker's XACT dropped short
+ * waves, and its multiplayer character select loaded a model the same frame
+ * it asked for it (conker-notes 2026-10-15, 2026-10-21). Reads with an APC
+ * complete at once as before: the APC has to run on the issuing thread. */
+#define IO_LATENCY_MAX 256
+static struct { uint32_t ios_va, status, info, event; LONGLONG due; } s_io_late[IO_LATENCY_MAX];
+static int s_io_late_n;
+static CRITICAL_SECTION s_io_late_lock;
+static HANDLE s_io_late_wake;          /* set when the queue gets an entry */
+static LONGLONG s_qpc_per_ms;
+
+static int io_latency_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("RECOMP_IO_LATENCY_MS");
+        ms = e ? atoi(e) : 0;
+        if (ms < 0)
+            ms = 0;
+    }
+    return ms;
+}
+
+/* Sleep(1) is ~15 ms at the default timer resolution, which made every
+ * deferred read cost a frame: boot, a run of ~1,000 small reads each waited
+ * for in turn, took ~20 s longer. So the thread yields (sub-millisecond)
+ * while a read is due and sleeps on an event while the queue is empty. */
+static DWORD WINAPI io_latency_thread(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        LARGE_INTEGER now;
+        int i, left;
+        QueryPerformanceCounter(&now);
+        EnterCriticalSection(&s_io_late_lock);
+        for (i = 0; i < s_io_late_n; ) {
+            if (now.QuadPart >= s_io_late[i].due) {
+                bridge_write_iostatus(s_io_late[i].ios_va,
+                                      (NTSTATUS)s_io_late[i].status,
+                                      s_io_late[i].info);
+                bridge_complete_file_io(s_io_late[i].event, 0, 0, 0);
+                s_io_late[i] = s_io_late[--s_io_late_n];
+            } else
+                i++;
+        }
+        left = s_io_late_n;
+        LeaveCriticalSection(&s_io_late_lock);
+        if (left)
+            SwitchToThread();
+        else
+            WaitForSingleObject(s_io_late_wake, INFINITE);
+    }
+}
+
+/* Queue a finished read's status for later; 0 if the queue is full (the
+ * caller then completes it at once). */
+static int io_latency_defer(uint32_t ios_va, NTSTATUS status, uint32_t info,
+                            uint32_t event)
+{
+    static LONG started;
+    LARGE_INTEGER now;
+    int ok = 0;
+    if (!InterlockedExchange(&started, 1)) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_qpc_per_ms = f.QuadPart / 1000;
+        InitializeCriticalSection(&s_io_late_lock);
+        s_io_late_wake = CreateEventA(NULL, FALSE, FALSE, NULL);
+        CloseHandle(CreateThread(NULL, 0, io_latency_thread, NULL, 0, NULL));
+    }
+    QueryPerformanceCounter(&now);
+    EnterCriticalSection(&s_io_late_lock);
+    if (s_io_late_n < IO_LATENCY_MAX) {
+        s_io_late[s_io_late_n].ios_va = ios_va;
+        s_io_late[s_io_late_n].status = (uint32_t)status;
+        s_io_late[s_io_late_n].info = info;
+        s_io_late[s_io_late_n].event = event;
+        s_io_late[s_io_late_n].due = now.QuadPart
+                                   + (LONGLONG)io_latency_ms() * s_qpc_per_ms;
+        s_io_late_n++;
+        bridge_write_iostatus(ios_va, STATUS_PENDING, 0);
+        ok = 1;
+    }
+    LeaveCriticalSection(&s_io_late_lock);
+    if (ok)
+        SetEvent(s_io_late_wake);
+    return ok;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3944,6 +4037,13 @@ static void bridge_NtReadFile(void)
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         fflush(stderr);
+    }
+    if (io_latency_ms() && iostatus && !STACK_ARG(2)
+            && bridge_handle_is_async(STACK_ARG(0))
+            && io_latency_defer(iostatus, ios.Status,
+                                (uint32_t)ios.Information, STACK_ARG(1))) {
+        g_eax = STATUS_PENDING;
+        return;
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
     bridge_complete_file_io(STACK_ARG(1), STACK_ARG(2), STACK_ARG(3),
