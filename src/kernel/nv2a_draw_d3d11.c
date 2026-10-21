@@ -45,6 +45,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include "postfx_d3d11.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowStart(void);
@@ -3833,16 +3834,13 @@ static int flip_dump_on(void)
  * back from the GPU and written as a 24-bit BMP, at the surface's scale: a
  * scaled frame dumps at the render resolution. What lies outside the
  * surface's texture comes out black. 1 when the file was written. */
+static int dump_tex(const char *path, ID3D11Texture2D *tex, uint32_t tw,
+                    uint32_t th, uint32_t x, uint32_t y, uint32_t w,
+                    uint32_t h);
+
 static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
                      uint32_t w, uint32_t h)
 {
-    static const uint8_t black[4] = {0, 0, 0, 0};
-    D3D11_MAPPED_SUBRESOURCE m;
-    ID3D11Texture2D *staging = NULL;
-    uint32_t cw = 0, ch = 0, row_bytes, pad, filesz, r, c;
-    uint8_t hdr[54];
-    FILE *f;
-
     if (i >= 0 && s_surf[i].scaled) {
         float sx = surf_sx(i), sy = surf_sy(i);
         uint32_t x1 = to_host(x + w, sx), y1 = to_host(y + h, sy);
@@ -3851,11 +3849,29 @@ static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
         w = x1 - x;
         h = y1 - y;
     }
+    return i >= 0 ? dump_tex(path, s_surf[i].tex, s_surf[i].tw, s_surf[i].th,
+                             x, y, w, h)
+                  : dump_tex(path, NULL, 0, 0, x, y, w, h);
+}
+
+/* Rectangle x,y,w,h (host pixels) of B8G8R8A8 texture tex (tw x th; or of
+ * nothing, tex NULL), as dump_rect writes it. */
+static int dump_tex(const char *path, ID3D11Texture2D *tex, uint32_t tw,
+                    uint32_t th, uint32_t x, uint32_t y, uint32_t w,
+                    uint32_t h)
+{
+    static const uint8_t black[4] = {0, 0, 0, 0};
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *staging = NULL;
+    uint32_t cw = 0, ch = 0, row_bytes, pad, filesz, r, c;
+    uint8_t hdr[54];
+    FILE *f;
+
     if (!w || !h)
         return 0;
-    if (i >= 0 && x < s_surf[i].tw && y < s_surf[i].th) {
-        cw = s_surf[i].tw - x < w ? s_surf[i].tw - x : w;
-        ch = s_surf[i].th - y < h ? s_surf[i].th - y : h;
+    if (tex && x < tw && y < th) {
+        cw = tw - x < w ? tw - x : w;
+        ch = th - y < h ? th - y : h;
     }
     memset(&m, 0, sizeof m);
     if (cw && ch) {
@@ -3876,7 +3892,7 @@ static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
         box.right = x + cw; box.bottom = y + ch; box.back = 1;
         ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
                 (ID3D11Resource *)staging, 0, 0, 0, 0,
-                (ID3D11Resource *)s_surf[i].tex, 0, &box);
+                (ID3D11Resource *)tex, 0, &box);
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)staging,
                                            0, D3D11_MAP_READ, 0, &m))) {
             ID3D11Texture2D_Release(staging);
@@ -3916,19 +3932,43 @@ static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
     return f != NULL;
 }
 
-/* The presented rectangle, as <prefix>NNNNN.bmp. */
-static void dump_shown(void)
+/* The presented rectangle, as <prefix>NNNNN.bmp. Its number, or -1 when
+ * nothing is shown. */
+static int dump_shown(void)
 {
     static int seq;
     char path[512];
 
     if (s_shown < 0 || !s_shown_w || !s_shown_h)
-        return;
+        return -1;
     snprintf(path, sizeof path, "%s%05d.bmp", getenv("RECOMP_FB_DUMP"), seq++);
     if (dump_rect(path, s_shown, s_shown_x, s_shown_y, s_shown_w, s_shown_h)
         && seq == 1)
         fprintf(stderr, "  [GPU] d3d11 frame dump: %s (%ux%u)%c", path,
                 s_shown_w, s_shown_h, 10);
+    return seq - 1;
+}
+
+/* RECOMP_BB_DUMP=<prefix> with the frame dumps: the back buffer as the
+ * filter chain left it (before the overlay), as <prefix>NNNNN.bmp with the
+ * frame dump's number, so compare_frames.py can check the chain against
+ * the frame (at 640x480 the two are the same size). */
+static void dump_back(int seq)
+{
+    const char *prefix = getenv("RECOMP_BB_DUMP");
+    ID3D11Texture2D *back = NULL;
+    char path[512];
+
+    if (!prefix || seq < 0
+        || FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                            (void **)&back)))
+        return;
+    snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
+    if (dump_tex(path, back, s_sc_w, s_sc_h, 0, 0, s_sc_w, s_sc_h)
+        && seq == 0)
+        fprintf(stderr, "  [GPU] d3d11 back buffer dump: %s (%ux%u)%c", path,
+                s_sc_w, s_sc_h, 10);
+    ID3D11Texture2D_Release(back);
 }
 
 /* Shadow mode: the software path has just dumped a rectangle of a surface;
@@ -3955,7 +3995,8 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
                 sw->w, sw->h, 10);
 }
 
-/* The shown frame into the swap chain's back buffer, on black. */
+/* The shown frame into the swap chain's back buffer, on black: copied, or
+ * drawn through the filter chain (postfx_d3d11.c) when a filter is on. */
 static void shown_to_back(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -3995,10 +4036,23 @@ static void shown_to_back(void)
              * size instead of copied at the old one. */
             uint32_t dw = to_host(s_shown_w, s_rsx);
             uint32_t dh = to_host(s_shown_h, s_rsy);
-            blit_stretch(s_surf[s_shown].tex, (float)box.left,
-                         (float)box.top, (float)bw, (float)bh, s_back_rtv,
-                         0.0f, 0.0f, (float)(dw < s_sc_w ? dw : s_sc_w),
-                         (float)(dh < s_sc_h ? dh : s_sc_h));
+            float fw = (float)(dw < s_sc_w ? dw : s_sc_w);
+            float fh = (float)(dh < s_sc_h ? dh : s_sc_h);
+            if (!postfx_active()
+                || !postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+                                (float)box.left, (float)box.top, (float)bw,
+                                (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
+                blit_stretch(s_surf[s_shown].tex, (float)box.left,
+                             (float)box.top, (float)bw, (float)bh,
+                             s_back_rtv, 0.0f, 0.0f, fw, fh);
+        } else if (postfx_active()
+                   && postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+                                  (float)box.left, (float)box.top,
+                                  (float)(box.right - box.left),
+                                  (float)(box.bottom - box.top), s_back_rtv,
+                                  0.0f, 0.0f, (float)(box.right - box.left),
+                                  (float)(box.bottom - box.top))) {
+            /* Filtered, pixel for pixel. */
         } else {
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
                     (ID3D11Resource *)back, 0, 0, 0, 0,
@@ -4134,6 +4188,8 @@ static void d3d_present(void)
         }
     }
 
+    int seq = -1;
+
     if (s_shadow) {
         /* The software back end presented first and has said what it
          * dumped; the window is its, not ours. */
@@ -4141,7 +4197,7 @@ static void d3d_present(void)
         if (sw)
             dump_beside_sw(sw);
     } else if (flip_dump_on()) {
-        dump_shown();
+        seq = dump_shown();
     }
     if (!s_shadow && ensure_swap_chain()) {
         int hold;
@@ -4154,6 +4210,8 @@ static void d3d_present(void)
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             shown_to_back();
+            dump_back(seq);
+            seq = -1;                   /* not again for a held frame */
             hold = overlay
                  ? overlay(s_dev, s_ctx, s_back_rtv, s_sc_w, s_sc_h) : 0;
             /* No vsync: the title paces itself on the vblank the kernel
