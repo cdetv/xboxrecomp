@@ -35,12 +35,13 @@ set(KERNEL_SOURCES
 )
 
 if(WIN32)
-    # The filter chain's anti-aliasing shaders (third_party/, vendored) are
-    # compiled at run time like the rest of postfx_d3d11.c: their source
-    # goes into the library as text.
+    # The filter chain's anti-aliasing and FSR shaders (third_party/,
+    # vendored) are compiled at run time like the rest of postfx_d3d11.c:
+    # their source goes into the library as text.
     get_filename_component(XBOXRECOMP_ROOT_DIR
         "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    foreach(pair "fxaa|fxaa/Fxaa3_11.h" "smaa|smaa/SMAA.hlsl")
+    foreach(pair "fxaa|fxaa/Fxaa3_11.h" "smaa|smaa/SMAA.hlsl"
+                 "ffx_a|fsr1/ffx_a.h" "ffx_fsr1|fsr1/ffx_fsr1.h")
         string(REPLACE "|" ";" pair "${pair}")
         list(GET pair 0 name)
         list(GET pair 1 in)

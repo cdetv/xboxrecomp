@@ -21,3 +21,8 @@ compiles (see NOTICE).
 `SMAA.txt` is the MIT licence and copyright notice of SMAA (Jimenez et al.),
 the other anti-aliasing shader, vendored in `third_party/smaa/` with its
 own copy of the same text (see NOTICE).
+
+`FidelityFX-FSR.txt` is AMD's MIT licence and copyright notice for
+FidelityFX Super Resolution 1.0, the upscaler (EASU) and its sharpener
+(RCAS), vendored in `third_party/fsr1/` with AMD's own `license.txt` (see
+NOTICE).

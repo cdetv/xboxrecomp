@@ -13,15 +13,18 @@
 #include <d3d11.h>
 
 /* Nonzero when any filter is on (or RECOMP_POSTFX_FORCE=1): the caller then
- * draws the frame through postfx_draw instead of copying it. */
+ * draws the frame through postfx_draw instead of copying it. A frame of
+ * another size than the target goes through postfx_draw either way. */
 int postfx_active(void);
 
 /* The rectangle sx0,sy0 sw x sh (host pixels) of texture src, filtered,
  * over the rectangle dx0,dy0 dw x dh of target dst. Same size: pixel for
- * pixel; otherwise sampled bilinearly (sharpening still at the source's
- * size, before the stretch). Sets every piece of pipeline state it
+ * pixel; bigger: shrunk by area; smaller: stretched by the upscaler
+ * (bilinear or FSR 1). Anti-aliasing runs at the source's size,
+ * sharpening at the target's. Sets every piece of pipeline state it
  * uses and leaves no target or view bound. 1 when drawn; 0 when the chain
- * could not be made (said once), and the caller copies as before. */
+ * could not be made (said once), and the caller copies or stretches as
+ * before. */
 int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                 ID3D11Texture2D *src, float sx0, float sy0, float sw,
                 float sh, ID3D11RenderTargetView *dst, float dx0, float dy0,

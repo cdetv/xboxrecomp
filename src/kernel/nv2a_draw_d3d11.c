@@ -75,8 +75,8 @@ void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
     s_overlay = fn;
 }
 
-/* The title's frame. The swap chain is this size times the render scale;
- * DXGI scales it to the window's aspect-keeping view. */
+/* The title's frame. The swap chain is the render resolution (this size
+ * when none is set); DXGI scales it to the window's aspect-keeping view. */
 #define SC_W 640
 #define SC_H 480
 
@@ -96,11 +96,97 @@ void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
  * and bumps s_scale_gen. Colour surfaces keep the scale they were made at
  * (GpuSurface sx, sy) until next drawn into, then are remade at the new one
  * with their picture stretched across (surface_current); a frame shown in
- * between is stretched to the new back buffer (shown_to_back). */
+ * between is stretched to the new back buffer (shown_to_back).
+ *
+ * The render scale (RECOMP_RENDER_SCALE=<percent>, xbox_SetRenderScale)
+ * draws the frame bigger or smaller than the back buffer: s_sc_w x s_sc_h
+ * is the render resolution (s_bb_w x s_bb_h, the swap chain) times the
+ * scale, and shown_to_back has the filter chain shrink it (supersampling)
+ * or stretch it (bilinear or FSR 1) onto the back buffer. 100 % = the two
+ * the same, as before. */
 static int      s_scale_on;
 static float    s_rsx = 1.0f, s_rsy = 1.0f;
 static uint32_t s_sc_w = SC_W, s_sc_h = SC_H;
+static uint32_t s_bb_w = SC_W, s_bb_h = SC_H;
 static uint32_t s_scale_gen;
+
+/* Render scale limits: a percent from 25 to 400 is taken (a menu offers
+ * fewer). The frame stays inside render_res_ok's (fb_present.c) 10240 x
+ * 7680, which keeps a scaled depth buffer inside D3D11's textures, and at
+ * most RS_MAX_PIXELS (twice 4K's): bigger asks are capped (draw_size). */
+#define RS_MIN 25
+#define RS_MAX 400
+#define RS_MAX_PIXELS (3840.0 * 2160.0 * 2.0)
+static volatile LONG s_scale_pct = -1;  /* -1: environment not read yet */
+
+static int render_scale_pct(void)
+{
+    LONG v = s_scale_pct;
+
+    if (v < 0) {
+        const char *e = getenv("RECOMP_RENDER_SCALE");
+        long p = 100;
+        char *end;
+        if (e && *e) {
+            p = strtol(e, &end, 10);
+            if (*end || p < RS_MIN || p > RS_MAX) {
+                fprintf(stderr, "[GPU] d3d11: RECOMP_RENDER_SCALE=%s ignored:"
+                        " want a percent from %d to %d%c", e, RS_MIN, RS_MAX,
+                        10);
+                p = 100;
+            }
+        }
+        /* A change made before the first read wins over the environment. */
+        InterlockedCompareExchange(&s_scale_pct, (LONG)p, -1);
+        v = s_scale_pct;
+    }
+    return (int)v;
+}
+
+/* For a settings menu: draw the frame at percent of the render resolution
+ * from the next present, 100 = the same. 1 when taken. */
+int xbox_SetRenderScale(int percent)
+{
+    if (percent < RS_MIN || percent > RS_MAX)
+        return 0;
+    render_scale_pct();
+    InterlockedExchange(&s_scale_pct, percent);
+    return 1;
+}
+
+/* The frame's size for a w x h back buffer at pct percent, capped (see
+ * RS_MAX_PIXELS). */
+static void draw_size(uint32_t w, uint32_t h, int pct, uint32_t *dw,
+                      uint32_t *dh)
+{
+    double f = pct / 100.0, cap = sqrt(RS_MAX_PIXELS / ((double)w * h));
+
+    if (f > 10240.0 / w) f = 10240.0 / w;
+    if (f > 7680.0 / h) f = 7680.0 / h;
+    if (f > cap) f = cap;
+    *dw = (uint32_t)(w * f + 0.5);
+    *dh = (uint32_t)(h * f + 0.5);
+    if (*dw < 64) *dw = 64;
+    if (*dh < 48) *dh = 48;
+}
+
+/* For a settings menu: the size the frame is drawn at with the render
+ * resolution and scale set now (it follows at the next present), and the
+ * percent that is: below the one set when it was capped. */
+int xbox_RenderScaleSize(unsigned *w, unsigned *h)
+{
+    unsigned bw = 0, bh = 0;
+    uint32_t dw, dh;
+
+    if (!xbox_RenderRes(&bw, &bh) || !bw || !bh) {
+        bw = SC_W;
+        bh = SC_H;
+    }
+    draw_size(bw, bh, render_scale_pct(), &dw, &dh);
+    *w = dw;
+    *h = dh;
+    return (int)(100.0 * dw / bw + 0.5);
+}
 
 /* The render scale for a w x h picture (0 x 0: the title's own size). */
 static void set_render_scale(uint32_t w, uint32_t h)
@@ -324,13 +410,13 @@ static int ensure_swap_chain(void)
         return 0;
     /* The swap chain goes on the window's aspect-keeping child view, so a
      * resized window scales the picture without stretching it. */
-    view = (HWND)xbox_FramebufferWindowGpuView(s_sc_w, s_sc_h);
+    view = (HWND)xbox_FramebufferWindowGpuView(s_bb_w, s_bb_h);
     if (!view)
         view = hwnd;
 
     memset(&d, 0, sizeof d);
-    d.Width = s_sc_w;
-    d.Height = s_sc_h;
+    d.Width = s_bb_w;
+    d.Height = s_bb_h;
     d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     d.SampleDesc.Count = 1;
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -360,7 +446,7 @@ static int ensure_swap_chain(void)
     /* From here on the window is ours; GDI would draw over every frame. */
     xbox_FramebufferWindowGpuOwned(1);
     fprintf(stderr, "[GPU] d3d11: swap chain on the framebuffer window"
-            " (%ux%u)%c", s_sc_w, s_sc_h, 10);
+            " (%ux%u)%c", s_bb_w, s_bb_h, 10);
     return 1;
 }
 
@@ -3964,10 +4050,10 @@ static void dump_back(int seq)
                                             (void **)&back)))
         return;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
-    if (dump_tex(path, back, s_sc_w, s_sc_h, 0, 0, s_sc_w, s_sc_h)
+    if (dump_tex(path, back, s_bb_w, s_bb_h, 0, 0, s_bb_w, s_bb_h)
         && seq == 0)
         fprintf(stderr, "  [GPU] d3d11 back buffer dump: %s (%ux%u)%c", path,
-                s_sc_w, s_sc_h, 10);
+                s_bb_w, s_bb_h, 10);
     ID3D11Texture2D_Release(back);
 }
 
@@ -3996,7 +4082,8 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
 }
 
 /* The shown frame into the swap chain's back buffer, on black: copied, or
- * drawn through the filter chain (postfx_d3d11.c) when a filter is on. */
+ * drawn through the filter chain (postfx_d3d11.c) when a filter is on or
+ * the frame is drawn at another scale than the back buffer's. */
 static void shown_to_back(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -4006,11 +4093,14 @@ static void shown_to_back(void)
     if (s_shown >= 0
         && SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0,
                 &IID_ID3D11Texture2D, (void **)&back))) {
-        /* The shown rectangle at its surface's scale, at most the
-         * swap chain's size. An unscaled surface shown while the frame
-         * is scaled would sit small in the corner: said once. */
+        /* The shown rectangle at its surface's scale; the back buffer's
+         * scale (bx, by: host pixels per guest pixel, worked out as
+         * set_render_scale does, so equal sizes give equal scales). An
+         * unscaled surface shown while the frame is scaled: said once. */
         D3D11_BOX box;
         float sx = surf_sx(s_shown), sy = surf_sy(s_shown);
+        float bx = (float)s_bb_w / (float)SC_W;
+        float by = (float)s_bb_h / (float)SC_H;
         uint32_t bw = to_host(s_shown_x + s_shown_w, sx)
                     - to_host(s_shown_x, sx);
         uint32_t bh = to_host(s_shown_y + s_shown_h, sy)
@@ -4026,22 +4116,22 @@ static void shown_to_back(void)
         box.left = to_host(s_shown_x, sx);
         box.top = to_host(s_shown_y, sy);
         box.front = 0;
-        box.right = box.left + (bw < s_sc_w ? bw : s_sc_w);
-        box.bottom = box.top + (bh < s_sc_h ? bh : s_sc_h);
+        box.right = box.left + (bw < s_bb_w ? bw : s_bb_w);
+        box.bottom = box.top + (bh < s_bb_h ? bh : s_bb_h);
         box.back = 1;
-        if (s_surf[s_shown].gen != s_scale_gen
-            && (sx != s_rsx || sy != s_rsy)) {
-            /* Drawn before the render scale changed (a held frame, or the
-             * one presented right after the change): stretched to the new
-             * size instead of copied at the old one. */
-            uint32_t dw = to_host(s_shown_w, s_rsx);
-            uint32_t dh = to_host(s_shown_h, s_rsy);
-            float fw = (float)(dw < s_sc_w ? dw : s_sc_w);
-            float fh = (float)(dh < s_sc_h ? dh : s_sc_h);
-            if (!postfx_active()
-                || !postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
-                                (float)box.left, (float)box.top, (float)bw,
-                                (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
+        if (sx != bx || sy != by) {
+            /* Drawn at another scale: a render scale, or drawn before the
+             * render resolution changed (a held frame, or the one
+             * presented right after the change). Shrunk or stretched to
+             * the back buffer by the filter chain; bilinearly here if
+             * that cannot run. */
+            uint32_t dw = to_host(s_shown_w, bx);
+            uint32_t dh = to_host(s_shown_h, by);
+            float fw = (float)(dw < s_bb_w ? dw : s_bb_w);
+            float fh = (float)(dh < s_bb_h ? dh : s_bb_h);
+            if (!postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+                             (float)box.left, (float)box.top, (float)bw,
+                             (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
                 blit_stretch(s_surf[s_shown].tex, (float)box.left,
                              (float)box.top, (float)bw, (float)bh,
                              s_back_rtv, 0.0f, 0.0f, fw, fh);
@@ -4064,8 +4154,9 @@ static void shown_to_back(void)
 
 /* RECOMP_RES_FILE=<path> (debug): about once a second the present looks for
  * that file; when it is there, its first line ("WxH", or "off" for the
- * title's own size) goes to xbox_SetRenderRes and the file is deleted. Tests
- * render-size changes without a settings menu. */
+ * title's own size) goes to xbox_SetRenderRes, or ("scale N") N to
+ * xbox_SetRenderScale, and the file is deleted. Tests render-size changes
+ * without a settings menu. */
 static void res_file_poll(void)
 {
     static const char *path = (const char *)-1;
@@ -4086,19 +4177,28 @@ static void res_file_poll(void)
     fclose(f);
     remove(path);
     line[strcspn(line, "\r\n")] = 0;
+    if (!_strnicmp(line, "scale", 5)) {
+        int pct = 0;
+        sscanf(line + 5, "%d", &pct);
+        fprintf(stderr, "[GPU] d3d11: RECOMP_RES_FILE asks for %s%s%c", line,
+                xbox_SetRenderScale(pct) ? "" : " (refused)", 10);
+        return;
+    }
     if (_strnicmp(line, "off", 3) != 0 && sscanf(line, "%ux%u", &w, &h) != 2)
         w = h = 1;                      /* refused below */
     fprintf(stderr, "[GPU] d3d11: RECOMP_RES_FILE asks for %s%s%c",
             w ? line : "off", xbox_SetRenderRes(w, h) ? "" : " (refused)", 10);
 }
 
-/* The render size changed (xbox_SetRenderRes): swap chain, scale and depth
- * buffers follow, between two frames. Called before each present, held ones
- * too, so a change made while the game is paused shows at once. Colour
- * surfaces follow when next drawn into (surface_current). */
+/* The render size changed (xbox_SetRenderRes, xbox_SetRenderScale): swap
+ * chain, scale and depth buffers follow, between two frames. Called before
+ * each present, held ones too, so a change made while the game is paused
+ * shows at once. Colour surfaces follow when next drawn into
+ * (surface_current). A scale change alone leaves the swap chain as it is. */
 static void apply_render_res(void)
 {
     unsigned w = 0, h = 0;
+    uint32_t dw, dh;
     ID3D11Texture2D *back = NULL;
     HRESULT hr;
     int i;
@@ -4109,20 +4209,30 @@ static void apply_render_res(void)
         w = SC_W;
         h = SC_H;
     }
-    if (w == s_sc_w && h == s_sc_h)
+    draw_size(w, h, render_scale_pct(), &dw, &dh);
+    if (w == s_bb_w && h == s_bb_h && dw == s_sc_w && dh == s_sc_h)
         return;
-    set_render_scale(w, h);
-    s_scale_gen++;
-    /* Scaled depth buffers are remade at the new scale when next used; a
-     * title clears its depth buffer every frame, so nothing is lost. */
-    for (i = 0; i < GPU_ZETAS; i++)
-        if (s_zeta[i].tex && s_zeta[i].scaled) {
-            if (s_zeta[i].srv_s) ID3D11ShaderResourceView_Release(s_zeta[i].srv_s);
-            if (s_zeta[i].srv_z) ID3D11ShaderResourceView_Release(s_zeta[i].srv_z);
-            if (s_zeta[i].dsv) ID3D11DepthStencilView_Release(s_zeta[i].dsv);
-            ID3D11Texture2D_Release(s_zeta[i].tex);
-            memset(&s_zeta[i], 0, sizeof s_zeta[i]);
-        }
+    if (dw != s_sc_w || dh != s_sc_h) {
+        set_render_scale(dw, dh);
+        s_scale_gen++;
+        /* Scaled depth buffers are remade at the new scale when next
+         * used; a title clears its depth buffer every frame, so nothing
+         * is lost. */
+        for (i = 0; i < GPU_ZETAS; i++)
+            if (s_zeta[i].tex && s_zeta[i].scaled) {
+                if (s_zeta[i].srv_s) ID3D11ShaderResourceView_Release(s_zeta[i].srv_s);
+                if (s_zeta[i].srv_z) ID3D11ShaderResourceView_Release(s_zeta[i].srv_z);
+                if (s_zeta[i].dsv) ID3D11DepthStencilView_Release(s_zeta[i].dsv);
+                ID3D11Texture2D_Release(s_zeta[i].tex);
+                memset(&s_zeta[i], 0, sizeof s_zeta[i]);
+            }
+    }
+    if (w == s_bb_w && h == s_bb_h) {
+        fprintf(stderr, "[GPU] d3d11: frame now drawn at %ux%u (scaled %.3g"
+                " x %.3g) for %ux%u%c", s_sc_w, s_sc_h, s_rsx, s_rsy,
+                s_bb_w, s_bb_h, 10);
+        return;
+    }
     /* The back buffer must have no view left for ResizeBuffers. */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
     if (s_back_rtv) {
@@ -4140,10 +4250,10 @@ static void apply_render_res(void)
         if (FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
                 (ID3D11Resource *)back, NULL, &s_back_rtv)))
             fail("back buffer view", E_FAIL);
-        if (d.Width != w || d.Height != h) {
-            /* Still the old size: draw and present at what it is. */
-            set_render_scale(d.Width, d.Height);
-        }
+        /* Still the old size when it failed: presented at what it is,
+         * the frame shrunk or stretched onto it. */
+        s_bb_w = d.Width;
+        s_bb_h = d.Height;
         ID3D11Texture2D_Release(back);
     }
     if (!s_back_rtv) {
@@ -4152,9 +4262,10 @@ static void apply_render_res(void)
         s_swap = NULL;
         return;
     }
-    xbox_FramebufferWindowShapeChanged(s_sc_w, s_sc_h);
-    fprintf(stderr, "[GPU] d3d11: render resolution now %ux%u (frame scaled"
-            " %.3g x %.3g)%c", s_sc_w, s_sc_h, s_rsx, s_rsy, 10);
+    xbox_FramebufferWindowShapeChanged(s_bb_w, s_bb_h);
+    fprintf(stderr, "[GPU] d3d11: render resolution now %ux%u, frame drawn"
+            " at %ux%u (scaled %.3g x %.3g)%c", s_bb_w, s_bb_h, s_sc_w,
+            s_sc_h, s_rsx, s_rsy, 10);
 }
 
 static void d3d_present(void)
@@ -4213,7 +4324,7 @@ static void d3d_present(void)
             dump_back(seq);
             seq = -1;                   /* not again for a held frame */
             hold = overlay
-                 ? overlay(s_dev, s_ctx, s_back_rtv, s_sc_w, s_sc_h) : 0;
+                 ? overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h) : 0;
             /* No vsync: the title paces itself on the vblank the kernel
              * emulates, as it does with the software path. */
             uint64_t ct0 = ct_now();
@@ -4646,11 +4757,22 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
     {
         /* Not in shadow mode: its dumps must match the software path's
          * 640x480 pixel for pixel. */
-        unsigned w, h;
-        if (!shadow && xbox_RenderRes(&w, &h) && (w != SC_W || h != SC_H)) {
-            set_render_scale(w, h);
-            fprintf(stderr, "[GPU] d3d11: render resolution %ux%u (frame"
-                    " scaled %.3g x %.3g)%c", w, h, s_rsx, s_rsy, 10);
+        unsigned w = 0, h = 0;
+        uint32_t dw, dh;
+        if (!shadow) {
+            if (!xbox_RenderRes(&w, &h) || !w || !h) {
+                w = SC_W;
+                h = SC_H;
+            }
+            draw_size(w, h, render_scale_pct(), &dw, &dh);
+            s_bb_w = w;
+            s_bb_h = h;
+            if (dw != SC_W || dh != SC_H) {
+                set_render_scale(dw, dh);
+                fprintf(stderr, "[GPU] d3d11: render resolution %ux%u, frame"
+                        " drawn at %ux%u (scaled %.3g x %.3g)%c", w, h, dw,
+                        dh, s_rsx, s_rsy, 10);
+            }
         }
     }
     return &s_backend;
@@ -4662,6 +4784,19 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
 {
     (void)shadow;
     return NULL;
+}
+
+int xbox_SetRenderScale(int percent)
+{
+    (void)percent;
+    return 0;
+}
+
+int xbox_RenderScaleSize(unsigned *w, unsigned *h)
+{
+    *w = 640;
+    *h = 480;
+    return 100;
 }
 
 #endif
