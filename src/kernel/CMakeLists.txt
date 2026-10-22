@@ -34,6 +34,29 @@ set(KERNEL_SOURCES
     nv2a_combiner.c
 )
 
+if(WIN32)
+    # The filter chain's anti-aliasing shaders (third_party/, vendored) are
+    # compiled at run time like the rest of postfx_d3d11.c: their source
+    # goes into the library as text.
+    get_filename_component(XBOXRECOMP_ROOT_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+    foreach(pair "fxaa|fxaa/Fxaa3_11.h")
+        string(REPLACE "|" ";" pair "${pair}")
+        list(GET pair 0 name)
+        list(GET pair 1 in)
+        set(out "${CMAKE_CURRENT_BINARY_DIR}/postfx_text_${name}.c")
+        add_custom_command(OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND}
+                "-DIN=${XBOXRECOMP_ROOT_DIR}/third_party/${in}"
+                "-DOUT=${out}" "-DNAME=postfx_text_${name}"
+                -P "${XBOXRECOMP_ROOT_DIR}/cmake/embed_text.cmake"
+            DEPENDS "${XBOXRECOMP_ROOT_DIR}/third_party/${in}"
+                    "${XBOXRECOMP_ROOT_DIR}/cmake/embed_text.cmake"
+            VERBATIM)
+        list(APPEND KERNEL_SOURCES "${out}")
+    endforeach()
+endif()
+
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via
