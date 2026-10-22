@@ -60,6 +60,25 @@ MIT — ported from AMD FidelityFX CAS
   notice, is in LICENSES/FidelityFX-CAS.txt.
 
 
+NVIDIA FXAA 3.11 — included unchanged
+--------------------------------------
+
+  Downloaded from the TorqueGameEngines/Torque3D repository (MIT engine
+  that ships it unchanged), commit 4c44642, path
+  Templates/BaseGame/game/core/postFX/scripts/FXAA/Fxaa3_11.h; NVIDIA's own
+  GameWorks GraphicsSamples copy is no longer online.
+
+  third_party/fxaa/Fxaa3_11.h   NVIDIA FXAA 3.11 by Timothy Lottes
+                                (c) 2010, 2011 NVIDIA Corporation
+  src/kernel/postfx_d3d11.c     calls it for the anti-aliasing stage; the
+                                build embeds the header's text
+                                (cmake/embed_text.cmake)
+
+  NVIDIA published it for use in games; the header's own notice (copyright
+  and warranty disclaimer, no further licence text) is kept in the file and
+  repeated in LICENSES/FXAA-3.11.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

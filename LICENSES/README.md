@@ -13,3 +13,7 @@ a courtesy.
 
 `FidelityFX-CAS.txt` is AMD's MIT licence and copyright notice for FidelityFX
 CAS, whose sharpening filter `src/kernel/postfx_d3d11.c` ports (see NOTICE).
+
+`FXAA-3.11.txt` repeats NVIDIA's notice from the top of
+`third_party/fxaa/Fxaa3_11.h`, the anti-aliasing shader the filter chain
+compiles (see NOTICE).

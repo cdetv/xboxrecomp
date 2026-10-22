@@ -11,17 +11,23 @@
  *
  * The chain, in order (one full-screen draw per stage that is on):
  *
+ *   aa        anti-aliasing: NVIDIA FXAA 3.11 (RECOMP_AA=off|fxaa;
+ *             xbox_SetAntiAlias), off by default; its shader is compiled
+ *             the first time it is used
  *   sharpen   AMD FidelityFX CAS, sharpen-only (RECOMP_SHARPEN, percent;
  *             xbox_SetSharpen), 0 = off
  *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
  *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged;
  *             also the stretch of a frame drawn at an older render scale
  *
- * Every stage but the last draws into an intermediate texture (s_mid,
- * 16-bit float, the source rectangle's size), which the next one reads;
- * the last draws into the target. Sharpening runs at the source's own
- * size, before any stretch. The picture stage is left out when it would
- * only copy pixel for pixel behind another stage.
+ * Every stage but the last draws into an intermediate texture (s_mid, two
+ * taken in turn, 16-bit float, the source rectangle's size), which the
+ * next one reads; the last draws into the target. Anti-aliasing and
+ * sharpening run at the source's own size, before any stretch. The picture
+ * stage is left out when it would only copy pixel for pixel behind another
+ * stage. Anti-aliasing samples by texture coordinates, so a source
+ * rectangle that is not its whole texture is first copied out alone
+ * (s_in): what lies around it never bleeds in.
  *
  * Values come from the environment once, then only from the setters (no
  * getenv per frame). A menu changes them on the executor thread, between
@@ -44,7 +50,12 @@
 
 /* Each as float bits in a LONG, swapped whole. */
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
+static volatile LONG s_aa;            /* AA_*, a plain number */
 static int s_force;
+
+/* Anti-aliasing (xbox_SetAntiAlias; RECOMP_AA by these names). */
+enum { AA_OFF, AA_FXAA, AA_MODES };
+static const char *const s_aa_name[AA_MODES] = { "off", "fxaa" };
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 
 static LONG fbits(float f)
@@ -92,6 +103,22 @@ static float env_float(const char *name, float lo, float hi, float def)
 #define ADJ_HI   4.0f
 #define SHARP_HI 100.0f
 
+/* AA_OFF when unset or not one of s_aa_name. */
+static int env_aa(void)
+{
+    const char *v = getenv("RECOMP_AA");
+    int i;
+
+    if (!v || !*v)
+        return AA_OFF;
+    for (i = 0; i < AA_MODES; i++)
+        if (!_stricmp(v, s_aa_name[i]))
+            return i;
+    fprintf(stderr, "[GPU] postfx: RECOMP_AA=%s not off or fxaa; off%c", v,
+            10);
+    return AA_OFF;
+}
+
 static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
 {
     const char *f = getenv("RECOMP_POSTFX_FORCE");
@@ -99,18 +126,23 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     float c = env_float("RECOMP_CONTRAST", ADJ_LO, ADJ_HI, 1.0f);
     float s = env_float("RECOMP_SATURATION", ADJ_LO, ADJ_HI, 1.0f);
     float sh = env_float("RECOMP_SHARPEN", 0.0f, SHARP_HI, 0.0f);
+    int aa = env_aa();
 
     (void)once; (void)p; (void)ctx;
     InterlockedExchange(&s_gamma, fbits(g));
     InterlockedExchange(&s_contrast, fbits(c));
     InterlockedExchange(&s_saturation, fbits(s));
     InterlockedExchange(&s_sharpen, fbits(sh));
+    InterlockedExchange(&s_aa, aa);
     s_force = f && !strcmp(f, "1");
     if (g != 1.0f || c != 1.0f || s != 1.0f)
         fprintf(stderr, "[GPU] postfx: picture gamma %.2f contrast %.2f"
                 " saturation %.2f%c", g, c, s, 10);
     if (sh != 0.0f)
         fprintf(stderr, "[GPU] postfx: sharpen %.0f %%%c", sh, 10);
+    if (aa != AA_OFF)
+        fprintf(stderr, "[GPU] postfx: anti-aliasing %s%c", s_aa_name[aa],
+                10);
     if (s_force)
         fprintf(stderr, "[GPU] postfx: RECOMP_POSTFX_FORCE: the chain runs"
                 " even when every filter is off%c", 10);
@@ -163,6 +195,17 @@ int xbox_SetSharpen(float percent)
     return 1;
 }
 
+/* For a settings menu: anti-aliasing, 0 = off, 1 = FXAA. Applies from the
+ * next present. 1 when taken. */
+int xbox_SetAntiAlias(int mode)
+{
+    params();
+    if (mode < 0 || mode >= AA_MODES)
+        return 0;
+    InterlockedExchange(&s_aa, mode);
+    return 1;
+}
+
 static int picture_on(void)
 {
     return fval(&s_gamma) != 1.0f || fval(&s_contrast) != 1.0f
@@ -172,7 +215,8 @@ static int picture_on(void)
 int postfx_active(void)
 {
     params();
-    return s_force || picture_on() || fval(&s_sharpen) != 0.0f;
+    return s_force || picture_on() || fval(&s_sharpen) != 0.0f
+        || s_aa != AA_OFF;
 }
 
 /* ---- the passes ----------------------------------------------------------- */
@@ -235,28 +279,67 @@ static const char s_hlsl[] =
 "  return float4(sqrt(o), pt.Load(int3(q, 0)).a);\n"
 "}\n";
 
+/* fps, the anti-aliasing stage: NVIDIA FXAA 3.11 (third_party/fxaa/
+ * Fxaa3_11.h, unchanged; its text is built into the library by
+ * cmake/embed_text.cmake), the PC quality shader at preset 39 (the
+ * highest), luma from green (the game's colours have none in alpha), and
+ * the header's own default strengths: subpixel 0.75, edge threshold 0.166,
+ * minimum 0.0833. Compiled after s_hlsl (constants and texture) and the
+ * defines below. pk.xy: one over the texture's size. Alpha is the
+ * source's, not FXAA's luma.
+ *
+ *   NVIDIA FXAA 3.11 by Timothy Lottes, (c) 2010, 2011 NVIDIA
+ *   Corporation; its notice is in the header (see NOTICE). */
+static const char s_fxaa_pre[] =
+"#define FXAA_PC 1\n"
+"#define FXAA_HLSL_5 1\n"
+"#define FXAA_QUALITY__PRESET 39\n"
+"#define FXAA_GREEN_AS_LUMA 1\n";
+static const char s_fxaa_main[] =
+"float4 fps(float4 p : SV_Position) : SV_Target {\n"
+"  float2 q = p.xy - po.xy + pl.xy;\n"
+"  FxaaTex t;\n"
+"  t.smpl = psm;\n"
+"  t.tex = pt;\n"
+"  float4 c = FxaaPixelShader(q * pk.xy, 0.0, t, t, t, pk.xy, 0.0, 0.0,\n"
+"                             0.0, 0.75, 0.166, 0.0833, 0.0, 0.0, 0.0,\n"
+"                             0.0);\n"
+"  return float4(c.rgb, pt.Load(int3(q, 0)).a);\n"
+"}\n";
+extern const unsigned char postfx_text_fxaa[];
+extern const unsigned postfx_text_fxaa_len;
+
 static ID3D11Device          *s_dev;      /* the objects below are its */
 static ID3D11VertexShader    *s_vs;
 static ID3D11PixelShader     *s_ps;       /* picture */
 static ID3D11PixelShader     *s_cas;      /* sharpen */
+static ID3D11PixelShader     *s_fxaa;     /* aa (FXAA), made on first use */
 static ID3D11Buffer          *s_cb;
 static ID3D11SamplerState    *s_samp;
 static ID3D11RasterizerState *s_rs;
 static int                    s_broken;   /* could not be made: copy */
+static int                    s_aa_broken;  /* FXAA: none, said once */
 
-/* Between two stages: made at the source rectangle's size, again when that
- * changes. */
-static ID3D11Texture2D          *s_mid;
-static ID3D11RenderTargetView   *s_mid_rtv;
-static ID3D11ShaderResourceView *s_mid_srv;
-static UINT                      s_mid_w, s_mid_h;
+/* A texture the chain draws into or copies to: made at a size, again when
+ * that changes. */
+typedef struct {
+    ID3D11Texture2D          *tex;
+    ID3D11RenderTargetView   *rtv;      /* NULL for s_in */
+    ID3D11ShaderResourceView *srv;
+    UINT                      w, h;
+    DXGI_FORMAT               fmt;
+} Surf;
 
-static ID3DBlob *compile(const char *entry, const char *target)
+static Surf s_mid[2];   /* between stages, taken in turn */
+static Surf s_in;       /* the source rectangle alone, for anti-aliasing */
+
+static ID3DBlob *compile(const char *src, size_t len, const char *entry,
+                         const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "postfx_d3d11", NULL,
-                            NULL, entry, target,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    HRESULT hr = D3DCompile(src, len, "postfx_d3d11", NULL, NULL, entry,
+                            target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code,
+                            &err);
     if (FAILED(hr)) {
         fprintf(stderr, "[GPU] postfx: shader %s failed: %s%c", entry,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?",
@@ -269,10 +352,11 @@ static ID3DBlob *compile(const char *entry, const char *target)
     return code;
 }
 
-static HRESULT make_ps(ID3D11Device *dev, const char *entry,
-                       ID3D11PixelShader **ps)
+static HRESULT make_ps_from(ID3D11Device *dev, const char *src, size_t len,
+                            const char *entry, const char *target,
+                            ID3D11PixelShader **ps)
 {
-    ID3DBlob *code = compile(entry, "ps_4_0");
+    ID3DBlob *code = compile(src, len, entry, target);
     HRESULT hr;
 
     if (!code)
@@ -281,6 +365,50 @@ static HRESULT make_ps(ID3D11Device *dev, const char *entry,
             ID3D10Blob_GetBufferSize(code), NULL, ps);
     ID3D10Blob_Release(code);
     return hr;
+}
+
+static HRESULT make_ps(ID3D11Device *dev, const char *entry,
+                       ID3D11PixelShader **ps)
+{
+    return make_ps_from(dev, s_hlsl, sizeof s_hlsl - 1, entry, "ps_4_0", ps);
+}
+
+/* The FXAA shader, the first time anti-aliasing is on (it takes a moment
+ * to compile). 0 (said once) when it cannot be made: anti-aliasing is
+ * then skipped. */
+static int fxaa_setup(ID3D11Device *dev)
+{
+    size_t n1 = sizeof s_hlsl - 1, n2 = sizeof s_fxaa_pre - 1;
+    size_t n3 = postfx_text_fxaa_len, n4 = sizeof s_fxaa_main - 1;
+    char *src;
+    DWORD t0;
+    HRESULT hr;
+
+    if (s_fxaa)
+        return 1;
+    if (s_aa_broken)
+        return 0;
+    src = (char *)malloc(n1 + n2 + n3 + n4);
+    if (!src) {
+        s_aa_broken = 1;
+        return 0;
+    }
+    memcpy(src, s_hlsl, n1);
+    memcpy(src + n1, s_fxaa_pre, n2);
+    memcpy(src + n1 + n2, postfx_text_fxaa, n3);
+    memcpy(src + n1 + n2 + n3, s_fxaa_main, n4);
+    t0 = GetTickCount();
+    hr = make_ps_from(dev, src, n1 + n2 + n3 + n4, "fps", "ps_5_0", &s_fxaa);
+    free(src);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[GPU] postfx: FXAA could not be made (hr 0x%08lX);"
+                " anti-aliasing skipped%c", (unsigned long)hr, 10);
+        s_aa_broken = 1;
+        return 0;
+    }
+    fprintf(stderr, "[GPU] postfx: FXAA ready (%lu ms)%c",
+            (unsigned long)(GetTickCount() - t0), 10);
+    return 1;
 }
 
 /* The pipeline objects, made on first use. 0 (said once) when they cannot
@@ -298,7 +426,7 @@ static int setup(ID3D11Device *dev)
     if (s_broken)
         return 0;
     s_dev = dev;
-    vs = compile("pvs", "vs_4_0");
+    vs = compile(s_hlsl, sizeof s_hlsl - 1, "pvs", "vs_4_0");
     hr = vs ? S_OK : E_FAIL;
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateVertexShader(dev,
@@ -341,53 +469,54 @@ static int setup(ID3D11Device *dev)
     return 1;
 }
 
-static void mid_free(void)
+static void surf_free(Surf *s)
 {
-    if (s_mid_srv) ID3D11ShaderResourceView_Release(s_mid_srv);
-    if (s_mid_rtv) ID3D11RenderTargetView_Release(s_mid_rtv);
-    if (s_mid) ID3D11Texture2D_Release(s_mid);
-    s_mid_srv = NULL;
-    s_mid_rtv = NULL;
-    s_mid = NULL;
-    s_mid_w = s_mid_h = 0;
+    if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
+    if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
+    if (s->tex) ID3D11Texture2D_Release(s->tex);
+    memset(s, 0, sizeof *s);
 }
 
-/* The intermediate texture at w x h. 0 (said once) when it cannot be made. */
-static int mid_fit(ID3D11Device *dev, UINT w, UINT h)
+/* s at w x h in format fmt, a render target too when rt. 0 (said once)
+ * when it cannot be made. */
+static int surf_fit(ID3D11Device *dev, Surf *s, UINT w, UINT h,
+                    DXGI_FORMAT fmt, int rt)
 {
     D3D11_TEXTURE2D_DESC td;
     HRESULT hr;
 
-    if (s_mid && s_mid_w == w && s_mid_h == h)
+    if (s->tex && s->w == w && s->h == h && s->fmt == fmt)
         return 1;
-    mid_free();
+    surf_free(s);
     memset(&td, 0, sizeof td);
     td.Width = w;
     td.Height = h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    td.Format = fmt;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    hr = ID3D11Device_CreateTexture2D(dev, &td, NULL, &s_mid);
-    if (SUCCEEDED(hr))
-        hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)s_mid,
-                                                 NULL, &s_mid_rtv);
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE
+                 | (rt ? D3D11_BIND_RENDER_TARGET : 0);
+    hr = ID3D11Device_CreateTexture2D(dev, &td, NULL, &s->tex);
+    if (SUCCEEDED(hr) && rt)
+        hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)s->tex,
+                                                 NULL, &s->rtv);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateShaderResourceView(dev,
-                (ID3D11Resource *)s_mid, NULL, &s_mid_srv);
+                (ID3D11Resource *)s->tex, NULL, &s->srv);
     if (FAILED(hr)) {
         static int said;
         if (!said++)
-            fprintf(stderr, "[GPU] postfx: no %ux%u intermediate texture (hr"
-                    " 0x%08lX); sharpening skipped%c", w, h,
-                    (unsigned long)hr, 10);
-        mid_free();
+            fprintf(stderr, "[GPU] postfx: no %ux%u texture (format %d, hr"
+                    " 0x%08lX) for the chain; stages skipped%c", w, h,
+                    (int)fmt, (unsigned long)hr, 10);
+        surf_free(s);
         return 0;
     }
-    s_mid_w = w;
-    s_mid_h = h;
+    s->w = w;
+    s->h = h;
+    s->fmt = fmt;
     return 1;
 }
 
@@ -440,18 +569,20 @@ static int run_pass(ID3D11DeviceContext *ctx, ID3D11PixelShader *ps,
     return 1;
 }
 
+enum { ST_AA, ST_SHARPEN, ST_PICTURE };
+
 int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                 ID3D11Texture2D *src, float sx0, float sy0, float sw,
                 float sh, ID3D11RenderTargetView *dst, float dx0, float dy0,
                 float dw, float dh)
 {
     D3D11_TEXTURE2D_DESC td;
-    ID3D11ShaderResourceView *srv = NULL;
+    ID3D11ShaderResourceView *srv = NULL, *in;
     float k[20], sharpen = fval(&s_sharpen);
-    float tw, th;
+    float tw, th, ix0, iy0;
+    UINT mw = (UINT)(sw + 0.5f), mh = (UINT)(sh + 0.5f);
     int same = sw == dw && sh == dh;
-    int pic = sharpen == 0.0f || !same || picture_on();
-    int ok = 1;
+    int aa = s_aa, pic, stage[3], n = 0, i, ok = 1;
 
     if (!src || !dst || dw < 1.0f || dh < 1.0f || sw <= 0.0f || sh <= 0.0f
         || !setup(dev))
@@ -460,58 +591,104 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     if (FAILED(ID3D11Device_CreateShaderResourceView(dev,
             (ID3D11Resource *)src, NULL, &srv)))
         return 0;
+    in = srv;
     tw = (float)td.Width;
     th = (float)td.Height;
-    memset(k, 0, sizeof k);
+    ix0 = sx0;
+    iy0 = sy0;
 
-    if (sharpen != 0.0f) {
-        UINT mw = (UINT)(sw + 0.5f), mh = (UINT)(sh + 0.5f);
-        /* Into the intermediate texture when the picture stage follows,
-         * else straight into the target. */
-        if (!pic || mid_fit(dev, mw, mh)) {
-            k[4] = pic ? 0.0f : dx0;
-            k[5] = pic ? 0.0f : dy0;
-            k[8] = sx0;
-            k[9] = sy0;
-            k[10] = sx0 + sw;
-            k[11] = sy0 + sh;
+    if (aa != AA_OFF && !fxaa_setup(dev))
+        aa = AA_OFF;
+    if (aa != AA_OFF && (sx0 != 0.0f || sy0 != 0.0f || (float)mw != tw
+                         || (float)mh != th)) {
+        /* The rectangle alone, so that sampling around its edge clamps
+         * there instead of reading what lies next to it. */
+        if (surf_fit(dev, &s_in, mw, mh, td.Format, 0)) {
+            D3D11_BOX box;
+            box.left = (UINT)sx0;
+            box.top = (UINT)sy0;
+            box.front = 0;
+            box.right = box.left + mw;
+            box.bottom = box.top + mh;
+            box.back = 1;
+            ID3D11DeviceContext_CopySubresourceRegion(ctx,
+                    (ID3D11Resource *)s_in.tex, 0, 0, 0, 0,
+                    (ID3D11Resource *)src, 0, &box);
+            in = s_in.srv;
+            tw = (float)mw;
+            th = (float)mh;
+            ix0 = iy0 = 0.0f;
+        } else {
+            aa = AA_OFF;
+        }
+    }
+
+    /* The stages that are on; every one but the last draws into s_mid. */
+    pic = (aa == AA_OFF && sharpen == 0.0f) || !same || picture_on();
+    if (aa != AA_OFF)
+        stage[n++] = ST_AA;
+    if (sharpen != 0.0f)
+        stage[n++] = ST_SHARPEN;
+    if (pic)
+        stage[n++] = ST_PICTURE;
+    if ((n > 1 && !surf_fit(dev, &s_mid[0], mw, mh,
+                            DXGI_FORMAT_R16G16B16A16_FLOAT, 1))
+        || (n > 2 && !surf_fit(dev, &s_mid[1], mw, mh,
+                               DXGI_FORMAT_R16G16B16A16_FLOAT, 1))) {
+        /* Only the picture stage, from the source itself. */
+        n = 0;
+        stage[n++] = ST_PICTURE;
+        in = srv;
+        tw = (float)td.Width;
+        th = (float)td.Height;
+        ix0 = sx0;
+        iy0 = sy0;
+    }
+
+    for (i = 0; ok && i < n; i++) {
+        int last = i == n - 1;
+        Surf *o = last ? NULL : &s_mid[i & 1];
+        ID3D11RenderTargetView *rtv = last ? dst : o->rtv;
+        float ox = last ? dx0 : 0.0f, oy = last ? dy0 : 0.0f;
+        float ow = last ? dw : (float)mw, oh = last ? dh : (float)mh;
+
+        memset(k, 0, sizeof k);
+        k[4] = ox;
+        k[5] = oy;
+        k[8] = ix0;
+        k[9] = iy0;
+        k[10] = ix0 + sw;
+        k[11] = iy0 + sh;
+        switch (stage[i]) {
+        case ST_AA:
+            k[0] = 1.0f / tw;
+            k[1] = 1.0f / th;
+            ok = run_pass(ctx, s_fxaa, in, rtv, ox, oy, ow, oh, k);
+            break;
+        case ST_SHARPEN:
             /* 100 % = CasSetup's sharpness 1 (-1/5); AMD's default,
              * sharpness 0 (-1/8), is 62.5 %. */
             k[16] = -0.2f * sharpen / 100.0f;
-            if (pic) {
-                ok = run_pass(ctx, s_cas, srv, s_mid_rtv, 0.0f, 0.0f,
-                              (float)mw, (float)mh, k);
-                ID3D11ShaderResourceView_Release(srv);
-                srv = s_mid_srv;
-                ID3D11ShaderResourceView_AddRef(srv);
-                tw = (float)mw;
-                th = (float)mh;
-                sx0 = sy0 = 0.0f;
-            } else {
-                ok = run_pass(ctx, s_cas, srv, dst, dx0, dy0, dw, dh, k);
-            }
-        } else {
-            pic = 1;
+            ok = run_pass(ctx, s_cas, in, rtv, ox, oy, ow, oh, k);
+            break;
+        default:
+            k[0] = sw / (dw * tw);
+            k[1] = sh / (dh * th);
+            k[2] = ix0 / tw;
+            k[3] = iy0 / th;
+            k[6] = same ? 1.0f : 0.0f;
+            k[12] = fval(&s_gamma);
+            k[13] = fval(&s_contrast);
+            k[14] = fval(&s_saturation);
+            ok = run_pass(ctx, s_ps, in, rtv, ox, oy, ow, oh, k);
+            break;
         }
-    }
-    if (ok && pic) {
-        k[0] = sw / (dw * tw);
-        k[1] = sh / (dh * th);
-        k[2] = sx0 / tw;
-        k[3] = sy0 / th;
-        k[4] = dx0;
-        k[5] = dy0;
-        k[6] = same ? 1.0f : 0.0f;
-        k[7] = 0.0f;
-        k[8] = sx0;
-        k[9] = sy0;
-        k[10] = sx0 + sw;
-        k[11] = sy0 + sh;
-        k[12] = fval(&s_gamma);
-        k[13] = fval(&s_contrast);
-        k[14] = fval(&s_saturation);
-        k[15] = 0.0f;
-        ok = run_pass(ctx, s_ps, srv, dst, dx0, dy0, dw, dh, k);
+        if (!last) {
+            in = o->srv;
+            tw = (float)mw;
+            th = (float)mh;
+            ix0 = iy0 = 0.0f;
+        }
     }
     ID3D11ShaderResourceView_Release(srv);
     return ok;
@@ -528,6 +705,12 @@ int xbox_SetPicture(float gamma, float contrast, float saturation)
 int xbox_SetSharpen(float percent)
 {
     (void)percent;
+    return 0;
+}
+
+int xbox_SetAntiAlias(int mode)
+{
+    (void)mode;
     return 0;
 }
 
