@@ -40,7 +40,7 @@ if(WIN32)
     # goes into the library as text.
     get_filename_component(XBOXRECOMP_ROOT_DIR
         "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-    foreach(pair "fxaa|fxaa/Fxaa3_11.h")
+    foreach(pair "fxaa|fxaa/Fxaa3_11.h" "smaa|smaa/SMAA.hlsl")
         string(REPLACE "|" ";" pair "${pair}")
         list(GET pair 0 name)
         list(GET pair 1 in)
@@ -69,6 +69,9 @@ target_include_directories(xbox_kernel PUBLIC
 )
 
 if(WIN32)
+    # SMAA's lookup images, as C headers (postfx_d3d11.c).
+    target_include_directories(xbox_kernel PRIVATE
+        "${XBOXRECOMP_ROOT_DIR}/third_party")
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt
