@@ -27,13 +27,20 @@
  *             instead, at the same setting
  *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
  *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged
+ *   crt       scanlines, or a CRT look: scanlines plus a slight curve,
+ *             glow and vignette (RECOMP_CRT=off|scanlines|crt,
+ *             RECOMP_CRT_STRENGTH percent; xbox_SetCrt), off by default.
+ *             The scanlines are the title's 480 lines over the target
+ *             rectangle's height at any size; CRT's glow is three more
+ *             small draws first (shrink to 240 lines, blur across, down)
  *
  * Every stage but the last draws into an intermediate texture (s_mid[i]
  * for stage i, 16-bit float, the size that stage puts out: the source
  * rectangle's before the scale stage, the target's from it on), which the
  * next one reads; the last draws into the target. Anti-aliasing runs at
  * the source's own size, sharpening at the target's. The picture stage is
- * left out when it would only copy pixel for pixel behind another stage;
+ * left out when it would only copy pixel for pixel behind another stage
+ * (the crt stage reads the frame itself when it is the target's size);
  * a bilinear stretch with no sharpening is done by the picture stage
  * itself, one draw. Anti-aliasing and EASU sample by texture coordinates,
  * so a source rectangle that is not its whole texture is first copied out
@@ -64,6 +71,8 @@
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
 static volatile LONG s_aa;            /* AA_*, a plain number */
 static volatile LONG s_upscale;       /* UP_*, a plain number */
+static volatile LONG s_crt;           /* CRT_*, a plain number */
+static volatile LONG s_crt_strength;  /* percent, float bits */
 static int s_force;
 
 /* Anti-aliasing (xbox_SetAntiAlias; RECOMP_AA by these names). */
@@ -73,6 +82,11 @@ static const char *const s_aa_name[AA_MODES] = { "off", "fxaa", "smaa" };
 /* The upscaler (xbox_SetUpscaler; RECOMP_UPSCALER by these names). */
 enum { UP_BILINEAR, UP_FSR, UP_MODES };
 static const char *const s_up_name[UP_MODES] = { "bilinear", "fsr" };
+
+/* Scanlines or a CRT look (xbox_SetCrt; RECOMP_CRT by these names). */
+enum { CRT_OFF, CRT_SCANLINES, CRT_CRT, CRT_MODES };
+static const char *const s_crt_name[CRT_MODES] = { "off", "scanlines",
+                                                    "crt" };
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 
 static LONG fbits(float f)
@@ -119,6 +133,8 @@ static float env_float(const char *name, float lo, float hi, float def)
 #define ADJ_LO   0.0f
 #define ADJ_HI   4.0f
 #define SHARP_HI 100.0f
+#define CRT_HI   100.0f
+#define CRT_DEF  50.0f    /* strength when only RECOMP_CRT is given */
 
 /* Variable name's value among names[0..n-1] (any case); 0 when unset or
  * not one of them (said, with what). */
@@ -148,6 +164,9 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     int aa = env_choice("RECOMP_AA", s_aa_name, AA_MODES, "off, fxaa or smaa");
     int up = env_choice("RECOMP_UPSCALER", s_up_name, UP_MODES,
                         "bilinear or fsr");
+    int crt = env_choice("RECOMP_CRT", s_crt_name, CRT_MODES,
+                         "off, scanlines or crt");
+    float cs = env_float("RECOMP_CRT_STRENGTH", 0.0f, CRT_HI, CRT_DEF);
 
     (void)once; (void)p; (void)ctx;
     InterlockedExchange(&s_gamma, fbits(g));
@@ -156,6 +175,8 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     InterlockedExchange(&s_sharpen, fbits(sh));
     InterlockedExchange(&s_aa, aa);
     InterlockedExchange(&s_upscale, up);
+    InterlockedExchange(&s_crt, crt);
+    InterlockedExchange(&s_crt_strength, fbits(cs));
     s_force = f && !strcmp(f, "1");
     if (g != 1.0f || c != 1.0f || s != 1.0f)
         fprintf(stderr, "[GPU] postfx: picture gamma %.2f contrast %.2f"
@@ -167,6 +188,9 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
                 10);
     if (up != UP_BILINEAR)
         fprintf(stderr, "[GPU] postfx: upscaler %s%c", s_up_name[up], 10);
+    if (crt != CRT_OFF)
+        fprintf(stderr, "[GPU] postfx: %s %.0f %%%c", s_crt_name[crt], cs,
+                10);
     if (s_force)
         fprintf(stderr, "[GPU] postfx: RECOMP_POSTFX_FORCE: the chain runs"
                 " even when every filter is off%c", 10);
@@ -242,17 +266,45 @@ int xbox_SetUpscaler(int mode)
     return 1;
 }
 
+/* For a settings menu: 0 = off, 1 = scanlines, 2 = CRT (scanlines, curve,
+ * glow), and its strength in percent (0 = off too). A negative value keeps
+ * that one as it is. Applies from the next present. 1 when every value
+ * given was taken; one out of range is refused and the other still taken. */
+int xbox_SetCrt(int mode, float strength)
+{
+    int ok = 1;
+
+    params();
+    if (mode >= CRT_MODES)
+        ok = 0;
+    else if (mode >= 0)
+        InterlockedExchange(&s_crt, mode);
+    if (strength >= 0.0f) {
+        if (in_range(strength, 0.0f, CRT_HI))
+            InterlockedExchange(&s_crt_strength, fbits(strength));
+        else
+            ok = 0;
+    }
+    return ok;
+}
+
 static int picture_on(void)
 {
     return fval(&s_gamma) != 1.0f || fval(&s_contrast) != 1.0f
         || fval(&s_saturation) != 1.0f;
 }
 
+/* The crt stage's mode, CRT_OFF at strength 0. */
+static int crt_mode(void)
+{
+    return fval(&s_crt_strength) > 0.0f ? (int)s_crt : CRT_OFF;
+}
+
 int postfx_active(void)
 {
     params();
     return s_force || picture_on() || fval(&s_sharpen) != 0.0f
-        || s_aa != AA_OFF;
+        || s_aa != AA_OFF || crt_mode() != CRT_OFF;
 }
 
 /* ---- the passes ----------------------------------------------------------- */
@@ -268,6 +320,22 @@ int postfx_active(void)
  * back exactly what it read. Stretching (po.z zero), it samples
  * bilinearly, clamped to pc (the source rectangle's outermost pixel
  * centres, in texture units) so nothing beside the rectangle bleeds in.
+ *
+ * tps, the crt stage, pixel for pixel over po.zw (the viewport's size),
+ * the source rectangle pl, pk.xy one over the texture's size; pa: the
+ * title's line count (480), the scanlines' strength (0 = none), the
+ * curve and the glow (0 = none); pc.x: the vignette's power (0 = none).
+ * In linear light (the sRGB curve). Curved, each pixel reads the frame
+ * bilinearly where the bulge puts it (clamped to the rectangle), and
+ * black beyond the frame's edge, smoothed over a pixel. The scanlines dim
+ * the gap between two of the title's lines along a cosine, averaged over
+ * the pixel's own height (exactly, by its integral), so a size that is no
+ * whole number of pixels per line shows no stripes; bright light dims
+ * less, as a CRT's wider beam would. The glow (t4, the frame shrunk and
+ * blurred, gps) is added after them, so it fills their gaps.
+ *
+ * gps, the glow's blur: 17 taps of a Gaussian (sigma 3 pixels) along
+ * pk.zw (1,0 across, 0,1 down), clamped to the texture (pl.zw, its size).
  *
  * zps, the scale stage's shrink: each target pixel covers pk.xy source
  * pixels (above 1); it is the average of every source pixel under it,
@@ -343,6 +411,49 @@ static const char s_hlsl[] =
 "  float3 v = saturate(s.rgb / n);\n"
 "  v = v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;\n"
 "  return float4(v, s.a / n);\n"
+"}\n"
+"Texture2D tg : register(t4);\n"
+"float4 tps(float4 p : SV_Position) : SV_Target {\n"
+"  float2 u = (p.xy - po.xy) / po.zw;\n"
+"  float m = 1.0;\n"
+"  float4 c;\n"
+"  [branch] if (pa.z != 0.0) {\n"
+"    float2 d = u * 2.0 - 1.0;\n"
+"    d *= 1.0 + d.yx * d.yx * pa.z * float2(0.75, 1.0);\n"
+"    u = d * 0.5 + 0.5;\n"
+"    float2 e = min(u, 1.0 - u) * po.zw;\n"
+"    m = saturate(e.x + 0.5) * saturate(e.y + 0.5);\n"
+"    c = pt.SampleLevel(psm, clamp(pl.xy + u * (pl.zw - pl.xy), pl.xy + 0.5,\n"
+"                                  pl.zw - 0.5) * pk.xy, 0);\n"
+"  } else {\n"
+"    c = pt.Load(int3(p.xy - po.xy + pl.xy, 0));\n"
+"  }\n"
+"  float3 v = zlin(saturate(c.rgb));\n"
+"  [branch] if (pa.y != 0.0) {\n"
+"    float f = pa.x / po.w, y = u.y * pa.x;\n"
+"    float g = 0.5 + (sin(6.2831853 * (y + 0.5 * f))\n"
+"                     - sin(6.2831853 * (y - 0.5 * f))) / (12.566371 * f);\n"
+"    v *= 1.0 - pa.y * g * (1.0 - 0.5 * v);\n"
+"  }\n"
+"  [branch] if (pa.w != 0.0)\n"
+"    v += pa.w * zlin(saturate(tg.SampleLevel(psm, u, 0).rgb));\n"
+"  [branch] if (pc.x != 0.0)\n"
+"    m *= pow(saturate(16.0 * u.x * u.y * (1.0 - u.x) * (1.0 - u.y)), pc.x);\n"
+"  v = saturate(v * m);\n"
+"  v = v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;\n"
+"  return float4(v, c.a);\n"
+"}\n"
+"float4 gps(float4 p : SV_Position) : SV_Target {\n"
+"  int2 q = int2(p.xy - po.xy), dv = int2(pk.zw);\n"
+"  float4 s = 0.0;\n"
+"  float n = 0.0;\n"
+"  [unroll] for (int i = -8; i <= 8; i++) {\n"
+"    float w = exp(-i * i / 18.0);\n"
+"    s += pt.Load(int3(clamp(q + dv * i, int2(0, 0), int2(pl.zw) - 1), 0))\n"
+"         * w;\n"
+"    n += w;\n"
+"  }\n"
+"  return s / n;\n"
 "}\n";
 
 /* fps, the anti-aliasing stage: NVIDIA FXAA 3.11 (third_party/fxaa/
@@ -508,6 +619,8 @@ static ID3D11VertexShader    *s_vs;
 static ID3D11PixelShader     *s_ps;       /* picture */
 static ID3D11PixelShader     *s_cas;      /* sharpen */
 static ID3D11PixelShader     *s_shrink;   /* scale, bigger to smaller */
+static ID3D11PixelShader     *s_crtps;    /* crt */
+static ID3D11PixelShader     *s_blur;     /* crt's glow */
 static ID3D11PixelShader     *s_easu;     /* scale (FSR), made on first use */
 static ID3D11PixelShader     *s_rcas;     /* sharpen behind EASU, with it */
 static int                    s_fsr_broken;  /* not made, said once */
@@ -537,10 +650,11 @@ typedef struct {
     DXGI_FORMAT               fmt;
 } Surf;
 
-static Surf s_mid[3];   /* stage i's output, when not the last */
+static Surf s_mid[4];   /* stage i's output, when not the last */
 static Surf s_in;       /* the source rectangle alone, for anti-aliasing */
 static Surf s_edges;    /* SMAA's edges and blend weights */
 static Surf s_blend;
+static Surf s_glow[2];  /* CRT's glow: shrunk, blurred across, down */
 
 static ID3DBlob *compile(const char *src, size_t len, const char *entry,
                          const char *target)
@@ -817,6 +931,10 @@ static int setup(ID3D11Device *dev)
         hr = make_ps(dev, "cps", &s_cas);
     if (SUCCEEDED(hr))
         hr = make_ps(dev, "zps", &s_shrink);
+    if (SUCCEEDED(hr))
+        hr = make_ps(dev, "tps", &s_crtps);
+    if (SUCCEEDED(hr))
+        hr = make_ps(dev, "gps", &s_blur);
     if (SUCCEEDED(hr)) {
         memset(&bd, 0, sizeof bd);
         bd.ByteWidth = 80;
@@ -932,8 +1050,8 @@ static int run_draw(ID3D11DeviceContext *ctx, ID3D11VertexShader *vs,
                     ID3D11RenderTargetView *dst, float dx0, float dy0,
                     float dw, float dh, const float *k)
 {
-    static ID3D11ShaderResourceView *const none[4] = { NULL, NULL, NULL,
-                                                       NULL };
+    static ID3D11ShaderResourceView *const none[5] = { NULL, NULL, NULL,
+                                                       NULL, NULL };
     ID3D11SamplerState *samp[2];
     D3D11_MAPPED_SUBRESOURCE m;
     D3D11_VIEWPORT vp;
@@ -1028,7 +1146,48 @@ static int smaa_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                     (float)w, (float)h, k);
 }
 
-enum { ST_AA, ST_SCALE, ST_SHARPEN, ST_PICTURE };
+#define CRT_LINES  480.0f   /* the title's own lines: the scanlines' count */
+#define GLOW_LINES 240u     /* the glow's height before its blur */
+
+/* CRT's glow: the input rectangle (k[8..11], as for the stage) shrunk by
+ * area to GLOW_LINES, keeping its shape, then blurred across and down,
+ * into s_glow[0]. Its view; NULL (no glow) when it could not be made. */
+static ID3D11ShaderResourceView *glow_make(ID3D11Device *dev,
+                                           ID3D11DeviceContext *ctx,
+                                           ID3D11ShaderResourceView *in,
+                                           const float *k, float cw, float ch)
+{
+    float g[20];
+    UINT gh = ch < (float)GLOW_LINES ? (UINT)ch : GLOW_LINES;
+    UINT gw = (UINT)(cw * (float)gh / ch + 0.5f);
+
+    if (gh < 1 || gw < 1
+        || !surf_fit(dev, &s_glow[0], gw, gh, DXGI_FORMAT_R16G16B16A16_FLOAT, 1)
+        || !surf_fit(dev, &s_glow[1], gw, gh, DXGI_FORMAT_R16G16B16A16_FLOAT, 1))
+        return NULL;
+    memset(g, 0, sizeof g);
+    g[0] = cw / (float)gw;
+    g[1] = ch / (float)gh;
+    memcpy(g + 8, k + 8, 4 * sizeof *g);
+    if (!run_pass(ctx, s_shrink, in, s_glow[0].rtv, 0.0f, 0.0f, (float)gw,
+                  (float)gh, g))
+        return NULL;
+    memset(g, 0, sizeof g);
+    g[2] = 1.0f;
+    g[10] = (float)gw;
+    g[11] = (float)gh;
+    if (!run_pass(ctx, s_blur, s_glow[0].srv, s_glow[1].rtv, 0.0f, 0.0f,
+                  (float)gw, (float)gh, g))
+        return NULL;
+    g[2] = 0.0f;
+    g[3] = 1.0f;
+    if (!run_pass(ctx, s_blur, s_glow[1].srv, s_glow[0].rtv, 0.0f, 0.0f,
+                  (float)gw, (float)gh, g))
+        return NULL;
+    return s_glow[0].srv;
+}
+
+enum { ST_AA, ST_SCALE, ST_SHARPEN, ST_PICTURE, ST_CRT };
 enum { SC_NONE, SC_SHRINK, SC_BILINEAR, SC_FSR };
 
 /* pps's stretch (po.z zero) of the rectangle ix0,iy0 cw x ch of a tw x th
@@ -1054,11 +1213,11 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11ShaderResourceView *srv = NULL, *in;
-    float k[20], sharpen;
+    float k[20], sharpen, crt_s;
     float tw, th, ix0, iy0, cw, ch;
     UINT mw = (UINT)(sw + 0.5f), mh = (UINT)(sh + 0.5f);
     UINT ow = (UINT)(dw + 0.5f), oh = (UINT)(dh + 0.5f);
-    int aa, scale = SC_NONE, whole, pic, stage[4], n = 0, i, ok = 1;
+    int aa, crt, scale = SC_NONE, whole, pic, stage[5], n = 0, i, ok = 1;
 
     /* The values, read here too: a frame of another size comes here
      * without postfx_active having been asked, and unread values are 0
@@ -1066,6 +1225,8 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     params();
     sharpen = fval(&s_sharpen);
     aa = s_aa;
+    crt = crt_mode();
+    crt_s = fval(&s_crt_strength) / 100.0f;
     if (!src || !dst || dw < 1.0f || dh < 1.0f || sw <= 0.0f || sh <= 0.0f
         || !setup(dev))
         return 0;
@@ -1122,7 +1283,9 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 
     /* The stages that are on; every one but the last draws into s_mid. A
      * bilinear stretch with nothing between it and the picture stage is
-     * the picture stage's own. */
+     * the picture stage's own. The crt stage reads its input at the
+     * target's size: the stage before it, or the frame when it is that
+     * size already. */
     pic = picture_on();
     if (aa != AA_OFF)
         stage[n++] = ST_AA;
@@ -1132,8 +1295,10 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         stage[n++] = ST_SCALE;
     if (sharpen != 0.0f)
         stage[n++] = ST_SHARPEN;
-    if (pic || n == 0)
+    if (pic || (n == 0 && crt == CRT_OFF))
         stage[n++] = ST_PICTURE;
+    if (crt != CRT_OFF)
+        stage[n++] = ST_CRT;
     for (i = 0; i < n - 1; i++) {
         /* Before the scale stage the source's size, from it on the
          * target's. */
@@ -1223,6 +1388,32 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
             k[16] = -0.2f * sharpen / 100.0f;
             ok = run_pass(ctx, s_cas, in, rtv, ox, oy, vw, vh, k);
             break;
+        case ST_CRT: {
+            /* The scanlines fade out between 2 and 1 target pixels per
+             * line (a 960 to 480 pixel tall picture): at fewer they
+             * cannot show, and would only darken. CRT: at 100 % about
+             * the curve of Timothy Lottes' CRT shader (1/32 across, 1/24
+             * down), glow a fifth of the light added. */
+            ID3D11ShaderResourceView *t[5];
+            float lines = vh / CRT_LINES - 1.0f;
+            t[0] = in;
+            t[1] = t[2] = t[3] = t[4] = NULL;
+            k[0] = 1.0f / tw;
+            k[1] = 1.0f / th;
+            k[6] = vw;
+            k[7] = vh;
+            k[12] = CRT_LINES;
+            k[13] = crt_s * (lines < 0.0f ? 0.0f : lines > 1.0f ? 1.0f
+                                                                 : lines);
+            if (crt == CRT_CRT) {
+                k[14] = 0.04f * crt_s;
+                t[4] = glow_make(dev, ctx, in, k, cw, ch);
+                k[15] = t[4] ? 0.2f * crt_s : 0.0f;
+                k[16] = 0.06f * crt_s;
+            }
+            ok = run_draw(ctx, NULL, s_crtps, t, 5, rtv, ox, oy, vw, vh, k);
+            break;
+        }
         default:
             if (cw == vw && ch == vh)
                 k[6] = 1.0f;            /* pixel for pixel */
@@ -1268,6 +1459,12 @@ int xbox_SetAntiAlias(int mode)
 int xbox_SetUpscaler(int mode)
 {
     (void)mode;
+    return 0;
+}
+
+int xbox_SetCrt(int mode, float strength)
+{
+    (void)mode; (void)strength;
     return 0;
 }
 
