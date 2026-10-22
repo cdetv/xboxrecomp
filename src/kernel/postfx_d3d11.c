@@ -11,9 +11,10 @@
  *
  * The chain, in order (one full-screen draw per stage that is on):
  *
- *   aa        anti-aliasing: NVIDIA FXAA 3.11 (RECOMP_AA=off|fxaa;
- *             xbox_SetAntiAlias), off by default; its shader is compiled
- *             the first time it is used
+ *   aa        anti-aliasing: NVIDIA FXAA 3.11 or SMAA 1x (RECOMP_AA=
+ *             off|fxaa|smaa; xbox_SetAntiAlias), off by default; their
+ *             shaders are compiled the first time each is used. SMAA is
+ *             three draws: edges, blend weights, blending
  *   sharpen   AMD FidelityFX CAS, sharpen-only (RECOMP_SHARPEN, percent;
  *             xbox_SetSharpen), 0 = off
  *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
@@ -27,7 +28,9 @@
  * stage is left out when it would only copy pixel for pixel behind another
  * stage. Anti-aliasing samples by texture coordinates, so a source
  * rectangle that is not its whole texture is first copied out alone
- * (s_in): what lies around it never bleeds in.
+ * (s_in): what lies around it never bleeds in. SMAA always copies, into a
+ * typeless texture with an sRGB view as well, so that its last draw
+ * blends in linear light as SMAA asks.
  *
  * Values come from the environment once, then only from the setters (no
  * getenv per frame). A menu changes them on the executor thread, between
@@ -54,8 +57,8 @@ static volatile LONG s_aa;            /* AA_*, a plain number */
 static int s_force;
 
 /* Anti-aliasing (xbox_SetAntiAlias; RECOMP_AA by these names). */
-enum { AA_OFF, AA_FXAA, AA_MODES };
-static const char *const s_aa_name[AA_MODES] = { "off", "fxaa" };
+enum { AA_OFF, AA_FXAA, AA_SMAA, AA_MODES };
+static const char *const s_aa_name[AA_MODES] = { "off", "fxaa", "smaa" };
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 
 static LONG fbits(float f)
@@ -114,7 +117,7 @@ static int env_aa(void)
     for (i = 0; i < AA_MODES; i++)
         if (!_stricmp(v, s_aa_name[i]))
             return i;
-    fprintf(stderr, "[GPU] postfx: RECOMP_AA=%s not off or fxaa; off%c", v,
+    fprintf(stderr, "[GPU] postfx: RECOMP_AA=%s not off, fxaa or smaa; off%c", v,
             10);
     return AA_OFF;
 }
@@ -195,7 +198,7 @@ int xbox_SetSharpen(float percent)
     return 1;
 }
 
-/* For a settings menu: anti-aliasing, 0 = off, 1 = FXAA. Applies from the
+/* For a settings menu: anti-aliasing, 0 = off, 1 = FXAA, 2 = SMAA. Applies from the
  * next present. 1 when taken. */
 int xbox_SetAntiAlias(int mode)
 {
@@ -309,16 +312,107 @@ static const char s_fxaa_main[] =
 extern const unsigned char postfx_text_fxaa[];
 extern const unsigned postfx_text_fxaa_len;
 
+/* The anti-aliasing stage's other choice: SMAA 1x (third_party/smaa/
+ * SMAA.hlsl, unchanged, built in like FXAA), preset HIGH, luma edges, no
+ * predication, three draws over the source's size, each with its own
+ * vertex shader for SMAA's offsets:
+ *
+ *   se   edges of the source (t0, UNORM: gamma, as SMAA wants) into
+ *        s_edges (R8G8, cleared first: the shader discards non-edges)
+ *   sb   blend weights from the edges (t0), areaTex (t1) and searchTex
+ *        (t2), SMAA's two lookup images, into s_blend (RGBA8, cleared)
+ *   sn   blending: the weights (t0) and the source (t3), its sRGB view so
+ *        that the mixing is in linear light (pc.y nonzero; encoded back to
+ *        sRGB on output), else its UNORM view (gamma space)
+ *
+ * pk: SMAA_RT_METRICS (1/w, 1/h, w, h). SMAA's porting macros are ours
+ * (SMAA_CUSTOM_SL): sampler s0 bilinear, s1 point, both clamped.
+ *
+ *   SMAA (c) 2013 Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando
+ *   Navarro, Diego Gutierrez. MIT licence; the full text is in
+ *   third_party/smaa/LICENSE.txt (see NOTICE). */
+static const char s_smaa_pre[] =
+"SamplerState ppt : register(s1);\n"
+"Texture2D sarea : register(t1); Texture2D ssearch : register(t2);\n"
+"Texture2D scol : register(t3);\n"
+"#define SMAA_RT_METRICS pk\n"
+"#define SMAA_PRESET_HIGH 1\n"
+"#define SMAA_CUSTOM_SL 1\n"
+"#define SMAATexture2D(tex) Texture2D tex\n"
+"#define SMAATexturePass2D(tex) tex\n"
+"#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(psm, coord, 0)\n"
+"#define SMAASampleLevelZeroPoint(tex, coord) tex.SampleLevel(ppt, coord, 0)\n"
+"#define SMAASampleLevelZeroOffset(tex, coord, offset)"
+" tex.SampleLevel(psm, coord, 0, offset)\n"
+"#define SMAASample(tex, coord) tex.Sample(psm, coord)\n"
+"#define SMAASamplePoint(tex, coord) tex.Sample(ppt, coord)\n"
+"#define SMAASampleOffset(tex, coord, offset) tex.Sample(psm, coord, offset)\n"
+"#define SMAA_FLATTEN [flatten]\n"
+"#define SMAA_BRANCH [branch]\n"
+"#define SMAATexture2DMS2(tex) Texture2DMS<float4, 2> tex\n"
+"#define SMAALoad(tex, pos, sample) tex.Load(pos, sample)\n"
+"#define SMAAGather(tex, coord) tex.Gather(psm, coord, 0)\n";
+static const char s_smaa_main[] =
+"float4 sfull(uint id, out float2 tc) {\n"
+"  float2 p = float2((id << 1) & 2, id & 2);\n"
+"  tc = p;\n"
+"  return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
+"}\n"
+"void sevs(uint id : SV_VertexID, out float4 pos : SV_Position,\n"
+"          out float2 tc : TEXCOORD0, out float4 off[3] : TEXCOORD1) {\n"
+"  pos = sfull(id, tc);\n"
+"  SMAAEdgeDetectionVS(tc, off);\n"
+"}\n"
+"float4 seps(float4 pos : SV_Position, float2 tc : TEXCOORD0,\n"
+"            float4 off[3] : TEXCOORD1) : SV_Target {\n"
+"  return float4(SMAALumaEdgeDetectionPS(tc, off, pt), 0.0, 0.0);\n"
+"}\n"
+"void sbvs(uint id : SV_VertexID, out float4 pos : SV_Position,\n"
+"          out float2 tc : TEXCOORD0, out float2 pix : TEXCOORD1,\n"
+"          out float4 off[3] : TEXCOORD2) {\n"
+"  pos = sfull(id, tc);\n"
+"  SMAABlendingWeightCalculationVS(tc, pix, off);\n"
+"}\n"
+"float4 sbps(float4 pos : SV_Position, float2 tc : TEXCOORD0,\n"
+"            float2 pix : TEXCOORD1, float4 off[3] : TEXCOORD2)\n"
+"            : SV_Target {\n"
+"  return SMAABlendingWeightCalculationPS(tc, pix, off, pt, sarea, ssearch,\n"
+"                                         0.0);\n"
+"}\n"
+"void snvs(uint id : SV_VertexID, out float4 pos : SV_Position,\n"
+"          out float2 tc : TEXCOORD0, out float4 off : TEXCOORD1) {\n"
+"  pos = sfull(id, tc);\n"
+"  SMAANeighborhoodBlendingVS(tc, off);\n"
+"}\n"
+"float4 snps(float4 pos : SV_Position, float2 tc : TEXCOORD0,\n"
+"            float4 off : TEXCOORD1) : SV_Target {\n"
+"  float4 c = SMAANeighborhoodBlendingPS(tc, off, scol, pt);\n"
+"  float3 v = saturate(c.rgb);\n"
+"  [branch] if (pc.y != 0.0)\n"
+"    v = v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;\n"
+"  return float4(v, SMAASampleLevelZeroPoint(scol, tc).a);\n"
+"}\n";
+extern const unsigned char postfx_text_smaa[];
+extern const unsigned postfx_text_smaa_len;
+
 static ID3D11Device          *s_dev;      /* the objects below are its */
 static ID3D11VertexShader    *s_vs;
 static ID3D11PixelShader     *s_ps;       /* picture */
 static ID3D11PixelShader     *s_cas;      /* sharpen */
 static ID3D11PixelShader     *s_fxaa;     /* aa (FXAA), made on first use */
+static ID3D11VertexShader    *s_svs[3];   /* aa (SMAA): edges, weights, */
+static ID3D11PixelShader     *s_sps[3];   /* blending; made on first use */
 static ID3D11Buffer          *s_cb;
-static ID3D11SamplerState    *s_samp;
+static ID3D11SamplerState    *s_samp;     /* bilinear, s0 */
+static ID3D11SamplerState    *s_point;    /* point, s1 (SMAA) */
 static ID3D11RasterizerState *s_rs;
 static int                    s_broken;   /* could not be made: copy */
-static int                    s_aa_broken;  /* FXAA: none, said once */
+static int                    s_aa_broken[AA_MODES];  /* none, said once */
+
+/* SMAA's lookup images (third_party/smaa/AreaTex.h, SearchTex.h). */
+#include "smaa/AreaTex.h"
+#include "smaa/SearchTex.h"
+static ID3D11ShaderResourceView *s_area, *s_search;
 
 /* A texture the chain draws into or copies to: made at a size, again when
  * that changes. */
@@ -326,12 +420,15 @@ typedef struct {
     ID3D11Texture2D          *tex;
     ID3D11RenderTargetView   *rtv;      /* NULL for s_in */
     ID3D11ShaderResourceView *srv;
+    ID3D11ShaderResourceView *srv2;     /* s_in for SMAA: the sRGB view */
     UINT                      w, h;
     DXGI_FORMAT               fmt;
 } Surf;
 
 static Surf s_mid[2];   /* between stages, taken in turn */
 static Surf s_in;       /* the source rectangle alone, for anti-aliasing */
+static Surf s_edges;    /* SMAA's edges and blend weights */
+static Surf s_blend;
 
 static ID3DBlob *compile(const char *src, size_t len, const char *entry,
                          const char *target)
@@ -373,40 +470,138 @@ static HRESULT make_ps(ID3D11Device *dev, const char *entry,
     return make_ps_from(dev, s_hlsl, sizeof s_hlsl - 1, entry, "ps_4_0", ps);
 }
 
-/* The FXAA shader, the first time anti-aliasing is on (it takes a moment
- * to compile). 0 (said once) when it cannot be made: anti-aliasing is
- * then skipped. */
-static int fxaa_setup(ID3D11Device *dev)
+/* s_hlsl, then pre, the vendored text and main: one anti-aliasing
+ * shader source, *len bytes, for free(). NULL when out of memory. */
+static char *aa_source(const char *pre, size_t n2, const unsigned char *text,
+                       size_t n3, const char *main, size_t n4, size_t *len)
 {
-    size_t n1 = sizeof s_hlsl - 1, n2 = sizeof s_fxaa_pre - 1;
-    size_t n3 = postfx_text_fxaa_len, n4 = sizeof s_fxaa_main - 1;
-    char *src;
+    size_t n1 = sizeof s_hlsl - 1;
+    char *src = (char *)malloc(n1 + n2 + n3 + n4);
+
+    if (src) {
+        memcpy(src, s_hlsl, n1);
+        memcpy(src + n1, pre, n2);
+        memcpy(src + n1 + n2, text, n3);
+        memcpy(src + n1 + n2 + n3, main, n4);
+    }
+    *len = n1 + n2 + n3 + n4;
+    return src;
+}
+
+/* The FXAA shader, the first time it is chosen (it takes a moment to
+ * compile). */
+static HRESULT fxaa_make(ID3D11Device *dev)
+{
+    size_t len;
+    char *src = aa_source(s_fxaa_pre, sizeof s_fxaa_pre - 1,
+                          postfx_text_fxaa, postfx_text_fxaa_len,
+                          s_fxaa_main, sizeof s_fxaa_main - 1, &len);
+    HRESULT hr;
+
+    if (!src)
+        return E_OUTOFMEMORY;
+    hr = make_ps_from(dev, src, len, "fps", "ps_5_0", &s_fxaa);
+    free(src);
+    return hr;
+}
+
+/* An immutable texture from one of SMAA's lookup images. */
+static HRESULT lut_make(ID3D11Device *dev, const unsigned char *bytes,
+                        UINT w, UINT h, UINT pitch, DXGI_FORMAT fmt,
+                        ID3D11ShaderResourceView **srv)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SUBRESOURCE_DATA sd;
+    ID3D11Texture2D *tex = NULL;
+    HRESULT hr;
+
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    sd.pSysMem = bytes;
+    sd.SysMemPitch = pitch;
+    sd.SysMemSlicePitch = 0;
+    hr = ID3D11Device_CreateTexture2D(dev, &td, &sd, &tex);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)tex,
+                                                   NULL, srv);
+    if (tex)
+        ID3D11Texture2D_Release(tex);
+    return hr;
+}
+
+/* SMAA's three shader pairs, its point sampler and lookup images, the
+ * first time it is chosen. */
+static HRESULT smaa_make(ID3D11Device *dev)
+{
+    static const char *const vs[3] = { "sevs", "sbvs", "snvs" };
+    static const char *const ps[3] = { "seps", "sbps", "snps" };
+    D3D11_SAMPLER_DESC sd;
+    size_t len;
+    char *src = aa_source(s_smaa_pre, sizeof s_smaa_pre - 1,
+                          postfx_text_smaa, postfx_text_smaa_len,
+                          s_smaa_main, sizeof s_smaa_main - 1, &len);
+    HRESULT hr = src ? S_OK : E_OUTOFMEMORY;
+    int i;
+
+    for (i = 0; i < 3 && SUCCEEDED(hr); i++) {
+        ID3DBlob *code = compile(src, len, vs[i], "vs_5_0");
+        hr = code ? S_OK : E_FAIL;
+        if (code) {
+            hr = ID3D11Device_CreateVertexShader(dev,
+                    ID3D10Blob_GetBufferPointer(code),
+                    ID3D10Blob_GetBufferSize(code), NULL, &s_svs[i]);
+            ID3D10Blob_Release(code);
+        }
+        if (SUCCEEDED(hr))
+            hr = make_ps_from(dev, src, len, ps[i], "ps_5_0", &s_sps[i]);
+    }
+    free(src);
+    if (SUCCEEDED(hr)) {
+        memset(&sd, 0, sizeof sd);
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = ID3D11Device_CreateSamplerState(dev, &sd, &s_point);
+    }
+    if (SUCCEEDED(hr))
+        hr = lut_make(dev, areaTexBytes, AREATEX_WIDTH, AREATEX_HEIGHT,
+                      AREATEX_PITCH, DXGI_FORMAT_R8G8_UNORM, &s_area);
+    if (SUCCEEDED(hr))
+        hr = lut_make(dev, searchTexBytes, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT,
+                      SEARCHTEX_PITCH, DXGI_FORMAT_R8_UNORM, &s_search);
+    return hr;
+}
+
+/* The chosen anti-aliasing's objects, the first time it is on (they take
+ * a moment to compile). 0 (said once) when they cannot be made: that
+ * anti-aliasing is then skipped. */
+static int aa_setup(ID3D11Device *dev, int aa)
+{
     DWORD t0;
     HRESULT hr;
 
-    if (s_fxaa)
+    /* s_search is the last of SMAA's objects made. */
+    if (aa == AA_FXAA ? s_fxaa != NULL : s_search != NULL)
         return 1;
-    if (s_aa_broken)
+    if (s_aa_broken[aa])
         return 0;
-    src = (char *)malloc(n1 + n2 + n3 + n4);
-    if (!src) {
-        s_aa_broken = 1;
-        return 0;
-    }
-    memcpy(src, s_hlsl, n1);
-    memcpy(src + n1, s_fxaa_pre, n2);
-    memcpy(src + n1 + n2, postfx_text_fxaa, n3);
-    memcpy(src + n1 + n2 + n3, s_fxaa_main, n4);
     t0 = GetTickCount();
-    hr = make_ps_from(dev, src, n1 + n2 + n3 + n4, "fps", "ps_5_0", &s_fxaa);
-    free(src);
+    hr = aa == AA_FXAA ? fxaa_make(dev) : smaa_make(dev);
     if (FAILED(hr)) {
-        fprintf(stderr, "[GPU] postfx: FXAA could not be made (hr 0x%08lX);"
-                " anti-aliasing skipped%c", (unsigned long)hr, 10);
-        s_aa_broken = 1;
+        fprintf(stderr, "[GPU] postfx: %s could not be made (hr 0x%08lX);"
+                " anti-aliasing skipped%c", s_aa_name[aa], (unsigned long)hr,
+                10);
+        s_aa_broken[aa] = 1;
         return 0;
     }
-    fprintf(stderr, "[GPU] postfx: FXAA ready (%lu ms)%c",
+    fprintf(stderr, "[GPU] postfx: %s ready (%lu ms)%c", s_aa_name[aa],
             (unsigned long)(GetTickCount() - t0), 10);
     return 1;
 }
@@ -471,19 +666,36 @@ static int setup(ID3D11Device *dev)
 
 static void surf_free(Surf *s)
 {
+    if (s->srv2) ID3D11ShaderResourceView_Release(s->srv2);
     if (s->srv) ID3D11ShaderResourceView_Release(s->srv);
     if (s->rtv) ID3D11RenderTargetView_Release(s->rtv);
     if (s->tex) ID3D11Texture2D_Release(s->tex);
     memset(s, 0, sizeof *s);
 }
 
-/* s at w x h in format fmt, a render target too when rt. 0 (said once)
- * when it cannot be made. */
+/* A view of s's texture in format view. */
+static HRESULT surf_view(ID3D11Device *dev, Surf *s, DXGI_FORMAT view,
+                         ID3D11ShaderResourceView **srv)
+{
+    D3D11_SHADER_RESOURCE_VIEW_DESC vd;
+
+    memset(&vd, 0, sizeof vd);
+    vd.Format = view;
+    vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.MipLevels = 1;
+    return ID3D11Device_CreateShaderResourceView(dev, (ID3D11Resource *)s->tex,
+                                                 &vd, srv);
+}
+
+/* s at w x h in format fmt, a render target too when rt. A typeless fmt
+ * (only B8G8R8A8_TYPELESS here, for SMAA's s_in) gets its UNORM view as
+ * srv and its sRGB one as srv2. 0 (said once) when it cannot be made. */
 static int surf_fit(ID3D11Device *dev, Surf *s, UINT w, UINT h,
                     DXGI_FORMAT fmt, int rt)
 {
     D3D11_TEXTURE2D_DESC td;
     HRESULT hr;
+    int typeless = fmt == DXGI_FORMAT_B8G8R8A8_TYPELESS;
 
     if (s->tex && s->w == w && s->h == h && s->fmt == fmt)
         return 1;
@@ -502,9 +714,14 @@ static int surf_fit(ID3D11Device *dev, Surf *s, UINT w, UINT h,
     if (SUCCEEDED(hr) && rt)
         hr = ID3D11Device_CreateRenderTargetView(dev, (ID3D11Resource *)s->tex,
                                                  NULL, &s->rtv);
-    if (SUCCEEDED(hr))
+    if (SUCCEEDED(hr) && typeless) {
+        hr = surf_view(dev, s, DXGI_FORMAT_B8G8R8A8_UNORM, &s->srv);
+        if (SUCCEEDED(hr))
+            hr = surf_view(dev, s, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, &s->srv2);
+    } else if (SUCCEEDED(hr)) {
         hr = ID3D11Device_CreateShaderResourceView(dev,
                 (ID3D11Resource *)s->tex, NULL, &s->srv);
+    }
     if (FAILED(hr)) {
         static int said;
         if (!said++)
@@ -520,17 +737,25 @@ static int surf_fit(ID3D11Device *dev, Surf *s, UINT w, UINT h,
     return 1;
 }
 
-/* One stage: pixel shader ps over the rectangle dx0,dy0 dw x dh of dst,
- * reading srv, with constants k (see s_hlsl). Sets every piece of pipeline
+/* One draw: shaders vs (NULL = the plain full-screen triangle) and ps
+ * over the rectangle dx0,dy0 dw x dh of dst, reading srv[0..nsrv-1] from
+ * t0 on, with constants k (see s_hlsl). Sets every piece of pipeline
  * state it uses and leaves no target or view bound. */
-static int run_pass(ID3D11DeviceContext *ctx, ID3D11PixelShader *ps,
-                    ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *dst,
-                    float dx0, float dy0, float dw, float dh, const float *k)
+static int run_draw(ID3D11DeviceContext *ctx, ID3D11VertexShader *vs,
+                    ID3D11PixelShader *ps,
+                    ID3D11ShaderResourceView *const *srv, UINT nsrv,
+                    ID3D11RenderTargetView *dst, float dx0, float dy0,
+                    float dw, float dh, const float *k)
 {
+    static ID3D11ShaderResourceView *const none[4] = { NULL, NULL, NULL,
+                                                       NULL };
+    ID3D11SamplerState *samp[2];
     D3D11_MAPPED_SUBRESOURCE m;
-    ID3D11ShaderResourceView *none = NULL;
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
+
+    samp[0] = s_samp;
+    samp[1] = s_point;
 
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)s_cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -554,19 +779,68 @@ static int run_pass(ID3D11DeviceContext *ctx, ID3D11PixelShader *ps,
     ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ID3D11DeviceContext_VSSetShader(ctx, s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetShader(ctx, vs ? vs : s_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_GSSetShader(ctx, NULL, NULL, 0);
     ID3D11DeviceContext_PSSetShader(ctx, ps, NULL, 0);
     ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &srv);
-    ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &s_samp);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, nsrv, srv);
+    ID3D11DeviceContext_PSSetSamplers(ctx, 0, s_point ? 2 : 1, samp);
     ID3D11DeviceContext_RSSetState(ctx, s_rs);
     ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(ctx, 1, &sc);
     ID3D11DeviceContext_Draw(ctx, 3, 0);
-    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &none);
+    ID3D11DeviceContext_PSSetShaderResources(ctx, 0, nsrv, none);
     ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
     return 1;
+}
+
+/* One draw of the plain triangle, reading srv alone. */
+static int run_pass(ID3D11DeviceContext *ctx, ID3D11PixelShader *ps,
+                    ID3D11ShaderResourceView *srv, ID3D11RenderTargetView *dst,
+                    float dx0, float dy0, float dw, float dh, const float *k)
+{
+    return run_draw(ctx, NULL, ps, &srv, 1, dst, dx0, dy0, dw, dh, k);
+}
+
+/* SMAA's three draws: in (s_in, its UNORM view; srgb its sRGB one or
+ * NULL) at w x h, into dst's rectangle dx0,dy0 of that size. */
+static int smaa_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                    ID3D11ShaderResourceView *in,
+                    ID3D11ShaderResourceView *srgb, UINT w, UINT h,
+                    ID3D11RenderTargetView *dst, float dx0, float dy0)
+{
+    static const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    ID3D11ShaderResourceView *srv[4];
+    float k[20];
+
+    if (!surf_fit(dev, &s_edges, w, h, DXGI_FORMAT_R8G8_UNORM, 1)
+        || !surf_fit(dev, &s_blend, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 1))
+        return 0;
+    memset(k, 0, sizeof k);
+    k[0] = 1.0f / (float)w;
+    k[1] = 1.0f / (float)h;
+    k[2] = (float)w;
+    k[3] = (float)h;
+    k[17] = srgb ? 1.0f : 0.0f;
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, s_edges.rtv, zero);
+    ID3D11DeviceContext_ClearRenderTargetView(ctx, s_blend.rtv, zero);
+    srv[0] = in;
+    if (!run_draw(ctx, s_svs[0], s_sps[0], srv, 1, s_edges.rtv, 0.0f, 0.0f,
+                  (float)w, (float)h, k))
+        return 0;
+    srv[0] = s_edges.srv;
+    srv[1] = s_area;
+    srv[2] = s_search;
+    if (!run_draw(ctx, s_svs[1], s_sps[1], srv, 3, s_blend.rtv, 0.0f, 0.0f,
+                  (float)w, (float)h, k))
+        return 0;
+    srv[0] = s_blend.srv;
+    srv[1] = NULL;
+    srv[2] = NULL;
+    srv[3] = srgb ? srgb : in;
+    return run_draw(ctx, s_svs[2], s_sps[2], srv, 4, dst, dx0, dy0,
+                    (float)w, (float)h, k);
 }
 
 enum { ST_AA, ST_SHARPEN, ST_PICTURE };
@@ -597,13 +871,17 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     ix0 = sx0;
     iy0 = sy0;
 
-    if (aa != AA_OFF && !fxaa_setup(dev))
+    if (aa != AA_OFF && !aa_setup(dev, aa))
         aa = AA_OFF;
-    if (aa != AA_OFF && (sx0 != 0.0f || sy0 != 0.0f || (float)mw != tw
-                         || (float)mh != th)) {
+    if (aa != AA_OFF && (aa == AA_SMAA || sx0 != 0.0f || sy0 != 0.0f
+                         || (float)mw != tw || (float)mh != th)) {
         /* The rectangle alone, so that sampling around its edge clamps
-         * there instead of reading what lies next to it. */
-        if (surf_fit(dev, &s_in, mw, mh, td.Format, 0)) {
+         * there instead of reading what lies next to it; for SMAA with
+         * an sRGB view too (srv2) when the source is 8-bit BGRA. */
+        DXGI_FORMAT f = td.Format;
+        if (aa == AA_SMAA && f == DXGI_FORMAT_B8G8R8A8_UNORM)
+            f = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        if (surf_fit(dev, &s_in, mw, mh, f, 0)) {
             D3D11_BOX box;
             box.left = (UINT)sx0;
             box.top = (UINT)sy0;
@@ -661,6 +939,11 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         k[11] = iy0 + sh;
         switch (stage[i]) {
         case ST_AA:
+            if (aa == AA_SMAA) {
+                /* Always from s_in (copied above). */
+                ok = smaa_run(dev, ctx, in, s_in.srv2, mw, mh, rtv, ox, oy);
+                break;
+            }
             k[0] = 1.0f / tw;
             k[1] = 1.0f / th;
             ok = run_pass(ctx, s_fxaa, in, rtv, ox, oy, ow, oh, k);

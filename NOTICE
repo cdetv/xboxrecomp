@@ -79,6 +79,24 @@ NVIDIA FXAA 3.11 — included unchanged
   repeated in LICENSES/FXAA-3.11.txt.
 
 
+MIT — SMAA, included unchanged
+------------------------------
+
+  https://github.com/iryoku/smaa (commit 71c806a)
+
+  third_party/smaa/SMAA.hlsl     SMAA shader (built in as text, like FXAA)
+  third_party/smaa/AreaTex.h     its two lookup images, as C data
+  third_party/smaa/SearchTex.h
+  src/kernel/postfx_d3d11.c      runs SMAA 1x as the anti-aliasing stage
+                                 (c) 2013 Jorge Jimenez, Jose I. Echevarria,
+                                 Belen Masia, Fernando Navarro, Diego
+                                 Gutierrez
+
+  Licensed under the MIT licence; the full text, with the authors'
+  copyright notice, is in third_party/smaa/LICENSE.txt (as published) and
+  LICENSES/SMAA.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 
