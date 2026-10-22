@@ -97,6 +97,25 @@ MIT — SMAA, included unchanged
   LICENSES/SMAA.txt.
 
 
+MIT — AMD FidelityFX FSR 1, included unchanged
+-----------------------------------------------
+
+  https://github.com/GPUOpen-Effects/FidelityFX-FSR (commit a21ffb8)
+
+  third_party/fsr1/ffx_a.h      AMD's portability header
+  third_party/fsr1/ffx_fsr1.h   FSR 1.0: EASU (upscaler) and RCAS
+                                (sharpener); both built in as text, like
+                                FXAA
+  third_party/fsr1/license.txt  its licence, as published
+  src/kernel/postfx_d3d11.c     runs EASU as the scale stage's upscaler
+                                and RCAS behind it
+                                (c) 2021 Advanced Micro Devices, Inc.
+
+  Licensed under the MIT licence; the full text, with AMD's copyright
+  notice, is in third_party/fsr1/license.txt and
+  LICENSES/FidelityFX-FSR.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

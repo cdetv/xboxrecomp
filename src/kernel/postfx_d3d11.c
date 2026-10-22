@@ -4,10 +4,10 @@
  *
  * shown_to_back (nv2a_draw_d3d11.c) asks postfx_active once per present,
  * held presents too (a paused game, an open menu), so a change shows at
- * once. Every filter off: it copies the frame exactly as before and nothing
- * here runs. Any filter on: postfx_draw draws the frame through the chain
- * instead, pixel for pixel, or stretched bilinearly when the frame was drawn
- * at an older render scale.
+ * once. Every filter off and the frame the back buffer's size: it copies
+ * the frame exactly as before and nothing here runs. Any filter on, or a
+ * frame of another size (a render scale, or one drawn at an older render
+ * resolution): postfx_draw draws the frame through the chain instead.
  *
  * The chain, in order (one full-screen draw per stage that is on):
  *
@@ -15,21 +15,30 @@
  *             off|fxaa|smaa; xbox_SetAntiAlias), off by default; their
  *             shaders are compiled the first time each is used. SMAA is
  *             three draws: edges, blend weights, blending
+ *   scale     only when the frame is not the target's size: bigger (a
+ *             render scale above 100 %, supersampling) is shrunk by area,
+ *             each target pixel the average of the frame pixels it covers,
+ *             in linear light; smaller is stretched by the upscaler
+ *             (RECOMP_UPSCALER=bilinear|fsr; xbox_SetUpscaler): bilinear,
+ *             or AMD FidelityFX FSR 1's EASU, compiled the first time it
+ *             is used
  *   sharpen   AMD FidelityFX CAS, sharpen-only (RECOMP_SHARPEN, percent;
- *             xbox_SetSharpen), 0 = off
+ *             xbox_SetSharpen), 0 = off; behind FSR's EASU, FSR's own RCAS
+ *             instead, at the same setting
  *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
- *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged;
- *             also the stretch of a frame drawn at an older render scale
+ *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged
  *
- * Every stage but the last draws into an intermediate texture (s_mid, two
- * taken in turn, 16-bit float, the source rectangle's size), which the
- * next one reads; the last draws into the target. Anti-aliasing and
- * sharpening run at the source's own size, before any stretch. The picture
- * stage is left out when it would only copy pixel for pixel behind another
- * stage. Anti-aliasing samples by texture coordinates, so a source
- * rectangle that is not its whole texture is first copied out alone
- * (s_in): what lies around it never bleeds in. SMAA always copies, into a
- * typeless texture with an sRGB view as well, so that its last draw
+ * Every stage but the last draws into an intermediate texture (s_mid[i]
+ * for stage i, 16-bit float, the size that stage puts out: the source
+ * rectangle's before the scale stage, the target's from it on), which the
+ * next one reads; the last draws into the target. Anti-aliasing runs at
+ * the source's own size, sharpening at the target's. The picture stage is
+ * left out when it would only copy pixel for pixel behind another stage;
+ * a bilinear stretch with no sharpening is done by the picture stage
+ * itself, one draw. Anti-aliasing and EASU sample by texture coordinates,
+ * so a source rectangle that is not its whole texture is first copied out
+ * alone (s_in): what lies around it never bleeds in. SMAA always copies,
+ * into a typeless texture with an sRGB view as well, so that its last draw
  * blends in linear light as SMAA asks.
  *
  * Values come from the environment once, then only from the setters (no
@@ -54,11 +63,16 @@
 /* Each as float bits in a LONG, swapped whole. */
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
 static volatile LONG s_aa;            /* AA_*, a plain number */
+static volatile LONG s_upscale;       /* UP_*, a plain number */
 static int s_force;
 
 /* Anti-aliasing (xbox_SetAntiAlias; RECOMP_AA by these names). */
 enum { AA_OFF, AA_FXAA, AA_SMAA, AA_MODES };
 static const char *const s_aa_name[AA_MODES] = { "off", "fxaa", "smaa" };
+
+/* The upscaler (xbox_SetUpscaler; RECOMP_UPSCALER by these names). */
+enum { UP_BILINEAR, UP_FSR, UP_MODES };
+static const char *const s_up_name[UP_MODES] = { "bilinear", "fsr" };
 static INIT_ONCE s_once = INIT_ONCE_STATIC_INIT;
 
 static LONG fbits(float f)
@@ -106,20 +120,22 @@ static float env_float(const char *name, float lo, float hi, float def)
 #define ADJ_HI   4.0f
 #define SHARP_HI 100.0f
 
-/* AA_OFF when unset or not one of s_aa_name. */
-static int env_aa(void)
+/* Variable name's value among names[0..n-1] (any case); 0 when unset or
+ * not one of them (said, with what). */
+static int env_choice(const char *name, const char *const *names, int n,
+                      const char *what)
 {
-    const char *v = getenv("RECOMP_AA");
+    const char *v = getenv(name);
     int i;
 
     if (!v || !*v)
-        return AA_OFF;
-    for (i = 0; i < AA_MODES; i++)
-        if (!_stricmp(v, s_aa_name[i]))
+        return 0;
+    for (i = 0; i < n; i++)
+        if (!_stricmp(v, names[i]))
             return i;
-    fprintf(stderr, "[GPU] postfx: RECOMP_AA=%s not off, fxaa or smaa; off%c", v,
-            10);
-    return AA_OFF;
+    fprintf(stderr, "[GPU] postfx: %s=%s not %s; %s%c", name, v, what,
+            names[0], 10);
+    return 0;
 }
 
 static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
@@ -129,7 +145,9 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     float c = env_float("RECOMP_CONTRAST", ADJ_LO, ADJ_HI, 1.0f);
     float s = env_float("RECOMP_SATURATION", ADJ_LO, ADJ_HI, 1.0f);
     float sh = env_float("RECOMP_SHARPEN", 0.0f, SHARP_HI, 0.0f);
-    int aa = env_aa();
+    int aa = env_choice("RECOMP_AA", s_aa_name, AA_MODES, "off, fxaa or smaa");
+    int up = env_choice("RECOMP_UPSCALER", s_up_name, UP_MODES,
+                        "bilinear or fsr");
 
     (void)once; (void)p; (void)ctx;
     InterlockedExchange(&s_gamma, fbits(g));
@@ -137,6 +155,7 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     InterlockedExchange(&s_saturation, fbits(s));
     InterlockedExchange(&s_sharpen, fbits(sh));
     InterlockedExchange(&s_aa, aa);
+    InterlockedExchange(&s_upscale, up);
     s_force = f && !strcmp(f, "1");
     if (g != 1.0f || c != 1.0f || s != 1.0f)
         fprintf(stderr, "[GPU] postfx: picture gamma %.2f contrast %.2f"
@@ -146,6 +165,8 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     if (aa != AA_OFF)
         fprintf(stderr, "[GPU] postfx: anti-aliasing %s%c", s_aa_name[aa],
                 10);
+    if (up != UP_BILINEAR)
+        fprintf(stderr, "[GPU] postfx: upscaler %s%c", s_up_name[up], 10);
     if (s_force)
         fprintf(stderr, "[GPU] postfx: RECOMP_POSTFX_FORCE: the chain runs"
                 " even when every filter is off%c", 10);
@@ -209,6 +230,18 @@ int xbox_SetAntiAlias(int mode)
     return 1;
 }
 
+/* For a settings menu: how a frame drawn smaller than the window (a render
+ * scale below 100 %) is stretched, 0 = bilinear, 1 = FSR 1. Applies from
+ * the next present. 1 when taken. */
+int xbox_SetUpscaler(int mode)
+{
+    params();
+    if (mode < 0 || mode >= UP_MODES)
+        return 0;
+    InterlockedExchange(&s_upscale, mode);
+    return 1;
+}
+
 static int picture_on(void)
 {
     return fval(&s_gamma) != 1.0f || fval(&s_contrast) != 1.0f
@@ -232,7 +265,14 @@ int postfx_active(void)
  * saturation; pc.x: CAS's peak (negative lobe), from the sharpen setting.
  *
  * pps, the picture stage: a value at 1 is skipped, so a neutral pass gives
- * back exactly what it read.
+ * back exactly what it read. Stretching (po.z zero), it samples
+ * bilinearly, clamped to pc (the source rectangle's outermost pixel
+ * centres, in texture units) so nothing beside the rectangle bleeds in.
+ *
+ * zps, the scale stage's shrink: each target pixel covers pk.xy source
+ * pixels (above 1); it is the average of every source pixel under it,
+ * weighted by how much of it is covered (at most 8 a side), in linear
+ * light (the sRGB curve), so a supersampled frame keeps its brightness.
  *
  * cps, the sharpen stage, is AMD FidelityFX CAS 1.20190610 (ffx_cas.h,
  * CasFilter), sharpen-only, ported to plain HLSL: exact rcp and sqrt
@@ -257,7 +297,8 @@ static const char s_hlsl[] =
 "float4 pps(float4 p : SV_Position) : SV_Target {\n"
 "  float2 t = p.xy - po.xy;\n"
 "  float4 c = po.z != 0.0 ? pt.Load(int3(t + pl.xy, 0))\n"
-"                         : pt.Sample(psm, t * pk.xy + pk.zw);\n"
+"                         : pt.Sample(psm, clamp(t * pk.xy + pk.zw, pc.xy,\n"
+"                                               pc.zw));\n"
 "  float3 v = c.rgb;\n"
 "  [branch] if (pa.x != 1.0) v = pow(saturate(v), 1.0 / pa.x);\n"
 "  [branch] if (pa.y != 1.0) v = saturate((v - 0.5) * pa.y + 0.5);\n"
@@ -280,6 +321,28 @@ static const char s_hlsl[] =
 "  float w = amp * pc.x;\n"
 "  float3 o = saturate(((b + d + f + h) * w + e) * rcp(1.0 + 4.0 * w));\n"
 "  return float4(sqrt(o), pt.Load(int3(q, 0)).a);\n"
+"}\n"
+"float3 zlin(float3 v) {\n"
+"  return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);\n"
+"}\n"
+"float4 zps(float4 p : SV_Position) : SV_Target {\n"
+"  float2 a = (p.xy - po.xy - 0.5) * pk.xy, b = a + pk.xy;\n"
+"  int2 i0 = int2(floor(a)), i1 = min(int2(ceil(b)) - 1, i0 + 7);\n"
+"  float4 s = 0.0;\n"
+"  float n = 0.0;\n"
+"  [loop] for (int y = i0.y; y <= i1.y; y++) {\n"
+"    float wy = min(b.y, y + 1.0) - max(a.y, (float)y);\n"
+"    [loop] for (int x = i0.x; x <= i1.x; x++) {\n"
+"      float w = (min(b.x, x + 1.0) - max(a.x, (float)x)) * wy;\n"
+"      float4 c = pt.Load(int3(clamp(int2(x, y) + int2(pl.xy),\n"
+"                                    int2(pl.xy), int2(pl.zw) - 1), 0));\n"
+"      s += float4(zlin(saturate(c.rgb)), c.a) * w;\n"
+"      n += w;\n"
+"    }\n"
+"  }\n"
+"  float3 v = saturate(s.rgb / n);\n"
+"  v = v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055;\n"
+"  return float4(v, s.a / n);\n"
 "}\n";
 
 /* fps, the anti-aliasing stage: NVIDIA FXAA 3.11 (third_party/fxaa/
@@ -395,10 +458,59 @@ static const char s_smaa_main[] =
 extern const unsigned char postfx_text_smaa[];
 extern const unsigned postfx_text_smaa_len;
 
+/* The upscaler's other choice: AMD FidelityFX FSR 1.0 (third_party/fsr1/
+ * ffx_a.h and ffx_fsr1.h, unchanged, built in like FXAA), its 32-bit float
+ * shaders, two draws, each target pixel for pixel:
+ *
+ *   eps   EASU, the scale stage: the source (t0, its whole texture, gamma-
+ *         encoded as EASU wants) stretched to the target size; pk, pl,
+ *         pa, pc: FsrEasuCon's con0..con3, as float bits
+ *   rps   RCAS, the sharpen stage behind EASU: pc.x FsrRcasCon's con[0]
+ *         (as float bits); taps clamped to the rectangle pl; alpha passed
+ *         through
+ *
+ *   Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+ *   MIT licence; the full text is in third_party/fsr1/license.txt and
+ *   LICENSES/FidelityFX-FSR.txt (see NOTICE). */
+static const char s_fsr_pre[] =
+"#define A_GPU 1\n"
+"#define A_HLSL 1\n"
+"#define FSR_EASU_F 1\n"
+"#define FSR_RCAS_F 1\n"
+"#define FSR_RCAS_PASSTHROUGH_ALPHA 1\n";
+static const char s_fsr_mid[] =
+"AF4 FsrEasuRF(AF2 p) { return pt.GatherRed(psm, p); }\n"
+"AF4 FsrEasuGF(AF2 p) { return pt.GatherGreen(psm, p); }\n"
+"AF4 FsrEasuBF(AF2 p) { return pt.GatherBlue(psm, p); }\n"
+"AF4 FsrRcasLoadF(ASU2 p) {\n"
+"  return pt.Load(int3(clamp(p, int2(pl.xy), int2(pl.zw) - 1), 0));\n"
+"}\n"
+"void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}\n";
+static const char s_fsr_main[] =
+"float4 eps(float4 p : SV_Position) : SV_Target {\n"
+"  AF3 c;\n"
+"  FsrEasuF(c, AU2(p.xy - po.xy), asuint(pk), asuint(pl), asuint(pa),\n"
+"           asuint(pc));\n"
+"  return float4(c, 1.0);\n"
+"}\n"
+"float4 rps(float4 p : SV_Position) : SV_Target {\n"
+"  float4 c;\n"
+"  FsrRcasF(c.r, c.g, c.b, c.a, AU2(p.xy - po.xy + pl.xy), asuint(pc));\n"
+"  return c;\n"
+"}\n";
+extern const unsigned char postfx_text_ffx_a[];
+extern const unsigned postfx_text_ffx_a_len;
+extern const unsigned char postfx_text_ffx_fsr1[];
+extern const unsigned postfx_text_ffx_fsr1_len;
+
 static ID3D11Device          *s_dev;      /* the objects below are its */
 static ID3D11VertexShader    *s_vs;
 static ID3D11PixelShader     *s_ps;       /* picture */
 static ID3D11PixelShader     *s_cas;      /* sharpen */
+static ID3D11PixelShader     *s_shrink;   /* scale, bigger to smaller */
+static ID3D11PixelShader     *s_easu;     /* scale (FSR), made on first use */
+static ID3D11PixelShader     *s_rcas;     /* sharpen behind EASU, with it */
+static int                    s_fsr_broken;  /* not made, said once */
 static ID3D11PixelShader     *s_fxaa;     /* aa (FXAA), made on first use */
 static ID3D11VertexShader    *s_svs[3];   /* aa (SMAA): edges, weights, */
 static ID3D11PixelShader     *s_sps[3];   /* blending; made on first use */
@@ -425,7 +537,7 @@ typedef struct {
     DXGI_FORMAT               fmt;
 } Surf;
 
-static Surf s_mid[2];   /* between stages, taken in turn */
+static Surf s_mid[3];   /* stage i's output, when not the last */
 static Surf s_in;       /* the source rectangle alone, for anti-aliasing */
 static Surf s_edges;    /* SMAA's edges and blend weights */
 static Surf s_blend;
@@ -470,22 +582,93 @@ static HRESULT make_ps(ID3D11Device *dev, const char *entry,
     return make_ps_from(dev, s_hlsl, sizeof s_hlsl - 1, entry, "ps_4_0", ps);
 }
 
+/* s_hlsl, then the n parts (part[i], size[i] bytes) in order: one shader
+ * source around vendored text, *len bytes, for free(). NULL when out of
+ * memory. */
+static char *join_source(const void *const *part, const size_t *size, int n,
+                         size_t *len)
+{
+    size_t total = sizeof s_hlsl - 1, at;
+    char *src;
+    int i;
+
+    for (i = 0; i < n; i++)
+        total += size[i];
+    src = (char *)malloc(total);
+    if (src) {
+        memcpy(src, s_hlsl, sizeof s_hlsl - 1);
+        at = sizeof s_hlsl - 1;
+        for (i = 0; i < n; i++) {
+            memcpy(src + at, part[i], size[i]);
+            at += size[i];
+        }
+    }
+    *len = total;
+    return src;
+}
+
 /* s_hlsl, then pre, the vendored text and main: one anti-aliasing
- * shader source, *len bytes, for free(). NULL when out of memory. */
+ * shader source (join_source). */
 static char *aa_source(const char *pre, size_t n2, const unsigned char *text,
                        size_t n3, const char *main, size_t n4, size_t *len)
 {
-    size_t n1 = sizeof s_hlsl - 1;
-    char *src = (char *)malloc(n1 + n2 + n3 + n4);
+    const void *part[3];
+    size_t size[3];
 
-    if (src) {
-        memcpy(src, s_hlsl, n1);
-        memcpy(src + n1, pre, n2);
-        memcpy(src + n1 + n2, text, n3);
-        memcpy(src + n1 + n2 + n3, main, n4);
+    part[0] = pre;
+    size[0] = n2;
+    part[1] = text;
+    size[1] = n3;
+    part[2] = main;
+    size[2] = n4;
+    return join_source(part, size, 3, len);
+}
+
+/* FSR's EASU and RCAS shaders, the first time the FSR upscaler is used
+ * (they take a moment to compile). 0 (said once) when they cannot be made:
+ * the stretch is then bilinear. */
+static int fsr_setup(ID3D11Device *dev)
+{
+    const void *part[5];
+    size_t size[5], len;
+    char *src;
+    DWORD t0;
+    HRESULT hr;
+
+    if (s_rcas)
+        return 1;
+    if (s_fsr_broken)
+        return 0;
+    t0 = GetTickCount();
+    part[0] = s_fsr_pre;
+    size[0] = sizeof s_fsr_pre - 1;
+    part[1] = postfx_text_ffx_a;
+    size[1] = postfx_text_ffx_a_len;
+    part[2] = s_fsr_mid;
+    size[2] = sizeof s_fsr_mid - 1;
+    part[3] = postfx_text_ffx_fsr1;
+    size[3] = postfx_text_ffx_fsr1_len;
+    part[4] = s_fsr_main;
+    size[4] = sizeof s_fsr_main - 1;
+    src = join_source(part, size, 5, &len);
+    hr = src ? make_ps_from(dev, src, len, "eps", "ps_5_0", &s_easu)
+             : E_OUTOFMEMORY;
+    if (SUCCEEDED(hr))
+        hr = make_ps_from(dev, src, len, "rps", "ps_5_0", &s_rcas);
+    free(src);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[GPU] postfx: FSR 1 could not be made (hr 0x%08lX);"
+                " the upscaler is bilinear%c", (unsigned long)hr, 10);
+        if (s_easu) {
+            ID3D11PixelShader_Release(s_easu);
+            s_easu = NULL;
+        }
+        s_fsr_broken = 1;
+        return 0;
     }
-    *len = n1 + n2 + n3 + n4;
-    return src;
+    fprintf(stderr, "[GPU] postfx: fsr ready (%lu ms)%c",
+            (unsigned long)(GetTickCount() - t0), 10);
+    return 1;
 }
 
 /* The FXAA shader, the first time it is chosen (it takes a moment to
@@ -632,6 +815,8 @@ static int setup(ID3D11Device *dev)
         hr = make_ps(dev, "pps", &s_ps);
     if (SUCCEEDED(hr))
         hr = make_ps(dev, "cps", &s_cas);
+    if (SUCCEEDED(hr))
+        hr = make_ps(dev, "zps", &s_shrink);
     if (SUCCEEDED(hr)) {
         memset(&bd, 0, sizeof bd);
         bd.ByteWidth = 80;
@@ -843,7 +1028,24 @@ static int smaa_run(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                     (float)w, (float)h, k);
 }
 
-enum { ST_AA, ST_SHARPEN, ST_PICTURE };
+enum { ST_AA, ST_SCALE, ST_SHARPEN, ST_PICTURE };
+enum { SC_NONE, SC_SHRINK, SC_BILINEAR, SC_FSR };
+
+/* pps's stretch (po.z zero) of the rectangle ix0,iy0 cw x ch of a tw x th
+ * texture over vw x vh target pixels, into k (see s_hlsl). */
+static void stretch_k(float *k, float ix0, float iy0, float cw, float ch,
+                      float tw, float th, float vw, float vh)
+{
+    k[0] = cw / (vw * tw);
+    k[1] = ch / (vh * th);
+    k[2] = ix0 / tw;
+    k[3] = iy0 / th;
+    k[6] = 0.0f;
+    k[16] = (ix0 + 0.5f) / tw;
+    k[17] = (iy0 + 0.5f) / th;
+    k[18] = (ix0 + cw - 0.5f) / tw;
+    k[19] = (iy0 + ch - 0.5f) / th;
+}
 
 int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                 ID3D11Texture2D *src, float sx0, float sy0, float sw,
@@ -852,12 +1054,18 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11ShaderResourceView *srv = NULL, *in;
-    float k[20], sharpen = fval(&s_sharpen);
-    float tw, th, ix0, iy0;
+    float k[20], sharpen;
+    float tw, th, ix0, iy0, cw, ch;
     UINT mw = (UINT)(sw + 0.5f), mh = (UINT)(sh + 0.5f);
-    int same = sw == dw && sh == dh;
-    int aa = s_aa, pic, stage[3], n = 0, i, ok = 1;
+    UINT ow = (UINT)(dw + 0.5f), oh = (UINT)(dh + 0.5f);
+    int aa, scale = SC_NONE, whole, pic, stage[4], n = 0, i, ok = 1;
 
+    /* The values, read here too: a frame of another size comes here
+     * without postfx_active having been asked, and unread values are 0
+     * (contrast 0 is a flat grey). */
+    params();
+    sharpen = fval(&s_sharpen);
+    aa = s_aa;
     if (!src || !dst || dw < 1.0f || dh < 1.0f || sw <= 0.0f || sh <= 0.0f
         || !setup(dev))
         return 0;
@@ -870,11 +1078,20 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     th = (float)td.Height;
     ix0 = sx0;
     iy0 = sy0;
+    whole = sx0 == 0.0f && sy0 == 0.0f && mw == td.Width && mh == td.Height;
 
     if (aa != AA_OFF && !aa_setup(dev, aa))
         aa = AA_OFF;
-    if (aa != AA_OFF && (aa == AA_SMAA || sx0 != 0.0f || sy0 != 0.0f
-                         || (float)mw != tw || (float)mh != th)) {
+    if (mw != ow || mh != oh) {
+        if (mw >= ow && mh >= oh)
+            scale = SC_SHRINK;
+        else if (s_upscale == UP_FSR && fsr_setup(dev))
+            scale = SC_FSR;
+        else
+            scale = SC_BILINEAR;
+    }
+    if ((aa != AA_OFF && (aa == AA_SMAA || !whole))
+        || (aa == AA_OFF && scale == SC_FSR && !whole)) {
         /* The rectangle alone, so that sampling around its edge clamps
          * there instead of reading what lies next to it; for SMAA with
          * an sRGB view too (srv2) when the source is 8-bit BGRA. */
@@ -898,21 +1115,34 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
             ix0 = iy0 = 0.0f;
         } else {
             aa = AA_OFF;
+            if (scale == SC_FSR)
+                scale = SC_BILINEAR;
         }
     }
 
-    /* The stages that are on; every one but the last draws into s_mid. */
-    pic = (aa == AA_OFF && sharpen == 0.0f) || !same || picture_on();
+    /* The stages that are on; every one but the last draws into s_mid. A
+     * bilinear stretch with nothing between it and the picture stage is
+     * the picture stage's own. */
+    pic = picture_on();
     if (aa != AA_OFF)
         stage[n++] = ST_AA;
+    if (scale == SC_BILINEAR && sharpen == 0.0f)
+        pic = 1;
+    else if (scale != SC_NONE)
+        stage[n++] = ST_SCALE;
     if (sharpen != 0.0f)
         stage[n++] = ST_SHARPEN;
-    if (pic)
+    if (pic || n == 0)
         stage[n++] = ST_PICTURE;
-    if ((n > 1 && !surf_fit(dev, &s_mid[0], mw, mh,
-                            DXGI_FORMAT_R16G16B16A16_FLOAT, 1))
-        || (n > 2 && !surf_fit(dev, &s_mid[1], mw, mh,
-                               DXGI_FORMAT_R16G16B16A16_FLOAT, 1))) {
+    for (i = 0; i < n - 1; i++) {
+        /* Before the scale stage the source's size, from it on the
+         * target's. */
+        int before = stage[i] == ST_AA;
+        if (!surf_fit(dev, &s_mid[i], before ? mw : ow, before ? mh : oh,
+                      DXGI_FORMAT_R16G16B16A16_FLOAT, 1))
+            break;
+    }
+    if (i < n - 1) {
         /* Only the picture stage, from the source itself. */
         n = 0;
         stage[n++] = ST_PICTURE;
@@ -923,20 +1153,22 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
         iy0 = sy0;
     }
 
+    cw = (float)mw;                     /* the input rectangle's size */
+    ch = (float)mh;
     for (i = 0; ok && i < n; i++) {
         int last = i == n - 1;
-        Surf *o = last ? NULL : &s_mid[i & 1];
+        Surf *o = last ? NULL : &s_mid[i];
         ID3D11RenderTargetView *rtv = last ? dst : o->rtv;
         float ox = last ? dx0 : 0.0f, oy = last ? dy0 : 0.0f;
-        float ow = last ? dw : (float)mw, oh = last ? dh : (float)mh;
+        float vw = last ? dw : (float)o->w, vh = last ? dh : (float)o->h;
 
         memset(k, 0, sizeof k);
         k[4] = ox;
         k[5] = oy;
         k[8] = ix0;
         k[9] = iy0;
-        k[10] = ix0 + sw;
-        k[11] = iy0 + sh;
+        k[10] = ix0 + cw;
+        k[11] = iy0 + ch;
         switch (stage[i]) {
         case ST_AA:
             if (aa == AA_SMAA) {
@@ -946,30 +1178,66 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
             }
             k[0] = 1.0f / tw;
             k[1] = 1.0f / th;
-            ok = run_pass(ctx, s_fxaa, in, rtv, ox, oy, ow, oh, k);
+            ok = run_pass(ctx, s_fxaa, in, rtv, ox, oy, vw, vh, k);
+            break;
+        case ST_SCALE:
+            if (scale == SC_SHRINK) {
+                k[0] = cw / vw;
+                k[1] = ch / vh;
+                ok = run_pass(ctx, s_shrink, in, rtv, ox, oy, vw, vh, k);
+            } else if (scale == SC_FSR) {
+                /* FsrEasuCon(con0..con3, cw, ch, tw, th, vw, vh); the
+                 * input is its whole texture here (s_in or s_mid). */
+                k[0] = cw / vw;
+                k[1] = ch / vh;
+                k[2] = 0.5f * cw / vw - 0.5f;
+                k[3] = 0.5f * ch / vh - 0.5f;
+                k[8] = 1.0f / tw;
+                k[9] = 1.0f / th;
+                k[10] = 1.0f / tw;
+                k[11] = -1.0f / th;
+                k[12] = -1.0f / tw;
+                k[13] = 2.0f / th;
+                k[14] = 1.0f / tw;
+                k[15] = 2.0f / th;
+                k[16] = 0.0f;
+                k[17] = 4.0f / th;
+                ok = run_pass(ctx, s_easu, in, rtv, ox, oy, vw, vh, k);
+            } else {
+                stretch_k(k, ix0, iy0, cw, ch, tw, th, vw, vh);
+                k[12] = k[13] = k[14] = 1.0f;
+                ok = run_pass(ctx, s_ps, in, rtv, ox, oy, vw, vh, k);
+            }
             break;
         case ST_SHARPEN:
+            if (scale == SC_FSR) {
+                /* FsrRcasCon's con[0], exp2(-stops): 100 % = 0 stops
+                 * (RCAS at its strongest), each 50 % less one stop less
+                 * sharp; AMD's default, 0.2 stops, is 90 %. */
+                k[16] = exp2f(-2.0f * (1.0f - sharpen / 100.0f));
+                ok = run_pass(ctx, s_rcas, in, rtv, ox, oy, vw, vh, k);
+                break;
+            }
             /* 100 % = CasSetup's sharpness 1 (-1/5); AMD's default,
              * sharpness 0 (-1/8), is 62.5 %. */
             k[16] = -0.2f * sharpen / 100.0f;
-            ok = run_pass(ctx, s_cas, in, rtv, ox, oy, ow, oh, k);
+            ok = run_pass(ctx, s_cas, in, rtv, ox, oy, vw, vh, k);
             break;
         default:
-            k[0] = sw / (dw * tw);
-            k[1] = sh / (dh * th);
-            k[2] = ix0 / tw;
-            k[3] = iy0 / th;
-            k[6] = same ? 1.0f : 0.0f;
+            if (cw == vw && ch == vh)
+                k[6] = 1.0f;            /* pixel for pixel */
+            else
+                stretch_k(k, ix0, iy0, cw, ch, tw, th, vw, vh);
             k[12] = fval(&s_gamma);
             k[13] = fval(&s_contrast);
             k[14] = fval(&s_saturation);
-            ok = run_pass(ctx, s_ps, in, rtv, ox, oy, ow, oh, k);
+            ok = run_pass(ctx, s_ps, in, rtv, ox, oy, vw, vh, k);
             break;
         }
         if (!last) {
             in = o->srv;
-            tw = (float)mw;
-            th = (float)mh;
+            tw = cw = (float)o->w;
+            th = ch = (float)o->h;
             ix0 = iy0 = 0.0f;
         }
     }
@@ -992,6 +1260,12 @@ int xbox_SetSharpen(float percent)
 }
 
 int xbox_SetAntiAlias(int mode)
+{
+    (void)mode;
+    return 0;
+}
+
+int xbox_SetUpscaler(int mode)
 {
     (void)mode;
     return 0;
