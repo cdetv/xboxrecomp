@@ -283,6 +283,7 @@ static struct {
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
+    uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
@@ -3247,6 +3248,105 @@ static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
     return s_cull[s_ncull++].rs;
 }
 
+/* ── Cut-out depth (RECOMP_CUTOUT_DEPTH) ──────────────────────────────────
+ *
+ * Titles draw thin cut-out things (wire, leaves) in two passes: alpha-tested
+ * with depth writes, then blended without them for soft edges. Whatever only
+ * the blended pass draws -- all of Conker's barbed-wire strands in It's War --
+ * has no depth, so blended smoke, fire and glows drawn later in the frame
+ * paint straight over it (2026-10-23). With the switch on, a blended batch
+ * that writes no depth and samples at stage 0 a texture that an
+ * alpha-tested, depth-writing batch used earlier in the frame is drawn a
+ * second time into depth only, alpha-tested as that earlier batch was: its
+ * solid texels then hide what is drawn behind them later, its soft edges
+ * still blend as before. Not what the hardware does, so off unless set. */
+#define CUT_TEX 32
+static struct {
+    uint32_t offset, func, ref;
+} s_cut[CUT_TEX];
+static uint32_t s_cut_n, s_cut_flip = ~0u;
+static ID3D11BlendState *s_bs_no_colour;
+
+static int cutout_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_CUTOUT_DEPTH");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+/* After a batch is drawn: remember stage 0's texture when the batch was a
+ * cut-out pass (alpha test GREATER/GEQUAL above 0, depth written), and
+ * return the entry when it was a blended pass of such a texture that wrote
+ * no depth, else -1. */
+static int cutout_match(int zi, uint32_t bound)
+{
+    uint32_t i, off = g_pb.texs[0].offset;
+
+    if (s_cut_flip != g_pb.flips) {
+        s_cut_flip = g_pb.flips;
+        s_cut_n = 0;
+    }
+    if (zi < 0 || !(bound & 1u) || !g_pb.depth_test)
+        return -1;
+    for (i = 0; i < s_cut_n; i++)
+        if (s_cut[i].offset == off)
+            break;
+    if (g_pb.depth_mask) {
+        if (i == s_cut_n && s_cut_n < CUT_TEX && g_pb.alpha_test
+            && (g_pb.alpha_func == 0x204 || g_pb.alpha_func == 0x206)
+            && (g_pb.alpha_ref & 0xFFu)) {
+            s_cut[i].offset = off;
+            s_cut[i].func = g_pb.alpha_func;
+            s_cut[i].ref = g_pb.alpha_ref & 0xFFu;
+            s_cut_n++;
+        }
+        return -1;
+    }
+    return i < s_cut_n && g_pb.blend_enable ? (int)i : -1;
+}
+
+/* The second, depth-only draw of the batch d3d_draw just drew (everything
+ * else still bound): no colour writes, depth written, alpha-tested as the
+ * cut-out pass of entry c was. The stencil test stays (Conker's wire passes
+ * test ALWAYS and replace with 0) but writes nothing, so ops that count are
+ * not applied twice. */
+static void cutout_depth(GpuConsts *k, int c, uint32_t nidx)
+{
+    ID3D11DepthStencilState *ds;
+    uint32_t mask = g_pb.depth_mask, wmask = g_pb.stencil_wmask;
+
+    if (!s_bs_no_colour) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);        /* blend off, write mask 0 */
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &s_bs_no_colour)))
+            return;
+    }
+    k->mode[2] = s_cut[c].func;
+    k->mode[3] = s_cut[c].ref;
+    if (!buf_fill(s_cb, k, sizeof *k))
+        return;
+    g_pb.depth_mask = 1;
+    g_pb.stencil_wmask = 0;
+    ds = ds_state();
+    g_pb.depth_mask = mask;
+    g_pb.stencil_wmask = wmask;
+    if (!ds)
+        return;
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_no_colour, NULL,
+                                        0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds,
+            g_pb.stencil_ref & 0xFFu);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    s_stat.cutout_draws++;
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     cut-out depth pass: tex %08X alpha"
+                " func %X ref %02X%c", s_cut[c].offset, s_cut[c].func,
+                s_cut[c].ref, 10);
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -3782,6 +3882,11 @@ static void d3d_draw(void)
         s_ftdump_big = 0;
     } else {
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    }
+    if (cutout_on()) {
+        int c = cutout_match(zi, bound);
+        if (c >= 0)
+            cutout_depth(&k, c, nidx);
     }
     if (zi >= 0)
         s_stat.zeta_draws++;
@@ -4392,6 +4497,10 @@ static void d3d_report(void)
             " handled (guest memory used)%c", s_stat.zeta_made,
             s_stat.zeta_clears, s_stat.zeta_draws, s_stat.zeta_too_big,
             s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
+    if (cutout_on())
+        fprintf(stderr, "[GPU] d3d11: cut-out depth (RECOMP_CUTOUT_DEPTH):"
+                " %u blended batches drawn again into depth%c",
+                s_stat.cutout_draws, 10);
     fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
             " flip) from guest memory inside a GPU surface or zeta buffer"
             " (stale); surface binds:"
