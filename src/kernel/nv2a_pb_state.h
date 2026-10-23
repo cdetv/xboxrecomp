@@ -347,7 +347,37 @@ typedef struct {
     void (*zpass)(int what);
     void (*get_report)(uint32_t at, uint64_t stamp);
     void (*poll)(void);
+    /* A host effect asked for in the pushbuffer (NV_HOST_SUBCH below), at
+     * its place among the title's draws: id, and the NV_HOST_PARAMS
+     * parameters set before it. NULL: the back end has none (the effect is
+     * simply not drawn). */
+    void (*host_effect)(uint32_t id, const uint32_t *p);
 } Nv2aPbBackend;
+
+/* Host methods: commands a game's own code (not the title's) puts in the
+ * pushbuffer for the runtime, so that something the host draws lands at
+ * exactly that point of the frame, in order with the title's draws -- the
+ * executor runs on its own thread, behind the title. They go on
+ * subchannel 7, which no Xbox D3D object uses, and never reach the NV2A
+ * state. Not 0x0100: the walk (nv2a_pb_scan.c) takes a NO_OPERATION with
+ * a parameter on any subchannel for a software-method trap, and a float
+ * parameter there sent the title's interrupt handler garbage (a crash).
+ *   NV_HOST_PARAM(i)  0x0800 + 4 i, i < NV_HOST_PARAMS: parameter i
+ *   NV_HOST_EFFECT    0x0880: run effect `param` with the parameters set
+ * Effects (back end host_effect):
+ *   NV_HOST_FX_DOF    depth of field over the current colour surface, from
+ *                     its depth buffer: p0 the depth (0..1) in focus, p1
+ *                     the depth distance from it to the most blur, p2/p3
+ *                     the camera's near/far planes (for distances), p4 the
+ *                     style (0 = blur with the square of the depth
+ *                     distance, as Conker's; 1 = cinematic, as a lens), p5
+ *                     the most blur in guest pixels (radius). All floats
+ *                     but p4. */
+#define NV_HOST_SUBCH    7u
+#define NV_HOST_PARAMS   8u
+#define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
+#define NV_HOST_EFFECT   0x0880u
+#define NV_HOST_FX_DOF   1u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 
