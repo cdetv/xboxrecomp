@@ -28,6 +28,7 @@ set(KERNEL_SOURCES
     nv2a_draw_sw.c
     nv2a_draw_d3d11.c
     postfx_d3d11.c
+    dof_d3d11.c
     nv2a_vsh_interp.c
     nv2a_vsh_hlsl.c
     nv2a_vsh_gpu.c

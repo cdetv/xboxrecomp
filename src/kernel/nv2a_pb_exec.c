@@ -999,6 +999,29 @@ void nv2a_pb_exec_poll(void)
         s_be->poll();
 }
 
+/* Host methods (nv2a_pb_state.h): parameters, then an effect run by the
+ * back end (and the shadow one) where it stands in the stream. */
+static void host_method(uint32_t method, uint32_t param)
+{
+    static uint32_t p[NV_HOST_PARAMS];
+
+    if (method >= NV_HOST_PARAM(0) && method < NV_HOST_PARAM(NV_HOST_PARAMS)) {
+        p[(method - NV_HOST_PARAM(0)) / 4u] = param;
+        return;
+    }
+    if (method != NV_HOST_EFFECT) {
+        note_unhandled(method, param);
+        return;
+    }
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE] host effect %u: %08X %08X %08X %08X %08X"
+                " %08X%c", param, p[0], p[1], p[2], p[3], p[4], p[5], 10);
+    if (s_be->host_effect)
+        s_be->host_effect(param, p);
+    if (s_shadow && s_shadow->host_effect)
+        s_shadow->host_effect(param, p);
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -1076,6 +1099,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
     if (subch == 0 && method >= NV_TEX_FIRST && method <= NV_TEX_LAST) {
         tex_stage_method(method, param);
+        return;
+    }
+    if (subch == NV_HOST_SUBCH) {
+        host_method(method, param);
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */

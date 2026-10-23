@@ -46,6 +46,7 @@
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include "postfx_d3d11.h"
+#include "dof_d3d11.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowStart(void);
@@ -284,6 +285,7 @@ static struct {
     uint32_t rtt_binds, rtt_unhandled;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
+    uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
@@ -4501,6 +4503,10 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: cut-out depth (RECOMP_CUTOUT_DEPTH):"
                 " %u blended batches drawn again into depth%c",
                 s_stat.cutout_draws, 10);
+    if (s_stat.dof_drawn || s_stat.dof_skipped)
+        fprintf(stderr, "[GPU] d3d11: host depth of field: %u drawn, %u not"
+                " (no surface, depth buffer or shaders)%c", s_stat.dof_drawn,
+                s_stat.dof_skipped, 10);
     fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
             " flip) from guest memory inside a GPU surface or zeta buffer"
             " (stale); surface binds:"
@@ -4692,6 +4698,47 @@ static void d3d_zpass(int what)
     }
 }
 
+/* Host effects (nv2a_pb_state.h). NV_HOST_FX_DOF: depth of field over the
+ * current colour surface's clip, from its depth buffer (dof_d3d11.c), in
+ * place of the title's own, which the game left out. */
+static float host_float(uint32_t bits)
+{
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static void d3d_host_effect(uint32_t id, const uint32_t *p)
+{
+    DofParams dp;
+    int si, zi;
+
+    if (id != NV_HOST_FX_DOF)
+        return;
+    si = surface_current();
+    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled) : -1;
+    dp.focus = host_float(p[0]);
+    dp.range = host_float(p[1]);
+    dp.zn = host_float(p[2]);
+    dp.zf = host_float(p[3]);
+    dp.style = (int)p[4];
+    dp.max_blur = host_float(p[5]);
+    if (zi < 0 || !dof_draw(s_dev, s_ctx, s_surf[si].tex, s_surf[si].rtv,
+                            s_zeta[zi].srv_z,
+                            to_host(g_pb.clip_x, surf_sx(si)),
+                            to_host(g_pb.clip_y, surf_sy(si)),
+                            to_host(g_pb.clip_w, surf_sx(si)),
+                            to_host(g_pb.clip_h, surf_sy(si)),
+                            (float)g_pb.clip_h, &dp)) {
+        s_stat.dof_skipped++;
+        return;
+    }
+    s_stat.dof_drawn++;
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host depth of field on %08X, %ux%u%c",
+                s_surf[si].addr, g_pb.clip_w, g_pb.clip_h, 10);
+}
+
 static void vis_write(uint32_t at, uint64_t stamp, uint32_t count)
 {
     volatile uint8_t *slot = (volatile uint8_t *)xbox_GetMemoryOffset() + at;
@@ -4814,7 +4861,7 @@ static void d3d_poll(void)
 
 static const Nv2aPbBackend s_backend = {
     "d3d11", d3d_clear, d3d_draw, d3d_present, d3d_report,
-    d3d_zpass, d3d_get_report, d3d_poll
+    d3d_zpass, d3d_get_report, d3d_poll, d3d_host_effect
 };
 
 const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
