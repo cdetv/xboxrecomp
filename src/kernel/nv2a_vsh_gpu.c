@@ -789,6 +789,22 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
             return NULL;
         }
         j.key = src_key(j.src, j.len);
+        /* RECOMP_VSH_SOURCE_LOG=1: where the program's first instruction came
+         * in (push buffer address; the recorded buffer it was in, 0 = the
+         * ring), once per program: which programs a title keeps in recorded
+         * buffers, for shader pre-compilation. */
+        {
+            static int src_log = -1;
+            if (src_log < 0)
+                src_log = getenv("RECOMP_VSH_SOURCE_LOG") != NULL;
+            if (src_log) {
+                uint32_t va, buf;
+                nv2a_vsh_start_source(&va, &buf);
+                fprintf(stderr, "[VSHORIGIN] program %016llX: %u instructions"
+                        " from %08X, buffer %08X\n",
+                        (unsigned long long)p->hash, count, va, buf);
+            }
+        }
         EnterCriticalSection(&s_q_cs);
         if (cache_on() && (p->draw_vs = disk_find(j.key)) != NULL) {
             /* Loaded at startup: drawn on the GPU from its first batch. */

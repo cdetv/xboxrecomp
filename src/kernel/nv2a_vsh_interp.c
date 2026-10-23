@@ -81,8 +81,28 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
     s_load_word = 0;
 }
 
+static uint32_t s_slot_va[NV2A_VSH_SLOTS], s_slot_buf[NV2A_VSH_SLOTS];
+static uint32_t s_next_va, s_next_buf;
+
+void nv2a_vsh_program_source(uint32_t word_va, uint32_t buf_va)
+{
+    s_next_va = word_va;
+    s_next_buf = buf_va;
+}
+
+void nv2a_vsh_start_source(uint32_t *word_va, uint32_t *buf_va)
+{
+    uint32_t s = s_start_slot < NV2A_VSH_SLOTS ? s_start_slot : 0;
+    *word_va = s_slot_va[s];
+    *buf_va = s_slot_buf[s];
+}
+
 void nv2a_vsh_program_word(uint32_t word)
 {
+    if (s_load_word == 0 && s_load_slot < NV2A_VSH_SLOTS) {
+        s_slot_va[s_load_slot] = s_next_va;
+        s_slot_buf[s_load_slot] = s_next_buf;
+    }
     s_dec_valid = 0;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;

@@ -44,6 +44,11 @@ typedef struct {
 
 void nv2a_vsh_set_load_slot(uint32_t slot);           /* _PROGRAM_LOAD      */
 void nv2a_vsh_program_word(uint32_t word);            /* _PROGRAM(i)        */
+/* Where the next _PROGRAM word comes from (push buffer address, and the
+ * recorded buffer it is in, 0 = the ring), kept per slot for
+ * nv2a_vsh_start_source (RECOMP_VSH_SOURCE_LOG). */
+void nv2a_vsh_program_source(uint32_t word_va, uint32_t buf_va);
+void nv2a_vsh_start_source(uint32_t *word_va, uint32_t *buf_va);
 void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
 void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
