@@ -1022,6 +1022,9 @@ static void host_method(uint32_t method, uint32_t param)
         s_shadow->host_effect(param, p);
 }
 
+/* nv2a_pb_scan.c: where the walk is reading (RECOMP_VSH_SOURCE_LOG). */
+extern uint32_t g_nv2a_pb_word_va, g_nv2a_pb_buf_va;
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -1493,7 +1496,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             break;
         }
         if (method >= 0x0B00 && method < 0x0B80) {    /* TRANSFORM_PROGRAM(i) */
-            extern uint32_t g_nv2a_pb_word_va, g_nv2a_pb_buf_va;
             nv2a_vsh_program_source(g_nv2a_pb_word_va, g_nv2a_pb_buf_va);
             nv2a_vsh_program_word(param);
             break;

@@ -46,6 +46,7 @@ static VshProg s_prog[VSH_CACHE];
 static VshProg s_spare;                 /* when the cache is full */
 static uint32_t s_nprog, s_ncompiled, s_nfailed;
 static VshProg *s_cur;                  /* the last prepared program */
+void (*nv2a_vsh_gpu_new_program_hook)(uint64_t hash);
 
 /* Step 3: the drawing shaders, compiled on worker threads (the D3D11
  * device is free-threaded) so a program seen for the first time costs the
@@ -805,6 +806,8 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
                         (unsigned long long)p->hash, count, va, buf);
             }
         }
+        if (nv2a_vsh_gpu_new_program_hook)
+            nv2a_vsh_gpu_new_program_hook(p->hash);
         EnterCriticalSection(&s_q_cs);
         if (cache_on() && (p->draw_vs = disk_find(j.key)) != NULL) {
             /* Loaded at startup: drawn on the GPU from its first batch. */

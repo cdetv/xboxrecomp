@@ -54,3 +54,12 @@ int guest_vmem_query(uint32_t address, uint32_t info[7]);
  * that lies above the mirrors (a title's own high reservation, or a CRT heap
  * grown into one). 0 when the tracker is not live. */
 int guest_vmem_committed(uint32_t va, uint32_t bytes);
+
+/* For readers on other threads (shader pre-compilation's memory scan): the
+ * first committed run of pages at or above `from` (1, *base and *size set; 0
+ * when there is none or the tracker is not live), and a copy of up to
+ * `bytes` from va made under the tracker's lock, so a free on another thread
+ * can never decommit a page halfway through; it stops at the first page not
+ * committed and returns the bytes copied. */
+int guest_vmem_next_committed(uint32_t from, uint32_t *base, uint32_t *size);
+uint32_t guest_vmem_read(uint32_t va, void *dst, uint32_t bytes);

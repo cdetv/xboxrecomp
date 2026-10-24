@@ -106,4 +106,9 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait);
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
                              uint32_t *queued, double *ms);
 
+/* Called (when set) with each program's hash the first time a drawing
+ * shader is asked for it: nv2a_vsh_prescan.c's way to see what is drawn
+ * without this file depending on it. */
+extern void (*nv2a_vsh_gpu_new_program_hook)(uint64_t hash);
+
 #endif
