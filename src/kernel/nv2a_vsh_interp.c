@@ -81,8 +81,28 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
     s_load_word = 0;
 }
 
+static uint32_t s_slot_va[NV2A_VSH_SLOTS], s_slot_buf[NV2A_VSH_SLOTS];
+static uint32_t s_next_va, s_next_buf;
+
+void nv2a_vsh_program_source(uint32_t word_va, uint32_t buf_va)
+{
+    s_next_va = word_va;
+    s_next_buf = buf_va;
+}
+
+void nv2a_vsh_start_source(uint32_t *word_va, uint32_t *buf_va)
+{
+    uint32_t s = s_start_slot < NV2A_VSH_SLOTS ? s_start_slot : 0;
+    *word_va = s_slot_va[s];
+    *buf_va = s_slot_buf[s];
+}
+
 void nv2a_vsh_program_word(uint32_t word)
 {
+    if (s_load_word == 0 && s_load_slot < NV2A_VSH_SLOTS) {
+        s_slot_va[s_load_slot] = s_next_va;
+        s_slot_buf[s_load_slot] = s_next_buf;
+    }
     s_dec_valid = 0;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
@@ -445,16 +465,22 @@ static void decode_src(VshSrc *d, const uint32_t *ins, int which)
     d->sw[3] = (uint8_t)(swz & 3);
 }
 
-static void decode_program(void)
+/* Up to n instructions from prog into dec, to the first FINAL: how many
+ * were decoded, *final whether a FINAL ended them, *inputs the inputs the
+ * ops read, *hash FNV-1a of dwords 1-3. No state of its own, so the shader
+ * pre-compiler can decode programs found in memory on its threads. */
+static uint32_t decode_words(const uint32_t (*prog)[4], uint32_t nslots,
+                             VshIns *dec, int *final, uint32_t *inputs,
+                             uint64_t *hash)
 {
     uint32_t s, n = 0;
     uint64_t h = 14695981039346656037ull;
 
-    s_dec_final = 0;
-    s_dec_inputs = 0;
-    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++, n++) {
-        const uint32_t *ins = s_program[s];
-        VshIns *I = &s_dec[n];
+    *final = 0;
+    *inputs = 0;
+    for (s = 0; s < nslots; s++, n++) {
+        const uint32_t *ins = prog[s];
+        VshIns *I = &dec[n];
         int k;
 
         for (k = 1; k < 4; k++)                     /* dword 0 is unused */
@@ -484,16 +510,39 @@ static void decode_program(void)
             I->need |= VSH_NEED_C;
         for (k = 0; k < 3; k++)
             if ((I->need & (1 << k)) && I->src[k].mux == 2)
-                s_dec_inputs |= 1u << I->iidx;
+                *inputs |= 1u << I->iidx;
         if (I->final) {
-            s_dec_final = 1;
+            *final = 1;
             n++;
             break;
         }
     }
-    s_dec_count = n;
-    s_dec_hash = h;
+    *hash = h;
+    return n;
+}
+
+static void decode_program(void)
+{
+    uint32_t s = s_start_slot < NV2A_VSH_SLOTS ? s_start_slot : 0;
+    uint32_t n = s_start_slot < NV2A_VSH_SLOTS ? NV2A_VSH_SLOTS - s : 0;
+
+    s_dec_count = decode_words((const uint32_t (*)[4])&s_program[s], n, s_dec,
+                               &s_dec_final, &s_dec_inputs, &s_dec_hash);
     s_dec_valid = 1;
+}
+
+uint32_t nv2a_vsh_decode_words(const uint32_t *words, uint32_t count,
+                               Nv2aVshIns *out, uint32_t *inputs_used,
+                               uint64_t *hash)
+{
+    int final;
+    uint32_t n;
+
+    if (count > NV2A_VSH_SLOTS)
+        count = NV2A_VSH_SLOTS;
+    n = decode_words((const uint32_t (*)[4])words, count, out, &final,
+                     inputs_used, hash);
+    return final ? n : 0;
 }
 
 const Nv2aVshIns *nv2a_vsh_decoded(uint32_t *count, uint64_t *hash)

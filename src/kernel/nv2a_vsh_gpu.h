@@ -102,8 +102,29 @@ void nv2a_vsh_gpu_draw_source(const char *head, const char *tail,
 struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait);
 
 /* Drawing shaders made, failed, waiting for a thread; their compile time
- * (summed over the threads). */
+ * (summed over the threads). Pre-compiled ones are not in these. */
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
                              uint32_t *queued, double *ms);
+
+/* Shader pre-compilation: a program found in guest memory (count
+ * instructions of 4 words, nv2a_vsh_scan's form) queued for its drawing
+ * shader, made into the disk cache (RECOMP_VSH_GPU_CACHE) by the compile
+ * threads whenever no drawn program is waiting. A program drawn later then
+ * finds its shader there and is drawn on the GPU from its first batch. Any
+ * thread; the words are copied. 1 if queued; 0 without the disk cache, or
+ * with the queue full (4096). Callers send each program once: nothing here
+ * notices a program queued twice until its turn (then it is skipped as
+ * already in the cache). */
+int nv2a_vsh_gpu_precompile(const uint32_t *words, uint32_t count);
+
+/* Pre-compiled programs (compiled or loaded from their file), ones already
+ * in the cache, ones that failed, ones still waiting or being made. */
+void nv2a_vsh_gpu_precompile_stats(uint32_t *compiled, uint32_t *had,
+                                   uint32_t *failed, uint32_t *waiting);
+
+/* Called (when set) with each program's hash the first time a drawing
+ * shader is asked for it: nv2a_vsh_prescan.c's way to see what is drawn
+ * without this file depending on it. */
+extern void (*nv2a_vsh_gpu_new_program_hook)(uint64_t hash);
 
 #endif

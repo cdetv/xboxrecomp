@@ -308,6 +308,11 @@ static uint32_t pb_check_jumped(const uint8_t *mem, uint32_t va, uint32_t last,
     return va;
 }
 
+/* Where the executor is reading: the parameter's address, and the start of
+ * the buffer a jump or call took the walk into (0 in the ring). Read by
+ * nv2a_pb_exec for RECOMP_VSH_SOURCE_LOG (which buffer a program came in). */
+uint32_t g_nv2a_pb_word_va, g_nv2a_pb_buf_va;
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                         uint32_t *jumps, uint32_t *unknown, uint32_t *exit_va)
 {
@@ -401,9 +406,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                                 bad < ram_end ? *(const uint32_t *)(mem + bad)
                                               : 0u, last);
                     back = want;                 /* as if it drew nothing */
-                } else
+                } else {
+                    uint32_t buf = g_nv2a_pb_buf_va;
+                    g_nv2a_pb_buf_va = tva;
                     words += pb_walk(tva, tva + 0x400000u, PB_JUMPED,
                                      jumps, unknown, &back);
+                    g_nv2a_pb_buf_va = buf;
+                }
                 if (!back) {
                     s_tot_jumped_open++;
                     if (s_tot_jumped_open <= 8)
@@ -448,9 +457,12 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
         if ((w & 3u) == 2u) {                    /* CALL */
             if (mode != PB_CALL) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
+                uint32_t buf = g_nv2a_pb_buf_va;
                 s_tot_calls++;
+                g_nv2a_pb_buf_va = sub;
                 words += pb_walk(sub, sub + 0x400000u, PB_CALL,
                                  jumps, unknown, NULL);
+                g_nv2a_pb_buf_va = buf;
             }
             continue;
         }
@@ -470,6 +482,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
+                g_nv2a_pb_word_va = va;
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));

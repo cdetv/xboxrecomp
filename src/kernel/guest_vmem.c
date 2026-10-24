@@ -385,3 +385,50 @@ int guest_vmem_committed(uint32_t va, uint32_t bytes)
     ReleaseSRWLockShared(&s_lock);
     return ok;
 }
+
+int guest_vmem_next_committed(uint32_t from, uint32_t *base, uint32_t *size)
+{
+    uint32_t p, n, start;
+
+    if (!s_pages || from >= s_top)
+        return 0;
+    if (from < s_lo)
+        from = s_lo;
+    n = page_index(s_top - 1) + 1;
+    AcquireSRWLockShared(&s_lock);
+    for (p = page_index(from); p < n && s_pages[p].state != MEM_COMMIT_FLAG; ++p)
+        ;
+    start = p;
+    while (p < n && s_pages[p].state == MEM_COMMIT_FLAG)
+        ++p;
+    ReleaseSRWLockShared(&s_lock);
+    if (start >= n)
+        return 0;
+    *base = s_lo + start * VMEM_PAGE;
+    *size = (p - start) * VMEM_PAGE;
+    return 1;
+}
+
+uint32_t guest_vmem_read(uint32_t va, void *dst, uint32_t bytes)
+{
+    uint32_t done = 0;
+
+    if (!s_pages || va < s_lo || va >= s_top)
+        return 0;
+    if (bytes > s_top - va)
+        bytes = s_top - va;
+    AcquireSRWLockShared(&s_lock);
+    while (done < bytes) {
+        uint32_t at = va + done;
+        uint32_t chunk = VMEM_PAGE - (at & (VMEM_PAGE - 1));
+        if (chunk > bytes - done)
+            chunk = bytes - done;
+        if (s_pages[page_index(at)].state != MEM_COMMIT_FLAG)
+            break;
+        memcpy((uint8_t *)dst + done,
+               (const void *)((uintptr_t)at + (uintptr_t)s_offset), chunk);
+        done += chunk;
+    }
+    ReleaseSRWLockShared(&s_lock);
+    return done;
+}

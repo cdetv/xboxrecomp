@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_vsh_scan_regression C)
+enable_testing()
+add_executable(nv2a-vsh-scan-test nv2a_vsh_scan_test.c ../../src/kernel/nv2a_vsh_scan.c)
+target_include_directories(nv2a-vsh-scan-test PRIVATE ../../src/kernel)
+add_test(NAME nv2a-vsh-scan COMMAND nv2a-vsh-scan-test)
