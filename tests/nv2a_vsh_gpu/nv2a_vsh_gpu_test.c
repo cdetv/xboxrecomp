@@ -550,6 +550,94 @@ static int draw_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
     return 1;
 }
 
+/* nv2a_vsh_gpu_precompile_stats's waiting count reaching 0, or 60 s. */
+static int pre_wait(uint32_t *compiled, uint32_t *had, uint32_t *failed)
+{
+    ULONGLONG t0 = GetTickCount64();
+    uint32_t waiting;
+
+    do {
+        Sleep(5);
+        nv2a_vsh_gpu_precompile_stats(compiled, had, failed, &waiting);
+    } while (waiting && GetTickCount64() - t0 < 60000);
+    return waiting == 0;
+}
+
+/* Shader pre-compilation: a program given as words (as a memory scan finds
+ * it) decodes as the uploaded one does, its drawing shader is made into the
+ * disk cache, a second request finds it there, and the drawing path then
+ * has it at once, without a compile. After draw_test (the back end's HLSL
+ * is set) and before the random programs fill the program cache. */
+static int precompile_test(void)
+{
+    static Nv2aVshIns dec[NV2A_VSH_SLOTS];
+    const Nv2aVshIns *ins;
+    uint32_t w[6][4], i, n, n2, used, used2, compiled, had, failed;
+    uint32_t keep = s_rng;
+    uint64_t h, h2;
+
+    s_rng = 0x5EED1234u;                 /* the random programs' run unchanged */
+    for (i = 0; i < 6; i++) {
+        random_instruction(w[i], i == 5);
+        nv2a_vsh_set_instruction(i, w[i]);
+    }
+    s_rng = keep;
+    nv2a_vsh_set_start_slot(1);
+    nv2a_vsh_set_start_slot(0);
+    n = nv2a_vsh_decode_words(&w[0][0], 6, dec, &used, &h);
+    ins = nv2a_vsh_decoded(&n2, &h2);
+    nv2a_vsh_prepare(&used2);
+    if (!ins || n != 6 || n != n2 || h != h2 || used != used2
+        || memcmp(ins, dec, n * sizeof *ins)) {
+        puts("FAIL: precompile: words decode differently from the upload");
+        return 0;
+    }
+    w[5][3] &= ~1u;
+    if (nv2a_vsh_decode_words(&w[0][0], 6, dec, &used, &h)) {
+        puts("FAIL: precompile: a program without FINAL decoded");
+        return 0;
+    }
+    w[5][3] |= 1u;
+
+    if (!nv2a_vsh_gpu_precompile(&w[0][0], 6)
+        || !pre_wait(&compiled, &had, &failed) || compiled != 1 || failed) {
+        printf("FAIL: precompile: not made (%u made, %u failed)\n", compiled,
+               failed);
+        return 0;
+    }
+    if (!nv2a_vsh_gpu_precompile(&w[0][0], 6)
+        || !pre_wait(&compiled, &had, &failed) || compiled != 1 || had != 1) {
+        printf("FAIL: precompile: asked again, %u made, %u already there\n",
+               compiled, had);
+        return 0;
+    }
+    if (!nv2a_vsh_gpu_prepare(NULL) || !nv2a_vsh_gpu_draw_shader(0)) {
+        puts("FAIL: precompile: the drawing path did not find the shader");
+        return 0;
+    }
+    puts("precompile: made from words, found again, drawn from the cache");
+    return 1;
+}
+
+/* *.vso in dir and dir itself. */
+static void remove_cache(const char *dir)
+{
+    char path[MAX_PATH];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+
+    snprintf(path, sizeof path, "%s\\*.vso", dir);
+    h = FindFirstFileA(path, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
+            DeleteFileA(path);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(dir);
+}
+
 int main(int argc, char **argv)
 {
     ID3D11Device *dev = NULL;
@@ -560,6 +648,14 @@ int main(int argc, char **argv)
     uint32_t compiled, failed;
     double ms;
     HRESULT hr;
+    char tmp[MAX_PATH], cache[MAX_PATH];
+
+    /* A disk cache of this run's own (the pre-compiler needs one), removed
+     * after the pre-compile test: the random programs make none. */
+    GetTempPathA(sizeof tmp, tmp);
+    snprintf(cache, sizeof cache, "%snv2a_vsh_gpu_test_%lu", tmp,
+             GetCurrentProcessId());
+    _putenv_s("RECOMP_VSH_GPU_CACHE", cache);
 
     hr = D3D11CreateDevice(NULL, hw ? D3D_DRIVER_TYPE_HARDWARE
                                     : D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0,
@@ -612,6 +708,10 @@ int main(int argc, char **argv)
     if (!fetch_test(hw))
         return 1;
     if (!draw_test(dev, ctx, hw))
+        return 1;
+    i = precompile_test();
+    remove_cache(cache);
+    if (!i)
         return 1;
 
     for (prog = 0; prog < 1500; prog++) {

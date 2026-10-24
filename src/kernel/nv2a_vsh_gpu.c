@@ -69,24 +69,44 @@ typedef struct {
  * programs in 4 s -- drew ~83,000 batches that way, 30 -> 22 fps
  * (2026-10-20). The key hashes the whole source and the compile options,
  * so a changed translator or head names new files and never loads an old
- * shader. Unset: no disk cache. */
-#define VSH_DISK_MAX 1024
+ * shader. Unset: no disk cache. 4096: the pre-compiler adds every program a
+ * scan finds, ~830 in Conker's soak test (1024 until 2026-10-24). */
+#define VSH_DISK_MAX 4096
 typedef struct {
     uint64_t key;
     ID3D11VertexShader *vs;
+    int pre;                            /* made by the pre-compiler this run */
 } DiskShader;
 static DiskShader s_disk[VSH_DISK_MAX];  /* under s_q_cs */
 static uint32_t s_ndisk;
 static char s_cache_dir[MAX_PATH];
 static int s_cache_on = -1;
 static const char *s_dhead, *s_dtail, *s_dentry;
+static INIT_ONCE          s_q_once = INIT_ONCE_STATIC_INIT;
 static CRITICAL_SECTION   s_q_cs;
 static CONDITION_VARIABLE s_q_work, s_q_done;
 static DrawJob s_q[VSH_CACHE];          /* a program is queued once at most */
 static uint32_t s_q_head, s_q_tail;
-static int s_workers;
+static volatile LONG s_workers;         /* 0 = not started, -1 = none */
 static uint32_t s_dcompiled, s_dfailed; /* under s_q_cs */
 static double s_dms;
+
+/* Shader pre-compilation (nv2a_vsh_gpu_precompile): programs found in guest
+ * memory before anything draws them, compiled into the disk cache by the
+ * same workers, but only while no drawing shader is waiting: a program on
+ * screen now comes before one that may be drawn later. A job holds the
+ * program's words; decoding and the HLSL are the worker's, so the caller
+ * (the scan thread) only copies. */
+#define VSH_PRE_MAX 4096
+typedef struct {
+    uint32_t *words;                    /* count instructions of 4 words */
+    uint32_t count;
+} PreJob;
+static PreJob s_pq[VSH_PRE_MAX];        /* under s_q_cs */
+static uint32_t s_pq_head, s_pq_tail, s_pre_busy;
+static uint32_t s_pre_compiled, s_pre_loaded, s_pre_had, s_pre_failed;
+static uint32_t s_pre_dropped, s_pre_done_said;
+static double s_pre_ms;
 /* What the cbuffer holds: c[0..191], then the zero row (nv2a_vsh_hlsl.h). */
 static float s_crows[NV2A_VSH_HLSL_CROWS][4];
 static double s_compile_ms;
@@ -488,27 +508,29 @@ static void cache_path(char *out, size_t cap, uint64_t key)
 }
 
 /* Callers hold s_q_cs. */
-static ID3D11VertexShader *disk_find(uint64_t key)
+static DiskShader *disk_find(uint64_t key)
 {
     uint32_t i;
     for (i = 0; i < s_ndisk; i++)
         if (s_disk[i].key == key)
-            return s_disk[i].vs;
+            return &s_disk[i];
     return NULL;
 }
 
 /* Callers hold s_q_cs. The shader kept for key: vs, or the one already
  * there (vs is then released). Shaders are never freed, as draw_vs. */
-static ID3D11VertexShader *disk_add(uint64_t key, ID3D11VertexShader *vs)
+static ID3D11VertexShader *disk_add(uint64_t key, ID3D11VertexShader *vs,
+                                    int pre)
 {
-    ID3D11VertexShader *had = disk_find(key);
+    DiskShader *had = disk_find(key);
     if (had) {
-        if (had != vs)
+        if (had->vs != vs)
             ID3D11VertexShader_Release(vs);
-        return had;
+        return had->vs;
     }
     if (s_ndisk < VSH_DISK_MAX) {
         s_disk[s_ndisk].key = key;
+        s_disk[s_ndisk].pre = pre;
         s_disk[s_ndisk++].vs = vs;
     }
     return vs;
@@ -583,7 +605,7 @@ static DWORD WINAPI cache_loader(LPVOID arg)
                 continue;
             }
             EnterCriticalSection(&s_q_cs);
-            disk_add((uint64_t)key, vs);
+            disk_add((uint64_t)key, vs, 0);
             LeaveCriticalSection(&s_q_cs);
             loaded++;
         } while (FindNextFileA(h, &fd));
@@ -605,7 +627,7 @@ static void compile_draw(DrawJob *j)
     /* The loader may not have reached this one yet: its file first. */
     if (cache_on() && (vs = cache_load_file(j->key)) != NULL) {
         EnterCriticalSection(&s_q_cs);
-        vs = disk_add(j->key, vs);
+        vs = disk_add(j->key, vs, 0);
         LeaveCriticalSection(&s_q_cs);
         fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
                 " cache file in %.1f ms\n", (unsigned long long)j->p->hash,
@@ -632,7 +654,7 @@ static void compile_draw(DrawJob *j)
         cache_save(j->key, ID3D10Blob_GetBufferPointer(code),
                    ID3D10Blob_GetBufferSize(code));
         EnterCriticalSection(&s_q_cs);
-        vs = disk_add(j->key, vs);
+        vs = disk_add(j->key, vs, 0);
         LeaveCriticalSection(&s_q_cs);
     }
     ms = now_ms() - t0;
@@ -660,20 +682,6 @@ static void compile_draw(DrawJob *j)
     s_dms += ms;
     WakeAllConditionVariable(&s_q_done);
     LeaveCriticalSection(&s_q_cs);
-}
-
-static DWORD WINAPI draw_worker(LPVOID arg)
-{
-    (void)arg;
-    for (;;) {
-        DrawJob j;
-        EnterCriticalSection(&s_q_cs);
-        while (s_q_head == s_q_tail)
-            SleepConditionVariableCS(&s_q_work, &s_q_cs, INFINITE);
-        j = s_q[s_q_head++ % VSH_CACHE];
-        LeaveCriticalSection(&s_q_cs);
-        compile_draw(&j);
-    }
 }
 
 void nv2a_vsh_gpu_draw_source(const char *head, const char *tail,
@@ -714,6 +722,125 @@ static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
     return s;
 }
 
+/* One program found in memory: its drawing shader made and kept in the disk
+ * cache (and its file) unless it is there already, exactly as the drawing
+ * path would make it, so that path finds it by the same key. No VshProg:
+ * the program may never be drawn. */
+static void precompile_job(PreJob *pj)
+{
+    Nv2aVshIns ins[NV2A_VSH_SLOTS];
+    ID3DBlob *code = NULL, *err = NULL;
+    ID3D11VertexShader *vs = NULL;
+    uint32_t count, used;
+    uint64_t hash, key = 0;
+    size_t len = 0;
+    char *src = NULL;
+    double t0 = now_ms(), ms = 0.0;
+    int had = 0, loaded = 0;
+    HRESULT hr = E_FAIL;
+
+    count = nv2a_vsh_decode_words(pj->words, pj->count, ins, &used, &hash);
+    if (count)
+        src = draw_source(ins, count, used, &len);
+    free(pj->words);
+    if (src) {
+        key = src_key(src, len);
+        EnterCriticalSection(&s_q_cs);
+        had = disk_find(key) != NULL;
+        LeaveCriticalSection(&s_q_cs);
+        if (!had && (vs = cache_load_file(key)) != NULL)
+            loaded = 1;
+        if (!had && !loaded) {
+            hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL, s_dentry,
+                            VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, &code, &err);
+            if (SUCCEEDED(hr))
+                hr = ID3D11Device_CreateVertexShader(s_dev,
+                        ID3D10Blob_GetBufferPointer(code),
+                        ID3D10Blob_GetBufferSize(code), NULL, &vs);
+            if (SUCCEEDED(hr))
+                cache_save(key, ID3D10Blob_GetBufferPointer(code),
+                           ID3D10Blob_GetBufferSize(code));
+            else
+                vs = NULL;
+            ms = now_ms() - t0;
+            if (vs)
+                fprintf(stderr, "[VSHPRE] program %016llX: %u instructions,"
+                        " pre-compiled in %.1f ms\n", (unsigned long long)hash,
+                        count, ms);
+            else
+                fprintf(stderr, "[VSHPRE] program %016llX: draw shader failed"
+                        " (0x%08lX): %s\n", (unsigned long long)hash,
+                        (unsigned long)hr,
+                        err ? (const char *)ID3D10Blob_GetBufferPointer(err)
+                            : "");
+        }
+        free(src);
+    }
+    if (code) ID3D10Blob_Release(code);
+    if (err) ID3D10Blob_Release(err);
+
+    EnterCriticalSection(&s_q_cs);
+    if (vs)
+        disk_add(key, vs, 1);
+    if (had) s_pre_had++;
+    else if (loaded) s_pre_loaded++;
+    else if (vs) s_pre_compiled++;
+    else s_pre_failed++;
+    s_pre_ms += ms;
+    s_pre_busy--;
+    /* Once all found so far are done: one line for the batch. */
+    if (s_pq_head == s_pq_tail && !s_pre_busy) {
+        uint32_t all = s_pre_compiled + s_pre_loaded + s_pre_had + s_pre_failed;
+        if (all != s_pre_done_said) {
+            s_pre_done_said = all;
+            fprintf(stderr, "[VSHPRE] queue empty: %u compiled (%.0f ms on the"
+                    " threads), %u from files, %u already cached, %u failed%s;"
+                    " %u in the cache\n", s_pre_compiled, s_pre_ms,
+                    s_pre_loaded, s_pre_had, s_pre_failed,
+                    s_pre_dropped ? " (some dropped: queue full)" : "",
+                    s_ndisk);
+        }
+    }
+    LeaveCriticalSection(&s_q_cs);
+}
+
+static DWORD WINAPI draw_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        DrawJob j;
+        PreJob pj;
+        EnterCriticalSection(&s_q_cs);
+        while (s_q_head == s_q_tail && s_pq_head == s_pq_tail)
+            SleepConditionVariableCS(&s_q_work, &s_q_cs, INFINITE);
+        if (s_q_head != s_q_tail) {
+            j = s_q[s_q_head++ % VSH_CACHE];
+            LeaveCriticalSection(&s_q_cs);
+            compile_draw(&j);
+        } else {
+            pj = s_pq[s_pq_head++ % VSH_PRE_MAX];
+            s_pre_busy++;
+            LeaveCriticalSection(&s_q_cs);
+            precompile_job(&pj);
+        }
+    }
+}
+
+/* The queue's lock and the disk cache's setting, once, from whichever
+ * thread comes first: the executor's first drawing shader or the scan
+ * thread's first program. */
+static BOOL CALLBACK q_init(PINIT_ONCE once, PVOID arg, PVOID *ctx)
+{
+    (void)once; (void)arg; (void)ctx;
+    InitializeCriticalSection(&s_q_cs);
+    InitializeConditionVariable(&s_q_work);
+    InitializeConditionVariable(&s_q_done);
+    if (s_dump < 0)
+        s_dump = getenv("RECOMP_VSH_GPU_DUMP") != NULL;
+    cache_on();
+    return TRUE;
+}
+
 static int start_workers(void)
 {
     const char *e;
@@ -721,11 +848,12 @@ static int start_workers(void)
 
     if (s_workers)
         return s_workers > 0;
-    InitializeCriticalSection(&s_q_cs);
-    InitializeConditionVariable(&s_q_work);
-    InitializeConditionVariable(&s_q_done);
-    if (s_dump < 0)
-        s_dump = getenv("RECOMP_VSH_GPU_DUMP") != NULL;
+    InitOnceExecuteOnce(&s_q_once, q_init, NULL, NULL);
+    EnterCriticalSection(&s_q_cs);
+    if (s_workers) {
+        LeaveCriticalSection(&s_q_cs);
+        return s_workers > 0;
+    }
     /* RECOMP_VSH_GPU_THREADS=<n>: compile threads. A level start or a burst
      * of new effects brings a few dozen new programs at once, and each
      * one's batches go the CPU way until it is ready. Default: half the
@@ -755,7 +883,54 @@ static int start_workers(void)
             CloseHandle(h);
         }
     }
+    LeaveCriticalSection(&s_q_cs);
     return i > 0;
+}
+
+int nv2a_vsh_gpu_precompile(const uint32_t *words, uint32_t count)
+{
+    PreJob pj;
+    int queued = 0;
+
+    if (!count || count > NV2A_VSH_SLOTS)
+        return 0;
+    InitOnceExecuteOnce(&s_q_once, q_init, NULL, NULL);
+    if (!cache_on())
+        return 0;
+    pj.words = (uint32_t *)malloc((size_t)count * 16);
+    if (!pj.words)
+        return 0;
+    memcpy(pj.words, words, (size_t)count * 16);
+    pj.count = count;
+    EnterCriticalSection(&s_q_cs);
+    if (s_pq_tail - s_pq_head < VSH_PRE_MAX) {
+        s_pq[s_pq_tail++ % VSH_PRE_MAX] = pj;
+        WakeConditionVariable(&s_q_work);
+        queued = 1;
+    } else if (!s_pre_dropped++) {
+        fprintf(stderr, "[VSHPRE] queue full (%d): programs dropped\n",
+                VSH_PRE_MAX);
+    }
+    LeaveCriticalSection(&s_q_cs);
+    if (!queued)
+        free(pj.words);
+    /* The workers start with the first drawing shader; once the back end
+     * has given its HLSL, the first program found may start them too. */
+    else if (s_ready && s_dentry)
+        start_workers();
+    return queued;
+}
+
+void nv2a_vsh_gpu_precompile_stats(uint32_t *compiled, uint32_t *had,
+                                   uint32_t *failed, uint32_t *waiting)
+{
+    InitOnceExecuteOnce(&s_q_once, q_init, NULL, NULL);
+    EnterCriticalSection(&s_q_cs);
+    *compiled = s_pre_compiled + s_pre_loaded;
+    *had = s_pre_had;
+    *failed = s_pre_failed;
+    *waiting = s_pq_tail - s_pq_head + s_pre_busy;
+    LeaveCriticalSection(&s_q_cs);
 }
 
 struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
@@ -773,6 +948,7 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
         uint32_t count, used = 0;
         uint64_t hash;
         DrawJob j;
+        DiskShader *d;
         if (!start_workers()) {
             p->draw_state = DRAW_FAILED;
             return NULL;
@@ -809,14 +985,18 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
         if (nv2a_vsh_gpu_new_program_hook)
             nv2a_vsh_gpu_new_program_hook(p->hash);
         EnterCriticalSection(&s_q_cs);
-        if (cache_on() && (p->draw_vs = disk_find(j.key)) != NULL) {
-            /* Loaded at startup: drawn on the GPU from its first batch. */
+        if (cache_on() && (d = disk_find(j.key)) != NULL) {
+            /* Loaded at startup or pre-compiled: drawn on the GPU from its
+             * first batch. */
+            int pre = d->pre;
+            p->draw_vs = d->vs;
             p->draw_state = DRAW_READY;
             s_dcompiled++;
             LeaveCriticalSection(&s_q_cs);
             free(j.src);
             fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
-                    " cache\n", (unsigned long long)p->hash);
+                    " cache%s\n", (unsigned long long)p->hash,
+                    pre ? " (pre-compiled)" : "");
             return p->draw_vs;
         }
         p->draw_state = DRAW_QUEUED;

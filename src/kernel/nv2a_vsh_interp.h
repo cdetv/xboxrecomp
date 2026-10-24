@@ -94,6 +94,15 @@ typedef struct {
  * titles reload different programs into the same slot). */
 const Nv2aVshIns *nv2a_vsh_decoded(uint32_t *count, uint64_t *hash);
 
+/* The same for a program given as words (count instructions of 4 words,
+ * as a memory scan finds them) instead of the uploaded one: decoded into
+ * out (NV2A_VSH_SLOTS entries), *inputs_used as nv2a_vsh_prepare reports
+ * it, *hash as nv2a_vsh_decoded's. Returns the instructions up to and with
+ * the FINAL, or 0 if there is none. Touches no state: any thread. */
+uint32_t nv2a_vsh_decode_words(const uint32_t *words, uint32_t count,
+                               Nv2aVshIns *out, uint32_t *inputs_used,
+                               uint64_t *hash);
+
 /* The range of constants written since the last call, inclusive: 1 and
  * lo/hi set if any, else 0. For uploading them to the GPU. */
 int nv2a_vsh_constants_take_dirty(uint32_t *lo, uint32_t *hi);

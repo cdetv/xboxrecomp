@@ -50,8 +50,12 @@ uint64_t nv2a_vsh_scan_hash(const uint32_t *ins, uint32_t count);
  * a thread of its own and prints a [VSHSCAN] line: programs found, by form,
  * distinct, new since the earlier scans, already drawn, the time it took.
  * Each program then drawn for the first time prints whether a scan had
- * found it, and which. Count only for now: nothing is compiled. Unset: the
- * request does nothing. */
+ * found it, and which.
+ *
+ * RECOMP_VSH_PRECOMPILE=1: the same scans, and each program the first time
+ * any scan finds it goes to nv2a_vsh_gpu_precompile, so its drawing shader
+ * is in the disk cache before it is drawn ([VSHPRE] lines). Either switch
+ * on runs the scans; both unset, the request does nothing. */
 void nv2a_vsh_prescan_request(const char *why);
 
 #endif

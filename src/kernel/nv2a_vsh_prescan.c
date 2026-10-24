@@ -1,6 +1,7 @@
 /*
- * Shader pre-compilation, step 1: scanning guest RAM for vertex programs and
- * counting what a scan would have caught (nv2a_vsh_scan.h, RECOMP_VSH_SCAN).
+ * Shader pre-compilation: scanning guest RAM for vertex programs, counting
+ * what a scan caught (nv2a_vsh_scan.h, RECOMP_VSH_SCAN) and handing each new
+ * one to the compile threads (RECOMP_VSH_PRECOMPILE, nv2a_vsh_gpu_precompile).
  *
  * The scan runs on a thread of its own, below normal priority, so a request
  * from the game thread costs it nothing. Every program found goes into one
@@ -44,6 +45,7 @@ static uint32_t s_why_head, s_why_tail;
 static uint32_t s_scans;                 /* scans done */
 static char s_last_why[WHY_MAX * 8][64]; /* why of scan n, n % size */
 static int s_on = -1;
+static int s_count, s_pre;               /* RECOMP_VSH_SCAN, _PRECOMPILE */
 
 /* The ranges scanned, counted apart to see what each adds: the contiguous
  * window (all of RAM, as the GPU sees it), the low view of RAM from
@@ -55,7 +57,7 @@ enum { R_CONTIG, R_LOW, R_EXT, R_COUNT };
 static const char *const k_range[R_COUNT] = { "contig", "low", "ext" };
 
 typedef struct {
-    uint32_t scan, found, pb, bin, distinct, fresh, drawn;
+    uint32_t scan, found, pb, bin, distinct, fresh, drawn, queued;
     uint32_t range, limit;               /* programs starting at limit+ are the next chunk's */
     uint32_t r_found[R_COUNT], r_fresh[R_COUNT], r_mb[R_COUNT];
 } ScanCtx;
@@ -82,6 +84,7 @@ static void on_found(void *ctx, uint32_t va, int kind, const uint32_t *ins,
     ScanCtx *c = (ScanCtx *)ctx;
     uint64_t h;
     Entry *e;
+    int fresh = 0;
 
     if (va >= c->limit)
         return;
@@ -99,12 +102,17 @@ static void on_found(void *ctx, uint32_t va, int kind, const uint32_t *ins,
             e->kind = (uint8_t)kind;
             c->fresh++;
             c->r_fresh[c->range]++;
+            fresh = 1;
         }
         if (e->drawn)
             c->drawn++;
         e->last_scan = c->scan;
     }
     LeaveCriticalSection(&s_cs);
+    /* The first time any scan sees a program, drawn already or not: one
+     * drawn before the scan is in the cache and skipped there. */
+    if (fresh && s_pre)
+        c->queued += (uint32_t)nv2a_vsh_gpu_precompile(ins, count);
 }
 
 /* [lo, hi) read in place, run by run of committed readable host pages (the
@@ -194,10 +202,11 @@ static DWORD WINAPI scan_thread(LPVOID arg)
         scan_ext(&c);
         QueryPerformanceCounter(&t1);
         fprintf(stderr, "[VSHSCAN] scan #%u (%s): %u programs (%u in push"
-                " buffers, %u binaries), %u distinct, %u new, %u already drawn;"
+                " buffers, %u binaries), %u distinct, %u new (%u queued to"
+                " compile), %u already drawn;"
                 " %.0f ms; %u known | %s %u/%u new (%u MB), %s %u/%u (%u MB),"
                 " %s %u/%u (%u MB)\n", c.scan, why, c.found, c.pb, c.bin,
-                c.distinct, c.fresh, c.drawn,
+                c.distinct, c.fresh, c.queued, c.drawn,
                 (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart,
                 s_nset, k_range[0], c.r_found[0], c.r_fresh[0], c.r_mb[0],
                 k_range[1], c.r_found[1], c.r_fresh[1], c.r_mb[1],
@@ -238,13 +247,17 @@ void nv2a_vsh_prescan_request(const char *why)
 {
     if (s_on < 0) {
         const char *e = getenv("RECOMP_VSH_SCAN");
+        const char *p = getenv("RECOMP_VSH_PRECOMPILE");
         HANDLE h;
-        s_on = e && e[0] && strcmp(e, "0") != 0;
+        s_count = e && e[0] && strcmp(e, "0") != 0;
+        s_pre = p && p[0] && strcmp(p, "0") != 0;
+        s_on = s_count || s_pre;
         if (!s_on)
             return;
         InitializeCriticalSection(&s_cs);
         InitializeConditionVariable(&s_cv);
-        nv2a_vsh_gpu_new_program_hook = on_new_program;
+        if (s_count)
+            nv2a_vsh_gpu_new_program_hook = on_new_program;
         h = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL);
         if (!h) {
             s_on = 0;
@@ -253,7 +266,8 @@ void nv2a_vsh_prescan_request(const char *why)
         SetThreadPriority(h, THREAD_PRIORITY_BELOW_NORMAL);
         CloseHandle(h);
         fprintf(stderr, "[VSHSCAN] scanning %u MB of guest RAM per request"
-                " (count only)\n", (unsigned)(g_xbox_total_ram >> 20));
+                " (%s)\n", (unsigned)(g_xbox_total_ram >> 20),
+                s_pre ? "programs found are pre-compiled" : "count only");
     }
     if (!s_on)
         return;
