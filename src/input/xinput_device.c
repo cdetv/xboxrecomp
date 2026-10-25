@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "xbox_kbm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -305,6 +306,9 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (slot != NO_SLOT)
             g_next_scan = 0;            /* unplugged: look again next time */
         g_controller_connected[dwPort] = FALSE;
+        /* No pad: keyboard and mouse alone are player 1. */
+        if (dwPort == 0 && xbox_KbmState(pState))
+            return ERROR_SUCCESS;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
             return ERROR_SUCCESS;
@@ -351,10 +355,15 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
+    /* The bound keyboard and mouse (kbm_pad.c) when the game has set them
+     * up, else the stand-in below. Merged the same way: a button pressed
+     * on either is pressed, the greater pressure wins, and a stick the
+     * keyboard or mouse moves is theirs. */
+    if (dwPort == 0 && (xbox_KbmConfigured() || keyboard_enabled())) {
         XBOX_INPUT_STATE kb;
         int i;
-        keyboard_state(&kb);
+        if (!xbox_KbmState(&kb))
+            keyboard_state(&kb);
         pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
         for (i = 0; i < 8; i++)
             if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
