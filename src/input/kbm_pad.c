@@ -1,7 +1,7 @@
 /**
  * Keyboard and mouse as player 1's pad. See xbox_kbm.h for the interface.
  *
- * Three things make a keyboard and mouse a usable pad, beyond "key down =
+ * Four things make a keyboard and mouse a usable pad, beyond "key down =
  * button down":
  *
  * - A press lasts at least MIN_PRESS_MS. The title reads its pad once a
@@ -10,15 +10,26 @@
  *   with as long a gap before the next, so a quick flick of several notches
  *   arrives as that many presses.
  *
- * - The mouse is a speed, not a position. A stick held to one side keeps
- *   the camera turning, so the stick's tilt is the mouse's speed over the
- *   last MOUSE_WINDOW_MS: the title turns by tilt times frame time, which is
- *   then the distance the mouse moved, at any frame rate.
+ * - The mouse is a turn owed, not a speed. A stick held to one side keeps
+ *   the camera turning at a speed the title caps; a mouse moved fast asks
+ *   for more than that. So each count of movement adds MOUSE_MS_PER_COUNT
+ *   (times the sensitivity) to a balance of "milliseconds at full tilt", and
+ *   the stick pays it off: tilt = balance / FRAME_MS, at most full, the
+ *   balance going down by tilt times the time that passes. A small movement
+ *   is a small tilt for about a frame; a big one is full tilt until the turn
+ *   is done, so a flick turns as far as the mouse went, only no faster than
+ *   the title allows. The balance is capped (TURN_CAP_*_MS) so a wild swing
+ *   does not keep the camera spinning, and the other way cancels it.
+ *   (The first version used the mouse's speed: fast movement was simply cut
+ *   at full tilt and the camera turned far less than the mouse moved.)
  *
  * - Tilt is asked for in the title's own range. A title ignores small tilt
  *   (dead zone) and treats tilt past some point as full; the profile says
  *   where both are (xbox_KbmStick), so a slow mouse turns slowly instead of
- *   not at all, and a fast one is not wasted past the point of full.
+ *   not at all.
+ *
+ * - A binding can toggle (XBOX_KBM_TOGGLE): one press holds the output, the
+ *   next lets it go (a head-cam held with the left trigger).
  *
  * Held keys come from the window thread one byte at a time and need no
  * lock, like the window's own key table (fb_present.c). Profiles are
@@ -35,7 +46,9 @@
 #if defined(_WIN32)
 
 #define MIN_PRESS_MS     70     /* about two frames at 30 fps */
-#define MOUSE_WINDOW_MS  40     /* speed measured over a bit more than one */
+#define FRAME_MS         33.0f  /* a turn owed is paid over about a frame */
+#define TURN_CAP_X_MS    1000.0f  /* most full-tilt time owed, left/right */
+#define TURN_CAP_Y_MS    400.0f   /* and up/down (the title stops at a limit) */
 #define WHEEL_LSTICK_MS  150    /* hold before the mouse steers the left
                                  * stick: a tap stays a tap */
 #define WHEEL_KEEP_MS    120    /* left stick kept after letting go, so the
@@ -47,6 +60,8 @@ typedef struct {
     int n;
     xbox_KbmMouse mouse;
     int set;
+    unsigned char was[256];   /* toggles: the input last report */
+    unsigned char latch[XBOX_KBM_OUTPUTS];   /* toggled on */
 } Profile;
 
 static SRWLOCK       s_lock = SRWLOCK_INIT;
@@ -55,6 +70,7 @@ static volatile LONG s_sel;
 static volatile LONG s_configured;
 static volatile LONG s_enabled = 1;
 static volatile LONG s_active = 1;
+static volatile LONG s_unlatch;   /* focus lost: toggles let go */
 static void (*volatile s_wake)(void);
 
 static volatile unsigned char s_down[XBOX_KBM_INPUTS];
@@ -62,14 +78,15 @@ static volatile ULONGLONG     s_down_at[XBOX_KBM_INPUTS];
 static volatile LONG          s_wheel_pending[2];
 static volatile LONG          s_mdx, s_mdy;
 
-/* Mouse counts per millisecond that tilt the right stick all the way at
- * sensitivity 1 (RECOMP_KBM_MOUSE_FULL, for tuning). */
-static float mouse_full(void)
+/* Milliseconds of full tilt one mouse count is worth at sensitivity 1
+ * (RECOMP_KBM_MOUSE_MS, for tuning). 0.5: at Conker's ~175 degrees a
+ * second, a full turn is ~4000 counts, 13 cm at 800 dpi. */
+static float mouse_ms(void)
 {
     static float v = -1.0f;
     if (v < 0.0f) {
-        const char *e = getenv("RECOMP_KBM_MOUSE_FULL");
-        v = e && atof(e) > 0.0 ? (float)atof(e) : 3.0f;
+        const char *e = getenv("RECOMP_KBM_MOUSE_MS");
+        v = e && atof(e) > 0.0 ? (float)atof(e) : 0.5f;
     }
     return v;
 }
@@ -109,6 +126,8 @@ void xbox_KbmSetProfile(int slot, const xbox_KbmBinding *b, int n,
     s_prof[slot].n = n;
     s_prof[slot].mouse = *mouse;
     s_prof[slot].set = 1;
+    memset(s_prof[slot].was, 0, sizeof(s_prof[slot].was));
+    memset(s_prof[slot].latch, 0, sizeof(s_prof[slot].latch));
     ReleaseSRWLockExclusive(&s_lock);
     first = !InterlockedExchange(&s_configured, 1);
     if (first) {
@@ -183,8 +202,8 @@ void xbox_KbmMouseMove(long dx, long dy)
     InterlockedExchangeAdd(&s_mdy, dy);
 }
 
-/* Focus lost: nothing stays held. A short press already counted keeps its
- * minimum length, which is harmless. */
+/* Focus lost: nothing stays held, toggles included. A short press already
+ * counted keeps its minimum length, which is harmless. */
 void xbox_KbmReleaseAll(void)
 {
     int i;
@@ -194,6 +213,7 @@ void xbox_KbmReleaseAll(void)
     InterlockedExchange(&s_wheel_pending[1], 0);
     InterlockedExchange(&s_mdx, 0);
     InterlockedExchange(&s_mdy, 0);
+    InterlockedExchange(&s_unlatch, 1);
 }
 
 /* ---- USB thread ----------------------------------------------------------- */
@@ -242,39 +262,39 @@ static SHORT axis(float v, const xbox_KbmStick *st)
     return (SHORT)(v < 0.0f ? -raw : raw);
 }
 
-/* The mouse's speed over the last MOUSE_WINDOW_MS, in counts per ms. The
- * window covers whole report intervals: a report every 50 ms carries 50 ms
- * of movement and is divided by 50, not 40. */
-#define SAMPLES 64
-static struct { ULONGLONG t; long dx, dy; } s_samp[SAMPLES];
-static unsigned s_samp_n;
+/* The turn owed, per axis, in milliseconds at full tilt (signed), and the
+ * tilt last reported, which has been paying it off since s_turn_t. */
+static float s_owe[2], s_tilt[2];
+static ULONGLONG s_turn_t;
 
-static void mouse_speed(ULONGLONG t, long dx, long dy, float *vx, float *vy)
+static float clampf(float v, float lo, float hi)
 {
-    unsigned i, k;
-    long sx = 0, sy = 0;
-    ULONGLONG since = t;
+    return v < lo ? lo : v > hi ? hi : v;
+}
 
-    s_samp[s_samp_n % SAMPLES].t = t;
-    s_samp[s_samp_n % SAMPLES].dx = dx;
-    s_samp[s_samp_n % SAMPLES].dy = dy;
-    s_samp_n++;
-    for (k = 0; k < SAMPLES - 1 && k < s_samp_n; k++) {
-        i = (s_samp_n - 1 - k) % SAMPLES;
-        if (t - s_samp[i].t > MOUSE_WINDOW_MS)
-            break;
-        sx += s_samp[i].dx;
-        sy += s_samp[i].dy;
+/* Pay off the time since the last report at the tilt it gave, add the new
+ * movement (already in milliseconds), and choose the tilt until the next. */
+static void mouse_turn(ULONGLONG t, float add_x, float add_y, float *tx,
+                       float *ty)
+{
+    static const float cap[2] = { TURN_CAP_X_MS, TURN_CAP_Y_MS };
+    float add[2], el = s_turn_t ? (float)(t - s_turn_t) : 0.0f;
+    int i;
+
+    add[0] = add_x;
+    add[1] = add_y;
+    s_turn_t = t;
+    for (i = 0; i < 2; i++) {
+        float paid = s_tilt[i] * el;
+        /* Never pay past zero: the stick does not turn back. */
+        if ((s_owe[i] > 0.0f && paid > s_owe[i])
+            || (s_owe[i] < 0.0f && paid < s_owe[i]))
+            paid = s_owe[i];
+        s_owe[i] = clampf(s_owe[i] - paid + add[i], -cap[i], cap[i]);
+        s_tilt[i] = clampf(s_owe[i] / FRAME_MS, -1.0f, 1.0f);
     }
-    /* The report before the oldest one counted is where the span starts. */
-    if (k < s_samp_n && k < SAMPLES - 1)
-        since = s_samp[(s_samp_n - 1 - k) % SAMPLES].t;
-    else
-        since = t - MOUSE_WINDOW_MS;
-    if (t - since < MOUSE_WINDOW_MS)
-        since = t - MOUSE_WINDOW_MS;
-    *vx = (float)sx / (float)(t - since);
-    *vy = (float)sy / (float)(t - since);
+    *tx = s_tilt[0];
+    *ty = s_tilt[1];
 }
 
 /* The weapon-wheel mode: the mouse as a position on the left stick. */
@@ -301,23 +321,41 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
     if (!s_active) {
         s_wx = s_wy = 0.0f;
         s_wheel_since = s_wheel_until = 0;
+        s_owe[0] = s_owe[1] = s_tilt[0] = s_tilt[1] = 0.0f;
+        s_turn_t = 0;
         return 1;
     }
 
     memset(out, 0, sizeof(out));
     sel = (int)s_sel;
-    AcquireSRWLockShared(&s_lock);
+    /* Exclusive: toggles write the profile's own state. */
+    AcquireSRWLockExclusive(&s_lock);
     if (!s_prof[sel].set) {
-        ReleaseSRWLockShared(&s_lock);
+        ReleaseSRWLockExclusive(&s_lock);
         return 1;
     }
+    if (InterlockedExchange(&s_unlatch, 0))
+        for (i = 0; i < XBOX_KBM_PROFILES; i++)
+            memset(s_prof[i].latch, 0, sizeof(s_prof[i].latch));
     m = s_prof[sel].mouse;
     for (i = 0; i < s_prof[sel].n; i++) {
         const xbox_KbmBinding *bd = &s_prof[sel].b[i];
-        if (bd->output < XBOX_KBM_OUTPUTS && input_held(bd->input, t))
-            out[bd->output] = 1;
+        unsigned o = bd->output & ~XBOX_KBM_TOGGLE;
+        int held;
+        if (o >= XBOX_KBM_OUTPUTS)
+            continue;
+        held = input_held(bd->input, t);
+        if (bd->output & XBOX_KBM_TOGGLE) {
+            if (held && !s_prof[sel].was[i])
+                s_prof[sel].latch[o] ^= 1;
+            s_prof[sel].was[i] = (unsigned char)held;
+        } else if (held) {
+            out[o] = 1;
+        }
     }
-    ReleaseSRWLockShared(&s_lock);
+    for (i = 0; i < XBOX_KBM_OUTPUTS; i++)
+        out[i] |= s_prof[sel].latch[i];
+    ReleaseSRWLockExclusive(&s_lock);
 
     /* Analog buttons fully pressed: a title reading a pressure never sees a
      * press at 1. */
@@ -375,14 +413,16 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         pState->Gamepad.sThumbLY = axis(s_wy, &m.left);
     }
 
-    /* Right stick: look keys at full tilt, else the mouse's speed. */
-    mouse_speed(t, dx, dy, &vx, &vy);
+    /* Right stick: look keys at full tilt, else the turn the mouse owes. */
+    mouse_turn(t, (float)dx * mouse_ms() * m.sens_x,
+               (float)(m.invert_y ? dy : -dy) * mouse_ms() * m.sens_y,
+               &vx, &vy);
     rx = (float)(out[XBOX_KBM_RSTICK_RIGHT] - out[XBOX_KBM_RSTICK_LEFT]);
     ry = (float)(out[XBOX_KBM_RSTICK_UP] - out[XBOX_KBM_RSTICK_DOWN]);
     if (rx == 0.0f)
-        rx = vx / mouse_full() * m.sens_x;
+        rx = vx;
     if (ry == 0.0f)
-        ry = (m.invert_y ? vy : -vy) / mouse_full() * m.sens_y;
+        ry = vy;
     pState->Gamepad.sThumbRX = axis(rx, &m.right);
     pState->Gamepad.sThumbRY = axis(ry, &m.right);
     return 1;

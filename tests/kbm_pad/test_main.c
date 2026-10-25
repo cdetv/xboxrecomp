@@ -1,6 +1,7 @@
 /* Keyboard and mouse as player 1's pad (src/input/kbm_pad.c): bindings to
  * buttons and sticks, the shortest press, wheel notches as presses, walking
- * tilt, the mouse as right-stick speed in the title's own stick range, and
+ * tilt, the mouse as a turn owed and paid off at up to full tilt in the
+ * title's own stick range, toggles, and
  * the weapon-wheel mode where the mouse steers the left stick. */
 #include <math.h>
 #include <stdio.h>
@@ -55,6 +56,7 @@ int main(void)
         { VK_ESCAPE, XBOX_KBM_START }, { XBOX_KBM_WHEEL_UP, XBOX_KBM_Y },
         { 'Q', XBOX_KBM_Y }, { 'Q', XBOX_KBM_MOUSE_LSTICK },
         { 'L', XBOX_KBM_RSTICK_RIGHT },
+        { 'C', XBOX_KBM_LT | XBOX_KBM_TOGGLE },
     };
     long v;
 
@@ -120,39 +122,55 @@ int main(void)
     st = read_pad();
     check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 0, "wheel: done", 0);
 
-    /* Mouse: 3 counts per ms is full tilt at sensitivity 1. The pad is
-     * read every 5 ms here, as the USB thread does; the speed is taken over
-     * the last 40 ms or a little more (whole report intervals). */
+    /* Mouse: each count owes 0.5 ms of full tilt at sensitivity 1, paid
+     * off over about a frame (33 ms), at most full tilt, the rest later. The
+     * pad is read every 5 ms here, as the USB thread does. */
     reports(100);
-    xbox_KbmMouseMove(200, 0);
+    xbox_KbmMouseMove(20, 0);
     st = read_pad();
-    check(st.Gamepad.sThumbRX == raw(1.0f, &m.right),
-          "mouse fast right: right stick at the title's full", st.Gamepad.sThumbRX);
-    reports(100);
-    xbox_KbmMouseMove(-12, 0);
-    st = read_pad();
-    check(st.Gamepad.sThumbRX < -raw(0.05f, &m.right)
-          && st.Gamepad.sThumbRX > -raw(0.11f, &m.right),
-          "mouse slow left: about a tenth, past the dead zone",
+    v = raw(10.0f / 33.0f, &m.right);
+    check(labs(st.Gamepad.sThumbRX - v) <= 2,
+          "small move right: a small tilt (10 ms owed over a frame)",
           st.Gamepad.sThumbRX);
-    reports(100);
-    xbox_KbmMouseMove(0, -60);
+    reports(200);
     st = read_pad();
-    check(st.Gamepad.sThumbRY > raw(0.35f, &m.right)
-          && st.Gamepad.sThumbRY < raw(0.55f, &m.right)
-          && st.Gamepad.sThumbRX == 0,
-          "mouse forward: right stick up, about half", st.Gamepad.sThumbRY);
-    reports(100);
+    check(st.Gamepad.sThumbRX == 0, "... paid off: centred", st.Gamepad.sThumbRX);
+    xbox_KbmMouseMove(-1600, 0);
     st = read_pad();
-    check(st.Gamepad.sThumbRX == 0 && st.Gamepad.sThumbRY == 0,
-          "mouse still: stick centred", st.Gamepad.sThumbRY);
+    check(st.Gamepad.sThumbRX == -raw(1.0f, &m.right),
+          "big move left: full tilt", st.Gamepad.sThumbRX);
+    reports(500);
+    st = read_pad();
+    check(st.Gamepad.sThumbRX == -raw(1.0f, &m.right),
+          "... still turning half a second later (800 ms owed)",
+          st.Gamepad.sThumbRX);
+    reports(500);
+    st = read_pad();
+    check(st.Gamepad.sThumbRX == 0, "... done after the time it was owed",
+          st.Gamepad.sThumbRX);
+    xbox_KbmMouseMove(4000, 0);
+    reports(1300);
+    st = read_pad();
+    check(st.Gamepad.sThumbRX == 0, "a wild swing is capped at 1 s of turning",
+          st.Gamepad.sThumbRX);
+    xbox_KbmMouseMove(400, 0);
+    xbox_KbmMouseMove(-400, 0);
+    st = read_pad();
+    check(st.Gamepad.sThumbRX == 0, "there and back: no turn", st.Gamepad.sThumbRX);
+    reports(100);
+    xbox_KbmMouseMove(0, -40);
+    st = read_pad();
+    v = raw(20.0f / 33.0f, &m.right);
+    check(labs(st.Gamepad.sThumbRY - v) <= 2 && st.Gamepad.sThumbRX == 0,
+          "mouse forward: right stick up", st.Gamepad.sThumbRY);
+    reports(200);
     m.invert_y = 1;
     xbox_KbmSetProfile(0, b, (int)(sizeof(b) / sizeof(b[0])), &m);
-    reports(100);
-    xbox_KbmMouseMove(0, -60);
+    xbox_KbmMouseMove(0, -40);
     st = read_pad();
     check(st.Gamepad.sThumbRY < 0, "inverted: forward looks down",
           st.Gamepad.sThumbRY);
+    reports(200);
     m.invert_y = 0;
     xbox_KbmSetProfile(0, b, (int)(sizeof(b) / sizeof(b[0])), &m);
     Sleep(100);
@@ -181,6 +199,32 @@ int main(void)
     Sleep(200);
     st = read_pad();
     check(st.Gamepad.sThumbLY == 0, "then centred", st.Gamepad.sThumbLY);
+
+    /* A toggle: C holds the left trigger until C again. */
+    xbox_KbmKey('C', 1);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 255, "C: trigger on",
+          st.Gamepad.bAnalogButtons[6]);
+    xbox_KbmKey('C', 0);
+    Sleep(100);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 255,
+          "C let go: trigger stays on", st.Gamepad.bAnalogButtons[6]);
+    xbox_KbmKey('C', 1);
+    st = read_pad();
+    xbox_KbmKey('C', 0);
+    Sleep(100);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 0,
+          "C again: trigger off", st.Gamepad.bAnalogButtons[6]);
+    xbox_KbmKey('C', 1);
+    st = read_pad();
+    xbox_KbmKey('C', 0);
+    xbox_KbmReleaseAll();
+    Sleep(100);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 0,
+          "focus lost: a toggle lets go", st.Gamepad.bAnalogButtons[6]);
 
     xbox_KbmKey('W', 1);
     xbox_KbmSetActive(0);

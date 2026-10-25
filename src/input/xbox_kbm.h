@@ -43,6 +43,9 @@ enum {
     XBOX_KBM_OUTPUTS
 };
 
+/* Or'ed into a binding's output: a press holds it, the next lets it go. */
+#define XBOX_KBM_TOGGLE      0x8000
+
 /* Inputs: Windows virtual-key codes 1-255, mouse buttons among them
  * (VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2), and the
  * wheel, one short press per notch. */
@@ -63,7 +66,8 @@ typedef struct {
 } xbox_KbmStick;
 
 typedef struct {
-    float sens_x, sens_y;     /* mouse to right stick, 1 = the default */
+    float sens_x, sens_y;     /* mouse to right stick, 1 = the default;
+                               * 0 = the mouse does not look */
     int   invert_y;           /* mouse forward looks down */
     float walk;               /* left-stick tilt while walking, 0-1 */
     xbox_KbmStick left, right;
