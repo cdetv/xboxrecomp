@@ -73,13 +73,14 @@ typedef struct {
     xbox_KbmStick left, right;
 } xbox_KbmMouse;
 
-#define XBOX_KBM_PROFILES 4
+#define XBOX_KBM_PROFILES 8
 
 /* Replace profile slot's bindings (at most 256; one input may drive several
  * outputs through several entries). */
 void xbox_KbmSetProfile(int slot, const xbox_KbmBinding *b, int n,
                         const xbox_KbmMouse *mouse);
-/* The profile in use. A key held across a change acts by the new one. */
+/* The profile in use. A key held across a change acts by the new one;
+ * toggles are let go (a head-cam left on through a cutscene). */
 void xbox_KbmSelectProfile(int slot);
 /* Keyboard and mouse on at all (they are once a profile is set). */
 void xbox_KbmSetEnabled(int on);

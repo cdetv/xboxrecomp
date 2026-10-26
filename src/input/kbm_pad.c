@@ -29,7 +29,8 @@
  *   not at all.
  *
  * - A binding can toggle (XBOX_KBM_TOGGLE): one press holds the output, the
- *   next lets it go (a head-cam held with the left trigger).
+ *   next lets it go (a head-cam held with the left trigger). Changing the
+ *   profile or losing the focus lets every toggle go.
  *
  * Held keys come from the window thread one byte at a time and need no
  * lock, like the window's own key table (fb_present.c). Profiles are
@@ -143,6 +144,7 @@ void xbox_KbmSelectProfile(int slot)
     if (slot < 0 || slot >= XBOX_KBM_PROFILES)
         return;
     if (InterlockedExchange(&s_sel, slot) != slot) {
+        InterlockedExchange(&s_unlatch, 1);
         fprintf(stderr, "[KBM] profile %d in use\n", slot);
         fflush(stderr);
     }

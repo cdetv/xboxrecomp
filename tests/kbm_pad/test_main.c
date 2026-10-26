@@ -225,6 +225,17 @@ int main(void)
     st = read_pad();
     check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 0,
           "focus lost: a toggle lets go", st.Gamepad.bAnalogButtons[6]);
+    xbox_KbmSetProfile(1, b, (int)(sizeof(b) / sizeof(b[0])), &m);
+    xbox_KbmKey('C', 1);
+    st = read_pad();
+    xbox_KbmKey('C', 0);
+    Sleep(100);
+    xbox_KbmSelectProfile(1);
+    xbox_KbmSelectProfile(0);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 0,
+          "profile changed and back: the toggle let go",
+          st.Gamepad.bAnalogButtons[6]);
 
     xbox_KbmKey('W', 1);
     xbox_KbmSetActive(0);
