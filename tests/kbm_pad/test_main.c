@@ -200,6 +200,44 @@ int main(void)
     st = read_pad();
     check(st.Gamepad.sThumbLY == 0, "then centred", st.Gamepad.sThumbLY);
 
+    /* Direct mouse look: the game takes the movement, the stick stays. */
+    {
+        long tx, ty;
+        reports(1200);
+        xbox_KbmMouseDirect(XBOX_KBM_DIRECT_X | XBOX_KBM_DIRECT_Y);
+        xbox_KbmMouseMove(300, -40);
+        st = read_pad();
+        check(st.Gamepad.sThumbRX == 0 && st.Gamepad.sThumbRY == 0,
+              "direct: the mouse does not tilt the stick", st.Gamepad.sThumbRX);
+        check(xbox_KbmTakeMouse(&tx, &ty) == 1 && tx == 300 && ty == -40,
+              "direct: the game takes the movement", tx);
+        check(xbox_KbmTakeMouse(&tx, &ty) == 1 && tx == 0 && ty == 0,
+              "direct: taken once", tx);
+        xbox_KbmKey('Q', 1);
+        st = read_pad();
+        xbox_KbmMouseMove(0, -500);
+        check(xbox_KbmTakeMouse(&tx, &ty) == 0 && tx == 0,
+              "direct: a held wheel key keeps the mouse", ty);
+        Sleep(200);
+        st = read_pad();
+        check(st.Gamepad.sThumbLY == raw(1.0f, &m.left),
+              "direct: ... and the wheel gets it", st.Gamepad.sThumbLY);
+        xbox_KbmKey('Q', 0);
+        Sleep(250);
+        st = read_pad();
+        reports(1200);
+        xbox_KbmMouseDirect(XBOX_KBM_DIRECT_X);
+        xbox_KbmMouseMove(300, -40);
+        st = read_pad();
+        check(st.Gamepad.sThumbRX == 0 && st.Gamepad.sThumbRY > 0,
+              "direct left/right only: up/down still tilts the stick",
+              st.Gamepad.sThumbRY);
+        check(xbox_KbmTakeMouse(&tx, &ty) == 1 && tx == 300 && ty == 0,
+              "direct left/right only: the game takes left/right", tx);
+        reports(600);
+        xbox_KbmMouseDirect(0);
+    }
+
     /* A toggle: C holds the left trigger until C again. */
     xbox_KbmKey('C', 1);
     st = read_pad();

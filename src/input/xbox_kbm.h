@@ -99,6 +99,18 @@ void xbox_KbmWheel(int notches);
 void xbox_KbmMouseMove(long dx, long dy);
 void xbox_KbmReleaseAll(void);
 
+/* Mouse look done by the game itself (turning its camera by the mouse's
+ * movement, past the stick's top speed), per axis: for the axes given the
+ * mouse no longer tilts the right stick, and xbox_KbmTakeMouse hands over
+ * their movement since the last call (raw counts, the sensitivity is the
+ * game's to apply; 0 for the other axis). 0 and nothing moved while not
+ * active, or while a binding has the mouse steer the left stick (a weapon
+ * wheel keeps it). */
+#define XBOX_KBM_DIRECT_X 1
+#define XBOX_KBM_DIRECT_Y 2
+void xbox_KbmMouseDirect(int axes);
+int  xbox_KbmTakeMouse(long *dx, long *dy);
+
 /* For the pad: player 1's keyboard and mouse as a pad state. 0 when they
  * are off or not active (pState is then at rest). */
 int  xbox_KbmState(XBOX_INPUT_STATE *pState);

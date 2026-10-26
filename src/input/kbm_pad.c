@@ -22,6 +22,9 @@
  *   does not keep the camera spinning, and the other way cancels it.
  *   (The first version used the mouse's speed: fast movement was simply cut
  *   at full tilt and the camera turned far less than the mouse moved.)
+ *   Better still is a game turning its own camera by the movement
+ *   (xbox_KbmMouseDirect / xbox_KbmTakeMouse): no top speed, no lag; the
+ *   stick is then only the fallback where the game cannot.
  *
  * - Tilt is asked for in the title's own range. A title ignores small tilt
  *   (dead zone) and treats tilt past some point as full; the profile says
@@ -72,6 +75,8 @@ static volatile LONG s_configured;
 static volatile LONG s_enabled = 1;
 static volatile LONG s_active = 1;
 static volatile LONG s_unlatch;   /* focus lost: toggles let go */
+static volatile LONG s_direct;    /* the game takes the mouse itself */
+static volatile LONG s_wheel_on;  /* a binding has the mouse on the left stick */
 static void (*volatile s_wake)(void);
 
 static volatile unsigned char s_down[XBOX_KBM_INPUTS];
@@ -204,6 +209,33 @@ void xbox_KbmMouseMove(long dx, long dy)
     InterlockedExchangeAdd(&s_mdy, dy);
 }
 
+void xbox_KbmMouseDirect(int axes)
+{
+    InterlockedExchange(&s_direct, axes & (XBOX_KBM_DIRECT_X
+                                           | XBOX_KBM_DIRECT_Y));
+}
+
+int xbox_KbmTakeMouse(long *dx, long *dy)
+{
+    LONG axes = s_direct;
+
+    *dx = *dy = 0;
+    if (!s_configured || !s_enabled || !s_active || s_wheel_on) {
+        if (!s_wheel_on) {
+            if (axes & XBOX_KBM_DIRECT_X)
+                InterlockedExchange(&s_mdx, 0);
+            if (axes & XBOX_KBM_DIRECT_Y)
+                InterlockedExchange(&s_mdy, 0);
+        }
+        return 0;
+    }
+    if (axes & XBOX_KBM_DIRECT_X)
+        *dx = InterlockedExchange(&s_mdx, 0);
+    if (axes & XBOX_KBM_DIRECT_Y)
+        *dy = InterlockedExchange(&s_mdy, 0);
+    return axes != 0;
+}
+
 /* Focus lost: nothing stays held, toggles included. A short press already
  * counted keeps its minimum length, which is harmless. */
 void xbox_KbmReleaseAll(void)
@@ -318,9 +350,9 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++packet;
     if (!s_configured || !s_enabled)
         return 0;
-    dx = InterlockedExchange(&s_mdx, 0);
-    dy = InterlockedExchange(&s_mdy, 0);
     if (!s_active) {
+        InterlockedExchange(&s_mdx, 0);
+        InterlockedExchange(&s_mdy, 0);
         s_wx = s_wy = 0.0f;
         s_wheel_since = s_wheel_until = 0;
         s_owe[0] = s_owe[1] = s_tilt[0] = s_tilt[1] = 0.0f;
@@ -388,8 +420,16 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         pState->Gamepad.sThumbLY = (SHORT)(ly * 32767.0f);
     }
 
-    /* Weapon-wheel mode: the mouse moves a point round the left stick. */
+    /* The mouse's movement is ours unless the game takes it (direct mouse
+     * look); a weapon wheel takes it back while its key is held. */
     wheel_mode = out[XBOX_KBM_MOUSE_LSTICK];
+    InterlockedExchange(&s_wheel_on, wheel_mode);
+    dx = !(s_direct & XBOX_KBM_DIRECT_X) || wheel_mode
+         ? InterlockedExchange(&s_mdx, 0) : 0;
+    dy = !(s_direct & XBOX_KBM_DIRECT_Y) || wheel_mode
+         ? InterlockedExchange(&s_mdy, 0) : 0;
+
+    /* Weapon-wheel mode: the mouse moves a point round the left stick. */
     if (wheel_mode) {
         float r = WHEEL_RADIUS / (m.sens_x > 0.05f ? m.sens_x : 0.05f);
         float len;

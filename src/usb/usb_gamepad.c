@@ -301,7 +301,8 @@ static uint8_t synthetic_buttons(void)
  * line appended to the file -- <button>[+<button>...][:<hold ms>], no time --
  * is pressed as soon as it is read. With RECOMP_FB_DUMP and a short
  * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
- * look again. A fixed timeline cannot do that on a rasterised run, where
+ * look again. A line "mouse:<dx>,<dy>" moves the keyboard-and-mouse pad's
+ * mouse instead (no time, no hold). A fixed timeline cannot do that on a rasterised run, where
  * how long a screen takes to appear depends on how much the software
  * rasteriser has to draw.
  *
@@ -477,6 +478,22 @@ static void pad_live_poll(unsigned long t)
     while ((c = fgetc(f)) != EOF) {
         consumed++;
         if (c == '\n' || c == '\r') {
+            /* "mouse:<dx>,<dy>": mouse movement for the keyboard-and-mouse
+             * pad (kbm_pad.c), as the window's raw input would give it, so
+             * mouse look can be tested with nobody at the mouse. */
+            if (npending > 6 && same_word(pending, "mouse:", 6)) {
+                extern void xbox_KbmMouseMove(long dx, long dy);
+                long mx = 0, my = 0;
+                pending[npending] = 0;
+                if (sscanf(pending + 6, "%ld,%ld", &mx, &my) == 2) {
+                    xbox_KbmMouseMove(mx, my);
+                    fprintf(stderr, "  PAD: live mouse %ld,%ld at t=%lu ms\n",
+                            mx, my, t);
+                    fflush(stderr);
+                }
+                npending = 0;
+                continue;
+            }
             if (npending) {
                 char line[560];
                 /* Several lines in one read go one after another, with a
