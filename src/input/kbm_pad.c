@@ -97,6 +97,20 @@ static float mouse_ms(void)
     return v;
 }
 
+/* Milliseconds a turn of the spinning left stick (XBOX_KBM_LSTICK_SPIN_*;
+ * RECOMP_KBM_SPIN_MS, for tuning). 300: about as fast as a thumb goes
+ * round, and under half a turn a frame even at 30 fps, so the title can
+ * tell the direction. */
+static float spin_ms(void)
+{
+    static float v = -1.0f;
+    if (v < 0.0f) {
+        const char *e = getenv("RECOMP_KBM_SPIN_MS");
+        v = e && atof(e) >= 50.0 ? (float)atof(e) : 300.0f;
+    }
+    return v;
+}
+
 /* Milliseconds from the performance counter: GetTickCount64 moves in 16 ms
  * steps, as coarse as the reports are frequent. */
 static ULONGLONG now_ms(void)
@@ -335,6 +349,11 @@ static void mouse_turn(ULONGLONG t, float add_x, float add_y, float *tx,
 static float s_wx, s_wy;
 static ULONGLONG s_wheel_since, s_wheel_until;
 
+/* The spinning left stick: its angle (turns, 0 = up) and when it was last
+ * moved; 0 while no spin output is held, so each spin starts at the top. */
+static float s_spin_a;
+static ULONGLONG s_spin_t;
+
 int xbox_KbmState(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
@@ -357,6 +376,8 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         s_wheel_since = s_wheel_until = 0;
         s_owe[0] = s_owe[1] = s_tilt[0] = s_tilt[1] = 0.0f;
         s_turn_t = 0;
+        s_spin_a = 0.0f;
+        s_spin_t = 0;
         return 1;
     }
 
@@ -418,6 +439,23 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
     } else {
         pState->Gamepad.sThumbLX = (SHORT)(lx * 32767.0f);
         pState->Gamepad.sThumbLY = (SHORT)(ly * 32767.0f);
+    }
+
+    /* A spin output held (both: none) takes the left stick round its edge
+     * at full tilt, one turn per spin_ms. */
+    i = out[XBOX_KBM_LSTICK_SPIN_CW] - out[XBOX_KBM_LSTICK_SPIN_CCW];
+    if (i) {
+        float a;
+        if (s_spin_t)
+            s_spin_a += (float)(t - s_spin_t) / spin_ms();
+        s_spin_a -= floorf(s_spin_a);
+        s_spin_t = t;
+        a = s_spin_a * 6.2831853f;
+        pState->Gamepad.sThumbLX = (SHORT)((float)i * sinf(a) * 32767.0f);
+        pState->Gamepad.sThumbLY = (SHORT)(cosf(a) * 32767.0f);
+    } else {
+        s_spin_a = 0.0f;
+        s_spin_t = 0;
     }
 
     /* The mouse's movement is ours unless the game takes it (direct mouse

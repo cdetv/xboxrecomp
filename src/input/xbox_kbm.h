@@ -40,6 +40,10 @@ enum {
     XBOX_KBM_WALK,            /* held: the left stick from keys at walk tilt */
     XBOX_KBM_MOUSE_LSTICK,    /* held: the mouse steers the left stick, not
                                * the right (a weapon wheel picked with it) */
+    XBOX_KBM_LSTICK_SPIN_CW,  /* held: the left stick goes round its edge,
+                               * clockwise (a title that wants the stick
+                               * rotated); RECOMP_KBM_SPIN_MS a turn */
+    XBOX_KBM_LSTICK_SPIN_CCW, /* the same, anticlockwise */
     XBOX_KBM_OUTPUTS
 };
 
