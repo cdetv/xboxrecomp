@@ -74,6 +74,7 @@ static volatile LONG s_sel;
 static volatile LONG s_configured;
 static volatile LONG s_enabled = 1;
 static volatile LONG s_active = 1;
+static volatile LONG s_keys_only; /* the keys are the game's, not the mouse */
 static volatile LONG s_unlatch;   /* focus lost: toggles let go */
 static volatile LONG s_direct;    /* the game takes the mouse itself */
 static volatile LONG s_wheel_on;  /* a binding has the mouse on the left stick */
@@ -185,6 +186,12 @@ void xbox_KbmSetActive(int on)
         wake();
 }
 
+void xbox_KbmSetKeysOnly(int on)
+{
+    if (InterlockedExchange(&s_keys_only, on ? 1 : 0) != (on ? 1 : 0))
+        wake();
+}
+
 int xbox_KbmConfigured(void)
 {
     return s_configured && s_enabled;
@@ -192,7 +199,7 @@ int xbox_KbmConfigured(void)
 
 int xbox_KbmWantsMouse(void)
 {
-    return s_configured && s_enabled && s_active;
+    return s_configured && s_enabled && s_active && !s_keys_only;
 }
 
 void xbox_KbmSetWake(void (*fn)(void))
@@ -235,7 +242,8 @@ int xbox_KbmTakeMouse(long *dx, long *dy)
     LONG axes = s_direct;
 
     *dx = *dy = 0;
-    if (!s_configured || !s_enabled || !s_active || s_wheel_on) {
+    if (!s_configured || !s_enabled || !s_active || s_keys_only
+        || s_wheel_on) {
         if (!s_wheel_on) {
             if (axes & XBOX_KBM_DIRECT_X)
                 InterlockedExchange(&s_mdx, 0);
@@ -397,6 +405,10 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         return 1;
     }
 
+    if (s_keys_only) {
+        InterlockedExchange(&s_mdx, 0);
+        InterlockedExchange(&s_mdy, 0);
+    }
     memset(out, 0, sizeof(out));
     sel = (int)s_sel;
     /* Exclusive: toggles write the profile's own state. */
@@ -532,6 +544,7 @@ void xbox_KbmSetProfile(int slot, const xbox_KbmBinding *b, int n,
 void xbox_KbmSelectProfile(int slot) { (void)slot; }
 void xbox_KbmSetEnabled(int on) { (void)on; }
 void xbox_KbmSetActive(int on) { (void)on; }
+void xbox_KbmSetKeysOnly(int on) { (void)on; }
 int  xbox_KbmConfigured(void) { return 0; }
 int  xbox_KbmWantsMouse(void) { return 0; }
 void xbox_KbmSetWake(void (*wake)(void)) { (void)wake; }

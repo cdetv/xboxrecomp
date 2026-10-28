@@ -91,6 +91,10 @@ void xbox_KbmSetEnabled(int on);
 /* 0 while a host menu is open or the game is held: the mouse is let go and
  * nothing reaches the pad. */
 void xbox_KbmSetActive(int on);
+/* While active: 1 = the keys only, the mouse is not the game's (a host menu
+ * is up but the player went back to the game: the pointer stays free for
+ * the menu, nothing is captured and the mouse neither looks nor clicks). */
+void xbox_KbmSetKeysOnly(int on);
 
 /* For the window: is there a profile, and should the mouse be held in the
  * window now. A change of either calls the wake function (the window posts
