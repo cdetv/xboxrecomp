@@ -73,7 +73,7 @@ typedef struct {
     xbox_KbmStick left, right;
 } xbox_KbmMouse;
 
-#define XBOX_KBM_PROFILES 8
+#define XBOX_KBM_PROFILES 16
 
 /* Replace profile slot's bindings (at most 256; one input may drive several
  * outputs through several entries). */
