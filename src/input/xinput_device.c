@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "xbox_kbm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -72,14 +73,21 @@ static BOOL pad_touched(const XINPUT_GAMEPAD *g)
         || g->sThumbRY > 16000 || g->sThumbRY < -16000;
 }
 
+/* Bit n: XInput slot n answered the last scan. */
+static volatile LONG g_slots_connected;
+
 static void scan_slots(void)
 {
     DWORD i, n = 0;
+    LONG mask = 0;
     for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
         XINPUT_STATE s;
-        if (XInputGetState(i, &s) == ERROR_SUCCESS)
+        if (XInputGetState(i, &s) == ERROR_SUCCESS) {
             g_slot_of_port[n++] = i;
+            mask |= 1L << i;
+        }
     }
+    InterlockedExchange(&g_slots_connected, mask);
     for (i = n; i < XBOX_MAX_CONTROLLERS; i++)
         g_slot_of_port[i] = NO_SLOT;
     /* The pad last used goes first; the others keep their order. */
@@ -120,11 +128,263 @@ static void follow_active_pad(void)
     }
 }
 
-static DWORD slot_of_port(DWORD port)
+static BOOL keyboard_enabled(void);
+
+/* ---- fixed assignment (xbox_InputAssign) ----------------------------------
+ *
+ * Made for local multiplayer and for swapping between the keyboard and a
+ * pad: the host's settings menu says which pad drives which port and which
+ * port the keyboard is. A pad's slot is the XInput user index Windows gave
+ * it; XBOX_INPUT_ANY keeps the old "the pad last used" for a port, among the
+ * pads no other port was given, so one player's setup needs no choosing. */
+static volatile LONG g_assign_on;
+static volatile LONG g_source[XBOX_MAX_CONTROLLERS] = {
+    XBOX_INPUT_NONE, XBOX_INPUT_NONE, XBOX_INPUT_NONE, XBOX_INPUT_NONE,
+};
+static volatile LONG g_kb_port;            /* -1: no port */
+static DWORD g_any_slot = NO_SLOT;         /* XBOX_INPUT_ANY's pad now */
+
+void xbox_InputAssign(DWORD port, int source)
 {
+    if (port >= XBOX_MAX_CONTROLLERS)
+        return;
+    if (source < XBOX_INPUT_ANY || source >= XBOX_MAX_CONTROLLERS)
+        source = XBOX_INPUT_NONE;
+    InterlockedExchange(&g_source[port], source);
+    if (!InterlockedExchange(&g_assign_on, 1))
+        fprintf(stderr, "[INPUT] fixed port assignment on\n");
+    fprintf(stderr, "[INPUT] port %lu: %s%c\n", (unsigned long)port + 1,
+            source == XBOX_INPUT_ANY ? "any controller"
+            : source == XBOX_INPUT_NONE ? "no input"
+            : source == 0 ? "controller 1" : source == 1 ? "controller 2"
+            : source == 2 ? "controller 3" : "controller 4", 10);
+}
+
+int xbox_InputAssigned(DWORD port)
+{
+    return port < XBOX_MAX_CONTROLLERS ? (int)g_source[port] : XBOX_INPUT_NONE;
+}
+
+void xbox_InputSetKeyboardPort(int port)
+{
+    if (port < 0 || port >= XBOX_MAX_CONTROLLERS)
+        port = -1;
+    if (InterlockedExchange(&g_kb_port, port) != port)
+        fprintf(stderr, "[INPUT] keyboard and mouse: %s%d\n",
+                port < 0 ? "no port" : "port ", port < 0 ? 0 : port + 1);
+}
+
+int xbox_InputKeyboardPort(void) { return (int)g_kb_port; }
+int xbox_InputAssignActive(void) { return g_assign_on ? 1 : 0; }
+
+unsigned xbox_InputPortsInUse(void)
+{
+    unsigned m = 0;
+    DWORD i;
+    if (!g_assign_on)
+        return 1u;
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_source[i] != XBOX_INPUT_NONE)
+            m |= 1u << i;
+    if (g_kb_port >= 0 && (xbox_KbmConfigured() || keyboard_enabled()))
+        m |= 1u << g_kb_port;
+    return m;
+}
+
+BOOL xbox_InputHostPadConnected(DWORD slot)
+{
+    if (slot >= XBOX_MAX_CONTROLLERS)
+        return FALSE;
     if (GetTickCount64() >= g_next_scan)
         scan_slots();
-    return g_slot_of_port[port];
+    return (g_slots_connected >> slot) & 1 ? TRUE : FALSE;
+}
+
+int xbox_InputHostPadOfPort(DWORD port)
+{
+    DWORD s;
+    if (port >= XBOX_MAX_CONTROLLERS)
+        return -1;
+    s = g_assign_on ? (g_source[port] == XBOX_INPUT_ANY ? g_any_slot
+                       : g_source[port] >= 0 ? (DWORD)g_source[port] : NO_SLOT)
+        : g_slot_of_port[port];
+    return s < XBOX_MAX_CONTROLLERS && ((g_slots_connected >> s) & 1) ? (int)s : -1;
+}
+
+/* ---- pad names, for a host menu -------------------------------------------
+ *
+ * XInput has no names, only user indices, and "controller 2" tells a player
+ * nothing (user 2026-10-28). Windows' own list (joy.cpl, "USB game
+ * controllers") is DirectInput's: its instance name per device, whose
+ * product GUID holds the USB vendor and product IDs. XInput's
+ * XInputGetCapabilitiesEx (xinput1_4.dll ordinal 108, undocumented, as SDL
+ * uses it) gives a pad's IDs, which picks its name from that list. Two pads
+ * of one model get the same name; virtual pads (Parsec, ViGEm, DS4Windows)
+ * mostly say Xbox 360. */
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#pragma comment(lib, "dinput8.lib")
+#pragma comment(lib, "dxguid.lib")
+
+typedef struct {
+    XINPUT_CAPABILITIES caps;
+    WORD  vendor, product, version, unk1;
+    DWORD unk2;
+} XInputCapsEx;
+typedef DWORD (WINAPI *XInputCapsExFn)(DWORD, DWORD, DWORD, XInputCapsEx *);
+
+#define MAX_DI_PADS 16
+typedef struct {
+    int   n;
+    DWORD id[MAX_DI_PADS];          /* product GUID Data1: vendor | product << 16 */
+    char  name[MAX_DI_PADS][96];
+} DiPads;
+
+static BOOL CALLBACK di_pad(LPCDIDEVICEINSTANCEW d, LPVOID ctx)
+{
+    DiPads *p = (DiPads *)ctx;
+    if (p->n >= MAX_DI_PADS)
+        return DIENUM_STOP;
+    p->id[p->n] = d->guidProduct.Data1;
+    if (!WideCharToMultiByte(CP_UTF8, 0, d->tszInstanceName, -1,
+                             p->name[p->n], sizeof(p->name[0]), NULL, NULL))
+        p->name[p->n][0] = '\0';
+    p->n++;
+    return DIENUM_CONTINUE;
+}
+
+static char g_pad_name[XBOX_MAX_CONTROLLERS][96];
+static LONG g_names_for = -1;       /* the connected set they were found for */
+
+static void find_pad_names(void)
+{
+    static XInputCapsExFn caps_ex;
+    static int tried;
+    IDirectInput8W *di = NULL;
+    DiPads list;
+    DWORD i;
+    int k;
+
+    memset(g_pad_name, 0, sizeof(g_pad_name));
+    if (!tried) {
+        HMODULE x = GetModuleHandleA("xinput1_4.dll");
+        tried = 1;
+        if (!x)
+            x = LoadLibraryA("xinput1_4.dll");
+        if (x)
+            caps_ex = (XInputCapsExFn)(void (*)(void))GetProcAddress(x, (LPCSTR)108);
+        if (!caps_ex)
+            fprintf(stderr, "[INPUT] no XInputGetCapabilitiesEx: controllers"
+                    " go by number\n");
+    }
+    list.n = 0;
+    if (!caps_ex || FAILED(DirectInput8Create(GetModuleHandleA(NULL),
+                                              DIRECTINPUT_VERSION,
+                                              &IID_IDirectInput8W,
+                                              (void **)&di, NULL)))
+        return;
+    IDirectInput8_EnumDevices(di, DI8DEVCLASS_GAMECTRL, di_pad, &list,
+                              DIEDFL_ATTACHEDONLY);
+    IDirectInput8_Release(di);
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+        XInputCapsEx c;
+        DWORD id;
+        if (!((g_slots_connected >> i) & 1))
+            continue;
+        memset(&c, 0, sizeof(c));
+        if (caps_ex(1, i, 0, &c) != ERROR_SUCCESS)
+            continue;
+        id = (DWORD)c.vendor | ((DWORD)c.product << 16);
+        for (k = 0; k < list.n; k++)
+            if (list.id[k] == id && list.name[k][0]) {
+                snprintf(g_pad_name[i], sizeof(g_pad_name[i]), "%s",
+                         list.name[k]);
+                break;
+            }
+        fprintf(stderr, "[INPUT] XInput slot %lu: %04X:%04X \"%s\"\n",
+                (unsigned long)i, c.vendor, c.product, g_pad_name[i]);
+    }
+}
+
+int xbox_InputHostPadName(DWORD slot, char *out, int size)
+{
+    if (size > 0)
+        out[0] = '\0';
+    if (slot >= XBOX_MAX_CONTROLLERS || size <= 0
+        || !xbox_InputHostPadConnected(slot))
+        return 0;
+    if (g_names_for != g_slots_connected) {
+        g_names_for = g_slots_connected;
+        find_pad_names();
+    }
+    snprintf(out, (size_t)size, "%s", g_pad_name[slot]);
+    return out[0] != '\0';
+}
+
+/* Given to a port by number (so not XBOX_INPUT_ANY's to take). */
+static BOOL slot_given(DWORD slot)
+{
+    DWORD i;
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_source[i] == (LONG)slot)
+            return TRUE;
+    return FALSE;
+}
+
+static BOOL slot_free_pad(DWORD slot)
+{
+    return ((g_slots_connected >> slot) & 1) && !slot_given(slot);
+}
+
+/* XBOX_INPUT_ANY: the pad it had while that is still free and connected;
+ * with RECOMP_PAD_FOLLOW, another free pad being touched while it is not
+ * takes over (as follow_active_pad does for port 0); with none yet, the
+ * first free pad. */
+static DWORD any_slot(void)
+{
+    XINPUT_STATE s;
+    DWORD i, cur = g_any_slot;
+
+    if (cur != NO_SLOT && !slot_free_pad(cur))
+        cur = NO_SLOT;
+    if (cur != NO_SLOT && pad_follow()
+        && !(XInputGetState(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad)))
+        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+            if (i != cur && slot_free_pad(i)
+                && XInputGetState(i, &s) == ERROR_SUCCESS
+                && pad_touched(&s.Gamepad)) {
+                fprintf(stderr, "[INPUT] any controller: XInput slot %lu"
+                        " (last used)\n", (unsigned long)i);
+                cur = i;
+                break;
+            }
+    for (i = 0; cur == NO_SLOT && i < XBOX_MAX_CONTROLLERS; i++)
+        if (slot_free_pad(i))
+            cur = i;
+    g_any_slot = cur;
+    return cur;
+}
+
+static DWORD slot_of_port(DWORD port)
+{
+    LONG src;
+    if (GetTickCount64() >= g_next_scan)
+        scan_slots();
+    if (!g_assign_on)
+        return g_slot_of_port[port];
+    src = g_source[port];
+    if (src == XBOX_INPUT_ANY)
+        return any_slot();
+    /* An empty slot is not asked: XInputGetState on one is slow. */
+    if (src >= 0 && ((g_slots_connected >> src) & 1))
+        return (DWORD)src;
+    return NO_SLOT;
+}
+
+/* The port the keyboard and mouse drive: port 0 until assignment says. */
+static BOOL keyboard_port(DWORD port)
+{
+    return g_assign_on ? (LONG)port == g_kb_port : port == 0;
 }
 
 /* ---- keyboard, when there is no pad --------------------------------------
@@ -295,7 +555,7 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     slot = slot_of_port(dwPort);
-    if (dwPort == 0 && pad_follow()) {
+    if (dwPort == 0 && pad_follow() && !g_assign_on) {
         follow_active_pad();
         slot = g_slot_of_port[0];
     }
@@ -305,7 +565,10 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (slot != NO_SLOT)
             g_next_scan = 0;            /* unplugged: look again next time */
         g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && keyboard_enabled()) {
+        /* No pad: keyboard and mouse alone are the player. */
+        if (keyboard_port(dwPort) && xbox_KbmState(pState))
+            return ERROR_SUCCESS;
+        if (keyboard_port(dwPort) && keyboard_enabled()) {
             keyboard_state(pState);
             return ERROR_SUCCESS;
         }
@@ -351,10 +614,15 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * Merging is also the better rule. A real pad keeps working -- its
      * buttons are already in pState and the keyboard only adds to them --
      * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
+    /* The bound keyboard and mouse (kbm_pad.c) when the game has set them
+     * up, else the stand-in below. Merged the same way: a button pressed
+     * on either is pressed, the greater pressure wins, and a stick the
+     * keyboard or mouse moves is theirs. */
+    if (keyboard_port(dwPort) && (xbox_KbmConfigured() || keyboard_enabled())) {
         XBOX_INPUT_STATE kb;
         int i;
-        keyboard_state(&kb);
+        if (!xbox_KbmState(&kb))
+            keyboard_state(&kb);
         pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
         for (i = 0; i < 8; i++)
             if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
@@ -447,8 +715,32 @@ void xbox_InputInit(void)
     open_controllers();
 }
 
-/* Host overlays are Windows-only so far. */
+/* Host overlays are Windows-only so far, and so is fixed assignment:
+ * ports here are SDL's controllers in order. */
 void xbox_InputSetBlocked(int on) { (void)on; }
+void xbox_InputAssign(DWORD dwPort, int source) { (void)dwPort; (void)source; }
+int  xbox_InputAssigned(DWORD dwPort) { return dwPort == 0 ? XBOX_INPUT_ANY : XBOX_INPUT_NONE; }
+void xbox_InputSetKeyboardPort(int port) { (void)port; }
+int  xbox_InputKeyboardPort(void) { return 0; }
+int  xbox_InputAssignActive(void) { return 0; }
+unsigned xbox_InputPortsInUse(void) { return 1u; }
+BOOL xbox_InputHostPadConnected(DWORD slot)
+{
+    return slot < XBOX_MAX_CONTROLLERS && g_pads[slot] ? TRUE : FALSE;
+}
+int  xbox_InputHostPadOfPort(DWORD dwPort)
+{
+    return dwPort < XBOX_MAX_CONTROLLERS && g_pads[dwPort] ? (int)dwPort : -1;
+}
+int  xbox_InputHostPadName(DWORD slot, char *out, int size)
+{
+    const char *n = slot < XBOX_MAX_CONTROLLERS && g_pads[slot]
+                  ? SDL_GameControllerName(g_pads[slot]) : NULL;
+    if (size <= 0)
+        return 0;
+    snprintf(out, (size_t)size, "%s", n ? n : "");
+    return out[0] != '\0';
+}
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {

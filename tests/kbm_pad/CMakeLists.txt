@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(kbm_pad_test C)
+set(CMAKE_C_STANDARD 11)
+add_subdirectory(../.. runtime)
+add_executable(kbm_pad_test test_main.c)
+target_link_libraries(kbm_pad_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME kbm_pad COMMAND kbm_pad_test)

@@ -405,6 +405,114 @@ static void fb_set_fullscreen(HWND h, int on)
     fflush(stderr);
 }
 
+/* Keyboard and mouse as player 1's pad (src/input/kbm_pad.c, once the game
+ * has bound them): every key, mouse button and wheel notch goes there as
+ * well as to s_key_down, and mouse movement comes from raw input, which
+ * has no pointer acceleration and keeps counting at the screen's edge.
+ *
+ * While they are in use the mouse is held in the window: the pointer is
+ * hidden and kept inside the client area, so it cannot wander onto another
+ * monitor or click another window. Held only while the window has the
+ * focus and nothing on the host side wants the pointer (an overlay menu
+ * open, the game held). In a window, it takes a click in the picture to
+ * hold the mouse (the click goes no further), so a window that opens under
+ * the pointer -- a test run started from somewhere else -- does not trap it;
+ * in full screen, getting the focus is enough. Alt+Tab lets go. */
+#define FB_WM_KBM (WM_APP + 4)
+
+extern int  xbox_KbmConfigured(void);
+extern int  xbox_KbmWantsMouse(void);
+extern void xbox_KbmSetWake(void (*wake)(void));
+extern void xbox_KbmKey(unsigned input, int down);
+extern void xbox_KbmWheel(int notches);
+extern void xbox_KbmMouseMove(long dx, long dy);
+extern void xbox_KbmReleaseAll(void);
+
+static int s_mouse_held;      /* pointer clipped and hidden */
+static int s_mouse_clicked;   /* windowed: a click asked for it */
+static int s_wheel_rest;      /* part of a notch (high-resolution wheels) */
+
+static void kbm_wake(void)
+{
+    if (s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_KBM, 0, 0);
+}
+
+static void kbm_clip(HWND h)
+{
+    RECT r;
+    GetClientRect(h, &r);
+    MapWindowPoints(h, NULL, (POINT *)&r, 2);
+    ClipCursor(&r);
+}
+
+static void kbm_follow(HWND h)
+{
+    int want = xbox_KbmWantsMouse() && GetForegroundWindow() == h
+               && (s_fullscreen || s_mouse_clicked);
+    if (want == s_mouse_held)
+        return;
+    s_mouse_held = want;
+    if (want) {
+        kbm_clip(h);
+        SetCursor(NULL);
+    } else {
+        ClipCursor(NULL);
+        /* Keys stay as they are; only the mouse is let go. */
+        xbox_KbmKey(VK_LBUTTON, 0);
+        xbox_KbmKey(VK_RBUTTON, 0);
+        xbox_KbmKey(VK_MBUTTON, 0);
+        xbox_KbmKey(VK_XBUTTON1, 0);
+        xbox_KbmKey(VK_XBUTTON2, 0);
+    }
+    fprintf(stderr, "  [FBWIN] mouse %s\n", want ? "held in the window"
+                                                 : "let go");
+    fflush(stderr);
+}
+
+static void kbm_register(HWND h)
+{
+    RAWINPUTDEVICE rid;
+    rid.usUsagePage = 0x01;     /* generic desktop */
+    rid.usUsage     = 0x02;     /* mouse */
+    rid.dwFlags     = 0;        /* the usual WM_MOUSE* messages too */
+    rid.hwndTarget  = h;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid)))
+        fprintf(stderr, "  [FBWIN] raw mouse input not available (%lu)\n",
+                (unsigned long)GetLastError());
+    xbox_KbmSetWake(kbm_wake);
+}
+
+/* A mouse button message: to the pad while the mouse is held; a click that
+ * asks to hold it is used up. Returns nonzero when handled. */
+static int kbm_button(HWND h, UINT m, WPARAM w)
+{
+    unsigned vk;
+    int down;
+
+    switch (m) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP: vk = VK_LBUTTON; break;
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP: vk = VK_RBUTTON; break;
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP: vk = VK_MBUTTON; break;
+    default:
+        vk = HIWORD(w) == XBUTTON2 ? VK_XBUTTON2 : VK_XBUTTON1;
+        break;
+    }
+    down = m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN
+        || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN;
+    if (!xbox_KbmConfigured())
+        return 0;
+    if (down && !s_mouse_held) {
+        if (m == WM_LBUTTONDOWN && xbox_KbmWantsMouse()) {
+            s_mouse_clicked = 1;
+            kbm_follow(h);
+        }
+        return 1;
+    }
+    xbox_KbmKey(vk, down);
+    return 1;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     {
@@ -459,7 +567,64 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_SIZE:
         fb_layout_gpu_view(h);
+        /* Full screen on or off comes through here too. */
+        kbm_follow(h);
+        if (s_mouse_held)
+            kbm_clip(h);
         return 0;
+
+    case WM_MOVE:
+        if (s_mouse_held)
+            kbm_clip(h);
+        break;
+
+    case FB_WM_KBM:
+        kbm_follow(h);
+        return 0;
+
+    case WM_ACTIVATE:
+    case WM_SETFOCUS:
+        kbm_follow(h);
+        break;
+
+    case WM_INPUT: {
+        RAWINPUT ri;
+        UINT size = sizeof(ri);
+        if (s_mouse_held
+            && GetRawInputData((HRAWINPUT)l, RID_INPUT, &ri, &size,
+                               sizeof(RAWINPUTHEADER)) != (UINT)-1
+            && ri.header.dwType == RIM_TYPEMOUSE
+            && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE))
+            xbox_KbmMouseMove(ri.data.mouse.lLastX, ri.data.mouse.lLastY);
+        break;                    /* DefWindowProc cleans up after it */
+    }
+
+    case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+    case WM_XBUTTONDOWN: case WM_XBUTTONUP:
+        if (kbm_button(h, m, w))
+            return (m == WM_XBUTTONDOWN || m == WM_XBUTTONUP) ? TRUE : 0;
+        break;
+
+    case WM_MOUSEWHEEL:
+        if (s_mouse_held) {
+            s_wheel_rest += GET_WHEEL_DELTA_WPARAM(w);
+            if (s_wheel_rest >= WHEEL_DELTA || s_wheel_rest <= -WHEEL_DELTA) {
+                xbox_KbmWheel(s_wheel_rest / WHEEL_DELTA);
+                s_wheel_rest %= WHEEL_DELTA;
+            }
+            return 0;
+        }
+        break;
+
+    /* Alt or F10 alone would put the window into its (absent) menu, and the
+     * next keys would go to that instead of the game: not while Alt is a
+     * key the game may use. Alt+Space and Alt+F4 still work. */
+    case WM_SYSCOMMAND:
+        if ((w & 0xFFF0) == SC_KEYMENU && l == 0 && xbox_KbmConfigured())
+            return 0;
+        break;
 
     case FB_WM_SET_SHAPE: {
         unsigned sw, sh;
@@ -495,8 +660,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 g_pb_ftrace_key = 1;
             return 0;
         }
-        if ((unsigned)w < 256)
+        if ((unsigned)w < 256) {
             s_key_down[w] = 1;
+            xbox_KbmKey((unsigned)w, 1);
+        }
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -517,8 +684,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
+        if ((unsigned)w < 256) {
             s_key_down[w] = 0;
+            xbox_KbmKey((unsigned)w, 0);
+        }
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     /* Alt+Enter's character: Windows would beep for it (no menu). */
@@ -530,7 +699,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     /* No mouse pointer over the picture in full screen. The GPU view is a
      * disabled child, so the mouse over it is reported here as client. */
     case WM_SETCURSOR:
-        if (s_fullscreen && LOWORD(l) == HTCLIENT) {
+        if ((s_fullscreen || s_mouse_held) && LOWORD(l) == HTCLIENT) {
             SetCursor(NULL);
             return TRUE;
         }
@@ -539,6 +708,9 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
         memset((void *)s_key_down, 0, sizeof s_key_down);
+        xbox_KbmReleaseAll();
+        s_mouse_clicked = 0;
+        kbm_follow(h);
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -669,6 +841,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
+    kbm_register(hwnd);
     if (getenv("RECOMP_FULLSCREEN") && atoi(getenv("RECOMP_FULLSCREEN")))
         fb_set_fullscreen(hwnd, 1);
 
