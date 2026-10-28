@@ -3261,7 +3261,8 @@ static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
  * alpha-tested, depth-writing batch used earlier in the frame is drawn a
  * second time into depth only, alpha-tested as that earlier batch was: its
  * solid texels then hide what is drawn behind them later, its soft edges
- * still blend as before. Not what the hardware does, so off unless set. */
+ * still blend as before. Not what the hardware does, so off unless set.
+ * Point sprites are left out (cutout_match). */
 #define CUT_TEX 32
 static struct {
     uint32_t offset, func, ref;
@@ -3307,7 +3308,12 @@ static int cutout_match(int zi, uint32_t bound)
         }
         return -1;
     }
-    return i < s_cut_n && g_pb.blend_enable ? (int)i : -1;
+    /* Not point sprites: their shape comes from another stage, so a pass
+     * alpha-tested on stage 0's texture wrote depth over each whole faint
+     * square (Conker's floating dust shares an atlas with cut-out scenery
+     * and punched square holes in smoke drawn behind it, 2026-10-28). */
+    return i < s_cut_n && g_pb.blend_enable && g_pb.prim != NV_PRIM_POINTS
+           ? (int)i : -1;
 }
 
 /* The second, depth-only draw of the batch d3d_draw just drew (everything
