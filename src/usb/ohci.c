@@ -392,6 +392,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
 #define TD_DP_IN       2u
 #define TD_CC_NOERROR  0u
 #define TD_CC_STALL    4u
+#define TD_CC_NOT_RESPONDING 5u
 #define TD_CC_DATAUNDERRUN 9u
 #define TD_ROUNDING    (1u << 18)   /* bufferRounding: a short packet is fine */
 
@@ -418,8 +419,12 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 #define g_ctrl_len  g_ctrl_len_[pad]
 #define g_ctrl_sent g_ctrl_sent_[pad]
 
-/* Pads plugged in so far, in port order. */
+/* Pads plugged in so far, in port order, and which: bit n = pad n. */
 static int s_plugged_pads;
+static volatile unsigned s_plugged_mask;
+/* The address a pulled pad had (fixed assignment), so transfers still
+ * queued to it fail as they would on a wire with nothing on it. */
+static uint8_t s_gone_addr[USB_GAMEPAD_MAX];
 
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
@@ -430,10 +435,21 @@ static int ohci_pad_for(uint32_t ed0)
 {
     uint32_t fa = ed0 & 0x7Fu;
     int d;
-    for (d = 0; d < s_plugged_pads; d++)
-        if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
+    for (d = 0; d < USB_GAMEPAD_MAX; d++)
+        if (((s_plugged_mask >> d) & 1u)
+            && (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0))
             return d;
     return -1;
+}
+
+static int ohci_gone_addr(uint32_t ed0)
+{
+    uint32_t fa = ed0 & 0x7Fu;
+    int d;
+    for (d = 0; fa && d < USB_GAMEPAD_MAX; d++)
+        if (s_gone_addr[d] == fa)
+            return 1;
+    return 0;
 }
 
 /* Every address below came out of guest memory, so none of them are trusted.
@@ -548,8 +564,8 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
     int      moved = 0;
     int      pad = ohci_pad_for(ed0);
 
-    if (pad < 0)
-        return TD_CC_NOERROR;   /* no device at that address: ignore */
+    if (pad < 0)                /* no device at that address */
+        return ohci_gone_addr(ed0) ? TD_CC_NOT_RESPONDING : TD_CC_NOERROR;
 
     if (s_trace) {
         static unsigned n;
@@ -1002,6 +1018,67 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  * the interrupt it has been waiting for. Repeat delivery and the transfer
  * lists come after that answer, not before it.
  */
+/* ---- fixed assignment: a pad per port the host drives -------------------
+ *
+ * With the host's port assignment on (xbox_InputAssign), pad n is Xbox
+ * controller port n and is on the bus while something drives that port:
+ * plugged when a port is given a pad or the keyboard, pulled when it is
+ * left with nothing, so a game sees players come and go as on the console.
+ *
+ * Which root hub port is which controller port: XAPI numbers them 3, 4, 1, 2
+ * (the one pad of RECOMP_USB_PORT=0, root hub port 1, was the game's
+ * controller port 3), so controller port n sits on root hub port
+ * (n + 2) % 4, and the hub needs all four.
+ *
+ * One change at a time, a second apart, and none while a plugged pad is not
+ * yet configured: only one device may answer at the default address. */
+extern int      xbox_InputAssignActive(void);
+extern unsigned xbox_InputPortsInUse(void);
+
+static int s_fixed;
+
+static unsigned hub_port_of_pad(int pad)
+{
+    return (unsigned)(pad + 2) % 4u;
+}
+
+static void plug_fixed(OhciController *hc, unsigned *settle)
+{
+    unsigned want = xbox_InputPortsInUse() & 0xFu, have = s_plugged_mask;
+    uint32_t *ps;
+    int pad;
+
+    if (want == have || ++*settle < 50)
+        return;
+    for (pad = 0; pad < USB_GAMEPAD_MAX; pad++)
+        if (((have >> pad) & 1u) && !usb_gamepad_configured(pad))
+            return;                     /* still enumerating */
+    for (pad = 0; pad < USB_GAMEPAD_MAX; pad++)
+        if (((want ^ have) >> pad) & 1u)
+            break;
+    ps = &hc->reg[(HcRhPortStatus1 + hub_port_of_pad(pad) * 4) / 4];
+    if ((want >> pad) & 1u) {
+        s_gone_addr[pad] = 0;
+        usb_gamepad_reset(pad);
+        g_setup_pending_[pad] = 0;
+        g_ctrl_len_[pad] = -1;
+        g_ctrl_sent_[pad] = 0;
+        *ps |= PORT_CCS | PORT_CSC;
+        s_plugged_mask = have | (1u << pad);
+        fprintf(stderr, "  [OHCI0] controller port %d plugged (root hub "
+                "port %u)%c", pad + 1, hub_port_of_pad(pad) + 1, 10);
+    } else {
+        s_gone_addr[pad] = usb_gamepad_address(pad);
+        s_plugged_mask = have & ~(1u << pad);
+        usb_gamepad_reset(pad);
+        *ps = (*ps & ~(PORT_CCS | PORT_PES)) | PORT_CSC;
+        fprintf(stderr, "  [OHCI0] controller port %d pulled%c", pad + 1, 10);
+    }
+    hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+    fflush(stderr);
+    *settle = 0;
+}
+
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
     /* This thread calls recompiled code, so it needs what any thread running
@@ -1057,7 +1134,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * change during its own bring-up scan, and a reset clears interrupt
          * status, so a device that was always there is one that never
          * arrives. */
-        if (!plugged && (enable & INTR_RHSC)) {
+        if (s_fixed) {
+            if (enable & INTR_RHSC)
+                plug_fixed(hc, &settle);
+        } else if (!plugged && (enable & INTR_RHSC)) {
             /* Which port the device appears on decides which controller slot
              * XAPI assigns it, and a title that reads "player 1" looks at slot
              * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
@@ -1069,6 +1149,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
             s_plugged_pads = 1;
+            s_plugged_mask = 1u;
             first_port = port;
             fprintf(stderr, "  [OHCI0] operational after %u ms; device "
                             "arriving on port 1\n", waited * 20);
@@ -1088,6 +1169,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 fprintf(stderr, "  [OHCI0] pad %d arriving on port %u%c",
                         s_plugged_pads + 1, port + 1, 10);
                 fflush(stderr);
+                s_plugged_mask |= 1u << s_plugged_pads;
                 s_plugged_pads++;
                 settle = 0;
             }
@@ -1280,6 +1362,14 @@ void xbox_OhciInit(void)
         }
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
+        /* Fixed assignment (set before this): every controller port, and
+         * RECOMP_USB_PORT / RECOMP_USB_PADS have no say. */
+        s_fixed = xbox_InputAssignActive();
+        if (s_fixed) {
+            s_ndp = 4;
+            fprintf(stderr, "  [OHCI] fixed port assignment: a pad per "
+                    "controller port in use%c", 10);
+        }
     }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);

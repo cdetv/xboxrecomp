@@ -56,6 +56,11 @@ static uint8_t s_configuration[USB_GAMEPAD_MAX];
 
 uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
 int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
+void usb_gamepad_reset(int pad)
+{
+    s_address[pad & 3] = 0;
+    s_configuration[pad & 3] = 0;
+}
 
 /* ---- control transfers ------------------------------------------------- */
 

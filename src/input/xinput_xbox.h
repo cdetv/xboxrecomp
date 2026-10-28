@@ -116,6 +116,37 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
 
+/* ---- which host device drives which Xbox port ------------------------------
+ *
+ * Until the first xbox_InputAssign, ports follow connection order (and
+ * RECOMP_PAD_FOLLOW) and the keyboard is port 0's, as they always have. The
+ * first call switches to fixed assignment: each port is driven by the host
+ * pad it was given, the keyboard and mouse by the port they were given, and
+ * nothing else. A pad is given to one port at a time; giving it to another
+ * is the caller's to undo (both are settings the caller saves). */
+#define XBOX_INPUT_NONE  (-1)   /* nothing: the port reports no device */
+#define XBOX_INPUT_ANY   (-2)   /* the pad last used that no port was given */
+
+/** source: an XInput user index 0-3, XBOX_INPUT_ANY or XBOX_INPUT_NONE. */
+void xbox_InputAssign(DWORD dwPort, int source);
+int  xbox_InputAssigned(DWORD dwPort);
+/** The port the keyboard and mouse drive, or -1 for none. */
+void xbox_InputSetKeyboardPort(int port);
+int  xbox_InputKeyboardPort(void);
+/** 1 once xbox_InputAssign has been called. */
+int  xbox_InputAssignActive(void);
+/** Ports something drives, bit n = port n: the USB model plugs a pad into
+ *  each of them and pulls the rest. */
+unsigned xbox_InputPortsInUse(void);
+/** Host pad user index 0-3 connected (as of the last scan, under a second
+ *  old), and the index driving a port now (-1: none). */
+BOOL xbox_InputHostPadConnected(DWORD slot);
+int  xbox_InputHostPadOfPort(DWORD dwPort);
+/** A connected host pad's name as Windows' game controller list shows it
+ *  (UTF-8), for a host menu: 1 if found, else 0 and out = "". Looked up
+ *  again whenever the set of connected pads changes. */
+int  xbox_InputHostPadName(DWORD slot, char *out, int size);
+
 #ifdef __cplusplus
 }
 #endif
