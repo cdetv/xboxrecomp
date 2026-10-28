@@ -6,7 +6,10 @@
  * trusting it skipped the commands between the two runs, or -- when that
  * return lay outside the segment -- ended the walk and lost the rest of it
  * (Conker's front end: black wedges). The return is now taken from the ring.
- * A buffer with no jump back at all must not walk off the end of RAM. */
+ * A buffer with no jump back at all must not walk off the end of RAM.
+ *
+ * Each buffer is dry-run first and skipped, like a draw that drew nothing,
+ * unless it jumps back to the ring at the last dword its record names. */
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -138,7 +141,7 @@ int main(void)
     put(CONTIG + 0x1300, M(0x100)); put(CONTIG + 0x1304, 0);
     put(CONTIG + 0x1308, JMP(0x40000));
     put(CONTIG + 0x130C, 0x1320); put(CONTIG + 0x1310, 0);
-    put(CONTIG + 0x1314, M(0x3FC)); put(CONTIG + 0x1318, 0);
+    put(CONTIG + 0x1314, buf + 8); put(CONTIG + 0x1318, 0);
     put(CONTIG + 0x131C, buf);
     put(CONTIG + 0x1320, M(0x318)); put(CONTIG + 0x1324, 7);
     nv2a_pb_scan(CONTIG + 0x1300, CONTIG + 0x1328);
@@ -157,14 +160,15 @@ int main(void)
         ok &= expect("idle buffer, no record", w, 2);
     }
 
-    /* A buffer at the very end of RAM with no jump back. */
+    /* A buffer at the very end of RAM with no jump back: the dry run stops
+     * at the end of RAM and the buffer is skipped; the walk goes on. */
     put(CONTIG + RAM - 8, M(0x314)); put(CONTIG + RAM - 4, 5);
     put(CONTIG + 0x1200, JMP(RAM - 8));
     put(CONTIG + 0x1204, M(0x31C)); put(CONTIG + 0x1208, 6);
     nv2a_pb_scan(CONTIG + 0x1200, CONTIG + 0x120C);
     {
-        static const uint32_t w[] = { 0x314, 0x31C };
-        ok &= expect("no jump back at end of RAM", w, 2);
+        static const uint32_t w[] = { 0x31C };
+        ok &= expect("no jump back at end of RAM", w, 1);
     }
     return ok ? 0 : 1;
 }
