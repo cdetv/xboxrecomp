@@ -115,6 +115,16 @@ void xbox_KbmReleaseAll(void);
 void xbox_KbmMouseDirect(int axes);
 int  xbox_KbmTakeMouse(long *dx, long *dy);
 
+/* Controls that depend on the game's state (a button pressed only while the
+ * player stands somewhere, a weapon drawn while a key is held): the game
+ * leaves those keys out of the profile, asks whether they are held, and
+ * holds the outputs itself. Held: a key or mouse button now, at least a
+ * short press long (0 for the wheel, and while not active). Force: an
+ * output held by the game, on top of the profile's, until it lets go; not
+ * while the keyboard and mouse are off or not active. */
+int  xbox_KbmHeld(unsigned input);
+void xbox_KbmForce(unsigned output, int on);
+
 /* For the pad: player 1's keyboard and mouse as a pad state. 0 when they
  * are off or not active (pState is then at rest). */
 int  xbox_KbmState(XBOX_INPUT_STATE *pState);

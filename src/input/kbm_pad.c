@@ -83,6 +83,7 @@ static volatile unsigned char s_down[XBOX_KBM_INPUTS];
 static volatile ULONGLONG     s_down_at[XBOX_KBM_INPUTS];
 static volatile LONG          s_wheel_pending[2];
 static volatile LONG          s_mdx, s_mdy;
+static volatile unsigned char s_force[XBOX_KBM_OUTPUTS];   /* held by the game */
 
 /* Milliseconds of full tilt one mouse count is worth at sensitivity 1
  * (RECOMP_KBM_MOUSE_MS, for tuning). 0.5: at Conker's ~175 degrees a
@@ -250,6 +251,21 @@ int xbox_KbmTakeMouse(long *dx, long *dy)
     return axes != 0;
 }
 
+int xbox_KbmHeld(unsigned input)
+{
+    if (!s_configured || !s_enabled || !s_active
+        || input >= XBOX_KBM_WHEEL_UP)
+        return 0;
+    return s_down[input] || (s_down_at[input]
+                             && now_ms() - s_down_at[input] < MIN_PRESS_MS);
+}
+
+void xbox_KbmForce(unsigned output, int on)
+{
+    if (output < XBOX_KBM_OUTPUTS)
+        s_force[output] = (unsigned char)(on ? 1 : 0);
+}
+
 /* Focus lost: nothing stays held, toggles included. A short press already
  * counted keeps its minimum length, which is harmless. */
 void xbox_KbmReleaseAll(void)
@@ -409,7 +425,7 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         }
     }
     for (i = 0; i < XBOX_KBM_OUTPUTS; i++)
-        out[i] |= s_prof[sel].latch[i];
+        out[i] |= s_prof[sel].latch[i] | s_force[i];
     ReleaseSRWLockExclusive(&s_lock);
 
     /* Analog buttons fully pressed: a title reading a pressure never sees a
@@ -523,6 +539,8 @@ void xbox_KbmKey(unsigned input, int down) { (void)input; (void)down; }
 void xbox_KbmWheel(int notches) { (void)notches; }
 void xbox_KbmMouseMove(long dx, long dy) { (void)dx; (void)dy; }
 void xbox_KbmReleaseAll(void) {}
+int  xbox_KbmHeld(unsigned input) { (void)input; return 0; }
+void xbox_KbmForce(unsigned output, int on) { (void)output; (void)on; }
 int  xbox_KbmState(XBOX_INPUT_STATE *pState)
 {
     memset(pState, 0, sizeof(*pState));

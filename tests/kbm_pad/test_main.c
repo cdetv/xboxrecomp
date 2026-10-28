@@ -1,8 +1,9 @@
 /* Keyboard and mouse as player 1's pad (src/input/kbm_pad.c): bindings to
  * buttons and sticks, the shortest press, wheel notches as presses, walking
  * tilt, the mouse as a turn owed and paid off at up to full tilt in the
- * title's own stick range, toggles, and
- * the weapon-wheel mode where the mouse steers the left stick. */
+ * title's own stick range, toggles,
+ * the weapon-wheel mode where the mouse steers the left stick, and keys the
+ * game reads itself with outputs it holds (xbox_KbmHeld, xbox_KbmForce). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -275,10 +276,32 @@ int main(void)
           "profile changed and back: the toggle let go",
           st.Gamepad.bAnalogButtons[6]);
 
+    /* A key the game reads itself (not bound), and an output it holds. */
+    xbox_KbmKey('F', 1);
+    check(xbox_KbmHeld('F') == 1, "an unbound key reads as held", 0);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0,
+          "... and presses nothing by itself", st.Gamepad.bAnalogButtons[1]);
+    xbox_KbmForce(XBOX_KBM_B, 1);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255,
+          "an output the game holds", st.Gamepad.bAnalogButtons[1]);
+    xbox_KbmForce(XBOX_KBM_B, 0);
+    st = read_pad();
+    check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0,
+          "... let go when it says", st.Gamepad.bAnalogButtons[1]);
+    xbox_KbmKey('F', 0);
+    Sleep(100);
+    check(xbox_KbmHeld('F') == 0, "the key let go", 0);
+
     xbox_KbmKey('W', 1);
+    xbox_KbmForce(XBOX_KBM_B, 1);
     xbox_KbmSetActive(0);
-    check(xbox_KbmState(&st) == 1 && st.Gamepad.sThumbLY == 0,
+    check(xbox_KbmState(&st) == 1 && st.Gamepad.sThumbLY == 0
+          && st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0,
           "menu open: in use, nothing pressed", st.Gamepad.sThumbLY);
+    check(xbox_KbmHeld('W') == 0, "menu open: no key reads as held", 0);
+    xbox_KbmForce(XBOX_KBM_B, 0);
     xbox_KbmSetActive(1);
     xbox_KbmSetEnabled(0);
     check(xbox_KbmState(&st) == 0, "turned off: not in use", 0);
