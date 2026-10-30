@@ -307,7 +307,9 @@ static uint8_t synthetic_buttons(void)
  * is pressed as soon as it is read. With RECOMP_FB_DUMP and a short
  * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
  * look again. A line "mouse:<dx>,<dy>" moves the keyboard-and-mouse pad's
- * mouse instead (no time, no hold). A fixed timeline cannot do that on a rasterised run, where
+ * mouse instead (no time, no hold). Lines go one after another with a 200 ms
+ * release between; a line starting with "&" ("&rt:300") is pressed at once,
+ * on top of whatever is held (a tap of RT while LT stays held). A fixed timeline cannot do that on a rasterised run, where
  * how long a screen takes to appear depends on how much the software
  * rasteriser has to draw.
  *
@@ -501,22 +503,25 @@ static void pad_live_poll(unsigned long t)
             }
             if (npending) {
                 char line[560];
+                int now_too = pending[0] == '&';
                 /* Several lines in one read go one after another, with a
                  * 200 ms release between: a title polling its pad a few times
                  * a second would otherwise see "down" and "a" in the same
                  * report, which is a different input from "down, then a". */
                 /* Serialised per pad: pad 2's throttle must not wait out
                  * pad 1's -- split-screen players press at the same time. */
-                int pd = (pending[0] == 'p' || pending[0] == 'P')
-                         && pending[1] >= '1' && pending[1] <= '4'
-                         && pending[2] == '-' ? pending[1] - '1' : 0;
-                unsigned long at = t > next_free[pd] ? t : next_free[pd];
+                const char *b = pending + now_too;
+                int pd = (b[0] == 'p' || b[0] == 'P')
+                         && b[1] >= '1' && b[1] <= '4'
+                         && b[2] == '-' ? b[1] - '1' : 0;
+                unsigned long at = now_too || t > next_free[pd] ? t
+                                                                 : next_free[pd];
                 pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", at, pending);
+                snprintf(line, sizeof line, "%lu:%s", at, b);
                 if (s_script_len >= PAD_SCRIPT_MAX - 1)
                     pad_script_compact(t);
                 pad_script_parse(line);
-                if (s_script_len > 0)
+                if (s_script_len > 0 && !now_too)
                     next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
                 fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
                 fflush(stderr);
@@ -529,11 +534,12 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
-static void pad_script_apply(int pad, uint8_t *out)
+/* Returns 1 if a step pressed something on this pad. */
+static int pad_script_apply(int pad, uint8_t *out)
 {
     static unsigned long t0;
     unsigned long now, t;
-    int i, j;
+    int i, j, pressed = 0;
 
     if (s_script_len < 0)
         pad_script_load();
@@ -543,7 +549,7 @@ static void pad_script_apply(int pad, uint8_t *out)
     t = now - t0;
     pad_live_poll(t);
     if (s_script_len == 0)
-        return;
+        return 0;
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
         if (st->pad != pad)
@@ -556,6 +562,7 @@ static void pad_script_apply(int pad, uint8_t *out)
                     t, i, st->digital, st->analog);
             fflush(stderr);
         }
+        pressed = 1;
         out[2] |= st->digital;
         for (j = 0; j < 8; j++)
             if (st->analog & (1u << j))
@@ -576,6 +583,55 @@ static void pad_script_apply(int pad, uint8_t *out)
             memcpy(&out[12], ax, sizeof ax);
         }
     }
+    return pressed;
+}
+
+/* The script as the input layer's pad overlay (xbox_InputSetPadOverlay):
+ * scripted presses join the controller's own state, so a game's controller
+ * layout (xbox_InputSetPadFilter) applies to them as to a real pad's. The
+ * report then takes them from xbox_InputGetState, not a second time here. */
+static int s_overlaid[4];
+
+static void state_to_report(const XBOX_GAMEPAD *g, uint8_t *out)
+{
+    int i;
+    out[2] = (uint8_t)(g->wButtons & 0xFF);
+    out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
+    for (i = 0; i < 8; i++)
+        out[4 + i] = g->bAnalogButtons[i];
+    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
+    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
+    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
+    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
+    out[16] = (uint8_t)(g->sThumbRX & 0xFF);
+    out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
+    out[18] = (uint8_t)(g->sThumbRY & 0xFF);
+    out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+}
+
+static int script_overlay(DWORD port, XBOX_INPUT_STATE *s)
+{
+    uint8_t r[20];
+    XBOX_GAMEPAD *g = &s->Gamepad;
+    int i, pressed;
+
+    if (port > 3)
+        return 0;
+    s_overlaid[port] = 1;
+    memset(r, 0, sizeof(r));
+    state_to_report(g, r);
+    pressed = pad_script_apply((int)port, r);
+    if (!pressed)
+        return 0;
+    g->wButtons = (WORD)(r[2] | (r[3] << 8));
+    for (i = 0; i < 8; i++)
+        g->bAnalogButtons[i] = r[4 + i];
+    g->sThumbLX = (SHORT)(r[12] | (r[13] << 8));
+    g->sThumbLY = (SHORT)(r[14] | (r[15] << 8));
+    g->sThumbRX = (SHORT)(r[16] | (r[17] << 8));
+    g->sThumbRY = (SHORT)(r[18] | (r[19] << 8));
+    s->dwPacketNumber++;
+    return 1;
 }
 
 int usb_gamepad_report(int pad, uint8_t *out, int max)
@@ -583,7 +639,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
     uint8_t synth = synthetic_buttons();
-    int i;
 
     if (max < 20)
         return 0;
@@ -630,25 +685,25 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     /* The synthetic press and the host pad drive pad n from host pad n. */
     if (pad != 0)
         synth = 0;
+    {
+        static int hooked;
+        if (!hooked) {
+            hooked = 1;
+            xbox_InputSetPadOverlay(script_overlay);
+        }
+    }
+    s_overlaid[pad & 3] = 0;
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
-        pad_script_apply(pad, out);
+        if (!s_overlaid[pad & 3])
+            pad_script_apply(pad, out);
         return 20;
     }
 
     g = &state.Gamepad;
-    out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
-    out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
-    for (i = 0; i < 8; i++)
-        out[4 + i] = g->bAnalogButtons[i];
-    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
-    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
-    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
-    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
-    out[16] = (uint8_t)(g->sThumbRX & 0xFF);
-    out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
-    out[18] = (uint8_t)(g->sThumbRY & 0xFF);
-    out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
-    pad_script_apply(pad, out);
+    state_to_report(g, out);
+    out[2] |= synth;
+    if (!s_overlaid[pad & 3])
+        pad_script_apply(pad, out);
     return 20;
 }
