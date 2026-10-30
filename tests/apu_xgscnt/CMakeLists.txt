@@ -4,7 +4,9 @@ set(CMAKE_C_STANDARD 11)
 add_subdirectory(../.. runtime)
 add_executable(apu_xgscnt_test test_main.c)
 target_include_directories(apu_xgscnt_test PRIVATE ../../src ../../src/apu)
-target_link_libraries(apu_xgscnt_test PRIVATE xboxrecomp)
+# xbox_apu_emu_static first: the APU internals linked in (the .exe gets them
+# from xemu_apu.dll, which exports only xemu_apu_connect).
+target_link_libraries(apu_xgscnt_test PRIVATE xbox_apu_emu_static xboxrecomp)
 enable_testing()
 # The read caches its getenv in a static, so each arm is its own process.
 # "wall" is the negative control: the old ns / 100 read must fail the same

@@ -23,7 +23,10 @@
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
-#include "../kernel/xbox_memory_layout.h"   /* XBOX_WORKER_STACK_TOP */
+#include "apu_host.h"
+
+/* The runtime, through the table the .exe hands xemu_apu.dll (apu_dll.c). */
+extern const ApuHost *g_apu_host;
 
 /* ============================================================
  * Globals
@@ -163,22 +166,19 @@ void mcpx_debug_end_frame(void) {}
  * notification into ordinary RAM, where DirectSound never looked -- so a
  * buffer never reported that it had stopped, and Burnout 3's frontend waits
  * on exactly that (IDirectSoundBuffer::GetStatus, polled forever). */
-extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
-extern uint32_t xbox_ContiguousAllocatedBytes(void);
-extern int xbox_PhysAliasToVa(uint32_t pa, uint32_t *va);
-
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
+    const ApuHost *h = g_apu_host;
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     /* A stand-in page MmGetPhysicalAddress gave heap memory: the VA it
      * stands for (kernel_memory.c). Stream packets in heap memory read as
      * contiguous memory were noise. */
     uint32_t va;
-    if (xbox_PhysAliasToVa(a, &va))
+    if (h->phys_alias_to_va(a, &va))
         return g_apu_ram_ptr + va;
-    if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
+    if (a >= *h->image_lo && a < *h->image_hi)
         return g_apu_ram_ptr + a;
-    if (a < xbox_ContiguousAllocatedBytes())
+    if (a < h->contiguous_allocated_bytes())
         return g_apu_ram_ptr + 0x80000000u + a;
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
@@ -210,32 +210,14 @@ static void update_irq(MCPXAPUState *d)
  * its service routine to (0x002F8E81 in Burnout 3). */
 #define APU_VECTOR 5
 
-typedef void (*apu_guest_fn)(void);
-extern apu_guest_fn recomp_lookup(uint32_t xbox_va);
-extern int  xbox_worker_stack_alloc(void);
-extern void xbox_worker_stack_free(int slot);
-extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
-extern uint32_t xbox_AllocThreadTib(void);
-extern int xbox_IrqlBlocksInterrupts(void);
-extern int xbox_IrqlEnterInterrupt(int level);
-extern void xbox_IrqlLeaveInterrupt(int saved);
-extern void xbox_IsrGateEnter(void);
-extern int  xbox_IsrGateTryEnter(void);
-extern void xbox_IsrGateLeave(void);
-#if defined(_MSC_VER)
-#  define APU_TLS __declspec(thread)
-#else
-#  define APU_TLS __thread
-#endif
-extern APU_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
-extern APU_TLS uint32_t g_fs_base;
-
 /* Call the connected service routine while the line is up, from the frame
  * thread, the way the OHCI model delivers USB interrupts (ohci_call_isr):
  * a worker stack for the call, a TIB of this thread's own, and a hold-off
  * while a guest thread sits at raised IRQL, which is when the single-CPU
  * console could not have taken the interrupt. The routine acknowledges by
- * writing ISTS, which drops the line through update_irq. */
+ * writing ISTS, which drops the line through update_irq. The guest call
+ * itself is the .exe's (g_apu_host->isr_*, apu_host.c): it runs on the
+ * runtime's thread-local guest registers. */
 /* RECOMP_APU_GATE_WAIT=1: wait for the ISR gate as before instead of
  * retrying next frame; RECOMP_APU_THREAD_PRIO=0: leave the frame thread at
  * normal priority. Both default to the new behaviour (see their uses). */
@@ -251,37 +233,20 @@ static int apu_gate_nowait(void)
 
 static void apu_deliver_irq(MCPXAPUState *d)
 {
-    static int tib_ready;
     static unsigned held_off;
-    uint32_t kint, routine, context;
-    apu_guest_fn fn;
-    int slot;
+    const ApuHost *h = g_apu_host;
+    ApuIsrCall c;
+    uint32_t eax;
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
     if (g_apu_prof_on) g_apu_prof.irq_up++;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50) {
+    if (h->irql_blocks_interrupts() && ++held_off <= 50) {
         if (g_apu_prof_on) g_apu_prof.irq_held++;
         return;
     }
     held_off = 0;
-    kint = xbox_GetConnectedInterrupt(APU_VECTOR);
-    if (!kint)
-        return;
-    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
-    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
-    fn = routine ? recomp_lookup(routine) : NULL;
-    if (!fn)
-        return;
-    if (!tib_ready) {
-        uint32_t tib = xbox_AllocThreadTib();
-        if (!tib)
-            return;
-        g_fs_base = tib;
-        tib_ready = 1;
-    }
-    slot = xbox_worker_stack_alloc();
-    if (slot < 0)
+    if (!h->isr_prepare(APU_VECTOR, &c))
         return;
 
     qemu_mutex_unlock(&d->lock);
@@ -293,38 +258,33 @@ static void apu_deliver_irq(MCPXAPUState *d)
         /* Busy: leave the line up and try on the next frame (0.67 ms) rather
          * than stop producing audio until a descheduled guest thread lowers
          * IRQL (xbox_IsrGateTryEnter). */
-        if (!xbox_IsrGateTryEnter()) {
+        if (!h->isr_gate_try_enter()) {
             if (g_apu_prof_on) g_apu_prof.gate_busy++;
-            xbox_worker_stack_free(slot);
+            h->isr_release(&c);
             qemu_mutex_lock(&d->lock);
             return;
         }
     } else {
-        xbox_IsrGateEnter();
+        h->isr_gate_enter();
     }
     if (g_apu_prof_on) {
         double ms = prof_now_ms() - tg;
         g_apu_prof.t_gate += ms;
         if (ms > g_apu_prof.max_gate) g_apu_prof.max_gate = ms;
     }
-    g_esp = XBOX_WORKER_STACK_TOP(slot);
-    g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
     {
         double t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
-        { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
+        eax = h->isr_call(&c);
         if (g_apu_prof_on) {
             double ms = prof_now_ms() - t0;
             g_apu_prof.irq_delivered++;
-            if (g_eax & 1) g_apu_prof.irq_claimed++;
+            if (eax & 1) g_apu_prof.irq_claimed++;
             g_apu_prof.t_isr += ms;
             if (ms > g_apu_prof.max_isr) g_apu_prof.max_isr = ms;
         }
     }
-    xbox_IsrGateLeave();
-    xbox_worker_stack_free(slot);
+    h->isr_gate_leave();
+    h->isr_release(&c);
     double tl = g_apu_prof_on ? prof_now_ms() : 0.0;
     qemu_mutex_lock(&d->lock);
     if (g_apu_prof_on) {
@@ -337,7 +297,7 @@ static void apu_deliver_irq(MCPXAPUState *d)
         static unsigned n;
         if (n++ < 3) {
             fprintf(stderr, "[APU] interrupt delivered to 0x%08X -> %s\n",
-                    routine, (g_eax & 1) ? "claimed" : "declined");
+                    c.routine, (eax & 1) ? "claimed" : "declined");
             fflush(stderr);
         }
     }
@@ -974,7 +934,9 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
  * Public API: Init / Shutdown
  * ============================================================ */
 
-MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
+/* The DLL's init (ApuApi.init); the .exe's mcpx_apu_init_standalone
+ * (apu_loader.c) loads the DLL and calls it. */
+MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr)
 {
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(MCPXAPUState));
     if (!d) {

@@ -6,7 +6,9 @@ add_executable(apu_mixdown_test test_main.c)
 target_include_directories(apu_mixdown_test PRIVATE ../../src ../../src/apu)
 # The whole runtime: the APU delivers its interrupt and resolves physical
 # addresses through the kernel.
-target_link_libraries(apu_mixdown_test PRIVATE xboxrecomp)
+# xbox_apu_emu_static first: the APU internals linked in (the .exe gets them
+# from xemu_apu.dll, which exports only xemu_apu_connect).
+target_link_libraries(apu_mixdown_test PRIVATE xbox_apu_emu_static xboxrecomp)
 enable_testing()
 # One test per mixdown arm. The mixdown caches its getenv in a static, so one
 # process can only exercise one arm -- and an arm that cannot fail is not a
