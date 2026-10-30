@@ -902,17 +902,87 @@ static ID3D11PixelShader  *s_bps;
 static ID3D11Buffer       *s_bcb;
 static ID3D11SamplerState *s_bsamp;
 
+/* The shaders below are compiled at the first draw, and the combiner shader
+ * ("ps") took ~3 s: the executor stops answering the title's vblank DPC for
+ * that long, so nothing is shown (Conker's boot loading screen never
+ * appeared, 2026-10-30). The bytecode is kept beside the vertex-program
+ * shaders (RECOMP_VSH_GPU_CACHE) as <key>.cso, key = hash of the source,
+ * entry, target and flags, so it compiles once per machine. Unset: no cache. */
+static FILE *shader_file(const char *entry, const char *target,
+                         const char *mode, char *path, size_t cap)
+{
+    const char *dir = getenv("RECOMP_VSH_GPU_CACHE");
+    uint64_t h = 0xCBF29CE484222325ull;
+    const char *parts[3];
+    size_t i, n;
+    int p;
+    FILE *f = NULL;
+
+    if (!dir || !dir[0] || !strcmp(dir, "0") || strlen(dir) > MAX_PATH)
+        return NULL;
+    parts[0] = s_hlsl;
+    parts[1] = entry;
+    parts[2] = target;
+    for (p = 0; p < 3; p++)
+        for (i = 0, n = strlen(parts[p]) + 1; i < n; i++)
+            h = (h ^ (uint8_t)parts[p][i]) * 0x100000001B3ull;
+    h = (h ^ D3DCOMPILE_OPTIMIZATION_LEVEL3) * 0x100000001B3ull;
+    CreateDirectoryA(dir, NULL);
+    snprintf(path, cap, "%s\\%016llX.cso", dir, (unsigned long long)h);
+    if (fopen_s(&f, path, mode))
+        f = NULL;
+    return f;
+}
+
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_draw_d3d11",
-                            NULL, NULL, entry, target,
-                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    char path[MAX_PATH + 32] = "", tmp[MAX_PATH + 48];
+    LARGE_INTEGER t0, t1, fq;
+    FILE *f = shader_file(entry, target, "rb", path, sizeof path);
+    HRESULT hr;
+
+    if (f) {
+        long n;
+        fseek(f, 0, SEEK_END);
+        n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (n > 0 && SUCCEEDED(D3DCreateBlob((SIZE_T)n, &code))
+            && fread(ID3D10Blob_GetBufferPointer(code), 1, (size_t)n, f)
+               != (size_t)n) {
+            ID3D10Blob_Release(code);
+            code = NULL;
+        }
+        fclose(f);
+        if (code)
+            return code;
+    }
+    QueryPerformanceCounter(&t0);
+    hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_draw_d3d11",
+                    NULL, NULL, entry, target,
+                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
     if (FAILED(hr)) {
         fprintf(stderr, "[GPU] d3d11: shader %s failed: %s%c", entry,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?", 10);
         if (code) ID3D10Blob_Release(code);
         code = NULL;
+    } else {
+        fprintf(stderr, "[GPU] d3d11: shader %s compiled in %.0f ms%c", entry,
+                (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart, 10);
+        /* Written beside its name and renamed, so a run that stops halfway
+         * never leaves a short file to be loaded next time. */
+        if (path[0]) {
+            snprintf(tmp, sizeof tmp, "%s.%lu", path, GetCurrentThreadId());
+            if (!fopen_s(&f, tmp, "wb") && f) {
+                size_t n = ID3D10Blob_GetBufferSize(code);
+                int ok = fwrite(ID3D10Blob_GetBufferPointer(code), 1, n, f) == n;
+                ok = !fclose(f) && ok;
+                if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                    DeleteFileA(tmp);
+            }
+        }
     }
     if (err)
         ID3D10Blob_Release(err);
