@@ -566,6 +566,16 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
  * do not. */
 extern void (*g_xbox_path_hook)(const char *xbox_path);
 
+/* Optional: a project sets this to send a translated path to another host
+ * file, for example a mod folder of replacement files. Called after the path
+ * is translated, with the guest path and the host path it became (buf_size
+ * characters); it may rewrite host_path and returns nonzero when it did. The
+ * kernel then uses the rewritten path for every operation (open, create,
+ * query, delete), so a redirect of a path the title writes must point at a
+ * writable place. NULL by default; same reach as g_xbox_path_hook. */
+extern int (*g_xbox_path_redirect)(const char *xbox_path,
+                                   xbox_host_char *host_path, DWORD buf_size);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

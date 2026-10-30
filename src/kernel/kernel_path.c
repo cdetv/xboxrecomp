@@ -25,6 +25,10 @@
  * example to print who opened a file). NULL by default. */
 void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
 
+/* A project may set this to send a translated path elsewhere (kernel.h). */
+int (*g_xbox_path_redirect)(const char *xbox_path,
+                            xbox_host_char *host_path, DWORD buf_size) = NULL;
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.
@@ -512,6 +516,12 @@ translate:
                 host_path_buf[--n] = L'\0';
         }
 
+        if (g_xbox_path_redirect
+            && g_xbox_path_redirect(xbox_path, host_path_buf, buf_size)) {
+            fprintf(stderr, "  [PATH]   -> %S\n", host_path_buf);
+            fflush(stderr);
+        }
+
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %S", xbox_path, host_path_buf);
         xbox_remember_host_path(host_path_buf);
         return TRUE;
@@ -657,6 +667,9 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+
+        if (g_xbox_path_redirect)
+            g_xbox_path_redirect(xbox_path, host_path_buf, buf_size);
 
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
         return TRUE;
