@@ -578,6 +578,11 @@ static BOOL any_held(const XBOX_INPUT_STATE *s)
 
 static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+static xbox_InputPadHook volatile g_pad_overlay, g_pad_filter;
+
+void xbox_InputSetPadOverlay(xbox_InputPadHook fn) { g_pad_overlay = fn; }
+void xbox_InputSetPadFilter(xbox_InputPadHook fn) { g_pad_filter = fn; }
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     DWORD rc = input_get_state(dwPort, pState);
@@ -612,9 +617,19 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
     result = slot == NO_SLOT ? ERROR_DEVICE_NOT_CONNECTED
                              : host_get_state(slot, &xi_state);
     if (result != ERROR_SUCCESS) {
+        xbox_InputPadHook overlay = g_pad_overlay;
         if (slot != NO_SLOT)
             g_next_scan = 0;            /* unplugged: look again next time */
         g_controller_connected[dwPort] = FALSE;
+        /* No pad, but scripted presses: they are the controller. */
+        memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+        if (overlay && overlay(dwPort, pState))
+            goto have_pad;
+        /* The filter still hears that no controller is there (an empty
+         * state, thrown away), or what it kept from the last one goes
+         * stale: a game's layout would see LT held for ever. */
+        if (g_pad_filter)
+            g_pad_filter(dwPort, pState);
         /* No pad: keyboard and mouse alone are the player. */
         if (keyboard_port(dwPort) && xbox_KbmState(pState))
             return ERROR_SUCCESS;
@@ -651,6 +666,12 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    if (g_pad_overlay)
+        g_pad_overlay(dwPort, pState);
+
+have_pad:
+    if (g_pad_filter)
+        g_pad_filter(dwPort, pState);
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
@@ -782,6 +803,8 @@ void xbox_InputSetKeyboardPort(int port) { (void)port; }
 int  xbox_InputKeyboardPort(void) { return 0; }
 int  xbox_InputAssignActive(void) { return 0; }
 unsigned xbox_InputPortsInUse(void) { return 1u; }
+void xbox_InputSetPadOverlay(xbox_InputPadHook fn) { (void)fn; }
+void xbox_InputSetPadFilter(xbox_InputPadHook fn) { (void)fn; }
 BOOL xbox_InputHostPadConnected(DWORD slot)
 {
     return slot < XBOX_MAX_CONTROLLERS && g_pads[slot] ? TRUE : FALSE;

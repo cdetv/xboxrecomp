@@ -150,6 +150,20 @@ int  xbox_InputHostPadOfPort(DWORD dwPort);
  *  (UTF-8), for a host menu: 1 if found, else 0 and out = "". Looked up
  *  again whenever the set of connected pads changes. */
 int  xbox_InputHostPadName(DWORD slot, char *out, int size);
+/* ---- hooks on a port's controller state -----------------------------------
+ *
+ * Both run on the reading (USB) thread for every report, on the controller's
+ * own state, before the keyboard and mouse are merged in. The overlay is the
+ * pad script's (src/usb/usb_gamepad.c): it adds scripted presses as a
+ * controller would and returns 1 if it pressed anything, which stands in for
+ * a controller when none is connected. The filter is a game's own controller
+ * layout: it may change anything in the state (return value unused); with
+ * no controller and nothing scripted it gets an empty state, whose changes
+ * are thrown away, so what it keeps never goes stale. */
+typedef int (*xbox_InputPadHook)(DWORD dwPort, XBOX_INPUT_STATE *pad);
+void xbox_InputSetPadOverlay(xbox_InputPadHook fn);
+void xbox_InputSetPadFilter(xbox_InputPadHook fn);
+
 /** The lowest-numbered connected host pad, or -1. */
 int  xbox_InputFirstHostPad(void);
 #if defined(_WIN32)
