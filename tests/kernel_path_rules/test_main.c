@@ -25,6 +25,15 @@ static void expect(const char *xbox, const char *base, const char *rest)
     }
 }
 
+/* Sends D:\mod\* to <save>\Mod\* and leaves everything else alone. */
+static int redirect_mod(const char *xbox, WCHAR *host, DWORD n)
+{
+    if (_strnicmp(xbox, "D:\\mod\\", 7) != 0)
+        return 0;
+    swprintf_s(host, n, L"%S\\Mod\\%S", s_save, xbox + 7);
+    return 1;
+}
+
 static void link_drive(const char *link, const char *target)
 {
     XBOX_ANSI_STRING l, t;
@@ -75,6 +84,13 @@ int main(void)
     expect("\\Device\\Harddisk0\\Partition1\\TDATAX\\a.bin", s_game, "TDATAX\\a.bin");
     expect("D:\\default.xbe", s_game, "default.xbe");
 
+    /* A project redirect rewrites only the paths it claims. */
+    g_xbox_path_redirect = redirect_mod;
+    expect("D:\\mod\\a.bin", s_save, "Mod\\a.bin");
+    expect("D:\\default.xbe", s_game, "default.xbe");
+    g_xbox_path_redirect = NULL;
+    expect("D:\\mod\\a.bin", s_game, "mod\\a.bin");
+
     for (i = 0; i < (int)(sizeof(made) / sizeof(made[0])); i++) {
         sprintf_s(p, MAX_PATH, "%s\\%s", s_save, made[i]);
         if (!DeleteFileA(p))
@@ -85,6 +101,6 @@ int main(void)
 
     if (!s_ok)
         return 1;
-    puts("PASS: Partition1 TDATA/UDATA/CACHE go to the save dir, the rest of Partition1 to the game dir");
+    puts("PASS: Partition1 TDATA/UDATA/CACHE go to the save dir, the rest of Partition1 to the game dir; a redirect rewrites its own paths");
     return 0;
 }
