@@ -6,7 +6,8 @@
  * (analog buttons as bytes, separate trigger channels) and the host
  * (digital face buttons, trigger axes).
  *
- *   _WIN32 -> Windows XInput
+ *   _WIN32 -> Windows XInput, plus PlayStation pads through SDL3
+ *             (sdl_pads.c) as host pads 4-7
  *   POSIX  -> SDL2 GameController
  */
 
@@ -23,6 +24,7 @@
 
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
+#include "sdl_pads.h"
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
@@ -38,9 +40,19 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
  * Rescanned once a second, and at once when the mapped slot stops
  * answering, because XInputGetState on an empty slot is slow enough not to
  * be done for every report. */
-#define NO_SLOT XBOX_MAX_CONTROLLERS
+#define HOST_SLOTS XBOX_INPUT_HOST_PADS
+#define NO_SLOT    HOST_SLOTS
 static DWORD     g_slot_of_port[XBOX_MAX_CONTROLLERS];
 static ULONGLONG g_next_scan;
+
+/* A host pad: XInput user index 0-3, or 4-7 for PlayStation pad 0-3
+ * (sdl_pads.c), read in XInput's shape. */
+static DWORD host_get_state(DWORD slot, XINPUT_STATE *st)
+{
+    if (slot < XBOX_MAX_CONTROLLERS)
+        return XInputGetState(slot, st);
+    return xbox_SdlPadGetState((int)(slot - XBOX_MAX_CONTROLLERS), st);
+}
 
 /* RECOMP_PAD_FOLLOW=1: port 0 is the pad last used, not the first one
  * connected. Made for a single-player title played from more than one
@@ -73,17 +85,26 @@ static BOOL pad_touched(const XINPUT_GAMEPAD *g)
         || g->sThumbRY > 16000 || g->sThumbRY < -16000;
 }
 
-/* Bit n: XInput slot n answered the last scan. */
+/* Bit n: host pad n answered the last scan. */
 static volatile LONG g_slots_connected;
 
 static void scan_slots(void)
 {
+    static volatile LONG scanning;
     DWORD i, n = 0;
     LONG mask = 0;
-    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
+    /* The USB model's thread and the host's menus both ask; one scan at a
+     * time, the other keeps what the last one found. */
+    if (InterlockedExchange(&scanning, 1))
+        return;
+    /* PlayStation pads start with the first scan: a title that reads its
+     * pads through the USB model never calls xbox_InputInit. */
+    xbox_SdlPadsInit();
+    for (i = 0; i < HOST_SLOTS; i++) {
         XINPUT_STATE s;
-        if (XInputGetState(i, &s) == ERROR_SUCCESS) {
-            g_slot_of_port[n++] = i;
+        if (host_get_state(i, &s) == ERROR_SUCCESS) {
+            if (n < XBOX_MAX_CONTROLLERS)
+                g_slot_of_port[n++] = i;
             mask |= 1L << i;
         }
     }
@@ -99,6 +120,7 @@ static void scan_slots(void)
             break;
         }
     g_next_scan = GetTickCount64() + 1000;
+    InterlockedExchange(&scanning, 0);
 }
 
 /* RECOMP_PAD_FOLLOW: before port 0 is read, look at the other connected
@@ -111,16 +133,16 @@ static void follow_active_pad(void)
 
     if (cur == NO_SLOT)
         return;
-    if (XInputGetState(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad))
+    if (host_get_state(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad))
         return;
     for (i = 1; i < XBOX_MAX_CONTROLLERS; i++) {
         DWORD slot = g_slot_of_port[i];
         if (slot == NO_SLOT)
             break;
-        if (XInputGetState(slot, &s) == ERROR_SUCCESS
+        if (host_get_state(slot, &s) == ERROR_SUCCESS
             && pad_touched(&s.Gamepad)) {
             g_active_slot = slot;
-            fprintf(stderr, "[INPUT] pad in XInput slot %lu is now port 0"
+            fprintf(stderr, "[INPUT] host pad %lu is now port 0"
                     " (last used)\n", (unsigned long)slot);
             scan_slots();
             return;
@@ -148,16 +170,19 @@ void xbox_InputAssign(DWORD port, int source)
 {
     if (port >= XBOX_MAX_CONTROLLERS)
         return;
-    if (source < XBOX_INPUT_ANY || source >= XBOX_MAX_CONTROLLERS)
+    if (source < XBOX_INPUT_ANY || source >= HOST_SLOTS)
         source = XBOX_INPUT_NONE;
     InterlockedExchange(&g_source[port], source);
     if (!InterlockedExchange(&g_assign_on, 1))
         fprintf(stderr, "[INPUT] fixed port assignment on\n");
-    fprintf(stderr, "[INPUT] port %lu: %s%c\n", (unsigned long)port + 1,
-            source == XBOX_INPUT_ANY ? "any controller"
-            : source == XBOX_INPUT_NONE ? "no input"
-            : source == 0 ? "controller 1" : source == 1 ? "controller 2"
-            : source == 2 ? "controller 3" : "controller 4", 10);
+    if (source < 0)
+        fprintf(stderr, "[INPUT] port %lu: %s\n", (unsigned long)port + 1,
+                source == XBOX_INPUT_ANY ? "any controller" : "no input");
+    else
+        fprintf(stderr, "[INPUT] port %lu: %s controller %d\n",
+                (unsigned long)port + 1,
+                source < XBOX_MAX_CONTROLLERS ? "XInput" : "PlayStation",
+                source % XBOX_MAX_CONTROLLERS + 1);
 }
 
 int xbox_InputAssigned(DWORD port)
@@ -193,7 +218,7 @@ unsigned xbox_InputPortsInUse(void)
 
 BOOL xbox_InputHostPadConnected(DWORD slot)
 {
-    if (slot >= XBOX_MAX_CONTROLLERS)
+    if (slot >= HOST_SLOTS)
         return FALSE;
     if (GetTickCount64() >= g_next_scan)
         scan_slots();
@@ -208,7 +233,7 @@ int xbox_InputHostPadOfPort(DWORD port)
     s = g_assign_on ? (g_source[port] == XBOX_INPUT_ANY ? g_any_slot
                        : g_source[port] >= 0 ? (DWORD)g_source[port] : NO_SLOT)
         : g_slot_of_port[port];
-    return s < XBOX_MAX_CONTROLLERS && ((g_slots_connected >> s) & 1) ? (int)s : -1;
+    return s < HOST_SLOTS && ((g_slots_connected >> s) & 1) ? (int)s : -1;
 }
 
 /* ---- pad names, for a host menu -------------------------------------------
@@ -253,7 +278,7 @@ static BOOL CALLBACK di_pad(LPCDIDEVICEINSTANCEW d, LPVOID ctx)
     return DIENUM_CONTINUE;
 }
 
-static char g_pad_name[XBOX_MAX_CONTROLLERS][96];
+static char g_pad_name[HOST_SLOTS][96];
 static LONG g_names_for = -1;       /* the connected set they were found for */
 
 static void find_pad_names(void)
@@ -266,6 +291,11 @@ static void find_pad_names(void)
     int k;
 
     memset(g_pad_name, 0, sizeof(g_pad_name));
+    /* PlayStation pads: SDL has their names. */
+    for (i = XBOX_MAX_CONTROLLERS; i < HOST_SLOTS; i++)
+        if ((g_slots_connected >> i) & 1)
+            xbox_SdlPadName((int)(i - XBOX_MAX_CONTROLLERS), g_pad_name[i],
+                            sizeof(g_pad_name[i]));
     if (!tried) {
         HMODULE x = GetModuleHandleA("xinput1_4.dll");
         tried = 1;
@@ -310,7 +340,7 @@ int xbox_InputHostPadName(DWORD slot, char *out, int size)
 {
     if (size > 0)
         out[0] = '\0';
-    if (slot >= XBOX_MAX_CONTROLLERS || size <= 0
+    if (slot >= HOST_SLOTS || size <= 0
         || !xbox_InputHostPadConnected(slot))
         return 0;
     if (g_names_for != g_slots_connected) {
@@ -319,6 +349,26 @@ int xbox_InputHostPadName(DWORD slot, char *out, int size)
     }
     snprintf(out, (size_t)size, "%s", g_pad_name[slot]);
     return out[0] != '\0';
+}
+
+/* For a host's own menus: the pad read directly, never a slow empty
+ * XInput slot (only ones the last scan found). */
+DWORD xbox_InputHostPadRead(DWORD slot, XINPUT_STATE *st)
+{
+    if (!xbox_InputHostPadConnected(slot))
+        return ERROR_DEVICE_NOT_CONNECTED;
+    return host_get_state(slot, st);
+}
+
+int xbox_InputFirstHostPad(void)
+{
+    DWORD i;
+    if (GetTickCount64() >= g_next_scan)
+        scan_slots();
+    for (i = 0; i < HOST_SLOTS; i++)
+        if ((g_slots_connected >> i) & 1)
+            return (int)i;
+    return -1;
 }
 
 /* Given to a port by number (so not XBOX_INPUT_ANY's to take). */
@@ -348,17 +398,17 @@ static DWORD any_slot(void)
     if (cur != NO_SLOT && !slot_free_pad(cur))
         cur = NO_SLOT;
     if (cur != NO_SLOT && pad_follow()
-        && !(XInputGetState(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad)))
-        for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        && !(host_get_state(cur, &s) == ERROR_SUCCESS && pad_touched(&s.Gamepad)))
+        for (i = 0; i < HOST_SLOTS; i++)
             if (i != cur && slot_free_pad(i)
-                && XInputGetState(i, &s) == ERROR_SUCCESS
+                && host_get_state(i, &s) == ERROR_SUCCESS
                 && pad_touched(&s.Gamepad)) {
-                fprintf(stderr, "[INPUT] any controller: XInput slot %lu"
+                fprintf(stderr, "[INPUT] any controller: host pad %lu"
                         " (last used)\n", (unsigned long)i);
                 cur = i;
                 break;
             }
-    for (i = 0; cur == NO_SLOT && i < XBOX_MAX_CONTROLLERS; i++)
+    for (i = 0; cur == NO_SLOT && i < HOST_SLOTS; i++)
         if (slot_free_pad(i))
             cur = i;
     g_any_slot = cur;
@@ -560,7 +610,7 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
         slot = g_slot_of_port[0];
     }
     result = slot == NO_SLOT ? ERROR_DEVICE_NOT_CONNECTED
-                             : XInputGetState(slot, &xi_state);
+                             : host_get_state(slot, &xi_state);
     if (result != ERROR_SUCCESS) {
         if (slot != NO_SLOT)
             g_next_scan = 0;            /* unplugged: look again next time */
@@ -650,6 +700,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     slot = slot_of_port(dwPort);
     if (slot == NO_SLOT)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (slot >= XBOX_MAX_CONTROLLERS)
+        return ERROR_SUCCESS;           /* PlayStation pad: no rumble yet */
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
     return XInputSetState(slot, &xi_vib);
@@ -672,6 +724,12 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     slot = slot_of_port(dwPort);
     if (slot == NO_SLOT)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (slot >= XBOX_MAX_CONTROLLERS) {
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = XINPUT_DEVTYPE_GAMEPAD;
+        pCaps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+        return ERROR_SUCCESS;
+    }
     result = XInputGetCapabilities(slot, dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
