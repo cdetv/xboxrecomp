@@ -27,6 +27,9 @@ extern "C" {
 
 /* Xbox controller port count */
 #define XBOX_MAX_CONTROLLERS 4
+/* Host pads a port can be given: XInput user index 0-3, then PlayStation
+ * pads 0-3 (through SDL3, when the build has it) as 4-7. */
+#define XBOX_INPUT_HOST_PADS 8
 
 /* Xbox gamepad button flags */
 #define XBOX_GAMEPAD_DPAD_UP        0x0001
@@ -127,7 +130,8 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 #define XBOX_INPUT_NONE  (-1)   /* nothing: the port reports no device */
 #define XBOX_INPUT_ANY   (-2)   /* the pad last used that no port was given */
 
-/** source: an XInput user index 0-3, XBOX_INPUT_ANY or XBOX_INPUT_NONE. */
+/** source: a host pad 0-7 (XBOX_INPUT_HOST_PADS), XBOX_INPUT_ANY or
+ *  XBOX_INPUT_NONE. */
 void xbox_InputAssign(DWORD dwPort, int source);
 int  xbox_InputAssigned(DWORD dwPort);
 /** The port the keyboard and mouse drive, or -1 for none. */
@@ -138,14 +142,23 @@ int  xbox_InputAssignActive(void);
 /** Ports something drives, bit n = port n: the USB model plugs a pad into
  *  each of them and pulls the rest. */
 unsigned xbox_InputPortsInUse(void);
-/** Host pad user index 0-3 connected (as of the last scan, under a second
- *  old), and the index driving a port now (-1: none). */
+/** Host pad 0-7 connected (as of the last scan, under a second old), and
+ *  the host pad driving a port now (-1: none). */
 BOOL xbox_InputHostPadConnected(DWORD slot);
 int  xbox_InputHostPadOfPort(DWORD dwPort);
 /** A connected host pad's name as Windows' game controller list shows it
  *  (UTF-8), for a host menu: 1 if found, else 0 and out = "". Looked up
  *  again whenever the set of connected pads changes. */
 int  xbox_InputHostPadName(DWORD slot, char *out, int size);
+/** The lowest-numbered connected host pad, or -1. */
+int  xbox_InputFirstHostPad(void);
+#if defined(_WIN32)
+/** A connected host pad's state in XInput's shape (a PlayStation pad laid
+ *  out as an Xbox pad), for a host's own menus; never slow on an empty
+ *  slot. */
+struct _XINPUT_STATE;
+DWORD xbox_InputHostPadRead(DWORD slot, struct _XINPUT_STATE *st);
+#endif
 
 #ifdef __cplusplus
 }
