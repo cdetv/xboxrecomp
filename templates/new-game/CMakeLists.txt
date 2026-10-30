@@ -71,6 +71,15 @@ add_executable(${PROJECT_NAME} WIN32
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
+# The emulated APU (xemu, LGPL) is its own xemu_apu.dll, loaded from the
+# .exe's folder (src/apu/apu_host.h); without it the game runs silent.
+if(WIN32)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:xemu_apu> $<TARGET_FILE_DIR:${PROJECT_NAME}>
+        VERBATIM)
+endif()
+
 # Include paths for generated recomp headers
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src

@@ -229,7 +229,9 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
 #define DSP_BOOT_WORDS 0x800
 #define APU_VA         0xFE800000u
 
-extern ptrdiff_t g_xbox_mem_offset;
+/* g_xbox_mem_offset, through the .exe's table (apu_host.h). */
+#include "apu_host.h"
+extern const ApuHost *g_apu_host;
 
 static void dsp_bootstrap(MCPXAPUState *d, uint32_t *regs, uint32_t window,
                           uint32_t pmem, hwaddr sge_base, uint32_t max_sge,
@@ -238,7 +240,7 @@ static void dsp_bootstrap(MCPXAPUState *d, uint32_t *regs, uint32_t window,
     static int reported[2];
     int which = (regs == d->ep.regs);
     volatile uint32_t *p = (volatile uint32_t *)
-        ((uintptr_t)g_xbox_mem_offset + APU_VA + window + pmem);
+        ((uintptr_t)*g_apu_host->mem_offset + APU_VA + window + pmem);
 
     if (!sge_base) {
         if (!reported[which]++)
