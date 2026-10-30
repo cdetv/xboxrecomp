@@ -297,14 +297,27 @@ static volatile unsigned char s_key_down[256];
 static wchar_t       s_title[48] = L"Xbox Recomp";
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
+static int           s_app_title;      /* the game set its own title */
+static int           s_title_stats = 1;
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
     int i;
+    if (s_app_title)
+        return;
     for (i = 0; i < max_chars && i < 47 && name[i]; i++)
         s_title[i] = (wchar_t)name[i];
     if (i)
         s_title[i] = 0;
+}
+
+void xbox_FramebufferWindowSetAppTitle(const wchar_t *title, int stats)
+{
+    wcsncpy_s(s_title, 48, title, _TRUNCATE);
+    s_title_stats = stats;
+    s_app_title = 1;
+    if (s_fb_running && s_hwnd)
+        SetWindowTextW(s_hwnd, s_title);
 }
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
@@ -798,14 +811,23 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     (void)unused;
 
     {
-        WNDCLASSA wc;
+        /* Icon: the .exe's icon resource 1 (none = the default). */
+        WNDCLASSEXA wc;
+        HINSTANCE inst = GetModuleHandleA(NULL);
         memset(&wc, 0, sizeof(wc));
+        wc.cbSize        = sizeof(wc);
         wc.lpfnWndProc   = fb_wndproc;
-        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.hInstance     = inst;
         wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);  /* the bars */
         wc.lpszClassName = "XboxRecompFramebuffer";
-        RegisterClassA(&wc);
+        wc.hIcon   = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXICON),
+                                       GetSystemMetrics(SM_CYICON), 0);
+        wc.hIconSm = (HICON)LoadImageA(inst, MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                       GetSystemMetrics(SM_CXSMICON),
+                                       GetSystemMetrics(SM_CYSMICON), 0);
+        RegisterClassExA(&wc);
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     {
@@ -839,6 +861,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    SetWindowTextW(hwnd, s_title);
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
     kbm_register(hwnd);
@@ -915,7 +938,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             static DWORD t0;
             static LONG f0;
             DWORD now = GetTickCount();
-            if (now - t0 >= 1000) {
+            if (now - t0 >= 1000 && s_title_stats) {
                 LONG f = s_flips;
                 wchar_t tb[128];
                 _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
@@ -958,6 +981,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
+void xbox_FramebufferWindowSetAppTitle(const wchar_t *t, int s) { (void)t; (void)s; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void *xbox_FramebufferWindowHandle(void) { return NULL; }
 void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h) { (void)w; (void)h; return NULL; }

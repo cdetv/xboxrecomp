@@ -11,6 +11,7 @@
 #define XBOXRECOMP_VIDEO_PLAYER_H
 
 #include <stdint.h>
+#include <wchar.h>
 
 /* Initialize/shutdown Media Foundation (call once at app start/end) */
 int  video_init(void);
@@ -70,5 +71,10 @@ int  xbox_FramebufferDumpBmp(const char *path);
  * UTF-16 title (40 chars max); the stats come from each flip. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+/* The game's own title instead: shown as is (stats = 0) or with the stats
+ * after it (stats = 1); the XBE title is then ignored. Call before
+ * xbox_FramebufferWindowStart or any time after. The window's icon is the
+ * .exe's icon resource 1, when it has one. */
+void xbox_FramebufferWindowSetAppTitle(const wchar_t *title, int stats);
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
