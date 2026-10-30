@@ -47,6 +47,7 @@
 #include <dxgi1_2.h>
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
+#include "tex_replace.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowStart(void);
@@ -1416,7 +1417,10 @@ static ID3D11DepthStencilState *ds_state(void)
  * reflections) would read stale; logged once per address. Only level 0 is
  * hashed: a title that rewrote a smaller level alone would keep the old one.
  * ponytail: the bytes are hashed at every bind, which is a full read of the
- * texture per batch; a dirty-page scheme would avoid it. */
+ * texture per batch; a dirty-page scheme would avoid it.
+ * That hash also names replacement textures (tex_replace.h): when new bytes
+ * match a PNG in RECOMP_TEX_REPLACE, the PNG goes up instead, at its own size
+ * (replaced_tex); 2D textures only. */
 
 /* Enough for a whole scene. With 128, Conker's first field evicted textures
  * it bound again the same frame and re-decoded ~30 a second while standing
@@ -1429,6 +1433,7 @@ typedef struct {
     uint32_t d;                         /* slices uploaded: 1, a volume's depth, 6 a cube */
     uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
     uint32_t lv;                        /* mip levels uploaded (2D only) */
+    uint32_t replaced;                  /* a replacement PNG (tex_replace.h): its levels */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
@@ -1453,6 +1458,36 @@ static void tex_unlink(int i)
     if (*p)
         *p = s_tex_next[i];
     s_tex_next[i] = 0;
+}
+
+/* Entry e unlinked, its texture released, emptied. */
+static void tex_drop(GpuTexture *e)
+{
+    if (e->tex)
+        tex_unlink((int)(e - s_tex));
+    if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
+    if (e->tex) ID3D11Resource_Release(e->tex);
+    memset(e, 0, sizeof *e);
+}
+
+/* The entry for a new texture: an empty one, else the least recently used,
+ * dropped. Linked (tex_link) once its addr is set. */
+static GpuTexture *tex_take(void)
+{
+    int i, lru = 0;
+    for (i = 0; i < GPU_TEXTURES; i++)
+        if (!s_tex[i].tex
+            || (s_tex[lru].tex && s_tex[i].used < s_tex[lru].used))
+            lru = i;
+    tex_drop(&s_tex[lru]);
+    return &s_tex[lru];
+}
+
+static void tex_link(GpuTexture *e)
+{
+    int i = (int)(e - s_tex);
+    s_tex_next[i] = s_tex_head[tex_bucket(e->addr)];
+    s_tex_head[tex_bucket(e->addr)] = (uint16_t)(i + 1);
 }
 static uint32_t  *s_texels;             /* decode scratch */
 static size_t     s_texels_cap;
@@ -1976,6 +2011,85 @@ static DXGI_FORMAT tex_bc_format(const Texture *t)
     }
 }
 
+/* RECOMP_TEX_HASH_DUMP: level 0 of guest texture t, decoded, as the PNG a
+ * replacement for hash would replace (tex_replace.h). */
+static void dump_guest_tex(const Texture *t, uint64_t hash)
+{
+    uint32_t *px, x, y;
+    if (!pb_tex_texel(t, 0, 0, &x))
+        return;                         /* a format the sampler cannot read */
+    px = (uint32_t *)malloc((size_t)t->width * t->height * 4);
+    if (!px)
+        return;
+    for (y = 0; y < t->height; y++)
+        for (x = 0; x < t->width; x++)
+            if (!pb_tex_texel(t, x, y, &px[(size_t)y * t->width + x]))
+                px[(size_t)y * t->width + x] = 0xFFFFFFFFu;
+    tex_replace_dump(hash, px, t->width, t->height, t->color & 0xFF);
+    free(px);
+}
+
+/* Stage st's texture t (hash, palette, lv levels in the guest) drawn as the
+ * replacement px (w x h): a texture of its own size, with a full mip chain
+ * when the guest's has levels. The cache entry keeps the guest's key, so the
+ * same bytes find it again; e (the entry those bytes had, or NULL) goes. */
+static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
+                                              GpuTexture *e, uint64_t hash,
+                                              uint32_t palette, uint32_t lv,
+                                              const uint32_t *px, uint32_t w,
+                                              uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC d;
+    uint32_t levels = 1;
+
+    if (e)
+        tex_drop(e);
+    e = tex_take();
+    if (lv > 1)
+        while ((1u << levels) <= (w > h ? w : h))
+            levels++;
+    memset(&d, 0, sizeof d);
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = levels;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE
+                  | (levels > 1 ? D3D11_BIND_RENDER_TARGET : 0);
+    d.MiscFlags = levels > 1 ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                            (ID3D11Texture2D **)&e->tex))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, e->tex, NULL,
+                                                        &e->srv))) {
+        if (e->tex) ID3D11Resource_Release(e->tex);
+        memset(e, 0, sizeof *e);
+        return NULL;
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, e->tex, 0, NULL, px, w * 4,
+                                          w * h * 4);
+    if (levels > 1)
+        ID3D11DeviceContext_GenerateMips(s_ctx, e->srv);
+    e->addr = t->offset;
+    e->fmt = t->color;
+    e->w = t->width;
+    e->h = t->height;
+    e->pitch = t->pitch;
+    e->palette = palette;
+    e->d = 1;
+    e->lv = lv;
+    e->replaced = levels;
+    e->hash = hash;
+    e->hashed_flip = g_pb.flips;
+    e->used = s_tex_tick;
+    tex_link(e);
+    s_stat.tex_made++;
+    s_stat.tex_uploads++;
+    s_tex_levels[st] = levels;
+    return e->srv;
+}
+
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
                                                int volume)
 {
@@ -1985,7 +2099,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint64_t hash;
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
-    int i, lru = 0;
+    int i;
     uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
@@ -2055,7 +2169,7 @@ guest:
     if (e && d3 > 1)
         *flags |= cube ? TEX_CUBE : TEX_VOLUME;
     if (e)
-        s_tex_levels[st] = lv;
+        s_tex_levels[st] = e->replaced ? e->replaced : lv;
     if (e && e->hashed_flip == g_pb.flips) {
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -2074,6 +2188,21 @@ guest:
         e->used = s_tex_tick;
         s_stat.tex_reused++;
         return e->srv;
+    }
+
+    /* New or changed: a replacement PNG for these bytes goes up instead. */
+    if (d3 == 1 && !cube && tex_replace_active()) {
+        uint32_t rw, rh;
+        const uint32_t *px;
+        if (tex_replace_dumping() && tex_replace_dump_new(hash))
+            dump_guest_tex(t, hash);
+        px = tex_replace_find(hash, &rw, &rh);
+        if (px)
+            return replaced_tex(st, t, e, hash, palette, lv, px, rw, rh);
+    }
+    if (e && e->replaced) {
+        tex_drop(e);                    /* its texture is the PNG's size */
+        e = NULL;
     }
 
     /* New or changed. DXT goes up as it is (tex_bc_format): only check
@@ -2146,16 +2275,7 @@ make:
         D3D11_TEXTURE2D_DESC d;
         D3D11_TEXTURE3D_DESC d3d;
         HRESULT hr;
-        for (i = 0; i < GPU_TEXTURES; i++)
-            if (!s_tex[i].tex
-                || (s_tex[lru].tex && s_tex[i].used < s_tex[lru].used))
-                lru = i;
-        e = &s_tex[lru];
-        if (e->tex)
-            tex_unlink(lru);
-        if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
-        if (e->tex) ID3D11Resource_Release(e->tex);
-        memset(e, 0, sizeof *e);
+        e = tex_take();
         if (d3 > 1 && !cube) {
             memset(&d3d, 0, sizeof d3d);
             d3d.Width = t->width;
@@ -2198,8 +2318,7 @@ make:
         e->lv = lv;
         if (d3 > 1)
             *flags |= cube ? TEX_CUBE : TEX_VOLUME;
-        s_tex_next[lru] = s_tex_head[tex_bucket(e->addr)];
-        s_tex_head[tex_bucket(e->addr)] = (uint16_t)(lru + 1);
+        tex_link(e);
         s_stat.tex_made++;
     }
     if (cube && bc) {
