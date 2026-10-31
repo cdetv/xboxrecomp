@@ -440,6 +440,7 @@ extern void xbox_KbmKey(unsigned input, int down);
 extern void xbox_KbmWheel(int notches);
 extern void xbox_KbmMouseMove(long dx, long dy);
 extern void xbox_KbmReleaseAll(void);
+extern void xbox_InputStopRumble(void);
 
 static int s_mouse_held;      /* pointer clipped and hidden */
 static int s_mouse_clicked;   /* windowed: a click asked for it */
@@ -542,6 +543,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * WriteFile, so nothing written so far is lost. */
         fprintf(stderr, "[EXIT] window closed\n");
         fflush(stderr);
+        xbox_InputStopRumble();         /* motors outlive the process */
         ExitProcess(0);
         return 0;
     case WM_DESTROY:

@@ -105,9 +105,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 void xbox_InputSetBlocked(int on);
 
 /**
- * Set controller vibration.
+ * Set controller vibration: the host pad behind the port (an XInput pad or a
+ * PlayStation pad) runs its motors at these speeds until the next call.
+ * RECOMP_RUMBLE_LOG=1 prints each change.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
+
+/**
+ * Stop every host pad's motors, from any thread: called on the way out, as
+ * a pad left running keeps running after the process has gone.
+ */
+void xbox_InputStopRumble(void);
 
 /**
  * Check if a controller is connected.
