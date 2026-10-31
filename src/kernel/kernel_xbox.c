@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -120,10 +121,30 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
  *   - Video: NTSC, widescreen+HDTV enabled
- *   - Language: English
+ *   - Language: English (RECOMP_LANGUAGE picks another)
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
+
+/* The dashboard language a title gets from XGetLanguage (usually read once at
+ * start): English unless RECOMP_LANGUAGE names another, by number or name:
+ * 1 english, 2 japanese, 3 german, 4 french, 5 spanish, 6 italian, 7 korean,
+ * 8 chinese, 9 portuguese. Anything else is English. */
+static ULONG xbox_language_id(void)
+{
+    static const char *const names[] = { "english", "japanese", "german",
+        "french", "spanish", "italian", "korean", "chinese", "portuguese" };
+    const char *lang = getenv("RECOMP_LANGUAGE");
+    ULONG id, i;
+
+    if (!lang || !*lang)
+        return 1;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++)
+        if (!_stricmp(lang, names[i]))
+            return i + 1;
+    id = strtoul(lang, NULL, 0);
+    return (id >= 1 && id <= 9) ? id : 1;
+}
 
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
@@ -136,9 +157,8 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_language_id();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
