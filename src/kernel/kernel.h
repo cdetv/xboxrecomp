@@ -576,6 +576,19 @@ extern void (*g_xbox_path_hook)(const char *xbox_path);
 extern int (*g_xbox_path_redirect)(const char *xbox_path,
                                    xbox_host_char *host_path, DWORD buf_size);
 
+#ifdef _WIN32
+/* Optional: lets a project show a host folder's entries under other names
+ * (NtQueryDirectoryFile, Windows): called for every entry with the host
+ * folder being listed (as GetFinalPathNameByHandleW gives it, without the
+ * \\?\ prefix) and the entry's host name; returns nonzero after writing the
+ * name the title sees into guest_name. Pair it with g_xbox_path_redirect so
+ * opening that name leads back to the host entry. The title's search pattern
+ * is then matched against the names it sees. NULL by default. */
+extern int (*g_xbox_dir_entry_redirect)(const WCHAR *host_dir,
+                                        const WCHAR *host_name,
+                                        char *guest_name, DWORD buf_size);
+#endif
+
 /* Optional: called just before the title ends the process itself
  * (HalReturnToFirmware, HalInitiateShutdown), which ExitProcess does without
  * running atexit handlers. The USB model sets it to stop the pads' rumble
