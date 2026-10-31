@@ -18,5 +18,10 @@ unsigned xbox_SdlPadsConnected(void);
 DWORD    xbox_SdlPadGetState(int n, XINPUT_STATE *st);
 /** SDL's name for pad n (UTF-8): 1 if connected. */
 int      xbox_SdlPadName(int n, char *out, int size);
+/** Pad n's motors (XInput's low- and high-frequency speeds, 0-65535),
+ *  until the next call; handed to SDL's thread. */
+void     xbox_SdlPadRumble(int n, WORD low, WORD high);
+/** Every pad's motors off now, from any thread (the process is ending). */
+void     xbox_SdlPadsStopRumble(void);
 
 #endif

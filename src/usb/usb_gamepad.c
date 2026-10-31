@@ -707,3 +707,27 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         pad_script_apply(pad, out);
     return 20;
 }
+
+/* ---- the output report (rumble) ----------------------------------------
+ *
+ * Six bytes, fixed like the input report:
+ *
+ *   0      report id, always 0
+ *   1      length, always 6
+ *   2..3   left motor speed  (the heavy, low-frequency one), 0-65535
+ *   4..5   right motor speed (the light, high-frequency one), 0-65535
+ *
+ * little endian: XAPI's XInputSetState sends the title's XINPUT_FEEDBACK
+ * speeds as they are, and XInput on the PC has the same two, so they go
+ * across unchanged.
+ */
+void usb_gamepad_output(int pad, const uint8_t *data, int len)
+{
+    XBOX_VIBRATION v;
+
+    if (len < 6 || data[0] != 0 || data[1] < 6)
+        return;
+    v.wLeftMotorSpeed  = (WORD)(data[2] | (data[3] << 8));
+    v.wRightMotorSpeed = (WORD)(data[4] | (data[5] << 8));
+    xbox_InputSetState((DWORD)(pad & 3), &v);
+}

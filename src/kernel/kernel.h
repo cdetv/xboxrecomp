@@ -576,6 +576,12 @@ extern void (*g_xbox_path_hook)(const char *xbox_path);
 extern int (*g_xbox_path_redirect)(const char *xbox_path,
                                    xbox_host_char *host_path, DWORD buf_size);
 
+/* Optional: called just before the title ends the process itself
+ * (HalReturnToFirmware, HalInitiateShutdown), which ExitProcess does without
+ * running atexit handlers. The USB model sets it to stop the pads' rumble
+ * motors. NULL by default. */
+extern void (*volatile g_xbox_exit_hook)(void);
+
 /* ============================================================================
  * Pool Allocator (kernel_pool.c)
  * ============================================================================ */

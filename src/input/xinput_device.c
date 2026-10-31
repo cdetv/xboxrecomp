@@ -710,22 +710,96 @@ have_pad:
     return ERROR_SUCCESS;
 }
 
+/* ---- rumble ----------------------------------------------------------------
+ *
+ * The title's motor speeds go to the host pad behind the port: XInput's own
+ * XInputSetState for an Xbox pad, SDL for a PlayStation pad. A title may
+ * set the same speeds every frame; a host pad only hears a change, or the
+ * same speeds again after a second (a pad unplugged and back again starts
+ * still). When a port moves to another host pad (assignment, any
+ * controller, RECOMP_PAD_FOLLOW), the one it left is stopped, or it would
+ * hum on with nobody to stop it. */
+static DWORD g_rumble_slot[XBOX_MAX_CONTROLLERS] = {
+    NO_SLOT, NO_SLOT, NO_SLOT, NO_SLOT
+};
+static DWORD     g_rumble_speeds[XBOX_MAX_CONTROLLERS];  /* left << 16 | right */
+static ULONGLONG g_rumble_at[XBOX_MAX_CONTROLLERS];
+static volatile LONG g_rumbled_slots;  /* bit n: host pad n was given speeds */
+
+static DWORD host_set_rumble(DWORD slot, WORD left, WORD right)
+{
+    if (slot < XBOX_MAX_CONTROLLERS) {
+        XINPUT_VIBRATION v;
+        v.wLeftMotorSpeed = left;
+        v.wRightMotorSpeed = right;
+        return XInputSetState(slot, &v);
+    }
+    if (slot < HOST_SLOTS) {
+        xbox_SdlPadRumble((int)(slot - XBOX_MAX_CONTROLLERS), left, right);
+        return ERROR_SUCCESS;
+    }
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+/* RECOMP_RUMBLE_LOG=1: one [RUMBLE] line per change of a port's speeds. */
+static BOOL rumble_log(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_RUMBLE_LOG");
+        on = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return on ? TRUE : FALSE;
+}
+
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
-    XINPUT_VIBRATION xi_vib;
-    DWORD slot;
+    DWORD slot, speeds, rc;
+    ULONGLONG now;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     slot = slot_of_port(dwPort);
+    speeds = ((DWORD)pVibration->wLeftMotorSpeed << 16)
+           | pVibration->wRightMotorSpeed;
+    now = GetTickCount64();
+    if (slot != g_rumble_slot[dwPort] && g_rumble_slot[dwPort] != NO_SLOT)
+        host_set_rumble(g_rumble_slot[dwPort], 0, 0);
+    if (slot == g_rumble_slot[dwPort] && speeds == g_rumble_speeds[dwPort]
+        && now - g_rumble_at[dwPort] < 1000)
+        return slot == NO_SLOT ? ERROR_DEVICE_NOT_CONNECTED : ERROR_SUCCESS;
+    if (rumble_log() && (speeds != g_rumble_speeds[dwPort]
+                         || slot != g_rumble_slot[dwPort])) {
+        fprintf(stderr, "[RUMBLE] port %lu: left %u right %u -> %s\n",
+                (unsigned long)dwPort, pVibration->wLeftMotorSpeed,
+                pVibration->wRightMotorSpeed,
+                slot == NO_SLOT ? "no pad"
+                : slot < XBOX_MAX_CONTROLLERS ? "XInput pad" : "PlayStation pad");
+        fflush(stderr);
+    }
+    g_rumble_slot[dwPort] = slot;
+    g_rumble_speeds[dwPort] = speeds;
+    g_rumble_at[dwPort] = now;
     if (slot == NO_SLOT)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (slot >= XBOX_MAX_CONTROLLERS)
-        return ERROR_SUCCESS;           /* PlayStation pad: no rumble yet */
-    xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
-    xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(slot, &xi_vib);
+    if (speeds)
+        InterlockedOr(&g_rumbled_slots, 1L << slot);
+    rc = host_set_rumble(slot, pVibration->wLeftMotorSpeed,
+                         pVibration->wRightMotorSpeed);
+    if (rc != ERROR_SUCCESS)
+        g_next_scan = 0;                /* unplugged: look again next time */
+    return rc;
+}
+
+void xbox_InputStopRumble(void)
+{
+    LONG mask = InterlockedExchange(&g_rumbled_slots, 0);
+    DWORD i;
+    for (i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if ((mask >> i) & 1)
+            host_set_rumble(i, 0, 0);
+    xbox_SdlPadsStopRumble();
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -895,6 +969,13 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     SDL_GameControllerRumble(c, pVibration->wLeftMotorSpeed,
                              pVibration->wRightMotorSpeed, 1000);
     return ERROR_SUCCESS;
+}
+
+void xbox_InputStopRumble(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            SDL_GameControllerRumble(g_pads[i], 0, 0, 0);
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)

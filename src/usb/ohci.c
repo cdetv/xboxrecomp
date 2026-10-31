@@ -33,6 +33,7 @@ extern recomp_func_t recomp_lookup(uint32_t xbox_va);
 extern int  xbox_worker_stack_alloc(void);
 extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
+extern void xbox_InputStopRumble(void);
 
 /* Declared in the generated runtime; thread-local, so the values below are
  * this thread's and not the guest thread's. */
@@ -653,18 +654,25 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
             moved = n;
         }
     } else {
-        /* OUT: the status stage of an IN control transfer, or rumble. Both
-         * are accepted and discarded -- but only the control pipe's ends a
-         * control transfer. A rumble packet on endpoint 2 used to clear the
-         * pending setup too, so a force-feedback write landing between a
-         * control request's stages broke that request; Burnout 3 starts its
-         * engine-rev rumble on the Crash countdown and then paused with the
-         * pad unresponsive. */
+        /* OUT: the status stage of an IN control transfer, or rumble -- an
+         * output report on endpoint 2, or the data stage of a SET_REPORT
+         * (21 09) on the control pipe. Rumble goes to the pad model; only
+         * the control pipe's OUT ends a control transfer. A rumble packet on
+         * endpoint 2 used to clear the pending setup too, so a
+         * force-feedback write landing between a control request's stages
+         * broke that request; Burnout 3 starts its engine-rev rumble on the
+         * Crash countdown and then paused with the pad unresponsive. */
+        const uint8_t *data = len > 0 ? guest_ptr(cbp, (uint32_t)len) : NULL;
         moved = len;
         if (endpoint == 0) {
+            if (data && g_setup_pending && g_setup.bmRequestType == 0x21
+                && g_setup.bRequest == 0x09)
+                usb_gamepad_output(pad, data, len);
             g_setup_pending = 0;
             s_n_out_ep0++;
         } else {
+            if (data)
+                usb_gamepad_output(pad, data, len);
             s_n_out_other++;
         }
     }
@@ -1347,6 +1355,8 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    /* The pads' motors run until told to stop, past the process's end. */
+    g_xbox_exit_hook = xbox_InputStopRumble;
     {
         const char *hcspec = getenv("RECOMP_USB_HC");
         const char *ndpspec = getenv("RECOMP_USB_NDP");

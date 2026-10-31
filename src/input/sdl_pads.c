@@ -34,11 +34,21 @@ typedef struct {
     BOOL          connected;
     XINPUT_STATE  state;
     char          name[96];
+    LONG          rumble_sent;  /* SDL thread only: last speeds given SDL */
+    ULONGLONG     rumble_at;    /* SDL thread only: when */
 } SdlPad;
 
 static SdlPad  g_pads[SDL_PADS_MAX];
 static SRWLOCK g_lock = SRWLOCK_INIT;
 static volatile LONG g_mask;    /* bit n: pad n connected */
+
+/* The speeds the title wants on pad n, low << 16 | high. XInput's motors
+ * run until told otherwise, SDL's only for a given time: the SDL thread
+ * hands SDL each change, and repeats a running one before it runs out. If
+ * the process dies without stopping them, they stop by themselves. */
+static volatile LONG g_rumble[SDL_PADS_MAX];
+#define RUMBLE_MS   2000
+#define RUMBLE_KEEP 1000
 
 /* Only PlayStation pads: an Xbox pad is XInput's already, and SDL's own
  * XInput, Raw Input, WGI and DirectInput back ends are off (sdl_thread),
@@ -73,6 +83,7 @@ static void pad_added(SDL_JoystickID id)
     g_pads[n].pad = gp;
     g_pads[n].id = id;
     g_pads[n].connected = TRUE;
+    g_pads[n].rumble_sent = 0;
     memset(&g_pads[n].state, 0, sizeof(g_pads[n].state));
     snprintf(g_pads[n].name, sizeof(g_pads[n].name), "%s",
              SDL_GetGamepadName(gp) ? SDL_GetGamepadName(gp) : "");
@@ -198,8 +209,17 @@ static DWORD WINAPI sdl_thread(LPVOID arg)
         }
         for (n = 0; n < SDL_PADS_MAX; n++) {
             XINPUT_GAMEPAD g;
+            LONG want;
             if (!g_pads[n].pad)
                 continue;
+            want = InterlockedCompareExchange(&g_rumble[n], 0, 0);
+            if (want != g_pads[n].rumble_sent
+                || (want && GetTickCount64() - g_pads[n].rumble_at >= RUMBLE_KEEP)) {
+                SDL_RumbleGamepad(g_pads[n].pad, (Uint16)((ULONG)want >> 16),
+                                  (Uint16)(want & 0xFFFF), want ? RUMBLE_MS : 0);
+                g_pads[n].rumble_sent = want;
+                g_pads[n].rumble_at = GetTickCount64();
+            }
             read_pad(g_pads[n].pad, &g);
             if (memcmp(&g, &g_pads[n].state.Gamepad, sizeof(g))) {
                 AcquireSRWLockExclusive(&g_lock);
@@ -259,6 +279,26 @@ int xbox_SdlPadName(int n, char *out, int size)
     return out[0] != '\0';
 }
 
+void xbox_SdlPadRumble(int n, WORD low, WORD high)
+{
+    if (n < 0 || n >= SDL_PADS_MAX)
+        return;
+    InterlockedExchange(&g_rumble[n], (LONG)(((ULONG)low << 16) | high));
+}
+
+/* Called on the way out, from whichever thread ends the process; SDL's
+ * gamepad calls take SDL's joystick lock, so this is safe beside its
+ * thread. ExitProcess does not wait for that thread to get there. */
+void xbox_SdlPadsStopRumble(void)
+{
+    int n;
+    for (n = 0; n < SDL_PADS_MAX; n++) {
+        InterlockedExchange(&g_rumble[n], 0);
+        if (g_pads[n].pad && g_pads[n].rumble_sent)
+            SDL_RumbleGamepad(g_pads[n].pad, 0, 0, 0);
+    }
+}
+
 #else /* !XBOX_INPUT_SDL3 */
 
 void xbox_SdlPadsInit(void) {}
@@ -275,5 +315,10 @@ int xbox_SdlPadName(int n, char *out, int size)
         out[0] = '\0';
     return 0;
 }
+void xbox_SdlPadRumble(int n, WORD low, WORD high)
+{
+    (void)n; (void)low; (void)high;
+}
+void xbox_SdlPadsStopRumble(void) {}
 
 #endif
