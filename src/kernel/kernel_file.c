@@ -17,6 +17,7 @@
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
 #include <string.h>
+#include <ctype.h>
 #include <stdio.h>
 
 #if !defined(_WIN32)
@@ -593,7 +594,31 @@ typedef struct {
     HANDLE find_handle;
     BOOL   first_done;
     WIN32_FIND_DATAW find_data;
+    /* With g_xbox_dir_entry_redirect: the host folder listed, and the
+     * title's pattern, matched against the names the title sees ("" = all). */
+    WCHAR  dir[MAX_PATH];
+    char   pattern[MAX_PATH];
 } DIR_CONTEXT;
+
+/* A project may set this to show a host folder's entries to the title under
+ * other names (kernel.h). NULL by default. */
+int (*g_xbox_dir_entry_redirect)(const WCHAR *host_dir, const WCHAR *host_name,
+                                 char *guest_name, DWORD buf_size) = NULL;
+
+/* The title's FATX wildcard pattern (* and ?, any case) against a name. */
+static BOOL dir_pattern_match(const char *pat, const char *name)
+{
+    if (!*pat)
+        return !*name;
+    if (*pat == '*')
+        return dir_pattern_match(pat + 1, name)
+               || (*name && dir_pattern_match(pat, name + 1));
+    if (!*name)
+        return FALSE;
+    if (*pat != '?' && tolower((unsigned char)*pat) != tolower((unsigned char)*name))
+        return FALSE;
+    return dir_pattern_match(pat + 1, name + 1);
+}
 
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
@@ -682,7 +707,17 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        ctx->pattern[0] = '\0';
+        wcscpy_s(ctx->dir, MAX_PATH, clean_path);
+        if (g_xbox_dir_entry_redirect) {
+            /* The host names may differ from the title's: list everything
+             * and match the pattern against the title's names below. */
+            if (FileName && FileName->Buffer && FileName->Length < MAX_PATH) {
+                memcpy(ctx->pattern, FileName->Buffer, FileName->Length);
+                ctx->pattern[FileName->Length] = '\0';
+            }
+            swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
+        } else if (FileName && FileName->Buffer) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
@@ -708,9 +743,22 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         }
     }
 
-    /* FATX enumeration never exposes the host's dot directories. */
-    while (!wcscmp(ctx->find_data.cFileName, L".") ||
-           !wcscmp(ctx->find_data.cFileName, L"..")) {
+    /* FATX enumeration never exposes the host's dot directories; with the
+     * entry redirect, entries the pattern doesn't match are skipped too. */
+    char filename_ansi[MAX_PATH];
+    int name_len;
+    for (;;) {
+        BOOL dot = !wcscmp(ctx->find_data.cFileName, L".") ||
+                   !wcscmp(ctx->find_data.cFileName, L"..");
+        if (!dot) {
+            if (!g_xbox_dir_entry_redirect
+                || !g_xbox_dir_entry_redirect(ctx->dir, ctx->find_data.cFileName,
+                                              filename_ansi, MAX_PATH))
+                WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
+                                    filename_ansi, MAX_PATH, NULL, NULL);
+            if (!ctx->pattern[0] || dir_pattern_match(ctx->pattern, filename_ansi))
+                break;
+        }
         if (!FindNextFileW(ctx->find_handle, &ctx->find_data)) {
             FindClose(ctx->find_handle);
             ctx->find_handle = NULL;
@@ -722,10 +770,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
 
     entry = (PXBOX_FILE_DIRECTORY_INFORMATION)FileInformation;
     memset(entry, 0, Length);
-    char filename_ansi[MAX_PATH];
-    int name_len = WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
-                                       filename_ansi, MAX_PATH, NULL, NULL);
-    if (name_len > 0) name_len--;
+    name_len = (int)strlen(filename_ansi);
 
     entry->NextEntryOffset = 0;
     entry->FileIndex = 0;
