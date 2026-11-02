@@ -194,6 +194,12 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
 
+/* Sleep instead of spinning on a mirrored GPU-time word: read the generation,
+ * test the word, then wait (up to ms) while the generation is still the one
+ * read. The fence mirror bumps it each time it moves a word. */
+uint32_t xbox_Nv2aFenceGeneration(void);
+void xbox_Nv2aWaitFence(uint32_t seen, DWORD ms);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

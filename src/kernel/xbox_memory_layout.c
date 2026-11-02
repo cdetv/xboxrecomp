@@ -785,8 +785,36 @@ static void frame_counters_tick(void)
     }
 }
 
+/* GPU-time waits. D3D waits for a fence by spinning on the GPU-time word
+ * (D3D_BlockOnTime), which on a PC keeps a whole core at 100% for as long as
+ * the GPU is behind -- every frame. A title's own wait can sleep here instead:
+ * read the generation, test the word, wait while the generation is the one it
+ * read. fence_mirrors_tick bumps it (after writing the word) and wakes the
+ * sleepers, so a sleeper sees a new time as soon as a spinner would have. */
+static volatile LONG s_fence_gen;
+#ifdef _WIN32
+#pragma comment(lib, "synchronization.lib")   /* WaitOnAddress */
+#endif
+
+uint32_t xbox_Nv2aFenceGeneration(void)
+{
+    return (uint32_t)s_fence_gen;
+}
+
+void xbox_Nv2aWaitFence(uint32_t seen, DWORD ms)
+{
+#ifdef _WIN32
+    WaitOnAddress((volatile VOID *)&s_fence_gen, &seen, sizeof seen, ms);
+#else
+    if ((uint32_t)s_fence_gen == seen)
+        Sleep(ms ? 1 : 0);
+#endif
+}
+
 static void fence_mirrors_tick(void)
 {
+    int moved = 0;
+
     /* Once the pushbuffer executor runs fences itself, the GPU time is the
      * last fence it actually reached, not the last one submitted: copying
      * the submitted time told the title the GPU was done with commands still
@@ -818,9 +846,17 @@ static void fence_mirrors_tick(void)
             uint32_t put = from_exec ? executed :
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
                                        + g_memory_offset);
-            if (*fence != put)
+            if (*fence != put) {
                 *fence = put;
+                moved = 1;
+            }
         }
+    }
+    if (moved) {
+        InterlockedIncrement(&s_fence_gen);
+#ifdef _WIN32
+        WakeByAddressAll((PVOID)&s_fence_gen);
+#endif
     }
 }
 
