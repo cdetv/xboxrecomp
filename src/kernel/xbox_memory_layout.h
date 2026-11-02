@@ -200,6 +200,20 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
 uint32_t xbox_Nv2aFenceGeneration(void);
 void xbox_Nv2aWaitFence(uint32_t seen, DWORD ms);
 
+/* Executor idle sleep (RECOMP_EXEC_SLEEP, default on; =0 spins as before).
+ * The executor sleeps between passes once a title waits for its handshakes
+ * through xbox_Nv2aWaitHandshake, since that is what wakes it for new work.
+ * xbox_Nv2aRing wakes it (a vblank raise does too). xbox_Nv2aWaitHandshake:
+ * wait, sleeping, until the executor has cleared mask in a handshake register
+ * the title set (reg = host pointer); kick_follows = the title writes DMA_PUT
+ * right after, so the executor stays awake until it does. */
+void xbox_Nv2aRing(void);
+void xbox_Nv2aWaitHandshake(volatile uint32_t *reg, uint32_t mask,
+                            int kick_follows);
+/* Executor thread, between methods: acknowledge an answered vblank at once,
+ * so D3D's vblank DPC does not spin for the rest of a long segment. */
+void xbox_Nv2aAnswerVblank(void);
+
 void xbox_MemoryLayoutShutdown(void);
 
 /**

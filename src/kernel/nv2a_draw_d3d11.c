@@ -3044,6 +3044,7 @@ static ID3D11Query *s_pace_q[PACE_SLOTS];
 static int64_t s_pace_t[PACE_SLOTS];
 static uint32_t s_pace_draws, s_pace_head, s_pace_n, s_pace_waits;
 static double s_pace_wait_ms;
+extern void xbox_Nv2aAnswerVblank(void);   /* xbox_memory_layout.c */
 
 static void pace_draw(void)
 {
@@ -3077,8 +3078,10 @@ static void pace_draw(void)
             if (!must)
                 break;
             while ((hr = ID3D11DeviceContext_GetData(s_ctx, a, &done,
-                                                     sizeof done, 0)) == S_FALSE)
+                                                     sizeof done, 0)) == S_FALSE) {
+                xbox_Nv2aAnswerVblank();   /* D3D's vblank DPC waits on it */
                 SwitchToThread();
+            }
             QueryPerformanceCounter(&t1);
             s_pace_waits++;
             s_pace_wait_ms += (double)(t1.QuadPart - now.QuadPart) * tick_ms;

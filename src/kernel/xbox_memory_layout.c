@@ -963,9 +963,16 @@ static int nv2a_vblank_held(volatile uint32_t *regs)
  * software-method trap is being delivered and they are its. Everything else
  * still has to be acknowledged meanwhile: D3D's DPC spins until a vblank's
  * PMC_INTR_0 bit clears, and holding all of PMC_INTR_0 left the timer thread
- * stuck in that DPC, never getting to the trap (run 109). */
-static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
+ * stuck in that DPC, never getting to the trap (run 109).
+ *
+ * Returns how many registers it cleared; each clear bumps s_ack_gen and wakes
+ * the titles sleeping in xbox_Nv2aWaitHandshake. */
+static volatile LONG s_ack_gen;
+
+static int nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
 {
+    int cleared = 0;
+
     for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
         volatile uint32_t *r =
             (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -987,9 +994,10 @@ static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
         if (NV2A_ACK[i].offset == NV2A_PCRTC_INTR_0_OFS
             && nv2a_vblank_held(regs))
             mask = 0;
-        if (v & mask)
-            InterlockedCompareExchange((volatile LONG *)r,
-                                       (LONG)(v & ~mask), (LONG)v);
+        if ((v & mask)
+            && InterlockedCompareExchange((volatile LONG *)r,
+                                          (LONG)(v & ~mask), (LONG)v) == (LONG)v)
+            cleared++;
     }
     for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
         volatile uint32_t *r =
@@ -998,6 +1006,13 @@ static void nv2a_handshake_pass(volatile uint32_t *regs, int intr_regs)
             *r |= NV2A_IDLE[i].idle_mask;
         }
     }
+    if (cleared) {
+        InterlockedIncrement(&s_ack_gen);
+#ifdef _WIN32
+        WakeByAddressAll((PVOID)&s_ack_gen);
+#endif
+    }
+    return cleared;
 }
 
 /*
@@ -1165,6 +1180,194 @@ static void turn_exec_done(uint64_t t0, uint32_t bytes)
 
 static volatile uint32_t *s_ack_regs;
 
+/* Executor idle sleep (RECOMP_EXEC_SLEEP, header). The executor ended every
+ * pass with Sleep(0) and its waits with SwitchToThread; with a core to spare
+ * both return at once, so it spun at ~90% of a core while the title had
+ * nothing for it (GitHub issue 11, 2026-11-01). Now a pass that did nothing
+ * sleeps up to 1 ms on s_exec_bell, and what brings work rings it: a title's
+ * handshake wait (xbox_Nv2aWaitHandshake), a vblank raise and a finished
+ * software-method trap (kernel_bridge.c). The 1 ms cap keeps the jobs that run
+ * on the pass clock (KeTickCount, frame counters) going, and bounds anything
+ * that does not ring. Stays awake meanwhile: while a vblank is raised (D3D's
+ * DPC spins until this thread clears it) and between a flush answered for
+ * a kick and that kick's DMA_PUT (the title writes it right after, unrung).
+ * Only once a title waits through xbox_Nv2aWaitHandshake: before that
+ * nothing would wake the executor for a kick, so it spins as it did. */
+static volatile LONG s_exec_bell;
+static volatile LONG s_exec_rung;           /* a title waits through us */
+static volatile LONG s_kick_armed;          /* a DMA_PUT write is coming */
+static volatile LONG s_kick_from;           /* DMA_PUT before it */
+static int s_exec_sleep = -1;
+static struct {                             /* RECOMP_EXEC_SLEEP_LOG=1 */
+    LONG passes, sleeps, hot_vblank, hot_kick, kick_late;
+} s_exec_stat;
+
+static int exec_sleep_on(void)
+{
+    if (s_exec_sleep < 0) {
+        const char *e = getenv("RECOMP_EXEC_SLEEP");
+        s_exec_sleep = !(e && *e == '0');
+    }
+    return s_exec_sleep;
+}
+
+void xbox_Nv2aRing(void)
+{
+    InterlockedIncrement(&s_exec_bell);
+#ifdef _WIN32
+    WakeByAddressSingle((PVOID)&s_exec_bell);
+#endif
+}
+
+void xbox_Nv2aWaitHandshake(volatile uint32_t *reg, uint32_t mask,
+                            int kick_follows)
+{
+    if (!exec_sleep_on() || !s_ack_regs) {
+        while (*reg & mask)
+            ;
+        return;
+    }
+    if (kick_follows) {
+        InterlockedExchange(&s_kick_from, (LONG)*(volatile uint32_t *)
+                            ((char *)s_ack_regs + NV2A_USER_DMA_PUT));
+        InterlockedExchange(&s_kick_armed, 1);
+    }
+    InterlockedExchange(&s_exec_rung, 1);
+    xbox_Nv2aRing();
+    {
+        /* Spin briefly first: an executor already awake (in a trap wait, say:
+         * D3D's trap handler flushes ~40 times a frame in busy scenes) answers
+         * within microseconds, and a sleep's wake-up costs 20-50 us each. */
+        LARGE_INTEGER f, t, end;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t);
+        end.QuadPart = t.QuadPart + f.QuadPart / 10000;      /* 100 us */
+        while (*reg & mask) {
+            YieldProcessor();
+            QueryPerformanceCounter(&t);
+            if (t.QuadPart >= end.QuadPart)
+                break;
+        }
+    }
+    for (;;) {
+        LONG gen = s_ack_gen;
+        if (!(*reg & mask))
+            return;
+        xbox_Nv2aRing();
+#ifdef _WIN32
+        WaitOnAddress((volatile VOID *)&s_ack_gen, &gen, sizeof gen, 2);
+#else
+        Sleep(0);
+#endif
+    }
+}
+
+void xbox_Nv2aAnswerVblank(void)
+{
+    volatile LONG *pmc;
+    uint32_t v;
+
+    if (!s_ack_regs || s_exec_sleep <= 0)
+        return;
+    pmc = (volatile LONG *)((char *)s_ack_regs + NV2A_PMC_INTR_0_OFS);
+    v = (uint32_t)*pmc;
+    if (!(v & NV2A_PMC_INTR_PCRTC_BIT) || nv2a_vblank_held(s_ack_regs))
+        return;
+    InterlockedCompareExchange(pmc, (LONG)(v & ~NV2A_PMC_INTR_PCRTC_BIT),
+                               (LONG)v);
+}
+
+static int exec_vblank_raised(volatile uint32_t *regs)
+{
+    return (*(volatile uint32_t *)((char *)regs + NV2A_PMC_INTR_0_OFS)
+            & NV2A_PMC_INTR_PCRTC_BIT) != 0;
+}
+
+/* A wait loop's pause (flip release, software-method trap): sleep until rung,
+ * at most 1 ms; `bell` = s_exec_bell read before the loop's tests. */
+static void exec_pause(volatile uint32_t *regs, LONG bell)
+{
+    if (!exec_sleep_on() || !s_exec_rung || exec_vblank_raised(regs)) {
+        SwitchToThread();
+        return;
+    }
+#ifdef _WIN32
+    WaitOnAddress((volatile VOID *)&s_exec_bell, &bell, sizeof bell, 1);
+#else
+    Sleep(1);
+#endif
+}
+
+/* The end of a main-loop pass; worked = it executed or cleared something. */
+static void exec_pass_end(volatile uint32_t *regs, LONG bell, int worked)
+{
+    static LARGE_INTEGER freq;
+    static LONGLONG kick_since, report_at;
+    static int log = -1;
+    LARGE_INTEGER now;
+
+    if (!exec_sleep_on() || !s_exec_rung) {
+        Sleep(0);  /* yield; the waiter is spinning on another core */
+        return;
+    }
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        log = getenv("RECOMP_EXEC_SLEEP_LOG") != NULL;
+    }
+    s_exec_stat.passes++;
+    if (log) {
+        QueryPerformanceCounter(&now);
+        if (!report_at)
+            report_at = now.QuadPart + freq.QuadPart * 10;
+        else if (now.QuadPart >= report_at) {
+            report_at = now.QuadPart + freq.QuadPart * 10;
+            fprintf(stderr, "[EXEC] 10 s: %ld passes, %ld slept, awake for a"
+                    " vblank %ld, for a kick %ld (%ld kicks not seen in 2 ms)\n",
+                    s_exec_stat.passes, s_exec_stat.sleeps,
+                    s_exec_stat.hot_vblank, s_exec_stat.hot_kick,
+                    s_exec_stat.kick_late);
+            fflush(stderr);
+            memset(&s_exec_stat, 0, sizeof s_exec_stat);
+        }
+    }
+    if (worked) {
+        kick_since = 0;
+        return;                       /* straight into the next pass */
+    }
+    if (exec_vblank_raised(regs)) {
+        s_exec_stat.hot_vblank++;
+        SwitchToThread();
+        return;
+    }
+    if (s_kick_armed) {
+        uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+        if (put == (uint32_t)s_kick_from) {
+            QueryPerformanceCounter(&now);
+            if (!kick_since)
+                kick_since = now.QuadPart;
+            if (now.QuadPart - kick_since < freq.QuadPart / 500) {
+                s_exec_stat.hot_kick++;
+                SwitchToThread();
+                return;
+            }
+            s_exec_stat.kick_late++;
+            InterlockedExchange(&s_kick_armed, 0);
+        } else {
+            /* It came after this pass read DMA_PUT: go and run it. */
+            InterlockedExchange(&s_kick_armed, 0);
+            kick_since = 0;
+            return;
+        }
+    }
+    kick_since = 0;
+    s_exec_stat.sleeps++;
+#ifdef _WIN32
+    WaitOnAddress((volatile VOID *)&s_exec_bell, &bell, sizeof bell, 1);
+#else
+    Sleep(1);
+#endif
+}
+
 /* The pushbuffer executor reached a NOP with a parameter: a PGRAPH
  * software-method trap (kernel_bridge.c, kernel_pgraph_swm_tick). Like the
  * GPU, it stops until the driver has handled it. It runs on this thread, so
@@ -1179,6 +1382,7 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
     extern int kernel_pgraph_swm_done(void);
     extern int kernel_pgraph_swm_cancel(void);
     ULONGLONG t0, warned = 0;
+    LARGE_INTEGER spin_end;
     uint64_t turn_t0 = 0;
     LONG turn_prev = TURN_EXEC;
 
@@ -1207,8 +1411,18 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
         turn_prev = InterlockedExchange(&s_turn_phase, TURN_SWM);
     }
     t0 = GetTickCount64();
-    while (!kernel_pgraph_swm_done()) {
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&spin_end);
+        spin_end.QuadPart += f.QuadPart / 4000;   /* 250 us */
+    }
+    for (;;) {
         ULONGLONG waited;
+        LARGE_INTEGER now;
+        LONG bell = s_exec_bell;      /* before the test: a ring after it wakes */
+        if (kernel_pgraph_swm_done())
+            break;
         if (s_turn_on && (*(volatile uint32_t *)((char *)s_ack_regs + 0x100410)
                           & 0x10000u))
             s_turn.flush_in_swm++;
@@ -1227,7 +1441,13 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
                     (unsigned long long)waited);
             fflush(stderr);
         }
-        SwitchToThread();
+        /* Traps take 0.03-0.06 ms and come ~40 a frame in busy scenes: a
+         * sleep's wake-up each time cost ~1 fps there, so spin first. */
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart < spin_end.QuadPart)
+            SwitchToThread();
+        else
+            exec_pause(s_ack_regs, bell);
     }
     if (s_turn_on) {
         s_turn.swm_n++;
@@ -1260,12 +1480,28 @@ int xbox_Nv2aTakeFlipRelease(DWORD wait_ms)
     inc = (volatile LONG *)((char *)s_ack_regs + NV2A_PGRAPH_INCREMENT_OFS);
     t0 = GetTickCount64();
     for (;;) {
-        if (InterlockedAnd(inc, ~2L) & 2L)
+        LONG bell = s_exec_bell;      /* before the test: a ring after it wakes */
+        if (InterlockedAnd(inc, ~2L) & 2L) {
+            /* The vblank DPC releases the flip, then acknowledges and spins
+             * until its PMC bit clears. Leaving now (to present, milliseconds
+             * of driver calls) kept it spinning all that time: answer it
+             * first, as long as the hold lasts (at most 2 ms here). */
+            LARGE_INTEGER f, t, end;
+            QueryPerformanceFrequency(&f);
+            QueryPerformanceCounter(&t);
+            end.QuadPart = t.QuadPart + f.QuadPart / 500;
+            while (exec_sleep_on() && exec_vblank_raised(s_ack_regs)
+                   && t.QuadPart < end.QuadPart) {
+                nv2a_handshake_pass(s_ack_regs, 1);
+                YieldProcessor();
+                QueryPerformanceCounter(&t);
+            }
             return 1;
+        }
         if (GetTickCount64() - t0 >= wait_ms)
             return 0;
         nv2a_handshake_pass(s_ack_regs, 1);
-        SwitchToThread();
+        exec_pause(s_ack_regs, bell);  /* a vblank raise rings */
     }
 }
 
@@ -1291,6 +1527,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     uint64_t turn_flush_at = 0;       /* when a flush was last answered */
     s_ack_regs = regs;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        LONG bell = s_exec_bell;      /* before the pass: a ring during it wakes */
+        int worked;
         if (s_turn_on) {
             InterlockedExchange(&s_turn_phase, TURN_TOP);
             if (*(volatile uint32_t *)((char *)regs + 0x100410) & 0x10000u) {
@@ -1299,7 +1537,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 turn_flush_at = turn_now();
             }
         }
-        nv2a_handshake_pass(regs, 1);
+        worked = nv2a_handshake_pass(regs, 1);
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
          *
@@ -1364,6 +1602,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
             uint64_t turn_t0 = 0;
             turn_ran = 0;
+            if (put != last_put)
+                worked = 1;
             if (s_turn_on && put != last_put) {
                 turn_t0 = turn_now();
                 turn_ran = 1;
@@ -1536,7 +1776,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             InterlockedExchange(&s_turn_phase,
                                 turn_ran ? TURN_YIELD : TURN_IDLE);
         }
-        Sleep(0);  /* yield; the waiter is spinning on another core */
+        exec_pass_end(regs, bell, worked);
     }
     return 0;
 }

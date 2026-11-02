@@ -2420,6 +2420,9 @@ static void kernel_vblank_tick(void)
         InterlockedOr((volatile LONG *)&BRIDGE_MEM32(XBOX_NV2A_REG_BASE
                                                      + NV2A_PMC_INTR_0),
                       (LONG)NV2A_PMC_INTR_PCRTC);
+        /* Wake the executor: D3D's DPC will spin until it clears the PMC
+         * bit, and it stays awake while the bit is up. */
+        xbox_Nv2aRing();
         {
             uint32_t before = g_vblank_counter_va
                             ? BRIDGE_MEM32(g_vblank_counter_va) : 0;
@@ -3002,6 +3005,7 @@ static void kernel_pgraph_swm_tick(void)
         fflush(stderr);
     }
     InterlockedExchange(&g_swm_state, SWM_DONE);
+    xbox_Nv2aRing();          /* the executor may be asleep in its trap wait */
 }
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
