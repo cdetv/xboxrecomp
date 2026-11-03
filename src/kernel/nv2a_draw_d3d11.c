@@ -59,6 +59,11 @@ extern void xbox_FramebufferWindowGpuOwned(int on);
 extern int xbox_RenderRes(unsigned *w, unsigned *h);
 extern int xbox_SetRenderRes(unsigned w, unsigned h);
 extern void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h);
+extern int xbox_FramebufferWindowExclusive(void);
+extern void xbox_FramebufferWindowReplace(void);
+extern int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h);
+extern void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y,
+                           int *fw, int *fh);
 extern void xbox_Nv2aIdle(DWORD ms);
 
 /* A host overlay (a settings menu) drawn over each presented frame: called
@@ -217,9 +222,28 @@ static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;    /* ClearView: clears a rectangle */
 static IDXGIFactory2        *s_factory;
 static UINT                  s_swap_flags;  /* vsync_swap_flags */
+static int                   s_swap_flags_read;
 static IDXGISwapChain1      *s_swap;
 static ID3D11RenderTargetView *s_back_rtv;
 static int                   s_swap_failed;
+static int                   s_swap_made;   /* one was made before */
+static int                   s_swap_tries;  /* failed remakes in a row */
+
+/* Exclusive full screen (xbox_FramebufferWindowExclusive, fb_present.c):
+ * the swap chain moves from the GPU view to the frame window, at the
+ * window's size (the monitor's, s_out_w x s_out_h, viewed by s_out_rtv),
+ * and takes the monitor with SetFullscreenState at the desktop's own mode.
+ * The frame is still drawn at the render resolution, into s_canvas
+ * (s_back_rtv's texture, s_bb_w x s_bb_h), and fitted onto the monitor on
+ * black at each present (canvas_to_out), where the hidden GPU view would
+ * show it, so a host overlay's mouse mapping holds. */
+static int                   s_excl;        /* swap chain on the frame window */
+static int                   s_excl_on;     /* and holding the monitor */
+static int                   s_excl_broken; /* could not be made: never again */
+static ULONGLONG             s_excl_retry;  /* no SetFullscreenState before */
+static ID3D11Texture2D      *s_canvas;
+static ID3D11RenderTargetView *s_out_rtv;
+static uint32_t              s_out_w, s_out_h;
 static int                   s_shadow;  /* RECOMP_GPU=both: no window */
 
 /* One GPU texture per guest colour surface, found by its resolved address
@@ -397,13 +421,124 @@ static void fail(const char *what, HRESULT hr)
             (unsigned long)hr, 10);
 }
 
+static int blit_stretch(ID3D11Texture2D *src, float sx0, float sy0, float sw,
+                        float sh, ID3D11RenderTargetView *dst, float dx0,
+                        float dy0, float dw, float dh);
+
+/* The texture the frame is drawn into (s_back_rtv's), with a reference:
+ * the swap chain's back buffer, or in exclusive mode the canvas. */
+static ID3D11Texture2D *back_tex(void)
+{
+    ID3D11Texture2D *t = NULL;
+
+    if (s_excl) {
+        if (s_canvas)
+            ID3D11Texture2D_AddRef(s_canvas);
+        return s_canvas;
+    }
+    if (FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                         (void **)&t)))
+        return NULL;
+    return t;
+}
+
+/* A view on the swap chain's buffer, just made or resized: the back
+ * buffer's own, or in exclusive mode the monitor's (s_out_rtv, its size
+ * read back). */
+static int swap_view(void)
+{
+    ID3D11Texture2D *buf = NULL;
+    HRESULT hr;
+
+    hr = IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
+                                   (void **)&buf);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)buf,
+                NULL, s_excl ? &s_out_rtv : &s_back_rtv);
+    if (buf) {
+        D3D11_TEXTURE2D_DESC d;
+        ID3D11Texture2D_GetDesc(buf, &d);
+        if (s_excl) {
+            s_out_w = d.Width;
+            s_out_h = d.Height;
+        }
+        ID3D11Texture2D_Release(buf);
+    }
+    if (FAILED(hr)) {
+        fail("back buffer view", hr);
+        return 0;
+    }
+    return 1;
+}
+
+/* Exclusive mode: the s_bb_w x s_bb_h texture the frame is drawn into. */
+static int make_canvas(void)
+{
+    D3D11_TEXTURE2D_DESC td;
+    HRESULT hr;
+
+    memset(&td, 0, sizeof td);
+    td.Width = s_bb_w;
+    td.Height = s_bb_h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_canvas);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)s_canvas, NULL, &s_back_rtv);
+    if (FAILED(hr)) {
+        fail("full screen canvas", hr);
+        return 0;
+    }
+    return 1;
+}
+
+/* Every view on the swap chain and the canvas let go, for a resize or a
+ * new swap chain. The flush lets a released swap chain really go: a
+ * window takes a new flip-model one only once its last is gone. */
+static void drop_views(void)
+{
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_back_rtv) {
+        ID3D11RenderTargetView_Release(s_back_rtv);
+        s_back_rtv = NULL;
+    }
+    if (s_out_rtv) {
+        ID3D11RenderTargetView_Release(s_out_rtv);
+        s_out_rtv = NULL;
+    }
+    if (s_canvas) {
+        ID3D11Texture2D_Release(s_canvas);
+        s_canvas = NULL;
+    }
+    ID3D11DeviceContext_Flush(s_ctx);
+}
+
+static void drop_swap_chain(void)
+{
+    if (s_excl_on) {
+        IDXGISwapChain1_SetFullscreenState(s_swap, FALSE, NULL);
+        s_excl_on = 0;
+    }
+    drop_views();
+    IDXGISwapChain1_Release(s_swap);
+    s_swap = NULL;
+    ID3D11DeviceContext_Flush(s_ctx);
+}
+
 /* The swap chain, once the window exists. The window opens on its own thread
  * a moment after xbox_FramebufferWindowStart, so this is retried at every
- * present until it is there (or never, without RECOMP_FB_WINDOW). */
+ * present until it is there (or never, without RECOMP_FB_WINDOW). Remade
+ * when exclusive full screen comes or goes (apply_display_mode); a remake
+ * that fails is retried for a while, as a window takes a new swap chain
+ * only once its old one is gone. */
 static int ensure_swap_chain(void)
 {
     DXGI_SWAP_CHAIN_DESC1 d;
-    ID3D11Texture2D *back = NULL;
     HWND hwnd, view;
     HRESULT hr;
 
@@ -419,48 +554,199 @@ static int ensure_swap_chain(void)
     view = (HWND)xbox_FramebufferWindowGpuView(s_bb_w, s_bb_h);
     if (!view)
         view = hwnd;
+    s_excl = !s_excl_broken && view != hwnd
+             && xbox_FramebufferWindowExclusive();
 
     memset(&d, 0, sizeof d);
     d.Width = s_bb_w;
     d.Height = s_bb_h;
+    if (s_excl) {
+        RECT r;
+        if (GetClientRect(hwnd, &r) && r.right > 0 && r.bottom > 0) {
+            d.Width = (UINT)r.right;
+            d.Height = (UINT)r.bottom;
+        }
+    }
     d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     d.SampleDesc.Count = 1;
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     d.BufferCount = 2;
     d.Scaling = DXGI_SCALING_STRETCH;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    s_swap_flags = vsync_swap_flags(s_factory);
+    if (!s_swap_flags_read) {
+        s_swap_flags = vsync_swap_flags(s_factory);
+        s_swap_flags_read = 1;
+    }
     d.Flags = s_swap_flags;
     hr = IDXGIFactory2_CreateSwapChainForHwnd(s_factory, (IUnknown *)s_dev,
-                                              view, &d, NULL, NULL, &s_swap);
+                                              s_excl ? hwnd : view, &d, NULL,
+                                              NULL, &s_swap);
+    if (SUCCEEDED(hr)) {
+        IDXGIFactory2_MakeWindowAssociation(s_factory, hwnd,
+                                            DXGI_MWA_NO_ALT_ENTER);
+        if (!swap_view() || (s_excl && !make_canvas())) {
+            drop_views();
+            IDXGISwapChain1_Release(s_swap);
+            s_swap = NULL;
+            hr = E_FAIL;
+        }
+    } else {
+        fail(s_excl ? "CreateSwapChainForHwnd (full screen)"
+                    : "CreateSwapChainForHwnd", hr);
+    }
     if (FAILED(hr)) {
-        fail("CreateSwapChainForHwnd", hr);
+        if (s_excl) {
+            /* Shown in the view as borderless instead. */
+            fprintf(stderr, "[GPU] d3d11: exclusive full screen not"
+                    " available: borderless%c", 10);
+            s_excl_broken = 1;
+            s_excl = 0;
+            return ensure_swap_chain();
+        }
+        if (s_swap_made && ++s_swap_tries < 120)
+            return 0;
         s_swap_failed = 1;
         return 0;
     }
-    IDXGIFactory2_MakeWindowAssociation(s_factory, hwnd, DXGI_MWA_NO_ALT_ENTER);
-    hr = IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
-                                   (void **)&back);
-    if (SUCCEEDED(hr))
-        hr = ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)back,
-                                                 NULL, &s_back_rtv);
-    if (back)
-        ID3D11Texture2D_Release(back);
-    if (FAILED(hr)) {
-        fail("back buffer view", hr);
-        s_swap_failed = 1;
-        return 0;
-    }
+    s_swap_made = 1;
+    s_swap_tries = 0;
     /* From here on the window is ours; GDI would draw over every frame. */
     xbox_FramebufferWindowGpuOwned(1);
-    fprintf(stderr, "[GPU] d3d11: swap chain on the framebuffer window"
-            " (%ux%u)%c", s_bb_w, s_bb_h, 10);
+    if (s_excl)
+        fprintf(stderr, "[GPU] d3d11: swap chain on the frame window for"
+                " exclusive full screen (%ux%u, the frame %ux%u)%c", s_out_w,
+                s_out_h, s_bb_w, s_bb_h, 10);
+    else
+        fprintf(stderr, "[GPU] d3d11: swap chain on the framebuffer window"
+                " (%ux%u)%c", s_bb_w, s_bb_h, 10);
     return 1;
 }
 
-static int blit_stretch(ID3D11Texture2D *src, float sx0, float sy0, float sw,
-                        float sh, ID3D11RenderTargetView *dst, float dx0,
-                        float dy0, float dw, float dh);
+/* Exclusive mode: the swap chain's buffer at the window's size again (the
+ * monitor's: after taking it or losing it, or on another monitor). */
+static void resize_out(void)
+{
+    HRESULT hr;
+
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    if (s_out_rtv) {
+        ID3D11RenderTargetView_Release(s_out_rtv);
+        s_out_rtv = NULL;
+    }
+    ID3D11DeviceContext_Flush(s_ctx);
+    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, 0, 0, DXGI_FORMAT_UNKNOWN,
+                                       s_swap_flags);
+    if (FAILED(hr))
+        fail("ResizeBuffers (full screen)", hr);
+    swap_view();
+}
+
+/* Exclusive full screen as the window asks (fb_present.c): the swap chain
+ * remade on the right window when it comes or goes; while it is wanted,
+ * the monitor taken whenever the window has the focus (Windows lets go of
+ * it when another window gets the focus: Alt+Tab, a message box), retried
+ * every 2 s when refused. Before each present.
+ *
+ * RECOMP_EXCLUSIVE_ANYFOCUS=1 (debug): also while no window has the focus
+ * at all, as on a PC nobody is at (a test run started from a script). */
+static void apply_display_mode(void)
+{
+    static int anyfocus = -1;
+    int want = !s_excl_broken && xbox_FramebufferWindowExclusive();
+    HWND hwnd = (HWND)xbox_FramebufferWindowHandle();
+    HWND fg;
+    BOOL fs = FALSE;
+    RECT r;
+
+    if (anyfocus < 0)
+        anyfocus = getenv("RECOMP_EXCLUSIVE_ANYFOCUS")
+                   && atoi(getenv("RECOMP_EXCLUSIVE_ANYFOCUS"));
+
+    if (s_shadow || !s_swap || !hwnd)
+        return;
+    if (want != s_excl) {
+        int was = s_excl_on;
+        drop_swap_chain();
+        s_excl_retry = 0;
+        if (!ensure_swap_chain())
+            return;
+        /* DXGI put the window back where it was when it took the
+         * monitor; the window places itself as its mode says. */
+        if (was)
+            xbox_FramebufferWindowReplace();
+        if (!s_excl)
+            xbox_FramebufferWindowShapeChanged(s_bb_w, s_bb_h);
+    }
+    if (!s_excl)
+        return;
+    if (FAILED(IDXGISwapChain1_GetFullscreenState(s_swap, &fs, NULL)))
+        fs = FALSE;
+    if (s_excl_on && !fs) {
+        fprintf(stderr, "[GPU] d3d11: exclusive full screen let go (the"
+                " window lost the focus)%c", 10);
+        s_excl_on = 0;
+        resize_out();
+    }
+    fg = GetForegroundWindow();
+    if (!s_excl_on && (fg == hwnd || (anyfocus && !fg)) && !IsIconic(hwnd)
+        && GetTickCount64() >= s_excl_retry) {
+        HRESULT hr = IDXGISwapChain1_SetFullscreenState(s_swap, TRUE, NULL);
+        if (SUCCEEDED(hr)) {
+            s_excl_on = 1;
+            resize_out();
+            fprintf(stderr, "[GPU] d3d11: exclusive full screen on (%ux%u)%c",
+                    s_out_w, s_out_h, 10);
+        } else {
+            static int said;
+            if (said++ < 5)
+                fail("SetFullscreenState", hr);
+            s_excl_retry = GetTickCount64() + 2000;
+        }
+    }
+    /* Taken or not, the buffer follows the window (moved to another
+     * monitor while windowed by Windows). */
+    if (GetClientRect(hwnd, &r) && r.right > 0 && r.bottom > 0
+        && ((uint32_t)r.right != s_out_w || (uint32_t)r.bottom != s_out_h))
+        resize_out();
+}
+
+/* Exclusive mode: the canvas onto the monitor's buffer, on black, where
+ * the hidden GPU view is laid out (the picture's aspect ratio, centred). */
+static void canvas_to_out(void)
+{
+    static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int x, y, w, h;
+    RECT c;
+    HWND hwnd = (HWND)xbox_FramebufferWindowHandle();
+
+    if (!s_out_rtv || !s_canvas)
+        return;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_out_rtv, black);
+    if (xbox_FramebufferWindowGpuViewRect(&x, &y, &w, &h) && hwnd
+        && GetClientRect(hwnd, &c) && c.right > 0 && c.bottom > 0) {
+        /* Client pixels to buffer pixels: the same while they match. */
+        x = (int)((long long)x * s_out_w / c.right);
+        w = (int)((long long)w * s_out_w / c.right);
+        y = (int)((long long)y * s_out_h / c.bottom);
+        h = (int)((long long)h * s_out_h / c.bottom);
+    } else {
+        xbox_FitAspect((int)s_out_w, (int)s_out_h, (int)s_bb_w, (int)s_bb_h,
+                       &x, &y, &w, &h);
+    }
+    if (w == (int)s_bb_w && h == (int)s_bb_h && x >= 0 && y >= 0) {
+        ID3D11Texture2D *out = NULL;
+        if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0,
+                &IID_ID3D11Texture2D, (void **)&out))) {
+            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                    (ID3D11Resource *)out, 0, (UINT)x, (UINT)y, 0,
+                    (ID3D11Resource *)s_canvas, 0, NULL);
+            ID3D11Texture2D_Release(out);
+        }
+    } else {
+        blit_stretch(s_canvas, 0.0f, 0.0f, (float)s_bb_w, (float)s_bb_h,
+                     s_out_rtv, (float)x, (float)y, (float)w, (float)h);
+    }
+}
 
 /* Surface i was made before the render scale last changed and is not at the
  * scale a surface made for the current target now would get. */
@@ -4373,9 +4659,7 @@ static void dump_back(int seq)
     ID3D11Texture2D *back = NULL;
     char path[512];
 
-    if (!prefix || seq < 0
-        || FAILED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
-                                            (void **)&back)))
+    if (!prefix || seq < 0 || !(back = back_tex()))
         return;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
     if (dump_tex(path, back, s_bb_w, s_bb_h, 0, 0, s_bb_w, s_bb_h)
@@ -4418,9 +4702,7 @@ static void shown_to_back(void)
     ID3D11Texture2D *back = NULL;
 
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    if (s_shown >= 0
-        && SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0,
-                &IID_ID3D11Texture2D, (void **)&back))) {
+    if (s_shown >= 0 && (back = back_tex())) {
         /* The shown rectangle at its surface's scale; the back buffer's
          * scale (bx, by: host pixels per guest pixel, worked out as
          * set_render_scale does, so equal sizes give equal scales). An
@@ -4561,6 +4843,30 @@ static void apply_render_res(void)
                 s_bb_w, s_bb_h, 10);
         return;
     }
+    if (s_excl) {
+        /* The canvas at the new size; the monitor's buffer stays. */
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        if (s_back_rtv) {
+            ID3D11RenderTargetView_Release(s_back_rtv);
+            s_back_rtv = NULL;
+        }
+        if (s_canvas) {
+            ID3D11Texture2D_Release(s_canvas);
+            s_canvas = NULL;
+        }
+        s_bb_w = w;
+        s_bb_h = h;
+        if (!make_canvas()) {
+            s_swap_failed = 1;
+            drop_swap_chain();
+            return;
+        }
+        xbox_FramebufferWindowShapeChanged(s_bb_w, s_bb_h);
+        fprintf(stderr, "[GPU] d3d11: render resolution now %ux%u, frame"
+                " drawn at %ux%u (scaled %.3g x %.3g)%c", s_bb_w, s_bb_h,
+                s_sc_w, s_sc_h, s_rsx, s_rsy, 10);
+        return;
+    }
     /* The back buffer must have no view left for ResizeBuffers. */
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
     if (s_back_rtv) {
@@ -4644,6 +4950,9 @@ static void d3d_present(void)
         do {
             xbox_GpuOverlayFn overlay = s_overlay;
             res_file_poll();
+            apply_display_mode();
+            if (!s_swap)
+                break;
             apply_render_res();
             if (!s_swap)
                 break;
@@ -4657,8 +4966,10 @@ static void d3d_present(void)
             /* The title paces itself on the vblank the kernel emulates;
              * whether the present also waits for the monitor is VSync's
              * (vsync_d3d11.c). */
+            if (s_excl)
+                canvas_to_out();
             uint64_t ct0 = ct_now();
-            vsync_present(s_swap);
+            vsync_present(s_swap, s_excl_on);
             ct_add(CT_PRESENT, ct0);
             s_stat.presents++;
             if (!hold)

@@ -18,8 +18,10 @@
  * the first vsync_present. */
 UINT vsync_swap_flags(IDXGIFactory2 *factory);
 
-/* Present the back buffer as the VSync mode says. */
-HRESULT vsync_present(IDXGISwapChain1 *swap);
+/* Present the back buffer as the VSync mode says. exclusive: the swap
+ * chain holds the monitor in exclusive full screen, where a present may not
+ * ask to tear (sync interval 0 tears there anyway). */
+HRESULT vsync_present(IDXGISwapChain1 *swap, int exclusive);
 
 #endif
 

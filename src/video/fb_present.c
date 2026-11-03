@@ -333,25 +333,67 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
-/* Borderless full screen: F11 or Alt+Enter, or RECOMP_FULLSCREEN=1 at start.
+/* Full screen: F11 or Alt+Enter, or RECOMP_DISPLAY_MODE / RECOMP_FULLSCREEN
+ * at start. Two kinds, chosen with xbox_FramebufferWindowSetDisplayMode
+ * (a settings menu); the keys go between the chosen kind and a window:
  *
- * The window loses its frame and covers the monitor it is on; the picture
- * keeps its aspect ratio through WM_SIZE like any other window size. Not
- * DXGI's exclusive full screen (the swap chain says DXGI_MWA_NO_ALT_ENTER):
- * no display-mode change, so alt-tabbing is instant and the swap chain is
- * never lost. Leaving it puts back the old style and placement. */
-static int             s_fullscreen;
+ *   borderless  the window loses its frame and covers the monitor it is on;
+ *               the picture keeps its aspect ratio through WM_SIZE like any
+ *               other window size. No display-mode change, so alt-tabbing
+ *               is instant and the swap chain is never lost.
+ *   exclusive   the same window, and the D3D11 back end also takes the
+ *               monitor with DXGI's exclusive full screen, at the desktop's
+ *               own mode (nv2a_draw_d3d11.c, apply_display_mode). Its swap
+ *               chain then sits on this window, not on the GPU view, which
+ *               is hidden but still laid out: its rectangle is where the
+ *               picture goes. Losing the focus leaves exclusive mode
+ *               (DXGI); getting it back takes it again.
+ *
+ * The swap chain says DXGI_MWA_NO_ALT_ENTER: Alt+Enter is ours. Leaving
+ * full screen puts back the old style and placement. */
+enum { DM_WINDOWED, DM_BORDERLESS, DM_EXCLUSIVE };
+static const char *const s_dm_names[] = { "windowed", "borderless",
+                                          "fullscreen" };
+static int             s_fullscreen;            /* borderless or exclusive */
+static int             s_full_kind = DM_BORDERLESS;   /* what the keys enter */
+static volatile LONG   s_exclusive;             /* the back end should take it */
 static LONG            s_saved_style;
 static WINDOWPLACEMENT s_saved_place;
 
 /* Full screen from another thread (a settings overlay): posted, because the
  * style change belongs to the window's own thread. */
 #define FB_WM_SET_FULLSCREEN (WM_APP + 2)
+#define FB_WM_SET_MODE       (WM_APP + 5)
+#define FB_WM_REPLACE        (WM_APP + 6)
 
 void xbox_FramebufferWindowSetFullscreen(int on)
 {
     if (s_fb_running && s_hwnd)
         PostMessageA(s_hwnd, FB_WM_SET_FULLSCREEN, on ? 1 : 0, 0);
+}
+
+/* 0 = windowed, 1 = borderless, 2 = exclusive full screen: applied at
+ * once, and full screen's kind from then on (the keys go between it and a
+ * window; windowed leaves the kind as it was). */
+void xbox_FramebufferWindowSetDisplayMode(int mode)
+{
+    if (mode >= DM_WINDOWED && mode <= DM_EXCLUSIVE && s_fb_running && s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_SET_MODE, (WPARAM)mode, 0);
+}
+
+/* For the D3D11 back end, every present: whether to hold the monitor in
+ * exclusive full screen. */
+int xbox_FramebufferWindowExclusive(void)
+{
+    return s_exclusive && s_fb_running;
+}
+
+/* The back end left exclusive full screen, and DXGI put the window back
+ * where it was when it entered: place it as the display mode says. */
+void xbox_FramebufferWindowReplace(void)
+{
+    if (s_fb_running && s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_REPLACE, 0, 0);
 }
 
 int xbox_FramebufferWindowIsFullscreen(void)
@@ -388,18 +430,15 @@ void xbox_SetWindowMessageHook(xbox_WindowMessageHook hook)
     s_msg_hook = hook;
 }
 
-static void fb_set_fullscreen(HWND h, int on)
+/* The window as s_fullscreen says: covering its monitor without a frame,
+ * or back in its saved style and placement. */
+static void fb_place(HWND h)
 {
-    if (on == s_fullscreen)
-        return;
-    if (on) {
+    if (s_fullscreen) {
         MONITORINFO mi;
         mi.cbSize = sizeof(mi);
-        s_saved_place.length = sizeof(s_saved_place);
-        if (!GetWindowPlacement(h, &s_saved_place) ||
-            !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
+        if (!GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi))
             return;
-        s_saved_style = GetWindowLongA(h, GWL_STYLE);
         SetWindowLongA(h, GWL_STYLE,
                        (s_saved_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
         SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
@@ -413,9 +452,54 @@ static void fb_set_fullscreen(HWND h, int on)
                      SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
                      SWP_NOZORDER | SWP_NOOWNERZORDER);
     }
-    s_fullscreen = on;
-    fprintf(stderr, "  [FBWIN] %s full screen\n", on ? "entered" : "left");
+}
+
+static void fb_set_fullscreen(HWND h, int on)
+{
+    int excl;
+
+    if (on != s_fullscreen) {
+        if (on) {
+            s_saved_place.length = sizeof(s_saved_place);
+            if (!GetWindowPlacement(h, &s_saved_place))
+                return;
+            s_saved_style = GetWindowLongA(h, GWL_STYLE);
+        }
+        s_fullscreen = on;
+        fb_place(h);
+    }
+    excl = on && s_full_kind == DM_EXCLUSIVE;
+    /* The view would cover the swap chain on this window. */
+    if (s_gpu_view)
+        ShowWindow(s_gpu_view, excl ? SW_HIDE : SW_SHOWNA);
+    InterlockedExchange(&s_exclusive, excl);
+    fprintf(stderr, "  [FBWIN] %s\n", !on ? "windowed"
+            : excl ? "full screen (exclusive)" : "full screen (borderless)");
     fflush(stderr);
+}
+
+/* RECOMP_DISPLAY_MODE=windowed|borderless|fullscreen at start; without it
+ * RECOMP_FULLSCREEN=1 is borderless, as it always was. */
+static void fb_start_mode(HWND h)
+{
+    const char *e = getenv("RECOMP_DISPLAY_MODE");
+    int mode = -1, i;
+
+    if (e && *e) {
+        for (i = 0; i <= DM_EXCLUSIVE; i++)
+            if (!_stricmp(e, s_dm_names[i]))
+                mode = i;
+        if (mode < 0)
+            fprintf(stderr, "  [FBWIN] RECOMP_DISPLAY_MODE=%s ignored: want"
+                    " windowed, borderless or fullscreen\n", e);
+    }
+    if (mode < 0)
+        mode = getenv("RECOMP_FULLSCREEN") && atoi(getenv("RECOMP_FULLSCREEN"))
+             ? DM_BORDERLESS : DM_WINDOWED;
+    if (mode != DM_WINDOWED) {
+        s_full_kind = mode;
+        fb_set_fullscreen(h, 1);
+    }
 }
 
 /* Keyboard and mouse as player 1's pad (src/input/kbm_pad.c, once the game
@@ -573,7 +657,8 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
                 }
             }
             s_gpu_view = CreateWindowExA(0, "XboxRecompGpuView", "",
-                                         WS_CHILD | WS_VISIBLE | WS_DISABLED,
+                                         WS_CHILD | WS_DISABLED
+                                         | (s_exclusive ? 0 : WS_VISIBLE),
                                          0, 0, 1, 1, h, NULL,
                                          GetModuleHandleA(NULL), NULL);
             fb_layout_gpu_view(h);
@@ -656,6 +741,16 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case FB_WM_SET_FULLSCREEN:
         fb_set_fullscreen(h, w != 0);
+        return 0;
+
+    case FB_WM_SET_MODE:
+        if (w != DM_WINDOWED)
+            s_full_kind = (int)w;
+        fb_set_fullscreen(h, w != DM_WINDOWED);
+        return 0;
+
+    case FB_WM_REPLACE:
+        fb_place(h);
         return 0;
 
     case WM_KEYDOWN:
@@ -867,8 +962,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
     kbm_register(hwnd);
-    if (getenv("RECOMP_FULLSCREEN") && atoi(getenv("RECOMP_FULLSCREEN")))
-        fb_set_fullscreen(hwnd, 1);
+    fb_start_mode(hwnd);
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -996,6 +1090,9 @@ void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h) { (void)w; (void
 int xbox_DisplayShape(unsigned *w, unsigned *h) { *w = 4; *h = 3; return 0; }
 void xbox_FramebufferWindowSetFullscreen(int on) { (void)on; }
 int xbox_FramebufferWindowIsFullscreen(void) { return 0; }
+void xbox_FramebufferWindowSetDisplayMode(int mode) { (void)mode; }
+int xbox_FramebufferWindowExclusive(void) { return 0; }
+void xbox_FramebufferWindowReplace(void) { }
 int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h)
 { (void)x; (void)y; (void)w; (void)h; return 0; }
 void xbox_SetWindowMessageHook(void *hook) { (void)hook; }

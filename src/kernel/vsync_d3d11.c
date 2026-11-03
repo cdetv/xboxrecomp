@@ -16,7 +16,9 @@
  *        own refresh. Other rates (144, 165) keep the kernel's own clock.
  *   off  presented at once, allowed to tear: the lowest delay.
  *   vrr  as off: Windows needs the "may tear" present for G-Sync /
- *        FreeSync in a window (borderless full screen included). Kept
+ *        FreeSync in a window (borderless full screen included); in
+ *        exclusive full screen the present may not ask for it, and sync
+ *        interval 0 alone does the same there. Kept
  *        apart for frame rates above 60, which it is to cap under the
  *        monitor's maximum.
  *
@@ -328,7 +330,8 @@ static void stats_note(IDXGISwapChain1 *swap)
     presents++;
     if (SUCCEEDED(IDXGISwapChain1_GetFrameStatistics(swap, &st))
             && st.PresentCount != last_count) {
-        if (last_count) {
+        /* A new swap chain (display mode) counts from 0 again. */
+        if (last_count && st.PresentCount > last_count) {
             UINT n = st.PresentCount - last_count;
             UINT d = st.PresentRefreshCount - last_refresh;
             shown++;
@@ -352,7 +355,7 @@ static void stats_note(IDXGISwapChain1 *swap)
     }
 }
 
-HRESULT vsync_present(IDXGISwapChain1 *swap)
+HRESULT vsync_present(IDXGISwapChain1 *swap, int exclusive)
 {
     int m = vsync_mode();
     UINT flags = 0;
@@ -360,7 +363,7 @@ HRESULT vsync_present(IDXGISwapChain1 *swap)
 
     if (m == VS_ON)
         follow_output(swap);
-    else if ((m == VS_OFF || m == VS_VRR) && s_tearing)
+    else if ((m == VS_OFF || m == VS_VRR) && s_tearing && !exclusive)
         flags = DXGI_PRESENT_ALLOW_TEARING;
     hr = IDXGISwapChain1_Present(swap, m == VS_ON ? 1 : 0, flags);
     stats_note(swap);
