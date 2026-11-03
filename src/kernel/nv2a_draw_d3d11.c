@@ -2949,17 +2949,23 @@ static ID3D11RasterizerState *offset_state(int zcull, float scale)
  * (Windy beehive, the barn, the rope bridge; 2026-10-14). D3D11's depth
  * clip drops exactly what lies outside 0..1, which is the range in use when
  * it is the whole of the zeta format's; any other range is clamped as
- * before and reported once. */
+ * before and reported once. The range is in raw depth units, not the
+ * format's: Conker draws its shadow pictures on a 16-bit target with the
+ * 0..2^24 range of the main scene, at depths around 1.3 million, which the
+ * console keeps; culling at the Z16 maximum dropped every shadow pixel and
+ * left the shadows blank (#8, 2026-11-03). So a range wider than the
+ * format's is clamped too. */
 static ID3D11RasterizerState *raster_state(float scale)
 {
     static uint32_t seen[8][3];
     static int nseen;
     float full = 1.0f / zeta_scale();
     int cull = ((g_pb.zminmax_control >> 4) & 0xF) == 0 && g_pb.clip_seen;
-    int whole = g_pb.clip_min <= 0.5f && g_pb.clip_max >= full - 0.5f;
+    int whole = g_pb.clip_min <= 0.5f && g_pb.clip_max >= full - 0.5f
+                && g_pb.clip_max <= full + 1.5f;
     uint32_t key[3], i;
 
-    key[0] = g_pb.zminmax_control;
+    key[0] = g_pb.zminmax_control | (uint32_t)zeta_format() << 16;
     memcpy(&key[1], &g_pb.clip_min, 4);
     memcpy(&key[2], &g_pb.clip_max, 4);
     for (i = 0; i < (uint32_t)nseen; i++)
@@ -2971,7 +2977,7 @@ static ID3D11RasterizerState *raster_state(float scale)
                 " %.0f), ZMIN_MAX_CONTROL 0x%X: %s%c", g_pb.clip_min,
                 g_pb.clip_max, full, g_pb.zminmax_control,
                 !cull ? "clamped" : whole ? "outside culled"
-                      : "partial range, clamped (not handled)", 10);
+                      : "not the format's range, clamped (not handled)", 10);
     }
     return offset_state(cull && whole && s_rs_zcull, scale);
 }
@@ -3797,6 +3803,19 @@ static void d3d_draw(void)
                 g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
                 g_pb.depth_test, g_pb.stencil_test, g_pb.alpha_test,
                 nidx / 3, g_pb.prim, 10);
+        {   /* Depth against the depth range and the zeta format (Z16 or
+             * Z24): a batch outside the range is culled (raster_state). */
+            float z0 = 1e30f, z1 = -1e30f, w0 = 1e30f, w1 = -1e30f;
+            for (i = 0; i < n; i++) {
+                if (verts[i].pos[2] < z0) z0 = verts[i].pos[2];
+                if (verts[i].pos[2] > z1) z1 = verts[i].pos[2];
+                if (verts[i].pos[3] < w0) w0 = verts[i].pos[3];
+                if (verts[i].pos[3] > w1) w1 = verts[i].pos[3];
+            }
+            fprintf(stderr, "[FTRACE]     depth %g..%g w %g..%g | range"
+                    " %g..%g Z%d%c", z0, z1, w0, w1, g_pb.clip_min,
+                    g_pb.clip_max, zeta_format() == 1 ? 16 : 24, 10);
+        }
         fprintf(stderr, "[FTRACE]     cmask %08X | stencil func %X ref %02X"
                 " r %02X w %02X op %X/%X/%X | alpha func %X ref %02X | zmask"
                 " %u zfunc %X | d0 %.2f %.2f %.2f %.2f%c", g_pb.color_mask,
