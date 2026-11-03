@@ -47,6 +47,7 @@
 #include <dxgi1_2.h>
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
+#include "vsync_d3d11.h"
 #include "tex_replace.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -215,6 +216,7 @@ static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;    /* ClearView: clears a rectangle */
 static IDXGIFactory2        *s_factory;
+static UINT                  s_swap_flags;  /* vsync_swap_flags */
 static IDXGISwapChain1      *s_swap;
 static ID3D11RenderTargetView *s_back_rtv;
 static int                   s_swap_failed;
@@ -427,6 +429,8 @@ static int ensure_swap_chain(void)
     d.BufferCount = 2;
     d.Scaling = DXGI_SCALING_STRETCH;
     d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    s_swap_flags = vsync_swap_flags(s_factory);
+    d.Flags = s_swap_flags;
     hr = IDXGIFactory2_CreateSwapChainForHwnd(s_factory, (IUnknown *)s_dev,
                                               view, &d, NULL, NULL, &s_swap);
     if (FAILED(hr)) {
@@ -4564,7 +4568,8 @@ static void apply_render_res(void)
         s_back_rtv = NULL;
     }
     ID3D11DeviceContext_Flush(s_ctx);
-    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, w, h, DXGI_FORMAT_UNKNOWN, 0);
+    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, w, h, DXGI_FORMAT_UNKNOWN,
+                                       s_swap_flags);
     if (FAILED(hr))
         fail("ResizeBuffers", hr);
     if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
@@ -4649,10 +4654,11 @@ static void d3d_present(void)
             seq = -1;                   /* not again for a held frame */
             hold = overlay
                  ? overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h) : 0;
-            /* No vsync: the title paces itself on the vblank the kernel
-             * emulates, as it does with the software path. */
+            /* The title paces itself on the vblank the kernel emulates;
+             * whether the present also waits for the monitor is VSync's
+             * (vsync_d3d11.c). */
             uint64_t ct0 = ct_now();
-            IDXGISwapChain1_Present(s_swap, 0, 0);
+            vsync_present(s_swap);
             ct_add(CT_PRESENT, ct0);
             s_stat.presents++;
             if (!hold)

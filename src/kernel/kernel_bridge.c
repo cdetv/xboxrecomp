@@ -2354,6 +2354,17 @@ static double g_vblank_isr_max_ms;
 static LARGE_INTEGER g_vblank_freq, g_vblank_origin;
 static long long g_vblank_delivered;
 
+/* VSync on (vsync_d3d11.c): the monitor's refreshes drive the clock
+ * instead, one vblank per xbox_VblankFromDisplay. If they stop coming (the
+ * watcher stalls or loses its output), a vblank is delivered anyway once
+ * a period and a half has passed since the last, so the title never waits
+ * longer than that. The timer thread notices a lock change at its next
+ * tick and starts its own clock afresh from then. */
+static volatile LONG g_vblank_display_lock;
+static volatile LONG g_vblank_display_owed;
+static int g_vblank_locked_seen;
+static long long g_vblank_last;     /* QPC of the last delivery, locked */
+
 /* Milliseconds until the next vblank is due, at most cap; cap when off. */
 static DWORD kernel_vblank_wait_ms(DWORD cap)
 {
@@ -2363,8 +2374,11 @@ static DWORD kernel_vblank_wait_ms(DWORD cap)
     if (!g_vblank_origin.QuadPart)
         return cap;
     QueryPerformanceCounter(&now);
-    next = g_vblank_origin.QuadPart
-         + (g_vblank_delivered + 1) * g_vblank_freq.QuadPart / 60;
+    if (g_vblank_locked_seen)       /* the watcher wakes the thread */
+        next = g_vblank_last + g_vblank_freq.QuadPart * 3 / 120;
+    else
+        next = g_vblank_origin.QuadPart
+             + (g_vblank_delivered + 1) * g_vblank_freq.QuadPart / 60;
     ms = (next - now.QuadPart) * 1000 / g_vblank_freq.QuadPart;
     if (ms < 0)
         ms = 0;
@@ -2391,14 +2405,37 @@ static void kernel_vblank_tick(void)
         QueryPerformanceFrequency(&g_vblank_freq);
         g_vblank_origin = now;
     }
-    /* vblanks since the first call */
-    due = (now.QuadPart - g_vblank_origin.QuadPart) * 60 / g_vblank_freq.QuadPart;
-    owed = due - g_vblank_delivered;
-    if (owed <= 0)
-        return;
-    if (owed > NV2A_VBLANK_CATCH_UP) {
-        g_vblank_delivered = due - NV2A_VBLANK_CATCH_UP;
-        owed = NV2A_VBLANK_CATCH_UP;
+    if (g_vblank_display_lock != g_vblank_locked_seen) {
+        g_vblank_locked_seen = g_vblank_display_lock;
+        g_vblank_origin = now;
+        g_vblank_delivered = 0;
+        g_vblank_last = now.QuadPart;
+        InterlockedExchange(&g_vblank_display_owed, 0);
+    }
+    if (g_vblank_locked_seen) {
+        owed = InterlockedExchange(&g_vblank_display_owed, 0);
+        if (owed > 0) {
+            g_vblank_last = now.QuadPart;
+        } else if (now.QuadPart - g_vblank_last
+                   >= g_vblank_freq.QuadPart * 3 / 120) {
+            owed = 1;
+            g_vblank_last += g_vblank_freq.QuadPart / 60;
+        } else {
+            return;
+        }
+        if (owed > NV2A_VBLANK_CATCH_UP)
+            owed = NV2A_VBLANK_CATCH_UP;
+    } else {
+        /* vblanks since the first call */
+        due = (now.QuadPart - g_vblank_origin.QuadPart) * 60
+            / g_vblank_freq.QuadPart;
+        owed = due - g_vblank_delivered;
+        if (owed <= 0)
+            return;
+        if (owed > NV2A_VBLANK_CATCH_UP) {
+            g_vblank_delivered = due - NV2A_VBLANK_CATCH_UP;
+            owed = NV2A_VBLANK_CATCH_UP;
+        }
     }
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
@@ -2821,6 +2858,23 @@ static uint32_t g_swm_codes = (uint32_t)-1;  /* bit per code; -1: not read yet *
 static unsigned long g_swm_delivered[32], g_swm_skipped[32];
 static unsigned long g_swm_unacked, g_swm_retries;
 static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
+
+/* VSync on (vsync_d3d11.c): the monitor's refreshes drive the vblank clock
+ * (kernel_vblank_tick) while on is nonzero; zero = its own 60 Hz again. */
+void xbox_VblankDisplayLock(int on)
+{
+    InterlockedExchange(&g_vblank_display_lock, on ? 1 : 0);
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
+
+/* One vblank is due now: called by the VSync watcher at a refresh. */
+void xbox_VblankFromDisplay(void)
+{
+    InterlockedIncrement(&g_vblank_display_owed);
+    if (g_timer_wake)
+        SetEvent(g_timer_wake);
+}
 
 static volatile LONG g_w1c_armed;
 static uint32_t g_w1c_value;     /* what PGRAPH_INTR holds while armed */
