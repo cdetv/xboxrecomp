@@ -29,6 +29,7 @@ set(KERNEL_SOURCES
     nv2a_draw_d3d11.c
     postfx_d3d11.c
     dof_d3d11.c
+    vsync_d3d11.c
     tex_replace.c
     nv2a_vsh_interp.c
     nv2a_vsh_hlsl.c
