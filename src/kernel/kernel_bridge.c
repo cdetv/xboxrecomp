@@ -2365,6 +2365,13 @@ static volatile LONG g_vblank_display_owed;
 static int g_vblank_locked_seen;
 static long long g_vblank_last;     /* QPC of the last delivery, locked */
 
+/* The clock's rate (xbox_SetVblankRate): 60 as the hardware, or faster for
+ * a title that is to run above 60 fps on its own pacing (the title then
+ * counts the extra vblanks as time; the caller scales that back). A change
+ * starts the clock afresh, as a lock change does. */
+static volatile LONG g_vblank_hz = 60;
+static LONG g_vblank_hz_seen = 60;
+
 /* Milliseconds until the next vblank is due, at most cap; cap when off. */
 static DWORD kernel_vblank_wait_ms(DWORD cap)
 {
@@ -2375,13 +2382,18 @@ static DWORD kernel_vblank_wait_ms(DWORD cap)
         return cap;
     QueryPerformanceCounter(&now);
     if (g_vblank_locked_seen)       /* the watcher wakes the thread */
-        next = g_vblank_last + g_vblank_freq.QuadPart * 3 / 120;
+        next = g_vblank_last + g_vblank_freq.QuadPart * 3 / (2 * g_vblank_hz_seen);
     else
         next = g_vblank_origin.QuadPart
-             + (g_vblank_delivered + 1) * g_vblank_freq.QuadPart / 60;
+             + (g_vblank_delivered + 1) * g_vblank_freq.QuadPart / g_vblank_hz_seen;
     ms = (next - now.QuadPart) * 1000 / g_vblank_freq.QuadPart;
     if (ms < 0)
         ms = 0;
+    /* At 500 Hz and up a vblank is always under 1 ms away, and waiting 0
+     * spun this thread at a whole core (uncapped frame rate): wake every
+     * ms instead and deliver what came due meanwhile (catch-up below). */
+    if (ms < 1 && g_vblank_hz_seen >= 500)
+        ms = 1;
     return ms < (long long)cap ? (DWORD)ms : cap;
 }
 
@@ -2405,8 +2417,10 @@ static void kernel_vblank_tick(void)
         QueryPerformanceFrequency(&g_vblank_freq);
         g_vblank_origin = now;
     }
-    if (g_vblank_display_lock != g_vblank_locked_seen) {
+    if (g_vblank_display_lock != g_vblank_locked_seen
+            || g_vblank_hz != g_vblank_hz_seen) {
         g_vblank_locked_seen = g_vblank_display_lock;
+        g_vblank_hz_seen = g_vblank_hz;
         g_vblank_origin = now;
         g_vblank_delivered = 0;
         g_vblank_last = now.QuadPart;
@@ -2417,9 +2431,9 @@ static void kernel_vblank_tick(void)
         if (owed > 0) {
             g_vblank_last = now.QuadPart;
         } else if (now.QuadPart - g_vblank_last
-                   >= g_vblank_freq.QuadPart * 3 / 120) {
+                   >= g_vblank_freq.QuadPart * 3 / (2 * g_vblank_hz_seen)) {
             owed = 1;
-            g_vblank_last += g_vblank_freq.QuadPart / 60;
+            g_vblank_last += g_vblank_freq.QuadPart / g_vblank_hz_seen;
         } else {
             return;
         }
@@ -2427,7 +2441,7 @@ static void kernel_vblank_tick(void)
             owed = NV2A_VBLANK_CATCH_UP;
     } else {
         /* vblanks since the first call */
-        due = (now.QuadPart - g_vblank_origin.QuadPart) * 60
+        due = (now.QuadPart - g_vblank_origin.QuadPart) * g_vblank_hz_seen
             / g_vblank_freq.QuadPart;
         owed = due - g_vblank_delivered;
         if (owed <= 0)
@@ -2866,6 +2880,24 @@ void xbox_VblankDisplayLock(int on)
     InterlockedExchange(&g_vblank_display_lock, on ? 1 : 0);
     if (g_timer_wake)
         SetEvent(g_timer_wake);
+}
+
+/* The vblank clock's rate in Hz (30-1000; 60 = as the hardware), from the
+ * next tick. The title's present intervals and vblank counts then run on
+ * it; the VSync watcher locks the monitor to it (xbox_VblankRate). */
+void xbox_SetVblankRate(int hz)
+{
+    if (hz < 30)
+        hz = 30;
+    if (hz > 1000)
+        hz = 1000;
+    if (InterlockedExchange(&g_vblank_hz, hz) != hz && g_timer_wake)
+        SetEvent(g_timer_wake);
+}
+
+int xbox_VblankRate(void)
+{
+    return (int)g_vblank_hz;
 }
 
 /* One vblank is due now: called by the VSync watcher at a refresh. */

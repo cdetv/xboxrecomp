@@ -11,16 +11,18 @@
  *   on   no tearing, every frame waits for a refresh (sync interval 1), and
  *        a watcher thread here hands the monitor's real refreshes to the
  *        vblank clock (xbox_VblankFromDisplay) whenever the monitor runs at
- *        about a multiple of 60 Hz (60, 120, 180, 240, within LOCK_TOL):
- *        one emulated vblank per k refreshes. Each frame then lands on its
- *        own refresh. Other rates (144, 165) keep the kernel's own clock.
+ *        about a multiple of the clock's rate (xbox_VblankRate; at 60: 60,
+ *        120, 180, 240, within LOCK_TOL): one emulated vblank per k
+ *        refreshes. Each frame then lands on its own refresh. Other rates
+ *        (144, 165 at 60) keep the kernel's own clock.
  *   off  presented at once, allowed to tear: the lowest delay.
  *   vrr  as off: Windows needs the "may tear" present for G-Sync /
  *        FreeSync in a window (borderless full screen included); in
  *        exclusive full screen the present may not ask for it, and sync
- *        interval 0 alone does the same there. Kept
- *        apart for frame rates above 60, which it is to cap under the
- *        monitor's maximum.
+ *        interval 0 alone does the same there. A title running above 60
+ *        caps its rate at xbox_VsyncCapHz (the monitor's refresh less
+ *        VRR_MARGIN; with on, the refresh), so frames stay inside the
+ *        monitor's VRR range.
  *
  * The watcher waits on the output the window is on (IDXGIOutput::
  * WaitForVBlank) and measures the refresh: the median of the first
@@ -43,15 +45,17 @@
 
 extern void xbox_VblankDisplayLock(int on);
 extern void xbox_VblankFromDisplay(void);
+extern int xbox_VblankRate(void);
 
 enum { VS_UNSET = -1, VS_OFF, VS_ON, VS_VRR, VS_MODES };
 static const char *const s_mode_names[VS_MODES] = { "off", "on", "vrr" };
 
 #define VS_UNREAD  (-2)
-#define LOCK_TOL   0.015       /* k refreshes within 1.5 % of 1/60 s */
-#define LOCK_MAX_K 4           /* up to 240 Hz */
+#define LOCK_TOL   0.015       /* k refreshes within 1.5 % of one vblank */
+#define LOCK_MAX_K 4           /* up to 4 refreshes a vblank (240 Hz at 60) */
 #define FIRST_N    15          /* intervals for the first (median) estimate */
 #define MEASURE_N  60          /* intervals per later estimate */
+#define VRR_MARGIN 3           /* Hz under the refresh: the vrr cap */
 
 static volatile LONG s_mode = VS_UNREAD;
 static int s_tearing;          /* the swap chain may tear */
@@ -64,6 +68,8 @@ static IDXGIOutput *s_out;
 static HMONITOR s_out_mon;
 static HANDLE s_wake;          /* mode changed, or an output to wait on */
 static HANDLE s_watcher;
+static volatile LONG s_mon_hz;     /* the window's monitor, whole Hz */
+static HMONITOR s_hz_mon;
 
 static int vsync_mode(void)
 {
@@ -102,17 +108,17 @@ int xbox_SetVsync(int mode)
     return 1;
 }
 
-static void lock_say(int locked, double ms, int k)
+static void lock_say(int locked, double ms, int k, int rate)
 {
     if (locked)
         fprintf(stderr, "[VSYNC] monitor %.2f Hz: game clock follows it"
                 " (one vblank every %d refresh%s)%c", 1000.0 / ms, k,
                 k == 1 ? "" : "es", 10);
     else if (ms > 0)
-        fprintf(stderr, "[VSYNC] monitor %.2f Hz: not a multiple of 60, game"
-                " clock stays on its own 60 Hz%c", 1000.0 / ms, 10);
+        fprintf(stderr, "[VSYNC] monitor %.2f Hz: not a multiple of %d, game"
+                " clock stays on its own %d Hz%c", 1000.0 / ms, rate, rate, 10);
     else
-        fprintf(stderr, "[VSYNC] game clock back on its own 60 Hz%c", 10);
+        fprintf(stderr, "[VSYNC] game clock back on its own %d Hz%c", rate, 10);
 }
 
 static int cmp_double(const void *a, const void *b)
@@ -151,6 +157,7 @@ static DWORD WINAPI watcher_main(void *arg)
     long long last = 0;
     double first[FIRST_N], window[MEASURE_N], period = 0, hz = 0;
     int nfirst = 0, nsum = 0, locked = 0, k = 1, phase = 0, said_k = -1;
+    int said_rate = 0;
     IDXGIOutput *seen = NULL;      /* the output measured; compared only */
 
     (void)arg;
@@ -162,7 +169,7 @@ static DWORD WINAPI watcher_main(void *arg)
         if (vsync_mode() != VS_ON) {
             if (locked) {
                 xbox_VblankDisplayLock(0);
-                lock_say(0, 0, 0);
+                lock_say(0, 0, 0, xbox_VblankRate());
             }
             locked = 0;
             said_k = -1;
@@ -228,19 +235,22 @@ static DWORD WINAPI watcher_main(void *arg)
                 }
             }
             if (period > 0) {
-                int nk = (int)floor(1000.0 / 60.0 / period + 0.5);
+                /* The clock's rate can change any time (frame rate). */
+                int rate = xbox_VblankRate();
+                double vb = 1000.0 / rate;
+                int nk = (int)floor(vb / period + 0.5);
                 int ok = nk >= 1 && nk <= LOCK_MAX_K
-                      && fabs(nk * period - 1000.0 / 60.0) / (1000.0 / 60.0)
-                         < LOCK_TOL;
+                      && fabs(nk * period - vb) / vb < LOCK_TOL;
                 if (ok != locked || (ok && nk != k)) {
                     xbox_VblankDisplayLock(ok);
                     locked = ok;
                     k = ok ? nk : 1;
                     phase = 0;
                 }
-                if (said_k != (locked ? k : 0)) {
+                if (said_k != (locked ? k : 0) || said_rate != rate) {
                     said_k = locked ? k : 0;
-                    lock_say(locked, period, k);
+                    said_rate = rate;
+                    lock_say(locked, period, k, rate);
                 }
             }
             if (locked) {
@@ -355,12 +365,57 @@ static void stats_note(IDXGISwapChain1 *swap)
     }
 }
 
+/* on, vrr: the window's monitor's refresh (Windows' display mode, whole
+ * Hz), read again only when the window moves to another monitor. */
+static void follow_mon_hz(IDXGISwapChain1 *swap)
+{
+    HWND hwnd = NULL;
+    HMONITOR mon;
+    MONITORINFOEXW mi;
+    DEVMODEW dm;
+    LONG hz = 0;
+
+    if (FAILED(IDXGISwapChain1_GetHwnd(swap, &hwnd)) || !hwnd)
+        return;
+    mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    if (mon == s_hz_mon && s_mon_hz)
+        return;
+    s_hz_mon = mon;
+    memset(&mi, 0, sizeof mi);
+    mi.cbSize = sizeof mi;
+    memset(&dm, 0, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (GetMonitorInfoW(mon, (MONITORINFO *)&mi)
+            && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm)
+            && dm.dmDisplayFrequency > VRR_MARGIN + 30)
+        hz = (LONG)dm.dmDisplayFrequency;
+    if (InterlockedExchange(&s_mon_hz, hz) != hz)
+        fprintf(stderr, "[VSYNC] monitor %ld Hz: frame rate cap %ld (on),"
+                " %ld (vrr)%c", hz, hz, hz ? hz - VRR_MARGIN : 0, 10);
+}
+
+/* The highest frame rate worth running at: on = the monitor's refresh
+ * (more frames would only wait), vrr = the refresh less VRR_MARGIN (inside
+ * the monitor's VRR range); 0 = no cap (off, or not known yet). Any
+ * thread. */
+int xbox_VsyncCapHz(void)
+{
+    int m = vsync_mode();
+    LONG hz = s_mon_hz;
+
+    if (!hz)
+        return 0;
+    return m == VS_ON ? (int)hz : m == VS_VRR ? (int)hz - VRR_MARGIN : 0;
+}
+
 HRESULT vsync_present(IDXGISwapChain1 *swap, int exclusive)
 {
     int m = vsync_mode();
     UINT flags = 0;
     HRESULT hr;
 
+    if (m == VS_ON || m == VS_VRR)
+        follow_mon_hz(swap);
     if (m == VS_ON)
         follow_output(swap);
     else if ((m == VS_OFF || m == VS_VRR) && s_tearing && !exclusive)
@@ -375,6 +430,11 @@ HRESULT vsync_present(IDXGISwapChain1 *swap, int exclusive)
 int xbox_SetVsync(int mode)
 {
     (void)mode;
+    return 0;
+}
+
+int xbox_VsyncCapHz(void)
+{
     return 0;
 }
 
