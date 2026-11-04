@@ -173,6 +173,7 @@ int pb_surface_write_refused(uint32_t base, uint32_t bytes, const char *what)
 #define NV097_SET_BLEND_COLOR             0x034C
 #define NV097_SET_BLEND_EQUATION          0x0350
 
+#define NV097_NO_OPERATION                0x0100
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
 #define NV097_SET_SURFACE_FORMAT          0x0208
@@ -1224,13 +1225,149 @@ static void host_method(uint32_t method, uint32_t param)
 /* nv2a_pb_scan.c: where the walk is reading (RECOMP_VSH_SOURCE_LOG). */
 extern uint32_t g_nv2a_pb_word_va, g_nv2a_pb_buf_va;
 
+/* The draw methods, shared by nv2a_pb_exec_method and
+ * nv2a_pb_exec_draw_words. */
+static void begin_end(uint32_t param)
+{
+    if (param) {
+        g_pb.prim = param;
+        g_pb.idx_count = 0;
+        g_pb.inline_count = 0;
+        g_pb.imm_count = 0;
+        return;
+    }
+    /* Three ways a batch can have arrived, and only one is in use at a time:
+     * vertices completed by SET_VERTEX4F, a payload written with
+     * INLINE_ARRAY, or indices into the title's own arrays. The last may be
+     * held to merge with the next (merge_take). */
+    if (g_pb.imm_count || g_pb.inline_count)
+        nv2a_pb_merge_flush();
+    if (g_pb.imm_count)
+        draw_immediate();
+    else if (g_pb.inline_count)
+        draw_inline_array();
+    else if (!merge_take())
+        draw_primitive();
+    g_pb.prim = 0;
+    g_pb.inline_count = 0;
+    g_pb.imm_count = 0;
+}
+
+/* Vertex data, not a pointer to it. Buffered rather than decoded here because
+ * the format is only fully known at END. */
+static void inline_array(uint32_t param)
+{
+    if (g_pb.prim && g_pb.inline_count < NV_MAX_INLINE)
+        g_pb.inline_buf[g_pb.inline_count++] = param;
+}
+
+/* The method this title actually draws with, and the reason the executor
+ * reported zero draws while geometry was being submitted the whole time:
+ * BEGIN_END arrived, END arrived, and in between came a run description
+ * rather than the index list the draw path wanted, so every batch ended with
+ * idx_count == 0 and was dropped in silence.
+ *
+ * Expanded into indices because that is what the rasteriser consumes, and an
+ * implicit run is just the indices start..start+count-1. */
+static void draw_arrays(uint32_t param)
+{
+    uint32_t start = param & 0x00FFFFFFu;
+    uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+    uint32_t i;
+
+    if (!g_pb.prim)
+        return;
+    for (i = 0; i < count && g_pb.idx_count < NV_MAX_INDICES; i++)
+        g_pb.idx[g_pb.idx_count++] = start + i;
+    g_pb.idx_dropped += count - i;
+}
+
+/* Two 16-bit indices per parameter word. */
+static void array_element16(uint32_t param)
+{
+    if (g_pb.prim && g_pb.idx_count + 2 <= NV_MAX_INDICES) {
+        g_pb.idx[g_pb.idx_count++] = param & 0xFFFFu;
+        g_pb.idx[g_pb.idx_count++] = param >> 16;
+    } else if (g_pb.prim) {
+        g_pb.idx_dropped += 2;
+    }
+}
+
+/* One 32-bit index. Xbox D3D sends 16-bit index lists two per word and the
+ * odd last one this way, so without it every odd-length draw lost its last
+ * index -- a lone triangle (one pair + one) all of it, since two indices draw
+ * nothing. */
+static void array_element32(uint32_t param)
+{
+    if (g_pb.prim && g_pb.idx_count < NV_MAX_INDICES)
+        g_pb.idx[g_pb.idx_count++] = param;
+    else if (g_pb.prim)
+        g_pb.idx_dropped++;
+}
+
+static int s_exec_inited;
+static int s_wf_on = -1;
+
+/* pb_walk's shortcut (RECOMP_WALK_FAST; on unless it is 0): the n words of
+ * one method header on subchannel 0, all to `method` (a non-incrementing
+ * header, or one word), done here in one call when they are draw data,
+ * SET_BEGIN_END or NOPs with 0. Returns 0, having done nothing, for anything
+ * else; the walk then goes word by word through nv2a_pb_exec_method. It's
+ * War's world is ~14,700 one-quad batches a frame, BEGIN, two
+ * ARRAY_ELEMENT16, END and NOP padding each, and a call a word was ~27 % of
+ * the executor on the beach at 120 (2026-11-04). The effect is
+ * nv2a_pb_exec_method's: these methods pass merge_passes (nothing held is
+ * drawn early) and none of its other per-call work applies to them. Off in a
+ * traced frame, which logs every method. RECOMP_WALK_FAST=2 takes it in even
+ * frames only (the RECOMP_DRAW_MERGE=2 check). */
+int nv2a_pb_exec_draw_words(uint32_t method, const uint32_t *p, uint32_t n)
+{
+    uint32_t i;
+
+    if (s_wf_on < 0) {
+        const char *e = getenv("RECOMP_WALK_FAST");
+        s_wf_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+    }
+    if (!s_wf_on || (s_wf_on == 2 && (g_pb.flips & 1)) || !s_exec_inited
+        || g_pb_ftrace == 2)
+        return 0;
+    switch (method) {
+    case NV097_NO_OPERATION:
+        for (i = 0; i < n; i++)
+            if (p[i])
+                return 0;
+        return 1;
+    case NV097_SET_BEGIN_END:
+        for (i = 0; i < n; i++)
+            begin_end(p[i]);
+        return 1;
+    case NV097_ARRAY_ELEMENT16:
+        for (i = 0; i < n; i++)
+            array_element16(p[i]);
+        return 1;
+    case NV097_ARRAY_ELEMENT32:
+        for (i = 0; i < n; i++)
+            array_element32(p[i]);
+        return 1;
+    case NV097_DRAW_ARRAYS:
+        for (i = 0; i < n; i++)
+            draw_arrays(p[i]);
+        return 1;
+    case NV097_INLINE_ARRAY:
+        for (i = 0; i < n; i++)
+            inline_array(p[i]);
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
-    static int inited;
     /* The vblank answer (xbox_Nv2aAnswerVblank) is pb_walk's, once per
      * method header: once per word here was ~3% of the executor. */
-    if (!inited) {
-        inited = 1;
+    if (!s_exec_inited) {
+        s_exec_inited = 1;
         {
             /* RECOMP_GPU picks the back end: unset or "sw" is the software
              * rasteriser, "d3d11" the GPU, "both" the software one in
@@ -1460,78 +1597,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_shadow->clear(param);
         break;
 
+    case NV097_NO_OPERATION:
+        /* Padding; one with a parameter is pb_walk's (a software method). */
+        break;
+
     case NV097_SET_BEGIN_END:
-        if (param) {
-            g_pb.prim = param;
-            g_pb.idx_count = 0;
-            g_pb.inline_count = 0;
-            g_pb.imm_count = 0;
-        } else {
-            /* Three ways a batch can have arrived, and only one is in use at
-             * a time: vertices completed by SET_VERTEX4F, a payload written
-             * with INLINE_ARRAY, or indices into the title's own arrays. The
-             * last may be held to merge with the next (merge_take). */
-            if (g_pb.imm_count || g_pb.inline_count)
-                nv2a_pb_merge_flush();
-            if (g_pb.imm_count)
-                draw_immediate();
-            else if (g_pb.inline_count)
-                draw_inline_array();
-            else if (!merge_take())
-                draw_primitive();
-            g_pb.prim = 0;
-            g_pb.inline_count = 0;
-            g_pb.imm_count = 0;
-        }
+        begin_end(param);
         break;
 
     case NV097_INLINE_ARRAY:
-        /* Vertex data, not a pointer to it. Buffered rather than decoded here
-         * because the format is only fully known at END. */
-        if (g_pb.prim && g_pb.inline_count < NV_MAX_INLINE)
-            g_pb.inline_buf[g_pb.inline_count++] = param;
+        inline_array(param);
         break;
 
-    case NV097_DRAW_ARRAYS: {
-        /* The method this title actually draws with, and the reason the
-         * executor reported zero draws while geometry was being submitted the
-         * whole time: BEGIN_END arrived, END arrived, and in between came a
-         * run description rather than the index list the draw path wanted, so
-         * every batch ended with idx_count == 0 and was dropped in silence.
-         *
-         * Expanded into indices because that is what the rasteriser consumes,
-         * and an implicit run is just the indices start..start+count-1. */
-        uint32_t start = param & 0x00FFFFFFu;
-        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
-        uint32_t i;
-
-        if (!g_pb.prim)
-            break;
-        for (i = 0; i < count && g_pb.idx_count < NV_MAX_INDICES; i++)
-            g_pb.idx[g_pb.idx_count++] = start + i;
-        g_pb.idx_dropped += count - i;
+    case NV097_DRAW_ARRAYS:
+        draw_arrays(param);
         break;
-    }
 
     case NV097_ARRAY_ELEMENT16:
-        /* Two 16-bit indices per parameter word. */
-        if (g_pb.prim && g_pb.idx_count + 2 <= NV_MAX_INDICES) {
-            g_pb.idx[g_pb.idx_count++] = param & 0xFFFFu;
-            g_pb.idx[g_pb.idx_count++] = param >> 16;
-        } else if (g_pb.prim) {
-            g_pb.idx_dropped += 2;
-        }
+        array_element16(param);
         break;
 
     case NV097_ARRAY_ELEMENT32:
-        /* One 32-bit index. Xbox D3D sends 16-bit index lists two per word
-         * and the odd last one this way, so without it every odd-length
-         * draw lost its last index -- a lone triangle (one pair + one) all
-         * of it, since two indices draw nothing. */
-        if (g_pb.prim && g_pb.idx_count < NV_MAX_INDICES)
-            g_pb.idx[g_pb.idx_count++] = param;
-        else if (g_pb.prim)
-            g_pb.idx_dropped++;
+        array_element32(param);
         break;
 
     case NV097_SET_FLIP_READ:

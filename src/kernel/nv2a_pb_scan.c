@@ -53,6 +53,8 @@ static uint32_t s_tot_jumped_skipped; /* failed the dry run, not executed */
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern int nv2a_pb_exec_draw_words(uint32_t method, const uint32_t *p,
+                                   uint32_t n);
 extern void nv2a_pb_merge_flush(void);
 extern void xbox_Nv2aAnswerVblank(void);  /* xbox_memory_layout.c */
 extern void nv2a_pb_exec_report(void);
@@ -65,12 +67,12 @@ static int s_exec_enabled = -1;
 /* An incrementing run starting near 0x1FFC reaches 0x3FF4. */
 static uint16_t s_seen_slot[8][0x4000 / 4];
 
-static void note(uint32_t subch, uint32_t method)
+static void note(uint32_t subch, uint32_t method, uint32_t n)
 {
     uint16_t *slot = &s_seen_slot[subch & 7u][(method >> 2) & 0xFFFu];
 
     if (*slot) {
-        s_seen[*slot - 1].count++;
+        s_seen[*slot - 1].count += n;
         return;
     }
     if (s_seen_count >= PB_MAX_METHODS) {
@@ -87,7 +89,7 @@ static void note(uint32_t subch, uint32_t method)
     if (s_seen_count < PB_MAX_METHODS) {
         s_seen[s_seen_count].method = method;
         s_seen[s_seen_count].subch  = subch;
-        s_seen[s_seen_count].count  = 1;
+        s_seen[s_seen_count].count  = n;
         s_seen_count++;
         *slot = (uint16_t)s_seen_count;
     }
@@ -478,9 +480,27 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
              * run is at most 2047 words, a few microseconds. */
             if (s_exec_enabled)
                 xbox_Nv2aAnswerVblank();
+            /* A header of draw data or plain NOPs, all one method: handed
+             * over whole (nv2a_pb_exec_draw_words), not a call a word. */
+            if (s_exec_enabled && subch == 0 && count
+                && (noninc || count == 1) && va < end_va
+                && count <= (end_va - va) / 4
+                && nv2a_pb_exec_draw_words(method,
+                                           (const uint32_t *)(mem + va),
+                                           count)) {
+                note(subch, method, count);
+                if (method == 0x0100u) {
+                    nop_param = 0;
+                    nop_end = va + count * 4;
+                }
+                g_nv2a_pb_word_va = va + (count - 1) * 4;
+                va += count * 4;
+                words += count;
+                continue;
+            }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                note(subch, m, 1);
                 if (m == 0x0100u) {
                     nop_param = *(const uint32_t *)(mem + va);
                     nop_end = va + 4;
