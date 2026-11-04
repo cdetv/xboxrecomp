@@ -53,6 +53,7 @@ static uint32_t s_tot_jumped_skipped; /* failed the dry run, not executed */
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern void xbox_Nv2aAnswerVblank(void);  /* xbox_memory_layout.c */
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
 static int s_exec_enabled = -1;
@@ -472,6 +473,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
+            /* D3D's vblank DPC waits on it. Once a header, not a word: a
+             * run is at most 2047 words, a few microseconds. */
+            if (s_exec_enabled)
+                xbox_Nv2aAnswerVblank();
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 note(subch, m);
