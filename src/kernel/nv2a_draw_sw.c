@@ -2907,8 +2907,11 @@ int pb_cull_tri(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
 {
     float area, w;
     int cw, front;
+    static int off = -1;
 
-    if (!g_pb.cull_enable)
+    if (off < 0)                       /* RECOMP_CULL_OFF=1: diagnosis only */
+        off = getenv("RECOMP_CULL_OFF") != NULL;
+    if (!g_pb.cull_enable || off)
         return 0;
     if (g_pb.cull_face == 0x408)                  /* FRONT_AND_BACK */
         return 1;
