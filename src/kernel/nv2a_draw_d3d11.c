@@ -309,7 +309,7 @@ static struct {
     uint32_t verts_need_clip, tris_clipped, tris_behind, combined, tris_culled;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
-    uint32_t rtt_binds, rtt_unhandled;
+    uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
@@ -1776,9 +1776,10 @@ static ID3D11DepthStencilState *ds_state(void)
  * from guest memory only: faces the GPU drew (a title rendering its own
  * reflections) would read stale; logged once per address. Only level 0 is
  * hashed: a title that rewrote a smaller level alone would keep the old one.
- * ponytail: the bytes are hashed at every bind, which is a full read of the
- * texture per batch; a dirty-page scheme would avoid it.
- * That hash also names replacement textures (tex_replace.h): when new bytes
+ * ponytail: the bytes are hashed once a flip (hash_fast), a full read of
+ * every bound texture per frame; a dirty-page scheme would avoid it.
+ * hash_bytes of the same bytes names replacement textures (tex_replace.h),
+ * taken only for new or changed bytes: when new bytes
  * match a PNG in RECOMP_TEX_REPLACE, the PNG goes up instead, at its own size
  * (replaced_tex); 2D textures only. */
 
@@ -1866,6 +1867,32 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     return h;
 }
 
+/* The texture cache's change check (GpuTexture.hash): hash_bytes' mixing in
+ * four independent lanes, 32 bytes a round, so the CPU runs them side by
+ * side. hash_bytes is one chain (~6 cycles per 8 bytes) and was ~17% of the
+ * executor at 120 fps in Conker's first field (2026-11-03). Replacement
+ * names (tex_replace.h) stay hash_bytes: they are on disk. */
+static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
+{
+    uint64_t a = h, b = h ^ 0x9E3779B97F4A7C15ull;
+    uint64_t c = h ^ 0xC2B2AE3D27D4EB4Full, d = h ^ 0x165667B19E3779F9ull;
+    size_t i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + i, 8);
+        memcpy(&w1, p + i + 8, 8);
+        memcpy(&w2, p + i + 16, 8);
+        memcpy(&w3, p + i + 24, 8);
+        a = (a ^ w0) * 0x100000001B3ull; a ^= a >> 29;
+        b = (b ^ w1) * 0x100000001B3ull; b ^= b >> 29;
+        c = (c ^ w2) * 0x100000001B3ull; c ^= c >> 29;
+        d = (d ^ w3) * 0x100000001B3ull; d ^= d >> 29;
+    }
+    h = (a ^ b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full)
+        ^ (d * 0x165667B19E3779F9ull) ^ (uint64_t)n;
+    return hash_bytes(p + i, n - i, h);
+}
+
 /* ── Render to texture ─────────────────────────────────────────────────────
  *
  * A title draws into a surface and then samples it: Conker's bloom
@@ -1902,11 +1929,17 @@ static int  s_tex_slot[4];
 static uint32_t s_tex_levels[4];
 static int  s_rtt_slot;
 
+/* A stage's copies of GPU surfaces it reads, one per size, the least
+ * recently used one remade. With one a stage, Conker's field remade it
+ * several times a frame (the glow chain reads surfaces of different sizes
+ * on the same stage), and making textures was ~5% of the executor. */
+#define RTT_SIZES 6
 static struct {
-    uint32_t w, h;
+    uint32_t w, h, used;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
-} s_rtt[4];
+} s_rtt[4][RTT_SIZES];
+static uint32_t s_rtt_tick;
 
 /* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
  * or -1 when that reading is not handled. */
@@ -1937,7 +1970,7 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
     const Texture *t = &g_pb.texs[st];
     uint32_t swz = d3d8_format_is_swizzled(t->color) ? 1u : 0u, tw, th;
     D3D11_BOX box;
-    int i, r;
+    int i, r, c, old;
 
     if (d3d8_format_dxt_block_bytes(t->color))
         return NULL;
@@ -2003,11 +2036,18 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
      * the same place in it. */
     tw = to_host(t->width, surf_sx(i));
     th = to_host(t->height, surf_sy(i));
-    if (!s_rtt[st].tex || s_rtt[st].w != tw || s_rtt[st].h != th) {
+    for (c = 0, old = 0; c < RTT_SIZES; c++) {
+        if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
+            break;
+        if (s_rtt[st][c].used < s_rtt[st][old].used)
+            old = c;
+    }
+    if (c == RTT_SIZES) {
         D3D11_TEXTURE2D_DESC d;
-        if (s_rtt[st].srv) ID3D11ShaderResourceView_Release(s_rtt[st].srv);
-        if (s_rtt[st].tex) ID3D11Texture2D_Release(s_rtt[st].tex);
-        memset(&s_rtt[st], 0, sizeof s_rtt[st]);
+        c = old;
+        if (s_rtt[st][c].srv) ID3D11ShaderResourceView_Release(s_rtt[st][c].srv);
+        if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+        memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
         memset(&d, 0, sizeof d);
         d.Width = tw;
         d.Height = th;
@@ -2018,16 +2058,19 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
-                                                &s_rtt[st].tex))
+                                                &s_rtt[st][c].tex))
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
-                    (ID3D11Resource *)s_rtt[st].tex, NULL, &s_rtt[st].srv))) {
-            if (s_rtt[st].tex) ID3D11Texture2D_Release(s_rtt[st].tex);
-            memset(&s_rtt[st], 0, sizeof s_rtt[st]);
+                    (ID3D11Resource *)s_rtt[st][c].tex, NULL,
+                    &s_rtt[st][c].srv))) {
+            if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+            memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
             return NULL;
         }
-        s_rtt[st].w = tw;
-        s_rtt[st].h = th;
+        s_rtt[st][c].w = tw;
+        s_rtt[st][c].h = th;
+        s_stat.rtt_made++;
     }
+    s_rtt[st][c].used = ++s_rtt_tick;
     /* What the surface has of the texture's rectangle; past its edge the
      * copy keeps whatever it held. */
     box.left = 0; box.top = 0; box.front = 0;
@@ -2035,13 +2078,13 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
     box.bottom = th < s_surf[i].th ? th : s_surf[i].th;
     box.back = 1;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-            (ID3D11Resource *)s_rtt[st].tex, 0, 0, 0, 0,
+            (ID3D11Resource *)s_rtt[st][c].tex, 0, 0, 0, 0,
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     *flags = (uint32_t)r;
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
     s_rtt_slot = i;
-    return s_rtt[st].srv;
+    return s_rtt[st][c].srv;
 }
 
 /* A zeta surface read as a texture: Conker's glow bright pass samples its
@@ -2540,9 +2583,9 @@ guest:
      * (~15,000 batches a frame, 2026-10-20). */
     if (!cube)
         note_stale_read(st, bytes);
-    hash = hash_bytes(mem + t->offset, bytes, 0xCBF29CE484222325ull);
+    hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
-        hash = hash_bytes(mem + palette, 256 * 4, hash);
+        hash = hash_fast(mem + palette, 256 * 4, hash);
     if (e && e->hash == hash) {
         e->hashed_flip = g_pb.flips;
         e->used = s_tex_tick;
@@ -2554,9 +2597,13 @@ guest:
     if (d3 == 1 && !cube && tex_replace_active()) {
         uint32_t rw, rh;
         const uint32_t *px;
-        if (tex_replace_dumping() && tex_replace_dump_new(hash))
-            dump_guest_tex(t, hash);
-        px = tex_replace_find(hash, &rw, &rh);
+        uint64_t name = hash_bytes(mem + t->offset, bytes,
+                                   0xCBF29CE484222325ull);
+        if (palette)
+            name = hash_bytes(mem + palette, 256 * 4, name);
+        if (tex_replace_dumping() && tex_replace_dump_new(name))
+            dump_guest_tex(t, name);
+        px = tex_replace_find(name, &rw, &rh);
         if (px)
             return replaced_tex(st, t, e, hash, palette, lv, px, rw, rh);
     }
@@ -5025,8 +5072,9 @@ static void d3d_report(void)
             " a GPU-drawn face (read stale from guest memory)%c",
             s_stat.cube_binds, s_stat.cube_drawn, 10);
     fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
-            " surface, %u of a surface in a reading not handled (guest"
-            " memory used)%c", s_stat.rtt_binds, s_stat.rtt_unhandled, 10);
+            " surface (%u copy textures made), %u of a surface in a reading"
+            " not handled (guest memory used)%c", s_stat.rtt_binds,
+            s_stat.rtt_made, s_stat.rtt_unhandled, 10);
     fprintf(stderr, "[GPU] d3d11: depth/stencil: %u buffers made, %u clears,"
             " %u batches drawn with them, %u on a surface too big for them"
             " (drawn without); %u reads as a texture, %u in a reading not"

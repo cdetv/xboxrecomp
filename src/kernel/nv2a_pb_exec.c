@@ -1028,7 +1028,8 @@ extern uint32_t g_nv2a_pb_word_va, g_nv2a_pb_buf_va;
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
-    xbox_Nv2aAnswerVblank();    /* D3D's vblank DPC waits on it; one read */
+    /* The vblank answer (xbox_Nv2aAnswerVblank) is pb_walk's, once per
+     * method header: once per word here was ~3% of the executor. */
     if (!inited) {
         inited = 1;
         {
