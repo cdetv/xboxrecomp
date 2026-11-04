@@ -356,13 +356,10 @@ static void frame_trace_flip(void)
 
 static int s_draw_lines = -1;          /* RECOMP_NV2A_TRACE */
 
-static void draw_primitive(void)
+/* The [GPU] report's counts for the batch in g_pb.idx: once per batch the
+ * title drew, also when draw merging (below) draws it as part of another. */
+static void draw_count(void)
 {
-    float v[4];
-    uint32_t i;
-
-    if (!g_pb.prim || !g_pb.idx_count)
-        return;
     g_pb.draws++;
     /* A progress line every 200 draws: ~250 a second in a 3D scene, so only
      * with RECOMP_NV2A_TRACE (the [GPU] reports count draws anyway). */
@@ -387,6 +384,19 @@ static void draw_primitive(void)
             }
         }
     }
+}
+
+static int s_mg_drawing;               /* merge_flush's draw: counted already */
+
+static void draw_primitive(void)
+{
+    float v[4];
+    uint32_t i;
+
+    if (!g_pb.prim || !g_pb.idx_count)
+        return;
+    if (!s_mg_drawing)
+        draw_count();
 
     s_be->draw();
     if (s_shadow)
@@ -481,6 +491,195 @@ static void draw_primitive(void)
             }
         }
     }
+}
+
+/* Draw merging (RECOMP_DRAW_MERGE; on unless it is 0). Some titles draw a
+ * level one quad at a time: Conker's It's War sends ~14,000 four-vertex fans a
+ * frame, each its own SET_BEGIN_END pair with only NOPs between them (267 runs
+ * of one state in a traced frame), and every one cost the back end a whole
+ * draw -- textures checked, inputs and indices uploaded, a D3D11 call; ~2 us,
+ * a 30 fps ceiling. So an indexed batch is held at END, and the next one joins
+ * it if nothing came between them but SET_BEGIN_END, the draw data methods
+ * and plain NOPs: the held batches become one triangle list, cut as
+ * vsh_gpu_index_list cuts each primitive (a strip's odd triangles turned
+ * round, so culling sees the batch's own winding on either path). Any other
+ * method draws what is held first (nv2a_pb_exec_method), so every triangle is
+ * drawn under the state it was recorded with, and so does the end of each
+ * walked segment (nv2a_pb_merge_flush from nv2a_pb_scan), before the executor
+ * reports progress: nothing is held while the title waits. A held batch no
+ * other joined draws as it came. A back end that draws something more per
+ * batch (the D3D11 one's cut-out depth pass) does it per title batch, from
+ * where each one's triangles end (g_pb.merge_part), so overlapping batches
+ * still see each other in the title's order. Off in a traced frame (the
+ * trace is per batch). Points and lines are not merged. RECOMP_DRAW_MERGE=2 merges in
+ * even frames only: with the picture held (photo mode) and frame dumps,
+ * neighbouring frames must then come out the same. */
+#define MERGE_SPAN_MAX 16384u  /* vertices a merged draw's inputs may span */
+static int s_mg_on = -1;
+static uint32_t s_mg_raw[NV_MAX_INDICES], s_mg_raw_n, s_mg_raw_prim;
+static uint32_t s_mg_list[NV_MAX_INDICES], s_mg_list_n;
+static uint32_t s_mg_part[NV_MAX_INDICES / 3], s_mg_nparts;  /* g_pb.merge_part */
+static uint32_t s_mg_held, s_mg_src, s_mg_lo, s_mg_hi;
+static uint32_t s_mg_keep[NV_MAX_INDICES];  /* the batch at END, across a flush */
+static unsigned long long s_mg_in, s_mg_out, s_mg_span;
+
+/* Triangles in n indices of prim; 0 for what is not merged. */
+static uint32_t merge_tris(uint32_t prim, uint32_t n)
+{
+    switch (prim) {
+    case NV_PRIM_TRIANGLES:      return n / 3;
+    case NV_PRIM_TRIANGLE_STRIP:
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:        return n >= 3 ? n - 2 : 0;
+    case NV_PRIM_QUADS:          return n / 4 * 2;
+    case NV_PRIM_QUAD_STRIP:     return n >= 4 ? (n - 2) / 2 * 2 : 0;
+    default:                     return 0;
+    }
+}
+
+/* vsh_gpu_index_list's cut, appended to s_mg_list. */
+static void merge_append(const uint32_t *x, uint32_t prim, uint32_t n)
+{
+    uint32_t i, out = s_mg_list_n, *ib = s_mg_list;
+
+#define PUT(a, b, c) do { ib[out++] = x[a]; ib[out++] = x[b];             \
+                          ib[out++] = x[c]; } while (0)
+    switch (prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) PUT(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) PUT(i, i + 2, i + 1);
+            else PUT(i, i + 1, i + 2);
+        }
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) PUT(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) {
+            PUT(i, i + 1, i + 2);
+            PUT(i, i + 2, i + 3);
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) {
+            PUT(i, i + 1, i + 3);
+            PUT(i, i + 3, i + 2);
+        }
+        break;
+    default:
+        break;
+    }
+#undef PUT
+    s_mg_list_n = out;
+    s_mg_part[s_mg_nparts++] = out;
+}
+
+/* Draw what is held, keeping the batch in g_pb (if any) as it was. */
+void nv2a_pb_merge_flush(void)
+{
+    uint32_t keep_n = g_pb.idx_count, keep_prim = g_pb.prim;
+
+    if (!s_mg_held)
+        return;
+    if (keep_n)
+        memcpy(s_mg_keep, g_pb.idx, keep_n * sizeof g_pb.idx[0]);
+    if (s_mg_held == 1) {
+        memcpy(g_pb.idx, s_mg_raw, s_mg_raw_n * sizeof g_pb.idx[0]);
+        g_pb.idx_count = s_mg_raw_n;
+        g_pb.prim = s_mg_raw_prim;
+    } else {
+        memcpy(g_pb.idx, s_mg_list, s_mg_list_n * sizeof g_pb.idx[0]);
+        g_pb.idx_count = s_mg_list_n;
+        g_pb.prim = NV_PRIM_TRIANGLES;
+        g_pb.merge_part = s_mg_part;
+        g_pb.merge_nparts = s_mg_nparts;
+        s_mg_in += s_mg_held;
+        s_mg_out++;
+    }
+    s_mg_held = 0;
+    s_mg_drawing = 1;
+    draw_primitive();
+    s_mg_drawing = 0;
+    g_pb.merge_nparts = 0;
+    g_pb.prim = keep_prim;
+    g_pb.idx_count = keep_n;
+    if (keep_n)
+        memcpy(g_pb.idx, s_mg_keep, keep_n * sizeof g_pb.idx[0]);
+}
+
+/* At END of an indexed batch: hold it (1), or draw what is held and leave
+ * this one to draw_primitive (0). */
+static int merge_take(void)
+{
+    uint32_t n = g_pb.idx_count, prim = g_pb.prim, lo = UINT32_MAX, hi = 0;
+    uint32_t i, t;
+
+    if (s_mg_on < 0) {
+        const char *e = getenv("RECOMP_DRAW_MERGE");
+        s_mg_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+    }
+    t = s_mg_on && (s_mg_on == 1 || !(g_pb.flips & 1)) && g_pb_ftrace != 2
+        && n ? merge_tris(prim, n) : 0;
+    if (!t) {
+        nv2a_pb_merge_flush();
+        return 0;
+    }
+    for (i = 0; i < n; i++) {
+        if (g_pb.idx[i] < lo) lo = g_pb.idx[i];
+        if (g_pb.idx[i] > hi) hi = g_pb.idx[i];
+    }
+    if (s_mg_held) {
+        /* Room for the triangles, and the inputs the merged draw uploads
+         * (its lowest to highest index) not much more than it uses. */
+        uint32_t have = s_mg_held == 1
+                      ? merge_tris(s_mg_raw_prim, s_mg_raw_n) * 3 : s_mg_list_n;
+        uint32_t span = (hi > s_mg_hi ? hi : s_mg_hi)
+                      - (lo < s_mg_lo ? lo : s_mg_lo) + 1;
+        if (have + t * 3 > NV_MAX_INDICES)
+            nv2a_pb_merge_flush();
+        else if (span > MERGE_SPAN_MAX || span > 4 * (s_mg_src + n) + 256) {
+            s_mg_span++;
+            nv2a_pb_merge_flush();
+        }
+    }
+    draw_count();
+    if (!s_mg_held) {
+        memcpy(s_mg_raw, g_pb.idx, n * sizeof g_pb.idx[0]);
+        s_mg_raw_n = n;
+        s_mg_raw_prim = prim;
+        s_mg_src = n;
+        s_mg_lo = lo;
+        s_mg_hi = hi;
+        s_mg_held = 1;
+        return 1;
+    }
+    if (s_mg_held == 1) {
+        s_mg_list_n = 0;
+        s_mg_nparts = 0;
+        merge_append(s_mg_raw, s_mg_raw_prim, s_mg_raw_n);
+    }
+    merge_append(g_pb.idx, prim, n);
+    s_mg_held++;
+    s_mg_src += n;
+    if (lo < s_mg_lo) s_mg_lo = lo;
+    if (hi > s_mg_hi) s_mg_hi = hi;
+    return 1;
+}
+
+/* Methods that may come between two batches merged into one draw. */
+static int merge_passes(uint32_t subch, uint32_t method, uint32_t param)
+{
+    if (method == 0x0100u)                       /* NO_OPERATION */
+        return param == 0;
+    return subch == 0 && (method == NV097_SET_BEGIN_END
+                          || method == NV097_ARRAY_ELEMENT16
+                          || method == NV097_ARRAY_ELEMENT32
+                          || method == NV097_DRAW_ARRAYS
+                          || method == NV097_INLINE_ARRAY);
 }
 
 /* Draw the vertices the title wrote straight into the pushbuffer.
@@ -1066,6 +1265,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         g_pb.min_x = g_pb.min_y = 1e30f;
         g_pb.max_x = g_pb.max_y = -1e30f;
     }
+    /* Merged batches draw before anything that is not more of the same. */
+    if (s_mg_held && !merge_passes(subch, method, param))
+        nv2a_pb_merge_flush();
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an
@@ -1267,12 +1469,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         } else {
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
-             * with INLINE_ARRAY, or indices into the title's own arrays. */
+             * with INLINE_ARRAY, or indices into the title's own arrays. The
+             * last may be held to merge with the next (merge_take). */
+            if (g_pb.imm_count || g_pb.inline_count)
+                nv2a_pb_merge_flush();
             if (g_pb.imm_count)
                 draw_immediate();
             else if (g_pb.inline_count)
                 draw_inline_array();
-            else
+            else if (!merge_take())
                 draw_primitive();
             g_pb.prim = 0;
             g_pb.inline_count = 0;
@@ -1724,6 +1929,10 @@ void nv2a_pb_exec_report(void)
                     " x %.1f..%.1f  y %.1f..%.1f\n",
             g_pb.draws, g_pb.nonzero_draws, g_pb.verts,
             g_pb.min_x, g_pb.max_x, g_pb.min_y, g_pb.max_y);
+    if (s_mg_on > 0)
+        fprintf(stderr, "[GPU] draw merge: %llu batches drawn as %llu draws"
+                " (RECOMP_DRAW_MERGE=0: off); %llu held apart by their"
+                " inputs' range%c", s_mg_in, s_mg_out, s_mg_span, 10);
     s_be->report();
     if (s_shadow)
         s_shadow->report();
