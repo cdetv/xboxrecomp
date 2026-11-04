@@ -4408,8 +4408,11 @@ static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
     D3D11_CULL_MODE mode;
     BOOL ccw;
     int i;
+    static int off = -1;
 
-    if (!g_pb.cull_enable)
+    if (off < 0)                       /* RECOMP_CULL_OFF=1: diagnosis only */
+        off = getenv("RECOMP_CULL_OFF") != NULL;
+    if (!g_pb.cull_enable || off)
         return base;
     mode = g_pb.cull_face == 0x404 ? D3D11_CULL_FRONT : D3D11_CULL_BACK;
     ccw = g_pb.front_face != 0x900;
