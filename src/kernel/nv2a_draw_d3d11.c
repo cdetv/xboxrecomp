@@ -310,6 +310,8 @@ static struct {
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
+    uint64_t rtt_px;                    /* host pixels those binds copied */
+    uint32_t rtt_rects;                 /* of them only the part read */
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
@@ -413,6 +415,223 @@ static void ct_report(void)
         last_count[i] = s_ct_count[i];
     }
     fprintf(stderr, "%c", 10);
+}
+
+/* RECOMP_GPU_TIMES=1: GPU time per frame by kind of work, and the draws
+ * that take the most, from D3D11 timestamps: one after each draw, copy,
+ * clear and effect, so the time since the one before is that step's
+ * (roughly: the GPU overlaps neighbours). Read back GT_FRAMES frames later,
+ * reported with the [GPU] lines as [GPUTIME]. For frames the graphics card
+ * makes slow: a big render size, see which draws fill the most. */
+enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_POST,
+       GT_OVERLAY, GT_N };
+static const char *const GT_NAME[GT_N] = {
+    "opaque draws", "blended draws", "surface copies", "depth reads",
+    "clears", "depth of field", "frame to screen (filters)", "menus"
+};
+#define GT_FRAMES 4
+#define GT_MARKS  4096
+#define GT_KEYS   256
+typedef struct {
+    uint32_t target, tex0, tex1, blend, cw, ch, tw, th;
+} GtKey;
+static int s_gt_on = -1;
+static struct {
+    ID3D11Query *disjoint, *ts[GT_MARKS];
+    uint8_t cat[GT_MARKS];
+    uint16_t key[GT_MARKS];
+    uint32_t n;
+    int open;
+} s_gt[GT_FRAMES];
+static int s_gt_cur;
+static GtKey s_gt_keys[GT_KEYS];
+static uint32_t s_gt_nkeys;
+static double s_gt_key_ms[GT_KEYS], s_gt_cat_ms[GT_N], s_gt_total_ms;
+static uint32_t s_gt_key_n[GT_KEYS], s_gt_frames, s_gt_lost;
+
+static int gt_on(void)
+{
+    if (s_gt_on < 0) {
+        const char *e = getenv("RECOMP_GPU_TIMES");
+        s_gt_on = e && *e && *e != '0';
+    }
+    return s_gt_on;
+}
+
+/* A timestamp now for a step of kind cat (key: GT_KEYS for none). */
+static void gt_mark(int cat, uint32_t key)
+{
+    D3D11_QUERY_DESC qd;
+    int f = s_gt_cur;
+    uint32_t i;
+
+    if (!gt_on() || !s_gt[f].open || s_gt[f].n >= GT_MARKS)
+        return;
+    i = s_gt[f].n;
+    if (!s_gt[f].ts[i]) {
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_gt[f].ts[i])))
+            return;
+    }
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_gt[f].ts[i]);
+    s_gt[f].cat[i] = (uint8_t)cat;
+    s_gt[f].key[i] = (uint16_t)key;
+    s_gt[f].n++;
+}
+
+/* The key of the draw being made: its target, first two textures, blend. */
+static uint32_t gt_draw_key(void)
+{
+    GtKey k;
+    uint32_t i;
+
+    memset(&k, 0, sizeof k);
+    k.target = g_pb.color_offset;
+    k.tex0 = g_pb.texs[0].valid ? g_pb.texs[0].offset : 0;
+    k.tex1 = g_pb.texs[1].valid ? g_pb.texs[1].offset : 0;
+    k.blend = g_pb.blend_enable
+              ? (g_pb.blend_sfactor & 0xFFFF) << 16 | (g_pb.blend_dfactor & 0xFFFF)
+              : 0;
+    k.cw = g_pb.clip_w;
+    k.ch = g_pb.clip_h;
+    k.tw = g_pb.texs[0].valid ? g_pb.texs[0].width : 0;
+    k.th = g_pb.texs[0].valid ? g_pb.texs[0].height : 0;
+    for (i = 0; i < s_gt_nkeys; i++)
+        if (!memcmp(&s_gt_keys[i], &k, sizeof k))
+            return i;
+    if (s_gt_nkeys == GT_KEYS)
+        return GT_KEYS;
+    s_gt_keys[s_gt_nkeys] = k;
+    return s_gt_nkeys++;
+}
+
+/* The frame's timestamps begin (after a present) or end (before it). */
+static void gt_frame_begin(void)
+{
+    D3D11_QUERY_DESC qd;
+    int f = s_gt_cur;
+
+    if (!gt_on() || !s_dev || s_gt[f].open)
+        return;
+    if (!s_gt[f].disjoint) {
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        qd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &s_gt[f].disjoint)))
+            return;
+    }
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_gt[f].disjoint);
+    s_gt[f].n = 0;
+    s_gt[f].open = 1;
+    gt_mark(GT_OVERLAY, GT_KEYS);       /* the start; its own time unused */
+}
+
+static void gt_frame_end(void)
+{
+    int f = s_gt_cur, old;
+    uint32_t i;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t, prev = 0;
+
+    if (!gt_on() || !s_gt[f].open)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_gt[f].disjoint);
+    s_gt[f].open = 0;
+    s_gt_cur = (f + 1) % GT_FRAMES;
+    /* The oldest frame, GT_FRAMES - 1 presents ago: read when it is done. */
+    old = s_gt_cur;
+    if (!s_gt[old].disjoint || !s_gt[old].n)
+        return;
+    /* The GPU may run that far behind (pacing lets it fall 100 ms back):
+     * waited for here, up to 200 ms, which slows only this debug mode. */
+    {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].disjoint, &dj,
+                    sizeof dj, 0)) == S_FALSE
+               && GetTickCount64() - t0 < 200)
+            SwitchToThread();
+        if (hr != S_OK || dj.Disjoint || !dj.Frequency) {
+            s_gt_lost++;
+            s_gt[old].n = 0;
+            return;
+        }
+    }
+    for (i = 0; i < s_gt[old].n; i++) {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].ts[i], &t, sizeof t,
+                    0)) == S_FALSE && GetTickCount64() - t0 < 200)
+            SwitchToThread();
+        if (hr != S_OK) {
+            s_gt_lost++;
+            break;
+        }
+        if (i) {
+            double ms = (double)(t - prev) * 1000.0 / (double)dj.Frequency;
+            uint32_t k = s_gt[old].key[i];
+            s_gt_cat_ms[s_gt[old].cat[i]] += ms;
+            s_gt_total_ms += ms;
+            if (k < GT_KEYS) {
+                s_gt_key_ms[k] += ms;
+                s_gt_key_n[k]++;
+            }
+        }
+        prev = t;
+    }
+    s_gt[old].n = 0;
+    s_gt_frames++;
+}
+
+static void gt_report(void)
+{
+    uint32_t i, j, top[12], ntop = 0;
+    double f;
+
+    if (s_gt_on <= 0 || !s_gt_frames)
+        return;
+    f = (double)s_gt_frames;
+    fprintf(stderr, "[GPUTIME] %u frames: %.2f ms a frame on the GPU:",
+            s_gt_frames, s_gt_total_ms / f);
+    for (i = 0; i < GT_N; i++)
+        fprintf(stderr, " %s %.2f;", GT_NAME[i], s_gt_cat_ms[i] / f);
+    fprintf(stderr, " (%u frames not read)%c", s_gt_lost, 10);
+    /* The draws that took the most. */
+    for (j = 0; j < 12; j++) {
+        int best = -1;
+        for (i = 0; i < s_gt_nkeys; i++) {
+            uint32_t q;
+            for (q = 0; q < ntop && top[q] != i; q++)
+                ;
+            if (q == ntop && (best < 0 || s_gt_key_ms[i] > s_gt_key_ms[best]))
+                best = (int)i;
+        }
+        if (best < 0 || s_gt_key_ms[best] / f < 0.05)
+            break;
+        top[ntop++] = (uint32_t)best;
+        fprintf(stderr, "[GPUTIME]   %.2f ms a frame, %.1f draws: target %08X"
+                " clip %ux%u, tex0 %08X %ux%u, tex1 %08X, blend %08X%c",
+                s_gt_key_ms[best] / f, s_gt_key_n[best] / f,
+                s_gt_keys[best].target, s_gt_keys[best].cw,
+                s_gt_keys[best].ch, s_gt_keys[best].tex0, s_gt_keys[best].tw,
+                s_gt_keys[best].th, s_gt_keys[best].tex1,
+                s_gt_keys[best].blend, 10);
+    }
+    memset(s_gt_cat_ms, 0, sizeof s_gt_cat_ms);
+    memset(s_gt_key_ms, 0, sizeof s_gt_key_ms);
+    memset(s_gt_key_n, 0, sizeof s_gt_key_n);
+    s_gt_total_ms = 0.0;
+    s_gt_frames = 0;
+    s_gt_lost = 0;
+    if (s_gt_nkeys > GT_KEYS * 3 / 4) {
+        /* Start the table over; frames still in flight point into it. */
+        for (i = 0; i < GT_FRAMES; i++)
+            if (!s_gt[i].open)
+                s_gt[i].n = 0;
+        s_gt_nkeys = 0;
+    }
 }
 
 static void fail(const char *what, HRESULT hr)
@@ -1126,6 +1345,8 @@ static void d3d_clear(uint32_t param)
     r.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(i));
     ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)s_surf[i].rtv, c,
                                    &r, 1);
+    gt_frame_begin();
+    gt_mark(GT_CLEAR, GT_KEYS);
     s_stat.clears++;
     note_shown(i);
 }
@@ -1942,6 +2163,193 @@ static struct {
 } s_rtt[4][RTT_SIZES];
 static uint32_t s_rtt_tick;
 
+/* RECOMP_RTT_LOG=1: the surface copies of each report by kind (copy size,
+ * the stage's program mode, how the batch's vertices were made and how many
+ * indices it has, whether it reads the surface it draws into), so the ones
+ * that cost the most at a big render size show. s_rtt_vk / s_rtt_n: the
+ * batch being drawn, set by d3d_draw. */
+#define RTT_KINDS 24
+static int s_rtt_log = -1;
+static char s_rtt_vk = '-';
+static uint32_t s_rtt_n;
+static struct {
+    uint32_t tw, th, gw, gh, m, n;
+    char vk, self;
+    uint32_t count;
+    uint64_t px;
+} s_rtt_kind[RTT_KINDS];
+static int s_rtt_nkinds;
+static uint32_t s_rtt_kind_other;
+
+static void rtt_kind_note(int st, int i, uint32_t tw, uint32_t th,
+                          uint64_t px)
+{
+    const Texture *t = &g_pb.texs[st];
+    uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
+    uint32_t n = s_rtt_n <= 6 ? 6 : s_rtt_n <= 64 ? 64 : 65;
+    char self = (s_surf[i].addr & 0x0FFFFFFFu)
+                == (g_pb.color_offset & 0x0FFFFFFFu) ? 'y' : 'n';
+    int k;
+
+    if (s_rtt_log < 0) {
+        const char *e = getenv("RECOMP_RTT_LOG");
+        s_rtt_log = e && *e && *e != '0';
+    }
+    if (!s_rtt_log)
+        return;
+    for (k = 0; k < s_rtt_nkinds; k++)
+        if (s_rtt_kind[k].tw == tw && s_rtt_kind[k].th == th
+            && s_rtt_kind[k].gw == t->width && s_rtt_kind[k].gh == t->height
+            && s_rtt_kind[k].m == m && s_rtt_kind[k].n == n
+            && s_rtt_kind[k].vk == s_rtt_vk && s_rtt_kind[k].self == self)
+            break;
+    if (k == s_rtt_nkinds) {
+        if (k == RTT_KINDS) {
+            s_rtt_kind_other++;
+            return;
+        }
+        memset(&s_rtt_kind[k], 0, sizeof s_rtt_kind[k]);
+        s_rtt_kind[k].tw = tw;
+        s_rtt_kind[k].th = th;
+        s_rtt_kind[k].gw = t->width;
+        s_rtt_kind[k].gh = t->height;
+        s_rtt_kind[k].m = m;
+        s_rtt_kind[k].n = n;
+        s_rtt_kind[k].vk = s_rtt_vk;
+        s_rtt_kind[k].self = self;
+        s_rtt_nkinds++;
+    }
+    s_rtt_kind[k].count++;
+    s_rtt_kind[k].px += px;
+}
+
+static void rtt_kind_report(uint32_t flips)
+{
+    int k;
+    if (s_rtt_log <= 0 || !flips)
+        return;
+    for (k = 0; k < s_rtt_nkinds; k++)
+        fprintf(stderr, "[RTT] copy %ux%u (texture %ux%u) mode %u, %c verts,"
+                " %s%u indices, reads its own target %c: %.1f a frame,"
+                " %.1f Mpx a frame%c", s_rtt_kind[k].tw, s_rtt_kind[k].th,
+                s_rtt_kind[k].gw, s_rtt_kind[k].gh, s_rtt_kind[k].m,
+                s_rtt_kind[k].vk, s_rtt_kind[k].n > 64 ? ">" : "<=",
+                s_rtt_kind[k].n > 64 ? 64 : s_rtt_kind[k].n,
+                s_rtt_kind[k].self, (double)s_rtt_kind[k].count / flips,
+                (double)s_rtt_kind[k].px / flips / 1e6, 10);
+    if (s_rtt_kind_other)
+        fprintf(stderr, "[RTT] +%u copies of further kinds%c",
+                s_rtt_kind_other, 10);
+    s_rtt_nkinds = 0;
+    s_rtt_kind_other = 0;
+}
+
+/* RECOMP_RTT_RECT (on; =0 off, =2 on even frames only, for the held-picture
+ * check as RECOMP_DRAW_MERGE=2): a surface copy covers only what the batch
+ * can sample, from its vertices' texture coordinates, instead of the whole
+ * texture. It's War's beach reads the frame ~80 times a frame (rain
+ * ripples, drops on the screen: small bump-env sprites), and at 200 % of
+ * 1080p each whole copy was 3840x2160. The rest of the copy keeps what it
+ * held, which nothing samples. s_rtt_verts / s_rtt_path: the batch's
+ * vertices (NULL: on the GPU, transformed here when the batch is small)
+ * and path, set by d3d_draw. */
+#define RTT_RECT_VERTS 64
+static int s_rr_on = -1;
+static const Nv2aVshOutput *s_rtt_verts;
+static int s_rtt_path;
+
+/* The copy rectangle [*x0, *x1) x [*y0, *y1) of a w x h copy (tw x th the
+ * texture's whole host size) that stage st reads; 0 when not known. */
+static int rtt_read_rect(int st, uint32_t tw, uint32_t th, uint32_t w,
+                         uint32_t h, uint32_t *x0, uint32_t *y0,
+                         uint32_t *x1, uint32_t *y1, float sx, float sy)
+{
+    const Texture *t = &g_pb.texs[st];
+    const Nv2aVshOutput *v = s_rtt_verts;
+    uint32_t n = s_rtt_n, i, m = 0;
+    float kx, ky, u0 = 3e38f, v0 = 3e38f, u1 = -3e38f, v1 = -3e38f;
+    float mu = 0.0f, mv = 0.0f, q0 = 0.0f;
+    int proj = 0, pos = 0, neg = 0, zero = 0;
+    double hx0, hy0, hx1, hy1, pad_x, pad_y;
+
+    if (s_rr_on < 0) {
+        const char *e = getenv("RECOMP_RTT_RECT");
+        s_rr_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+    }
+    if (!s_rr_on || (s_rr_on == 2 && (g_pb.flips & 1)) || !n)
+        return 0;
+    if (!v && s_rtt_vk == 'G' && n <= RTT_RECT_VERTS)
+        v = s_rtt_verts = pb_transform_batch();
+    if (!v)
+        return 0;
+    /* Where stage_fetch / texel (the HLSL) take the coordinates from. */
+    if (s_rtt_path == PATH_COMBINERS) {
+        m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
+        if (m == 1 || m == 2)
+            proj = 1;                   /* xy / q */
+        else if ((m == 6 || m == 7) && st > 0) {
+            /* xy + bump_mat x (du, dv), |du|, |dv| <= 128/127 (sign3) */
+            mu = (fabsf(t->bump_mat[0]) + fabsf(t->bump_mat[2])) * 1.008f;
+            mv = (fabsf(t->bump_mat[1]) + fabsf(t->bump_mat[3])) * 1.008f;
+        } else if (m != 3)
+            return 0;
+    } else if (st != 0)
+        return 0;
+    for (i = 0; i < n; i++) {
+        float s = v[i].tex[st][0], u = v[i].tex[st][1], q = v[i].tex[st][3];
+        if (proj) {
+            if (q > 0.0f) pos = 1;
+            else if (q < 0.0f) neg = 1;
+            else zero = 1;
+            if (i == 0)
+                q0 = q;
+            if (q != 0.0f) {
+                s /= q;
+                u /= q;
+            }
+        }
+        if (!(fabsf(s) < 1e30f) || !(fabsf(u) < 1e30f))
+            return 0;
+        if (s < u0) u0 = s;
+        if (s > u1) u1 = s;
+        if (u < v0) v0 = u;
+        if (u > v1) v1 = u;
+    }
+    /* Projective: the pixels' s/q lie between the vertices' only when every
+     * q has one sign (or all are 0: q = 1 everywhere). */
+    if (proj && (pos + neg + zero > 1 || (neg && q0 == 0.0f)))
+        return 0;
+    kx = tex_size_from_format(t->color) ? 1.0f : 1.0f / (float)t->width;
+    ky = tex_size_from_format(t->color) ? 1.0f : 1.0f / (float)t->height;
+    /* Host pixels; a bilinear tap reaches one past the coordinate, and a
+     * guest texel of slack for the GPU's own vertex maths. */
+    pad_x = 2.0 + sx;
+    pad_y = 2.0 + sy;
+    hx0 = floor(((double)u0 - mu) * kx * tw - pad_x);
+    hx1 = ceil(((double)u1 + mu) * kx * tw + pad_x);
+    hy0 = floor(((double)v0 - mv) * ky * th - pad_y);
+    hy1 = ceil(((double)v1 + mv) * ky * th + pad_y);
+    /* Wrap and mirror bring in the other side: only when wholly inside. */
+    if ((t->addr_u == 1 || t->addr_u == 2) && (hx0 < 0.0 || hx1 > (double)tw))
+        return 0;
+    if ((t->addr_v == 1 || t->addr_v == 2) && (hy0 < 0.0 || hy1 > (double)th))
+        return 0;
+    /* Clamped: past an edge reads the edge. */
+    if (hx0 > (double)w - 1.0) hx0 = (double)w - 1.0;
+    if (hy0 > (double)h - 1.0) hy0 = (double)h - 1.0;
+    if (hx0 < 0.0) hx0 = 0.0;
+    if (hy0 < 0.0) hy0 = 0.0;
+    if (hx1 > (double)w) hx1 = (double)w;
+    if (hy1 > (double)h) hy1 = (double)h;
+    if (hx1 < hx0 + 1.0) hx1 = hx0 + 1.0;
+    if (hy1 < hy0 + 1.0) hy1 = hy0 + 1.0;
+    *x0 = (uint32_t)hx0;
+    *y0 = (uint32_t)hy0;
+    *x1 = (uint32_t)hx1;
+    *y1 = (uint32_t)hy1;
+    return 1;
+}
+
 /* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
  * or -1 when that reading is not handled. */
 static int rtt_reading(uint32_t fmt, uint32_t bpp)
@@ -2072,18 +2480,34 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
         s_stat.rtt_made++;
     }
     s_rtt[st][c].used = ++s_rtt_tick;
-    /* What the surface has of the texture's rectangle; past its edge the
-     * copy keeps whatever it held. */
+    /* What the surface has of the texture's rectangle, or of the part the
+     * batch reads (rtt_read_rect); past it the copy keeps whatever it
+     * held. */
     box.left = 0; box.top = 0; box.front = 0;
     box.right = tw < s_surf[i].tw ? tw : s_surf[i].tw;
     box.bottom = th < s_surf[i].th ? th : s_surf[i].th;
     box.back = 1;
+    {
+        uint32_t x0, y0, x1, y1;
+        if (rtt_read_rect(st, tw, th, box.right, box.bottom, &x0, &y0, &x1,
+                          &y1, surf_sx(i), surf_sy(i))) {
+            box.left = x0;
+            box.top = y0;
+            box.right = x1;
+            box.bottom = y1;
+            s_stat.rtt_rects++;
+        }
+    }
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-            (ID3D11Resource *)s_rtt[st][c].tex, 0, 0, 0, 0,
+            (ID3D11Resource *)s_rtt[st][c].tex, 0, box.left, box.top, 0,
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
+    gt_mark(GT_COPY, GT_KEYS);
     *flags = (uint32_t)r;
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
+    s_stat.rtt_px += (uint64_t)(box.right - box.left) * (box.bottom - box.top);
+    rtt_kind_note(st, i, tw, th,
+                  (uint64_t)(box.right - box.left) * (box.bottom - box.top));
     s_rtt_slot = i;
     return s_rtt[st][c].srv;
 }
@@ -2287,6 +2711,7 @@ static ID3D11ShaderResourceView *texture_from_zeta(int st)
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    gt_mark(GT_ZCOPY, GT_KEYS);
     /* Unbound again, so the depth buffer can be a target once more and the
      * copy can be read: D3D drops a shader view of a bound target. */
     srv[0] = srv[1] = NULL;
@@ -4074,7 +4499,11 @@ static void d3d_draw(void)
         uint64_t ct0;
         if (!gvs)
             mark_unclipped(verts, n);
+        s_rtt_vk = gvs ? 'G' : program ? 'C' : 'F';
+        s_rtt_n = n;
+        s_rtt_verts = gvs ? verts : program ? verts : s_bv;
         path = combiners ? PATH_COMBINERS : PATH_MODULATE;
+        s_rtt_path = path;
         ct0 = ct_now();
         for (st = 0; st < 4; st++) {
             uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
@@ -4148,6 +4577,10 @@ static void d3d_draw(void)
         }
         path = PATH_FLAT;
         if (textured) {
+            s_rtt_vk = 'R';
+            s_rtt_n = n;
+            s_rtt_verts = s_bv;
+            s_rtt_path = PATH_FLAT;
             srv[0] = texture_stage(0, &rtt, 0);
             samp[0] = srv[0] && !(rtt & TEX_CUBE) ? sampler_stage(0, 0) : NULL;
             if (samp[0]) {
@@ -4528,6 +4961,10 @@ static void d3d_draw(void)
     }
     if (cut >= 0)
         cutout_depth(&k, cut, nidx);
+    if (gt_on()) {
+        gt_frame_begin();
+        gt_mark(g_pb.blend_enable ? GT_BLEND : GT_OPAQUE, gt_draw_key());
+    }
     if (zi >= 0)
         s_stat.zeta_draws++;
     /* Unbound again, so a later batch may draw into a texture this one
@@ -5089,11 +5526,15 @@ static void d3d_present(void)
                 break;
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
+            gt_frame_begin();
             shown_to_back();
+            gt_mark(GT_POST, GT_KEYS);
             dump_back(seq);
             seq = -1;                   /* not again for a held frame */
             hold = overlay
                  ? overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h) : 0;
+            gt_mark(GT_OVERLAY, GT_KEYS);
+            gt_frame_end();
             /* The title paces itself on the vblank the kernel emulates;
              * whether the present also waits for the monitor is VSync's
              * (vsync_d3d11.c). */
@@ -5157,8 +5598,16 @@ static void d3d_report(void)
             s_stat.cube_binds, s_stat.cube_drawn, 10);
     fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
             " surface (%u copy textures made), %u of a surface in a reading"
-            " not handled (guest memory used)%c", s_stat.rtt_binds,
-            s_stat.rtt_made, s_stat.rtt_unhandled, 10);
+            " not handled (guest memory used); %.0f Mpx copied, %u copies"
+            " of only the part read%c", s_stat.rtt_binds, s_stat.rtt_made,
+            s_stat.rtt_unhandled, (double)s_stat.rtt_px / 1e6,
+            s_stat.rtt_rects, 10);
+    {
+        static uint32_t last_presents;
+        rtt_kind_report(s_stat.presents - last_presents);
+        last_presents = s_stat.presents;
+    }
+    gt_report();
     fprintf(stderr, "[GPU] d3d11: depth/stencil: %u buffers made, %u clears,"
             " %u batches drawn with them, %u on a surface too big for them"
             " (drawn without); %u reads as a texture, %u in a reading not"
@@ -5400,6 +5849,7 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
         return;
     }
     s_stat.dof_drawn++;
+    gt_mark(GT_DOF, GT_KEYS);
     if (g_pb_ftrace == 2)
         fprintf(stderr, "[FTRACE]     host depth of field on %08X, %ux%u%c",
                 s_surf[si].addr, g_pb.clip_w, g_pb.clip_h, 10);
