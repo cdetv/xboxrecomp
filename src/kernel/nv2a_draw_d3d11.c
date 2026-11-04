@@ -12,7 +12,8 @@
  * texture per guest colour surface. Step 2: batches -- vertices still
  * transformed on the CPU by the software path's interpreter, pixels on the
  * GPU with four texture stages, the register combiners (one general shader
- * that reads them from a constant buffer), alpha test, fog, blend and colour
+ * that reads them from a constant buffer, and one per setup once compiled:
+ * ps_spec), alpha test, fog, blend and colour
  * mask. Step 3: a texture that is a GPU surface is sampled from the GPU
  * (render to texture); depth and stencil buffers on the GPU, read back as
  * textures there too; near-plane clipping on the CPU. Not yet: mip levels.
@@ -1420,8 +1421,9 @@ static ID3D11SamplerState *s_bsamp;
  * appeared, 2026-10-30). The bytecode is kept beside the vertex-program
  * shaders (RECOMP_VSH_GPU_CACHE) as <key>.cso, key = hash of the source,
  * entry, target and flags, so it compiles once per machine. Unset: no cache. */
-static FILE *shader_file(const char *entry, const char *target,
-                         const char *mode, char *path, size_t cap)
+static FILE *shader_file(const char *src, const char *entry,
+                         const char *target, const char *mode, char *path,
+                         size_t cap)
 {
     const char *dir = getenv("RECOMP_VSH_GPU_CACHE");
     uint64_t h = 0xCBF29CE484222325ull;
@@ -1432,7 +1434,7 @@ static FILE *shader_file(const char *entry, const char *target,
 
     if (!dir || !dir[0] || !strcmp(dir, "0") || strlen(dir) > MAX_PATH)
         return NULL;
-    parts[0] = s_hlsl;
+    parts[0] = src;
     parts[1] = entry;
     parts[2] = target;
     for (p = 0; p < 3; p++)
@@ -1446,13 +1448,19 @@ static FILE *shader_file(const char *entry, const char *target,
     return f;
 }
 
-static ID3DBlob *compile(const char *entry, const char *target)
+/* src compiled (or loaded from the cache); *loaded (may be NULL) says it
+ * came from the cache. quiet: no line for a compile that worked. */
+static ID3DBlob *compile_src(const char *src, const char *entry,
+                             const char *target, int quiet, int *loaded)
 {
     ID3DBlob *code = NULL, *err = NULL;
     char path[MAX_PATH + 32] = "", tmp[MAX_PATH + 48];
     LARGE_INTEGER t0, t1, fq;
-    FILE *f = shader_file(entry, target, "rb", path, sizeof path);
+    FILE *f = shader_file(src, entry, target, "rb", path, sizeof path);
     HRESULT hr;
+
+    if (loaded)
+        *loaded = 0;
 
     if (f) {
         long n;
@@ -1466,11 +1474,14 @@ static ID3DBlob *compile(const char *entry, const char *target)
             code = NULL;
         }
         fclose(f);
-        if (code)
+        if (code) {
+            if (loaded)
+                *loaded = 1;
             return code;
+        }
     }
     QueryPerformanceCounter(&t0);
-    hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "nv2a_draw_d3d11",
+    hr = D3DCompile(src, strlen(src), "nv2a_draw_d3d11",
                     NULL, NULL, entry, target,
                     D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
     QueryPerformanceCounter(&t1);
@@ -1481,8 +1492,10 @@ static ID3DBlob *compile(const char *entry, const char *target)
         if (code) ID3D10Blob_Release(code);
         code = NULL;
     } else {
-        fprintf(stderr, "[GPU] d3d11: shader %s compiled in %.0f ms%c", entry,
-                (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart, 10);
+        if (!quiet)
+            fprintf(stderr, "[GPU] d3d11: shader %s compiled in %.0f ms%c",
+                    entry, (double)(t1.QuadPart - t0.QuadPart) * 1000.0
+                           / fq.QuadPart, 10);
         /* Written beside its name and renamed, so a run that stops halfway
          * never leaves a short file to be loaded next time. */
         if (path[0]) {
@@ -1499,6 +1512,204 @@ static ID3DBlob *compile(const char *entry, const char *target)
     if (err)
         ID3D10Blob_Release(err);
     return code;
+}
+
+static ID3DBlob *compile(const char *entry, const char *target)
+{
+    return compile_src(s_hlsl, entry, target, 0, NULL);
+}
+
+/* RECOMP_PS_SPEC (on; =0 off, =2 on even frames only, for the held-picture
+ * check as RECOMP_DRAW_MERGE=2): a pixel shader per combiner setup. The
+ * one combiner shader reads the setup from the constant buffer, so every
+ * pixel walks up to eight stages through switches on the register numbers:
+ * ~3700 instruction slots. At a big render size that is the GPU's limit
+ * (It's War's beach at 200 % of 1080p: 22.6 ms a frame, 2026-11-04). The
+ * same source with one setup's words defined as literals (the K_ macros at
+ * its top) folds down to what that setup does: the beach's water quad, 75
+ * slots. Compiled on a worker thread, ~70 ms each, and kept in the shader
+ * cache with the others; a batch draws with the one shader until its own is
+ * ready. Values (factors, fog, texture flags, alpha test) stay in the
+ * constant buffer, so one shader serves every draw of its setup. */
+typedef struct {
+    uint32_t bound, prog, clip, ctrl, fin[2], icw[8][4];
+} PsKey;
+
+#define PS_SPEC_MAX 2048                /* setups kept; past it, the one shader */
+typedef struct {
+    PsKey key;
+    uint64_t h;
+    volatile LONG state;                /* PS_* */
+    ID3D11PixelShader *ps;
+} PsSpec;
+enum { PS_EMPTY, PS_QUEUED, PS_READY, PS_FAILED };
+
+static PsSpec s_pss[PS_SPEC_MAX];
+static uint32_t s_pss_n;
+static int s_pss_on = -1;
+static CRITICAL_SECTION s_pss_cs;
+static CONDITION_VARIABLE s_pss_cv;
+static uint32_t s_pss_q[PS_SPEC_MAX], s_pss_qh, s_pss_qt;  /* under s_pss_cs */
+static volatile LONG s_pss_compiled, s_pss_loaded, s_pss_failed;
+static volatile LONG64 s_pss_us;        /* compile time, microseconds */
+static uint64_t s_pss_draws, s_pss_waits;  /* drawn with their own, not yet */
+
+/* The setup the shader branches on, as the K_ macros read it from k; words
+ * no stage of this setup reads are left 0, so they do not split setups. */
+static void ps_key(const GpuConsts *k, PsKey *o)
+{
+    uint32_t n = k->stage[2] & 0xFF, s, st, clip = 0;
+
+    memset(o, 0, sizeof *o);
+    o->bound = k->mode[1];
+    o->prog = k->stage[0];
+    o->ctrl = k->stage[2];
+    o->fin[0] = k->fin[0];
+    o->fin[1] = k->fin[1];
+    for (s = 0; s < n && s < 8; s++)
+        memcpy(o->icw[s], k->icw[s], sizeof o->icw[s]);
+    for (st = 0; st < 4; st++)
+        if (((k->stage[0] >> (st * 5)) & 31) == 5)
+            clip = 1;
+    o->clip = clip ? k->stage[1] : 0;
+}
+
+/* The source for one setup: the K_ macros as its literals, then s_hlsl. */
+static char *ps_spec_source(const PsKey *k)
+{
+    size_t n = sizeof s_hlsl + 1024;
+    char *src = (char *)malloc(n);
+    int at, s;
+
+    if (!src)
+        return NULL;
+    at = snprintf(src, n,
+                  "#define PS_SPEC\n#define K_PATH 2u\n#define K_BOUND 0x%Xu\n"
+                  "#define K_PROG 0x%Xu\n#define K_CLIP 0x%Xu\n"
+                  "#define K_CTRL 0x%Xu\n#define K_FIN uint2(0x%Xu, 0x%Xu)\n"
+                  "#define K_LOOP [unroll]\n#define K_ICW(s) k_icw[s]\n"
+                  "static const uint4 k_icw[8] = {", k->bound, k->prog,
+                  k->clip, k->ctrl, k->fin[0], k->fin[1]);
+    for (s = 0; s < 8; s++)
+        at += snprintf(src + at, n - at, "%suint4(0x%Xu, 0x%Xu, 0x%Xu, 0x%Xu)",
+                       s ? ", " : "", k->icw[s][0], k->icw[s][1],
+                       k->icw[s][2], k->icw[s][3]);
+    at += snprintf(src + at, n - at, "};\n");
+    memcpy(src + at, s_hlsl, sizeof s_hlsl);
+    return src;
+}
+
+static DWORD WINAPI ps_spec_worker(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        PsSpec *e;
+        char *src;
+        ID3DBlob *code;
+        LARGE_INTEGER t0, t1, fq;
+        int loaded = 0;
+
+        EnterCriticalSection(&s_pss_cs);
+        while (s_pss_qh == s_pss_qt)
+            SleepConditionVariableCS(&s_pss_cv, &s_pss_cs, INFINITE);
+        e = &s_pss[s_pss_q[s_pss_qh++ % PS_SPEC_MAX]];
+        LeaveCriticalSection(&s_pss_cs);
+        QueryPerformanceCounter(&t0);
+        src = ps_spec_source(&e->key);
+        code = src ? compile_src(src, "ps", "ps_4_0", 1, &loaded) : NULL;
+        free(src);
+        if (code && FAILED(ID3D11Device_CreatePixelShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(code),
+                    ID3D10Blob_GetBufferSize(code), NULL, &e->ps)))
+            e->ps = NULL;
+        if (code)
+            ID3D10Blob_Release(code);
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&fq);
+        InterlockedAdd64(&s_pss_us, (LONG64)((t1.QuadPart - t0.QuadPart)
+                                             * 1000000 / fq.QuadPart));
+        InterlockedIncrement(e->ps ? (loaded ? &s_pss_loaded : &s_pss_compiled)
+                                   : &s_pss_failed);
+        InterlockedExchange(&e->state, e->ps ? PS_READY : PS_FAILED);
+    }
+}
+
+/* The pixel shader of k's setup when it is ready; NULL: the one shader
+ * (off, not compiled yet, failed, table full). Executor thread only. */
+static ID3D11PixelShader *ps_spec(const GpuConsts *k)
+{
+    static PsSpec *last;
+    PsKey key;
+    uint64_t h = 0xCBF29CE484222325ull;
+    const uint8_t *b = (const uint8_t *)&key;
+    uint32_t i, at;
+    PsSpec *e;
+
+    if (s_pss_on < 0) {
+        const char *v = getenv("RECOMP_PS_SPEC");
+        int t, want = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) / 4;
+        s_pss_on = !(v && v[0] == '0') ? 1 + (v && v[0] == '2') : 0;
+        if (s_pss_on) {
+            InitializeCriticalSection(&s_pss_cs);
+            InitializeConditionVariable(&s_pss_cv);
+            if (want < 1) want = 1;
+            if (want > 4) want = 4;
+            for (t = 0; t < want; t++) {
+                HANDLE th = CreateThread(NULL, 0, ps_spec_worker, NULL, 0, NULL);
+                if (!th)
+                    break;
+                SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
+                CloseHandle(th);
+            }
+            if (!t)
+                s_pss_on = 0;
+            fprintf(stderr, "[GPU] d3d11: a pixel shader per combiner setup"
+                    " (RECOMP_PS_SPEC=%d), %d compile thread%s%c", s_pss_on,
+                    t, t == 1 ? "" : "s", 10);
+        }
+    }
+    if (!s_pss_on || k->mode[0] != PATH_COMBINERS
+        || (s_pss_on == 2 && (g_pb.flips & 1)))
+        return NULL;
+    ps_key(k, &key);
+    if (last && !memcmp(&last->key, &key, sizeof key)) {
+        e = last;
+    } else {
+        for (i = 0; i < sizeof key; i++)
+            h = (h ^ b[i]) * 0x100000001B3ull;
+        e = NULL;
+        for (i = 0, at = (uint32_t)h % PS_SPEC_MAX; i < PS_SPEC_MAX;
+             i++, at = (at + 1) % PS_SPEC_MAX) {
+            if (s_pss[at].state == PS_EMPTY)
+                break;
+            if (s_pss[at].h == h && !memcmp(&s_pss[at].key, &key, sizeof key)) {
+                e = &s_pss[at];
+                break;
+            }
+        }
+        if (!e) {
+            /* New: queued for a worker; the table stays half empty at most
+             * so a probe always ends. */
+            if (i == PS_SPEC_MAX || s_pss_n >= PS_SPEC_MAX / 2)
+                return NULL;
+            e = &s_pss[at];
+            e->key = key;
+            e->h = h;
+            e->state = PS_QUEUED;
+            s_pss_n++;
+            EnterCriticalSection(&s_pss_cs);
+            s_pss_q[s_pss_qt++ % PS_SPEC_MAX] = at;
+            LeaveCriticalSection(&s_pss_cs);
+            WakeConditionVariable(&s_pss_cv);
+        }
+        last = e;
+    }
+    if (e->state != PS_READY) {
+        s_pss_waits++;
+        return NULL;
+    }
+    s_pss_draws++;
+    return e->ps;
 }
 
 /* The fixed pipeline objects. 0 when they cannot be made; batches are then
@@ -4911,7 +5122,10 @@ static void d3d_draw(void)
                                          DXGI_FORMAT_R32_UINT, ib_offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    {
+        ID3D11PixelShader *sp = ps_spec(&k);
+        ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
+    }
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, vsrv);
@@ -5618,6 +5832,14 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: cut-out depth (RECOMP_CUTOUT_DEPTH):"
                 " %u blended batches drawn again into depth%c",
                 s_stat.cutout_draws, 10);
+    if (s_pss_on > 0)
+        fprintf(stderr, "[GPU] d3d11: combiner setups (RECOMP_PS_SPEC): %u"
+                " seen, %ld compiled, %ld from the cache, %ld failed, %.1f s"
+                " of compile threads; batches %llu with their own shader,"
+                " %llu with the one (theirs not ready)%c", s_pss_n,
+                s_pss_compiled, s_pss_loaded, s_pss_failed,
+                (double)s_pss_us / 1e6, (unsigned long long)s_pss_draws,
+                (unsigned long long)s_pss_waits, 10);
     if (s_stat.dof_drawn || s_stat.dof_skipped)
         fprintf(stderr, "[GPU] d3d11: host depth of field: %u drawn, %u not"
                 " (no surface, depth buffer or shaders)%c", s_stat.dof_drawn,
