@@ -1776,9 +1776,10 @@ static ID3D11DepthStencilState *ds_state(void)
  * from guest memory only: faces the GPU drew (a title rendering its own
  * reflections) would read stale; logged once per address. Only level 0 is
  * hashed: a title that rewrote a smaller level alone would keep the old one.
- * ponytail: the bytes are hashed at every bind, which is a full read of the
- * texture per batch; a dirty-page scheme would avoid it.
- * That hash also names replacement textures (tex_replace.h): when new bytes
+ * ponytail: the bytes are hashed once a flip (hash_fast), a full read of
+ * every bound texture per frame; a dirty-page scheme would avoid it.
+ * hash_bytes of the same bytes names replacement textures (tex_replace.h),
+ * taken only for new or changed bytes: when new bytes
  * match a PNG in RECOMP_TEX_REPLACE, the PNG goes up instead, at its own size
  * (replaced_tex); 2D textures only. */
 
@@ -1864,6 +1865,32 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     for (; i < n; i++)
         h = (h ^ p[i]) * 0x100000001B3ull;
     return h;
+}
+
+/* The texture cache's change check (GpuTexture.hash): hash_bytes' mixing in
+ * four independent lanes, 32 bytes a round, so the CPU runs them side by
+ * side. hash_bytes is one chain (~6 cycles per 8 bytes) and was ~17% of the
+ * executor at 120 fps in Conker's first field (2026-11-03). Replacement
+ * names (tex_replace.h) stay hash_bytes: they are on disk. */
+static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
+{
+    uint64_t a = h, b = h ^ 0x9E3779B97F4A7C15ull;
+    uint64_t c = h ^ 0xC2B2AE3D27D4EB4Full, d = h ^ 0x165667B19E3779F9ull;
+    size_t i;
+    for (i = 0; i + 32 <= n; i += 32) {
+        uint64_t w0, w1, w2, w3;
+        memcpy(&w0, p + i, 8);
+        memcpy(&w1, p + i + 8, 8);
+        memcpy(&w2, p + i + 16, 8);
+        memcpy(&w3, p + i + 24, 8);
+        a = (a ^ w0) * 0x100000001B3ull; a ^= a >> 29;
+        b = (b ^ w1) * 0x100000001B3ull; b ^= b >> 29;
+        c = (c ^ w2) * 0x100000001B3ull; c ^= c >> 29;
+        d = (d ^ w3) * 0x100000001B3ull; d ^= d >> 29;
+    }
+    h = (a ^ b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full)
+        ^ (d * 0x165667B19E3779F9ull) ^ (uint64_t)n;
+    return hash_bytes(p + i, n - i, h);
 }
 
 /* ── Render to texture ─────────────────────────────────────────────────────
@@ -2540,9 +2567,9 @@ guest:
      * (~15,000 batches a frame, 2026-10-20). */
     if (!cube)
         note_stale_read(st, bytes);
-    hash = hash_bytes(mem + t->offset, bytes, 0xCBF29CE484222325ull);
+    hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
-        hash = hash_bytes(mem + palette, 256 * 4, hash);
+        hash = hash_fast(mem + palette, 256 * 4, hash);
     if (e && e->hash == hash) {
         e->hashed_flip = g_pb.flips;
         e->used = s_tex_tick;
@@ -2554,9 +2581,13 @@ guest:
     if (d3 == 1 && !cube && tex_replace_active()) {
         uint32_t rw, rh;
         const uint32_t *px;
-        if (tex_replace_dumping() && tex_replace_dump_new(hash))
-            dump_guest_tex(t, hash);
-        px = tex_replace_find(hash, &rw, &rh);
+        uint64_t name = hash_bytes(mem + t->offset, bytes,
+                                   0xCBF29CE484222325ull);
+        if (palette)
+            name = hash_bytes(mem + palette, 256 * 4, name);
+        if (tex_replace_dumping() && tex_replace_dump_new(name))
+            dump_guest_tex(t, name);
+        px = tex_replace_find(name, &rw, &rh);
         if (px)
             return replaced_tex(st, t, e, hash, palette, lv, px, rw, rh);
     }
