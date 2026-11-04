@@ -101,6 +101,11 @@ typedef struct Nv2aPbState {
     uint32_t   idx[NV_MAX_INDICES];
     uint32_t   idx_count;
     uint32_t   idx_dropped;             /* indices past NV_MAX_INDICES */
+    /* A merged batch (nv2a_pb_exec.c, draw merging): idx is a triangle list
+     * of merge_nparts title batches, batch p's triangles ending at index
+     * merge_part[p]. merge_nparts is 0 for any other batch. */
+    const uint32_t *merge_part;
+    uint32_t   merge_nparts;
     /* INLINE_ARRAY payload: vertices written straight into the pushbuffer
      * instead of into a buffer the title points at. Same vertex format, a
      * different place to read them from. */

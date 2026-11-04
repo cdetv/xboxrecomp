@@ -1157,6 +1157,7 @@ static uint8_t       s_bv_ok[NV_MAX_INDICES];       /* vertex usable */
 /* The triangle list: at most one triangle per vertex, and a clipped one
  * fans into at most three. */
 static uint32_t      s_ib[9 * NV_MAX_INDICES];
+static uint32_t      s_part_out[NV_MAX_INDICES / 3];  /* build_triangles */
 
 static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
@@ -3093,6 +3094,19 @@ static uint32_t build_triangles(const Nv2aVshOutput *v, uint32_t n)
 
     switch (g_pb.prim) {
     case NV_PRIM_TRIANGLES:
+        /* A merged batch: where each part's triangles end in s_ib, culled
+         * and clipped as they are (s_part_out, for cutout_parts). */
+        if (g_pb.merge_nparts) {
+            uint32_t p = 0;
+            for (i = 0; i + 2 < n; i += 3) {
+                while (p < g_pb.merge_nparts && g_pb.merge_part[p] <= i)
+                    s_part_out[p++] = out;
+                TRI(i, i + 1, i + 2);
+            }
+            while (p < g_pb.merge_nparts)
+                s_part_out[p++] = out;
+            break;
+        }
         for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
@@ -3890,6 +3904,73 @@ static void cutout_depth(GpuConsts *k, int c, uint32_t nidx)
                 s_cut[c].ref, 10);
 }
 
+/* A merged batch (g_pb.merge_part) that gets the cut-out depth pass: each
+ * part drawn and then drawn into depth before the next part's colour, as the
+ * title's own batches were, so overlapping strands hide each other as they
+ * did. The batch's setup stays shared; the depth draws read their alpha test
+ * from a second constant buffer. end[p] = where part p's indices end in the
+ * bound index list. 0 when nothing was drawn: draw the batch whole. */
+static int cutout_parts(GpuConsts *k, int c, const uint32_t *end,
+                         uint32_t nparts, ID3D11BlendState *bs,
+                         const float *bf, ID3D11DepthStencilState *ds)
+{
+    static ID3D11Buffer *cb_cut;
+    ID3D11DepthStencilState *dsc;
+    GpuConsts kc = *k;
+    uint32_t mask = g_pb.depth_mask, wmask = g_pb.stencil_wmask;
+    uint32_t p, start = 0, ref = g_pb.stencil_ref & 0xFFu;
+    int cut_bound = 0;
+
+    if (!s_bs_no_colour) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);        /* blend off, write mask 0 */
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &s_bs_no_colour)))
+            return 0;
+    }
+    if (!cb_cut) {
+        D3D11_BUFFER_DESC bd;
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = sizeof(GpuConsts);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &cb_cut)))
+            return 0;
+    }
+    kc.mode[2] = s_cut[c].func;
+    kc.mode[3] = s_cut[c].ref;
+    if (!buf_fill(cb_cut, &kc, sizeof kc))
+        return 0;
+    g_pb.depth_mask = 1;
+    g_pb.stencil_wmask = 0;
+    dsc = ds_state();
+    g_pb.depth_mask = mask;
+    g_pb.stencil_wmask = wmask;
+    if (!dsc)
+        return 0;
+    for (p = 0; p < nparts; start = end[p++]) {
+        uint32_t cnt = end[p] - start;
+        if (!cnt)
+            continue;
+        if (cut_bound) {
+            ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+            ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, ref);
+            ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+            ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+        }
+        ID3D11DeviceContext_DrawIndexed(s_ctx, cnt, start, 0);
+        ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_no_colour, NULL,
+                                            0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dsc, ref);
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &cb_cut);
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &cb_cut);
+        ID3D11DeviceContext_DrawIndexed(s_ctx, cnt, start, 0);
+        cut_bound = 1;
+        s_stat.cutout_draws++;
+    }
+    return 1;
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -3906,7 +3987,8 @@ static void d3d_draw(void)
     float bf[4];
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
     uint32_t offset = 0, ib_offset = 0, path, rtt;
-    int si, st, combiners, program, zi;
+    int si, st, combiners, program, zi, cut;
+    ID3D11BlendState *bs;
     ID3D11DepthStencilState *ds;
     ID3D11RasterizerState *rs;
     ID3D11VertexShader *gvs = NULL;     /* the program on the GPU */
@@ -4407,13 +4489,18 @@ static void d3d_draw(void)
     ID3D11DeviceContext_RSSetState(s_ctx, gvs ? cull_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
-    ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_state(bpp), bf,
-                                        0xFFFFFFFFu);
+    bs = blend_state(bpp);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds,
             g_pb.stencil_ref & 0xFFu);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
             zi >= 0 ? s_zeta[zi].dsv : NULL);
-    if (g_pb_ftrace == 2) {
+    cut = cutout_on() ? cutout_match(zi, bound) : -1;
+    if (cut >= 0 && g_pb.merge_nparts > 1
+        && cutout_parts(&k, cut, gvs ? g_pb.merge_part : s_part_out,
+                        g_pb.merge_nparts, bs, bf, ds)) {
+        cut = -1;                       /* drawn, depth pass and all */
+    } else if (g_pb_ftrace == 2) {
         uint32_t dw = to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
         uint32_t dh = to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
         int tiny = g_pb.clip_w * g_pb.clip_h <= 256u * 256u;
@@ -4439,11 +4526,8 @@ static void d3d_draw(void)
     } else {
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
-    if (cutout_on()) {
-        int c = cutout_match(zi, bound);
-        if (c >= 0)
-            cutout_depth(&k, c, nidx);
-    }
+    if (cut >= 0)
+        cutout_depth(&k, cut, nidx);
     if (zi >= 0)
         s_stat.zeta_draws++;
     /* Unbound again, so a later batch may draw into a texture this one

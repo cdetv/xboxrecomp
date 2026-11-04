@@ -53,6 +53,7 @@ static uint32_t s_tot_jumped_skipped; /* failed the dry run, not executed */
 /* Executing is opt-in separately from surveying: a survey is read-only, while
  * the executor writes to guest memory. */
 extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+extern void nv2a_pb_merge_flush(void);
 extern void xbox_Nv2aAnswerVblank(void);  /* xbox_memory_layout.c */
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
@@ -580,6 +581,10 @@ static uint32_t pb_scan_segment(uint32_t start_va, uint32_t end_va)
         end_va = start_va + 0x400000u;
 
     words = pb_walk(start_va, end_va, PB_RING, &jumps, &unknown, &wrap_to);
+    /* Batches held for merging draw now: the executor is about to report
+     * this segment done (nv2a_pb_exec.c, draw merging). */
+    if (s_exec_enabled)
+        nv2a_pb_merge_flush();
 
     s_tot_words += words;
     s_tot_unknown += unknown;
