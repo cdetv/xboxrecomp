@@ -259,12 +259,16 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
     bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    static int trace = -1;
 
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
-     * wait. */
-    if (getenv("RECOMP_APU_TRACE")) {
+     * wait. Read once: a getenv per access was 1-3 % of Conker's game thread
+     * in It's War (2026-11-04). */
+    if (trace < 0)
+        trace = getenv("RECOMP_APU_TRACE") != NULL;
+    if (trace) {
         static unsigned n;
         if (n++ < 400) {
             /* The value as well as the offset: finding which register carries
