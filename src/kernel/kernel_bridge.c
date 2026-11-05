@@ -2867,6 +2867,7 @@ static void timer_profile(LARGE_INTEGER a, LARGE_INTEGER b, LARGE_INTEGER c)
 
 enum { SWM_IDLE, SWM_POSTED, SWM_DELIVERING, SWM_DONE };
 static volatile LONG g_swm_state;
+static int g_swm_recent;           /* the timer thread delivered one this pass */
 static uint32_t g_swm_subch, g_swm_param;
 static uint32_t g_swm_codes = (uint32_t)-1;  /* bit per code; -1: not read yet */
 static unsigned long g_swm_delivered[32], g_swm_skipped[32];
@@ -3069,6 +3070,7 @@ static void kernel_pgraph_swm_tick(void)
         return;
     }
     if (claimed > 0) {
+        g_swm_recent = 1;
         g_swm_delivered[code]++;
         if (left)
             g_swm_unacked++;
@@ -3092,6 +3094,40 @@ static void kernel_pgraph_swm_tick(void)
     }
     InterlockedExchange(&g_swm_state, SWM_DONE);
     xbox_Nv2aRing();          /* the executor may be asleep in its trap wait */
+}
+
+/* RECOMP_SWM_SPIN_US=<us> (0 = off, the default): after delivering a trap
+ * the timer thread watches for the next one that long before it sleeps
+ * again. The executor stands still from posting a trap until it is handed
+ * back; Conker posts ~17 a frame in bursts, ~25 us each on average at 120
+ * fps (4.8 % of the executor, 2026-11-04), part of it the timer thread's
+ * wake-up from its event. Costs a core that long after each trap. 1 when
+ * one came. */
+static int kernel_swm_linger(void)
+{
+    static long spin_us = -1;
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t0, now;
+
+    if (spin_us < 0) {
+        const char *e = getenv("RECOMP_SWM_SPIN_US");
+        spin_us = e ? strtol(e, NULL, 10) : 0;
+        if (spin_us < 0 || spin_us > 2000)
+            spin_us = 0;
+        QueryPerformanceFrequency(&f);
+    }
+    if (!spin_us || !g_swm_recent)
+        return 0;
+    g_swm_recent = 0;
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        if (g_swm_state == SWM_POSTED)
+            return 1;
+        YieldProcessor();
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - t0.QuadPart) * 1000000 > spin_us * f.QuadPart)
+            return 0;
+    }
 }
 
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
@@ -3130,7 +3166,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
          * PGRAPH trap wakes it: the pushbuffer executor is stopped until the
          * trap is delivered. */
         DWORD sleep_ms = kernel_vblank_wait_ms(10);
-        if (!g_timer_wake
+        if (kernel_swm_linger())
+            ;                  /* a trap came while watching: straight on */
+        else if (!g_timer_wake
                 || WaitForSingleObject(g_timer_wake, sleep_ms) == WAIT_FAILED)
             Sleep(sleep_ms);
         QueryPerformanceCounter(&pa);
