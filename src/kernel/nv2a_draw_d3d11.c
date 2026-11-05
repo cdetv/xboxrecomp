@@ -43,6 +43,7 @@
 
 #define COBJMACROS
 #include <windows.h>
+#include <emmintrin.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -266,6 +267,7 @@ typedef struct {
     uint32_t drawn_flip;                /* g_pb.flips when last drawn on */
     ID3D11Texture2D        *tex;
     ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;      /* made at the first direct read */
 } GpuSurface;
 
 /* Conker's 3D menu room renders into 39 small targets plus the frame: with
@@ -279,6 +281,31 @@ typedef struct {
 #define ZETA_H 1024
 static GpuSurface s_surf[GPU_SURFACES];
 static uint32_t   s_surf_tick;
+
+/* Which addresses may have a surface: one bit per address hash, set when a
+ * surface takes an address, made again from the table once a flip (bits of
+ * thrown-out surfaces go). Every texture bind looks for a surface first,
+ * and nearly all are not one: the 128-slot scan was ~0.7 % of the executor
+ * (2026-11-03). A clear bit = no surface there; a set one = scan. */
+static uint64_t   s_surf_bloom[4];
+static uint32_t   s_surf_bloom_flip = (uint32_t)-1;
+
+static uint32_t surf_bloom_bit(uint32_t addr)
+{
+    return ((addr & 0x0FFFFFFFu) * 2654435761u) >> 24;     /* 0..255 */
+}
+
+static void surf_bloom_add(uint32_t addr)
+{
+    uint32_t b = surf_bloom_bit(addr);
+    s_surf_bloom[b >> 6] |= 1ull << (b & 63);
+}
+
+static int surf_bloom_may(uint32_t addr)
+{
+    uint32_t b = surf_bloom_bit(addr);
+    return (int)((s_surf_bloom[b >> 6] >> (b & 63)) & 1);
+}
 
 static float surf_sx(int i) { return s_surf[i].sx; }
 static float surf_sy(int i) { return s_surf[i].sy; }
@@ -313,6 +340,7 @@ static struct {
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
+    uint32_t rtt_direct;                /* surfaces read as they are, no copy */
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
@@ -1080,6 +1108,7 @@ static int surface_current(void)
                              (float)to_host(old.w, sx),
                              (float)to_host(old.h, sy));
         }
+        if (old.srv) ID3D11ShaderResourceView_Release(old.srv);
         if (old.rtv) ID3D11RenderTargetView_Release(old.rtv);
         if (old.tex) ID3D11Texture2D_Release(old.tex);
         if (FAILED(hr)) {
@@ -1101,6 +1130,7 @@ static int surface_current(void)
         s_surf[i].sy = sy;
     }
     s_surf[i].addr = addr;
+    surf_bloom_add(addr);
     s_surf[i].pitch = g_pb.pitch;
     s_surf[i].w = w;
     s_surf[i].h = h;
@@ -1385,6 +1415,17 @@ static ID3D11VertexShader *s_vs;
 static ID3D11PixelShader  *s_ps;
 static ID3D11InputLayout  *s_layout;
 static ID3D11Buffer       *s_cb;
+/* The pixel shader's second constant buffer (cbuffer D): per stage, the
+ * last texel centre a surface read as it is may sample (RECOMP_RTT_DIRECT),
+ * 0 for the others. Apart from cbuffer C so the vertex programs' shaders
+ * (and their cache) stay as they are; uploaded only when it changes. */
+static ID3D11Buffer       *s_cb1;
+static struct {
+    float tclamp[4][4];
+} s_cbd;
+/* Per stage reading a surface as it is: coordinate scale x y, clamp x y
+ * (texture_from_surface, RECOMP_RTT_DIRECT). */
+static float s_rtt_direct[4][4];
 static ID3D11RasterizerState *s_rs;        /* depth clamped to 0..1 */
 static ID3D11RasterizerState *s_rs_zcull;  /* outside 0..1 dropped */
 
@@ -1751,6 +1792,10 @@ static int draw_setup(void)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb);
+        if (SUCCEEDED(hr)) {
+            bd.ByteWidth = sizeof s_cbd;
+            hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb1);
+        }
     }
     if (SUCCEEDED(hr)) {
         /* The zeta copy pass. Without it a zeta surface read as a texture
@@ -1835,6 +1880,32 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
         return 0;
     memcpy(m.pData, src, bytes);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)b, 0);
+    return 1;
+}
+
+/* Stage st reads its surface as it is (RTT_DIRECT): coordinates scaled into
+ * the texture's part of it, and the clamp for the shader. */
+static void tclamp_stage(GpuConsts *k, int st)
+{
+    k->tscale[st][0] *= s_rtt_direct[st][0];
+    k->tscale[st][1] *= s_rtt_direct[st][1];
+    s_cbd.tclamp[st][0] = s_rtt_direct[st][2];
+    s_cbd.tclamp[st][1] = s_rtt_direct[st][3];
+}
+
+/* cbuffer D up to date for this draw; 0 when it could not be written. */
+static int tclamp_upload(void)
+{
+    static float last[sizeof s_cbd / sizeof(float)];
+    static int valid;
+    if (!s_cb1)
+        return 0;
+    if (valid && !memcmp(last, &s_cbd, sizeof last))
+        return 1;
+    if (!buf_fill(s_cb1, &s_cbd, sizeof s_cbd))
+        return 0;
+    memcpy(last, &s_cbd, sizeof last);
+    valid = 1;
     return 1;
 }
 
@@ -2300,12 +2371,17 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n, uint64_t h)
     return h;
 }
 
-/* The texture cache's change check (GpuTexture.hash): hash_bytes' mixing in
- * four independent lanes, 32 bytes a round, so the CPU runs them side by
- * side. hash_bytes is one chain (~6 cycles per 8 bytes) and was ~17% of the
- * executor at 120 fps in Conker's first field (2026-11-03). Replacement
- * names (tex_replace.h) stay hash_bytes: they are on disk. */
-static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
+/* The texture cache's change check (GpuTexture.hash), SSE2, 64 bytes a
+ * round: each 64-bit lane adds (lo32 x hi32) of its word xor a key, as
+ * XXH3's accumulate does, plus the word itself; the keys move on every round
+ * so the same bytes at another offset add something else (a texture whose
+ * rows trade places still changes its hash). One multiply chain
+ * (hash_bytes, ~6 cycles per 8 bytes) was ~17 % of the executor at 120 fps
+ * in Conker's first field (2026-11-03), four scalar lanes still ~8 %. Only
+ * compared in memory, never stored: any mixing will do. Replacement names
+ * (tex_replace.h) stay hash_bytes: they are on disk. RECOMP_HASH_SCALAR=1:
+ * the four-lane scalar version, for A/B. */
+static uint64_t hash_fast_scalar(const uint8_t *p, size_t n, uint64_t h)
 {
     uint64_t a = h, b = h ^ 0x9E3779B97F4A7C15ull;
     uint64_t c = h ^ 0xC2B2AE3D27D4EB4Full, d = h ^ 0x165667B19E3779F9ull;
@@ -2323,6 +2399,45 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
     }
     h = (a ^ b * 0x9E3779B97F4A7C15ull) ^ (c * 0xC2B2AE3D27D4EB4Full)
         ^ (d * 0x165667B19E3779F9ull) ^ (uint64_t)n;
+    return hash_bytes(p + i, n - i, h);
+}
+
+static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
+{
+    static int scalar = -1;
+    __m128i acc[4], key[4], step;
+    uint64_t lane[8];
+    size_t i;
+    int j;
+
+    if (scalar < 0)
+        scalar = getenv("RECOMP_HASH_SCALAR") != NULL;
+    if (scalar)
+        return hash_fast_scalar(p, n, h);
+    step = _mm_set_epi64x((long long)0xC2B2AE3D27D4EB4Full,
+                          (long long)0x9E3779B97F4A7C15ull);
+    for (j = 0; j < 4; j++) {
+        acc[j] = _mm_set_epi64x((long long)(h ^ (0x165667B19E3779F9ull * (2 * j + 2))),
+                                (long long)(h ^ (0x27D4EB2F165667C5ull * (2 * j + 1))));
+        key[j] = _mm_set_epi64x((long long)(0x85EBCA77C2B2AE63ull * (2 * j + 2)),
+                                (long long)(0x9FB21C651E98DF25ull * (2 * j + 1)));
+    }
+    for (i = 0; i + 64 <= n; i += 64) {
+        for (j = 0; j < 4; j++) {
+            __m128i d = _mm_loadu_si128((const __m128i *)(p + i + 16 * j));
+            __m128i k = _mm_xor_si128(d, key[j]);
+            acc[j] = _mm_add_epi64(acc[j],
+                    _mm_mul_epu32(k, _mm_srli_epi64(k, 32)));
+            acc[j] = _mm_add_epi64(acc[j], d);
+            key[j] = _mm_add_epi64(key[j], step);
+        }
+    }
+    memcpy(lane, acc, sizeof lane);
+    for (j = 0; j < 8; j++) {
+        h = (h ^ lane[j]) * 0x100000001B3ull;
+        h ^= h >> 29;
+    }
+    h ^= (uint64_t)n;
     return hash_bytes(p + i, n - i, h);
 }
 
@@ -2351,6 +2466,7 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
 #define RTT_SWAP_RB   2u
 #define TEX_VOLUME    4u    /* a Texture3D view: bind it to the stage's 3D slot */
 #define TEX_CUBE      8u    /* a cube map's faces: bind to the stage's cube slot */
+#define RTT_DIRECT   16u    /* the surface itself: coordinates by s_rtt_direct */
 
 /* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
  * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
@@ -2561,6 +2677,42 @@ static int rtt_read_rect(int st, uint32_t tw, uint32_t th, uint32_t w,
     return 1;
 }
 
+/* RECOMP_RTT_DIRECT (on; =0 off, =2 on even frames only, for the
+ * held-picture check as RECOMP_DRAW_MERGE=2): a surface that is not the
+ * batch's own target is bound as it is instead of copied. The copies left
+ * after RECOMP_RTT_RECT were mostly whole frames read by full-screen quads
+ * (glow, haze): 17 of 3840x2160 a frame on It's War's beach at 200 % of
+ * 1080p, 1.5 of its 7.6 ms GPU a frame (2026-11-05). A surface is padded to
+ * at least ZETA_W x ZETA_H guest pixels, so the texture's rectangle is only
+ * its top-left part: the coordinates are scaled into it (s_rtt_direct xy)
+ * and, as the copy's edge clamps, held to its last texel centre (zw, the
+ * shader's tclamp): bilinear or point, clamp-to-edge at that edge reads the
+ * same. Wrap, mirror and border colour reach past the edge into more
+ * surface, so those stages still copy, as does a surface smaller than the
+ * texture (the copy keeps old texels past it). s_rtt_target: the batch's
+ * target slot, set by d3d_draw. */
+static int s_rd_on = -1;
+static int s_rtt_target = -1;
+
+static int rtt_direct_ok(int st, int i, uint32_t tw, uint32_t th)
+{
+    const Texture *t = &g_pb.texs[st];
+
+    if (s_rd_on < 0) {
+        const char *e = getenv("RECOMP_RTT_DIRECT");
+        s_rd_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+    }
+    if (!s_rd_on || (s_rd_on == 2 && (g_pb.flips & 1)) || i == s_rtt_target)
+        return 0;
+    if (s_surf[i].tw < tw || s_surf[i].th < th)
+        return 0;
+    if (t->addr_u == 1 || t->addr_u == 2 || t->addr_v == 1 || t->addr_v == 2)
+        return 0;
+    if (t->border_from_color && (t->addr_u == 4 || t->addr_v == 4))
+        return 0;
+    return 1;
+}
+
 /* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
  * or -1 when that reading is not handled. */
 static int rtt_reading(uint32_t fmt, uint32_t bpp)
@@ -2593,6 +2745,15 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
     int i, r, c, old;
 
     if (d3d8_format_dxt_block_bytes(t->color))
+        return NULL;
+    if (s_surf_bloom_flip != g_pb.flips) {
+        s_surf_bloom_flip = g_pb.flips;
+        memset(s_surf_bloom, 0, sizeof s_surf_bloom);
+        for (i = 0; i < GPU_SURFACES; i++)
+            if (s_surf[i].tex)
+                surf_bloom_add(s_surf[i].addr);
+    }
+    if (!surf_bloom_may(t->offset))
         return NULL;
     for (i = 0; i < GPU_SURFACES; i++)
         if (s_surf[i].tex
@@ -2656,6 +2817,22 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
      * the same place in it. */
     tw = to_host(t->width, surf_sx(i));
     th = to_host(t->height, surf_sy(i));
+    if (rtt_direct_ok(st, i, tw, th)
+        && (s_surf[i].srv
+            || SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_surf[i].tex, NULL, &s_surf[i].srv)))) {
+        float sw = (float)s_surf[i].tw, sh = (float)s_surf[i].th;
+        s_rtt_direct[st][0] = (float)tw / sw;
+        s_rtt_direct[st][1] = (float)th / sh;
+        s_rtt_direct[st][2] = ((float)tw - 0.5f) / sw;
+        s_rtt_direct[st][3] = ((float)th - 0.5f) / sh;
+        *flags = (uint32_t)r | RTT_DIRECT;
+        s_surf[i].used = ++s_surf_tick;
+        s_stat.rtt_binds++;
+        s_stat.rtt_direct++;
+        s_rtt_slot = i;
+        return s_surf[i].srv;
+    }
     for (c = 0, old = 0; c < RTT_SIZES; c++) {
         if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
             break;
@@ -4389,6 +4566,27 @@ static uint32_t vsh_gpu_index_list(uint32_t n)
     return out;
 }
 
+/* RECOMP_GPU_STRIPS (on; =0 off, =2 on even frames only, for the
+ * held-picture check): a triangle strip drawn on the GPU path goes up as
+ * the title's own indices with D3D's strip topology, instead of cut into a
+ * list (vsh_gpu_index_list, ~2.5 % of the executor; three times the
+ * indices to upload). D3D turns a strip's odd triangles round for culling
+ * as that cut does. Not for merged batches (one list of several), and not
+ * the flat path, whose colour is the first vertex's: in a strip D3D's odd
+ * triangle starts at i + 1, the cut's at i. */
+static int s_strips = -1;
+
+static int gpu_strip(uint32_t path, uint32_t n)
+{
+    if (s_strips < 0) {
+        const char *e = getenv("RECOMP_GPU_STRIPS");
+        s_strips = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+    }
+    return s_strips && !(s_strips == 2 && (g_pb.flips & 1))
+           && g_pb.prim == NV_PRIM_TRIANGLE_STRIP && !g_pb.merge_nparts
+           && path != PATH_FLAT && n >= 3;
+}
+
 /* base with pb_cull_tri's face culling, for the GPU path (the CPU path
  * culls before the draw). On the render target, as on the guest's screen,
  * y runs down, so the winding there is the one pb_cull_tri measures:
@@ -4626,6 +4824,7 @@ static void d3d_draw(void)
     float bf[4];
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
     uint32_t offset = 0, ib_offset = 0, path, rtt;
+    int strip = 0;
     int si, st, combiners, program, zi, cut;
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *ds;
@@ -4681,6 +4880,8 @@ static void d3d_draw(void)
     combiners = g_pb.rc_seen && !no_rc;
     n = g_pb.idx_count;
     memset(&k, 0, sizeof k);
+    memset(&s_cbd, 0, sizeof s_cbd);
+    s_rtt_target = si;
 
     if (program || combiners) {
         /* Through the title's own program, or the fixed-function vertex
@@ -4759,6 +4960,8 @@ static void d3d_draw(void)
                               ? 1.0f : 1.0f / (float)t->height;
             k.tscale[st][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;
             k.tscale[st][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
+            if (rtt & RTT_DIRECT)
+                tclamp_stage(&k, st);
         }
         ct_add(CT_TEXTURES, ct0);
         if (g_pb.alpha_test) {
@@ -4803,6 +5006,8 @@ static void d3d_draw(void)
                 k.tscale[0][1] = 1.0f / (float)g_pb.texs[0].height;
                 k.tscale[0][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;
                 k.tscale[0][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
+                if (rtt & RTT_DIRECT)
+                    tclamp_stage(&k, 0);
             } else {
                 srv[0] = NULL;
             }
@@ -4810,7 +5015,8 @@ static void d3d_draw(void)
     }
 
     if (gvs) {
-        nidx = vsh_gpu_index_list(n);
+        strip = gpu_strip(path, n);
+        nidx = strip ? n : vsh_gpu_index_list(n);
     } else {
         nidx = build_triangles(verts, n);
         vis_note_batch(verts, n, nidx);
@@ -5058,7 +5264,8 @@ static void d3d_draw(void)
             return;
         ct0 = ct_now();
         ok = ring_put(&s_ib_ring, D3D11_BIND_INDEX_BUFFER,
-                      s_ib, (size_t)nidx * 4, NULL, 0, &ib_offset);
+                      strip ? g_pb.idx : s_ib, (size_t)nidx * 4, NULL, 0,
+                      &ib_offset);
         ct_add(CT_IB, ct0);
         if (!ok)
             return;
@@ -5116,8 +5323,9 @@ static void d3d_draw(void)
     ct_draw0 = ct_now();
     /* The GPU path reads no vertex buffer: vs_gpu fetches by index. */
     ID3D11DeviceContext_IASetInputLayout(s_ctx, gvs ? NULL : s_layout);
-    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
-            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, strip
+            ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP
+            : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (!gvs)
         ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb.b, &stride,
                                                &offset);
@@ -5130,6 +5338,15 @@ static void d3d_draw(void)
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
     }
     ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    if (!tclamp_upload())
+        return;
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb1);
+    /* The target before the textures: a surface read as it is
+     * (RECOMP_RTT_DIRECT) is often the one the batch before drew into, still
+     * bound as the target, and D3D unbinds a view that overlaps a bound
+     * target, so the batch read black (rain ripples as black discs). */
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
+            zi >= 0 ? s_zeta[zi].dsv : NULL);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 7, 4, vsrv);
     if (bound & 0xF00u)
@@ -5143,8 +5360,6 @@ static void d3d_draw(void)
     ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds,
             g_pb.stencil_ref & 0xFFu);
-    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
-            zi >= 0 ? s_zeta[zi].dsv : NULL);
     cut = cutout_on() ? cutout_match(zi, bound) : -1;
     if (cut >= 0 && g_pb.merge_nparts > 1
         && cutout_parts(&k, cut, gvs ? g_pb.merge_part : s_part_out,
@@ -5196,7 +5411,7 @@ static void d3d_draw(void)
     pace_draw();
 
     s_stat.drawn++;
-    s_stat.tris += nidx / 3;
+    s_stat.tris += strip ? nidx - 2 : nidx / 3;
     if (bound)
         s_stat.textured++;
     if (path == PATH_COMBINERS)
@@ -5205,7 +5420,7 @@ static void d3d_draw(void)
         s_stat.vsh_gpu++;
     note_shown(si);
     if (s_ct_on > 0)                    /* no screen box on the GPU path */
-        heavy_note(verts, gvs ? 0 : n, nidx / 3);
+        heavy_note(verts, gvs ? 0 : n, strip ? nidx - 2 : nidx / 3);
 }
 
 /* RECOMP_GPU_CALL_TIMES: a present after 3000+ batches (a frame is ~1000)
@@ -5816,9 +6031,10 @@ static void d3d_report(void)
     fprintf(stderr, "[GPU] d3d11: render to texture: %u binds of a GPU"
             " surface (%u copy textures made), %u of a surface in a reading"
             " not handled (guest memory used); %.0f Mpx copied, %u copies"
-            " of only the part read%c", s_stat.rtt_binds, s_stat.rtt_made,
+            " of only the part read; %u read as they are (no copy)%c",
+            s_stat.rtt_binds, s_stat.rtt_made,
             s_stat.rtt_unhandled, (double)s_stat.rtt_px / 1e6,
-            s_stat.rtt_rects, 10);
+            s_stat.rtt_rects, s_stat.rtt_direct, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
