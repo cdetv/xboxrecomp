@@ -56,6 +56,8 @@ extern void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 extern int nv2a_pb_exec_draw_words(uint32_t method, const uint32_t *p,
                                    uint32_t n);
 extern void nv2a_pb_merge_flush(void);
+extern void nv2a_interp_rec_flush(void);  /* nv2a_interp.c */
+extern void nv2a_interp_tick(void);
 extern void xbox_Nv2aAnswerVblank(void);  /* xbox_memory_layout.c */
 extern void nv2a_pb_exec_report(void);
 extern void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param);
@@ -478,8 +480,10 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
 
             /* D3D's vblank DPC waits on it. Once a header, not a word: a
              * run is at most 2047 words, a few microseconds. */
-            if (s_exec_enabled)
+            if (s_exec_enabled) {
                 xbox_Nv2aAnswerVblank();
+                nv2a_interp_tick();     /* an in-between picture due */
+            }
             /* A header of draw data or plain NOPs, all one method: handed
              * over whole (nv2a_pb_exec_draw_words), not a call a word. */
             if (s_exec_enabled && subch == 0 && count
@@ -603,8 +607,10 @@ static uint32_t pb_scan_segment(uint32_t start_va, uint32_t end_va)
     words = pb_walk(start_va, end_va, PB_RING, &jumps, &unknown, &wrap_to);
     /* Batches held for merging draw now: the executor is about to report
      * this segment done (nv2a_pb_exec.c, draw merging). */
-    if (s_exec_enabled)
+    if (s_exec_enabled) {
+        nv2a_interp_rec_flush();
         nv2a_pb_merge_flush();
+    }
 
     s_tot_words += words;
     s_tot_unknown += unknown;

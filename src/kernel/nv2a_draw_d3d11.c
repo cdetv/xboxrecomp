@@ -5634,19 +5634,28 @@ static int dump_tex(const char *path, ID3D11Texture2D *tex, uint32_t tw,
 
 /* The presented rectangle, as <prefix>NNNNN.bmp. Its number, or -1 when
  * nothing is shown. */
+static int s_dump_seq;
+
+/* The next frame dump's number (in-between pictures take theirs too). */
+static int dump_seq_next(void)
+{
+    return s_dump_seq++;
+}
+
 static int dump_shown(void)
 {
-    static int seq;
     char path[512];
+    int seq;
 
     if (s_shown < 0 || !s_shown_w || !s_shown_h)
         return -1;
-    snprintf(path, sizeof path, "%s%05d.bmp", getenv("RECOMP_FB_DUMP"), seq++);
+    seq = dump_seq_next();
+    snprintf(path, sizeof path, "%s%05d.bmp", getenv("RECOMP_FB_DUMP"), seq);
     if (dump_rect(path, s_shown, s_shown_x, s_shown_y, s_shown_w, s_shown_h)
-        && seq == 1)
+        && seq == 0)
         fprintf(stderr, "  [GPU] d3d11 frame dump: %s (%ux%u)%c", path,
                 s_shown_w, s_shown_h, 10);
-    return seq - 1;
+    return seq;
 }
 
 /* RECOMP_BB_DUMP=<prefix> with the frame dumps: the back buffer as the
@@ -5696,35 +5705,47 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
 /* The shown frame into the swap chain's back buffer, on black: copied, or
  * drawn through the filter chain (postfx_d3d11.c) when a filter is on or
  * the frame is drawn at another scale than the back buffer's. */
+/* Rectangle x,y,w,h (guest pixels) of tex, drawn at scale sx, sy, into the
+ * back buffer as shown_to_back describes; tex NULL: black only. */
+static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
 static void shown_to_back(void)
+{
+    if (s_shown >= 0 && s_scale_on && !s_surf[s_shown].scaled) {
+        /* An unscaled surface shown while the frame is scaled: said once. */
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[GPU] d3d11: presenting unscaled"
+                    " surface 0x%08X pitch %u (%ux%u) while the"
+                    " render scale is on%c", s_surf[s_shown].addr,
+                    s_surf[s_shown].pitch, s_shown_w, s_shown_h, 10);
+    }
+    if (s_shown >= 0)
+        tex_to_back(s_surf[s_shown].tex, surf_sx(s_shown), surf_sy(s_shown),
+                    s_shown_x, s_shown_y, s_shown_w, s_shown_h);
+    else
+        tex_to_back(NULL, 1.0f, 1.0f, 0, 0, 0, 0);
+}
+
+static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
 
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    if (s_shown >= 0 && (back = back_tex())) {
+    if (tex && (back = back_tex())) {
         /* The shown rectangle at its surface's scale; the back buffer's
          * scale (bx, by: host pixels per guest pixel, worked out as
-         * set_render_scale does, so equal sizes give equal scales). An
-         * unscaled surface shown while the frame is scaled: said once. */
+         * set_render_scale does, so equal sizes give equal scales). */
         D3D11_BOX box;
-        float sx = surf_sx(s_shown), sy = surf_sy(s_shown);
         float bx = (float)s_bb_w / (float)SC_W;
         float by = (float)s_bb_h / (float)SC_H;
-        uint32_t bw = to_host(s_shown_x + s_shown_w, sx)
-                    - to_host(s_shown_x, sx);
-        uint32_t bh = to_host(s_shown_y + s_shown_h, sy)
-                    - to_host(s_shown_y, sy);
-        if (s_scale_on && !s_surf[s_shown].scaled) {
-            static int said;
-            if (!said++)
-                fprintf(stderr, "[GPU] d3d11: presenting unscaled"
-                        " surface 0x%08X pitch %u (%ux%u) while the"
-                        " render scale is on%c", s_surf[s_shown].addr,
-                        s_surf[s_shown].pitch, s_shown_w, s_shown_h, 10);
-        }
-        box.left = to_host(s_shown_x, sx);
-        box.top = to_host(s_shown_y, sy);
+        uint32_t bw = to_host(x + w, sx) - to_host(x, sx);
+        uint32_t bh = to_host(y + h, sy) - to_host(y, sy);
+        box.left = to_host(x, sx);
+        box.top = to_host(y, sy);
         box.front = 0;
         box.right = box.left + (bw < s_bb_w ? bw : s_bb_w);
         box.bottom = box.top + (bh < s_bb_h ? bh : s_bb_h);
@@ -5735,18 +5756,18 @@ static void shown_to_back(void)
              * presented right after the change). Shrunk or stretched to
              * the back buffer by the filter chain; bilinearly here if
              * that cannot run. */
-            uint32_t dw = to_host(s_shown_w, bx);
-            uint32_t dh = to_host(s_shown_h, by);
+            uint32_t dw = to_host(w, bx);
+            uint32_t dh = to_host(h, by);
             float fw = (float)(dw < s_bb_w ? dw : s_bb_w);
             float fh = (float)(dh < s_bb_h ? dh : s_bb_h);
-            if (!postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+            if (!postfx_draw(s_dev, s_ctx, tex,
                              (float)box.left, (float)box.top, (float)bw,
                              (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
-                blit_stretch(s_surf[s_shown].tex, (float)box.left,
+                blit_stretch(tex, (float)box.left,
                              (float)box.top, (float)bw, (float)bh,
                              s_back_rtv, 0.0f, 0.0f, fw, fh);
         } else if (postfx_active()
-                   && postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+                   && postfx_draw(s_dev, s_ctx, tex,
                                   (float)box.left, (float)box.top,
                                   (float)(box.right - box.left),
                                   (float)(box.bottom - box.top), s_back_rtv,
@@ -5756,7 +5777,7 @@ static void shown_to_back(void)
         } else {
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
                     (ID3D11Resource *)back, 0, 0, 0, 0,
-                    (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+                    (ID3D11Resource *)tex, 0, &box);
         }
         ID3D11Texture2D_Release(back);
     }
@@ -5903,36 +5924,152 @@ static void apply_render_res(void)
             s_sc_h, s_rsx, s_rsy, 10);
 }
 
+/* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a line --
+ * how evenly the title paces its frames once drawing costs nothing. */
+static void pace_count(void)
+{
+    static int on = -1;
+    static ULONGLONG second;
+    static uint32_t n, line[10], nline;
+    ULONGLONG now;
+    if (on < 0)
+        on = getenv("RECOMP_GPU_PACING") != NULL;
+    if (on) {
+        now = GetTickCount64() / 1000;
+        if (second && now != second) {
+            line[nline++] = n;
+            n = 0;
+            if (nline == 10) {
+                fprintf(stderr, "[PACE] presents/s: %u %u %u %u %u %u %u"
+                        " %u %u %u (flip %u)%c", line[0], line[1], line[2],
+                        line[3], line[4], line[5], line[6], line[7],
+                        line[8], line[9], g_pb.flips, 10);
+                nline = 0;
+            }
+        }
+        second = now;
+        n++;
+    }
+}
+
+/* Frame interpolation (nv2a_interp.c): copies of the shown surface, each with
+ * what presenting it needs. */
+#define INTERP_PICS 8
+static struct {
+    ID3D11Texture2D *tex;
+    int surf;                           /* s_surf it is a copy of */
+    ID3D11Texture2D *src;               /* that surface's texture then */
+    float sx, sy;
+    uint32_t x, y, w, h;                /* shown rectangle, guest pixels */
+} s_pic[INTERP_PICS];
+
+/* Picture slot's shown rectangle as dump_rect writes a surface's. */
+static int dump_pic_rect(const char *path, int slot)
+{
+    D3D11_TEXTURE2D_DESC d;
+    uint32_t x = s_pic[slot].x, y = s_pic[slot].y;
+    uint32_t w = s_pic[slot].w, h = s_pic[slot].h;
+    float sx = s_pic[slot].sx, sy = s_pic[slot].sy;
+    uint32_t x1 = to_host(x + w, sx), y1 = to_host(y + h, sy);
+
+    x = to_host(x, sx);
+    y = to_host(y, sy);
+    ID3D11Texture2D_GetDesc(s_pic[slot].tex, &d);
+    return dump_tex(path, s_pic[slot].tex, d.Width, d.Height, x, y, x1 - x,
+                    y1 - y);
+}
+
+static int d3d_interp(int op, int slot)
+{
+    if (slot < 0 || slot >= INTERP_PICS || s_shadow)
+        return 0;
+    if (op == NV_INTERP_SAVE) {
+        D3D11_TEXTURE2D_DESC d, h;
+        ID3D11Texture2D *src;
+        if (s_shown < 0 || !s_shown_w || !s_shown_h
+            || !(src = s_surf[s_shown].tex))
+            return 0;
+        ID3D11Texture2D_GetDesc(src, &d);
+        if (s_pic[slot].tex) {
+            ID3D11Texture2D_GetDesc(s_pic[slot].tex, &h);
+            if (h.Width != d.Width || h.Height != d.Height
+                || h.Format != d.Format || h.MipLevels != d.MipLevels) {
+                ID3D11Texture2D_Release(s_pic[slot].tex);
+                s_pic[slot].tex = NULL;
+            }
+        }
+        if (!s_pic[slot].tex) {
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.CPUAccessFlags = 0;
+            d.MiscFlags = 0;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                    &s_pic[slot].tex))) {
+                s_pic[slot].tex = NULL;
+                return 0;
+            }
+        }
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_pic[slot].tex,
+                                         (ID3D11Resource *)src);
+        s_pic[slot].surf = s_shown;
+        s_pic[slot].src = src;
+        s_pic[slot].sx = surf_sx(s_shown);
+        s_pic[slot].sy = surf_sy(s_shown);
+        s_pic[slot].x = s_shown_x;
+        s_pic[slot].y = s_shown_y;
+        s_pic[slot].w = s_shown_w;
+        s_pic[slot].h = s_shown_h;
+        return 1;
+    }
+    if (!s_pic[slot].tex || s_pic[slot].surf < 0
+        || s_surf[s_pic[slot].surf].tex != s_pic[slot].src)
+        return 0;                       /* the surface is gone or remade */
+    if (op == NV_INTERP_LOAD) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_pic[slot].src,
+                                         (ID3D11Resource *)s_pic[slot].tex);
+        return 1;
+    }
+    if (op == NV_INTERP_SHOW) {
+        /* As d3d_present, once and without what belongs between two of the
+         * title's frames (render size and display mode changes, GPU frame
+         * times, a held frame): this is in the middle of the next one. */
+        int seq = -1;
+        xbox_GpuOverlayFn overlay = s_overlay;
+        pace_count();
+        if (flip_dump_on() && getenv("RECOMP_FB_DUMP")) {
+            static int said;
+            char path[512];
+            seq = dump_seq_next();
+            snprintf(path, sizeof path, "%s%05d.bmp",
+                     getenv("RECOMP_FB_DUMP"), seq);
+            dump_pic_rect(path, slot);
+            if (!said++)
+                fprintf(stderr, "  [GPU] d3d11 in-between dump: %s%c", path,
+                        10);
+            /* Which picture each dump is (an unnamed one is slot 1, shown
+             * by the frame's own present). */
+            fprintf(stderr, "[IDUMP] %05d slot %d%c", seq, slot, 10);
+        }
+        if (!s_swap || !ensure_swap_chain())
+            return 0;
+        tex_to_back(s_pic[slot].tex, s_pic[slot].sx, s_pic[slot].sy,
+                    s_pic[slot].x, s_pic[slot].y, s_pic[slot].w,
+                    s_pic[slot].h);
+        dump_back(seq);
+        if (overlay)
+            overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h);
+        if (s_excl)
+            canvas_to_out();
+        vsync_present(s_swap, s_excl_on);
+        s_stat.presents++;
+        return 1;
+    }
+    return 0;
+}
+
 static void d3d_present(void)
 {
     heavy_report();
-    {
-        /* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a
-         * line -- how evenly the title paces its frames once drawing costs
-         * nothing. */
-        static int on = -1;
-        static ULONGLONG second;
-        static uint32_t n, line[10], nline;
-        ULONGLONG now;
-        if (on < 0)
-            on = getenv("RECOMP_GPU_PACING") != NULL;
-        if (on) {
-            now = GetTickCount64() / 1000;
-            if (second && now != second) {
-                line[nline++] = n;
-                n = 0;
-                if (nline == 10) {
-                    fprintf(stderr, "[PACE] presents/s: %u %u %u %u %u %u %u"
-                            " %u %u %u (flip %u)%c", line[0], line[1], line[2],
-                            line[3], line[4], line[5], line[6], line[7],
-                            line[8], line[9], g_pb.flips, 10);
-                    nline = 0;
-                }
-            }
-            second = now;
-            n++;
-        }
-    }
+    pace_count();
 
     int seq = -1;
 
@@ -6418,7 +6555,7 @@ static void d3d_poll(void)
 
 static const Nv2aPbBackend s_backend = {
     "d3d11", d3d_clear, d3d_draw, d3d_present, d3d_report,
-    d3d_zpass, d3d_get_report, d3d_poll, d3d_host_effect
+    d3d_zpass, d3d_get_report, d3d_poll, d3d_host_effect, d3d_interp
 };
 
 const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)

@@ -288,6 +288,9 @@ int pb_batch_screen_space(void);
  * once per batch whichever back end asks first. Screen-space x, y, z with
  * the clip-space w kept in pos[3], as raster_xf_triangle takes them. */
 const Nv2aVshOutput *pb_transform_batch(void);
+/* pb_transform_forget: the next pb_transform_batch runs the program again
+ * (a frame drawn again counts its batches from the same number). */
+void pb_transform_forget(void);
 /* pb_fixed_vertex: a fixed-function screen-space vertex in the form the
  * combiner path takes (fixed_vertex): position with w = 1, colour in d0,
  * one texcoord set per stage. */
@@ -357,7 +360,17 @@ typedef struct {
      * parameters set before it. NULL: the back end has none (the effect is
      * simply not drawn). */
     void (*host_effect)(uint32_t id, const uint32_t *p);
+    /* Frame interpolation (nv2a_interp.c); NULL: none. NV_INTERP_SAVE: the
+     * frame as it is shown (its surface, the shown rectangle) copied into
+     * picture `slot`; NV_INTERP_LOAD: picture `slot` copied back into that
+     * surface; NV_INTERP_SHOW: picture `slot` presented, through the
+     * filters and the overlay, in the middle of the next frame. 1 when done. */
+    int (*interp)(int op, int slot);
 } Nv2aPbBackend;
+
+#define NV_INTERP_SAVE 0
+#define NV_INTERP_LOAD 1
+#define NV_INTERP_SHOW 2
 
 /* Host methods: commands a game's own code (not the title's) puts in the
  * pushbuffer for the runtime, so that something the host draws lands at

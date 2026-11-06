@@ -21,6 +21,7 @@
 #ifndef XBOXRECOMP_NV2A_VSH_INTERP_H
 #define XBOXRECOMP_NV2A_VSH_INTERP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define NV2A_VSH_SLOTS      136     /* program memory, 128-bit instructions */
@@ -114,5 +115,14 @@ const float *nv2a_vsh_constant(uint32_t index);   /* for traces */
  * (scale) and c[59] (offset) a word at a time rather than via _CONSTANT. */
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word);
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4]);
+
+/* Frame interpolation (nv2a_interp.c): the vertex unit's whole state --
+ * program memory, constants, load and start slots -- saved and put back
+ * (every constant then counts as written), and all the constants at once. */
+size_t nv2a_vsh_state_size(void);
+void nv2a_vsh_state_save(void *out);
+void nv2a_vsh_state_load(const void *in);
+const float (*nv2a_vsh_constants_all(void))[4];
+void nv2a_vsh_constants_set_all(const float (*c)[4]);
 
 #endif

@@ -165,6 +165,76 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
         memcpy(s_program[slot], words, sizeof s_program[slot]);
 }
 
+/* ---- saved state (frame interpolation) ----------------------------------- */
+
+typedef struct {
+    uint32_t program[NV2A_VSH_SLOTS][4];
+    float    consts[NV2A_VSH_CONSTANTS][4];
+    uint32_t load_slot, load_word, start_slot, const_load, const_word;
+    uint32_t cxt_write;
+    uint32_t slot_va[NV2A_VSH_SLOTS], slot_buf[NV2A_VSH_SLOTS];
+    uint32_t next_va, next_buf;
+} VshState;
+
+size_t nv2a_vsh_state_size(void)
+{
+    return sizeof(VshState);
+}
+
+void nv2a_vsh_state_save(void *out)
+{
+    VshState *s = out;
+
+    memcpy(s->program, s_program, sizeof s_program);
+    memcpy(s->consts, s_const, sizeof s_const);
+    s->load_slot = s_load_slot;
+    s->load_word = s_load_word;
+    s->start_slot = s_start_slot;
+    s->const_load = s_const_load;
+    s->const_word = s_const_word;
+    s->cxt_write = s_cxt_write;
+    memcpy(s->slot_va, s_slot_va, sizeof s_slot_va);
+    memcpy(s->slot_buf, s_slot_buf, sizeof s_slot_buf);
+    s->next_va = s_next_va;
+    s->next_buf = s_next_buf;
+}
+
+void nv2a_vsh_state_load(const void *in)
+{
+    const VshState *s = in;
+
+    if (memcmp(s_program, s->program, sizeof s_program)
+        || s_start_slot != s->start_slot) {
+        memcpy(s_program, s->program, sizeof s_program);
+        s_dec_valid = 0;
+    }
+    memcpy(s_const, s->consts, sizeof s_const);
+    s_load_slot = s->load_slot;
+    s_load_word = s->load_word;
+    s_start_slot = s->start_slot;
+    s_const_load = s->const_load;
+    s_const_word = s->const_word;
+    s_cxt_write = s->cxt_write;
+    memcpy(s_slot_va, s->slot_va, sizeof s_slot_va);
+    memcpy(s_slot_buf, s->slot_buf, sizeof s_slot_buf);
+    s_next_va = s->next_va;
+    s_next_buf = s->next_buf;
+    s_cdirty_lo = 0;
+    s_cdirty_hi = NV2A_VSH_CONSTANTS - 1;
+}
+
+const float (*nv2a_vsh_constants_all(void))[4]
+{
+    return (const float (*)[4])s_const;
+}
+
+void nv2a_vsh_constants_set_all(const float (*c)[4])
+{
+    memcpy(s_const, c, sizeof s_const);
+    s_cdirty_lo = 0;
+    s_cdirty_hi = NV2A_VSH_CONSTANTS - 1;
+}
+
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
 
 static const char *const k_mac[16] = {

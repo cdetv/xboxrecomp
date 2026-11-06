@@ -1283,6 +1283,8 @@ static int exec_vblank_raised(volatile uint32_t *regs)
             & NV2A_PMC_INTR_PCRTC_BIT) != 0;
 }
 
+extern void nv2a_interp_tick(void);   /* nv2a_interp.c */
+
 /* A wait loop's pause (flip release, software-method trap): sleep until rung,
  * at most 1 ms; `bell` = s_exec_bell read before the loop's tests. */
 static void exec_pause(volatile uint32_t *regs, LONG bell)
@@ -1427,6 +1429,7 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
                           & 0x10000u))
             s_turn.flush_in_swm++;
         nv2a_handshake_pass(s_ack_regs, 0);
+        nv2a_interp_tick();
         waited = GetTickCount64() - t0;
         if (waited > 2000 && kernel_pgraph_swm_cancel()) {
             fprintf(stderr, "  [NV2A] software method %X (param %08X) not taken"
@@ -1501,6 +1504,7 @@ int xbox_Nv2aTakeFlipRelease(DWORD wait_ms)
         if (GetTickCount64() - t0 >= wait_ms)
             return 0;
         nv2a_handshake_pass(s_ack_regs, 1);
+        nv2a_interp_tick();
         exec_pause(s_ack_regs, bell);  /* a vblank raise rings */
     }
 }
@@ -1516,6 +1520,7 @@ void xbox_Nv2aIdle(DWORD ms)
     do {
         if (s_ack_regs)
             nv2a_handshake_pass(s_ack_regs, 1);
+        nv2a_interp_tick();
         Sleep(1);
     } while (GetTickCount64() - t0 < ms);
 }
@@ -1538,6 +1543,7 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
         worked = nv2a_handshake_pass(regs, 1);
+        nv2a_interp_tick();           /* an in-between picture due */
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
          *

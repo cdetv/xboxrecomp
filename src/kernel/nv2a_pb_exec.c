@@ -44,6 +44,7 @@
 #include "nv2a_vsh_interp.h"
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_interp.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
@@ -399,6 +400,8 @@ static void draw_primitive(void)
     if (!s_mg_drawing)
         draw_count();
 
+    if (nv2a_interp_n() > 1)
+        nv2a_interp_draw();
     s_be->draw();
     if (s_shadow)
         s_shadow->draw();
@@ -1331,6 +1334,13 @@ int nv2a_pb_exec_draw_words(uint32_t method, const uint32_t *p, uint32_t n)
     if (!s_wf_on || (s_wf_on == 2 && (g_pb.flips & 1)) || !s_exec_inited
         || g_pb_ftrace == 2)
         return 0;
+    /* Frame interpolation records what is run here as one entry. */
+    if (method != NV097_NO_OPERATION && nv2a_interp_n() > 1
+        && !nv2a_interp_replaying()
+        && (method == NV097_SET_BEGIN_END || method == NV097_ARRAY_ELEMENT16
+            || method == NV097_ARRAY_ELEMENT32 || method == NV097_DRAW_ARRAYS
+            || method == NV097_INLINE_ARRAY))
+        nv2a_interp_rec_words(method, p, n);
     switch (method) {
     case NV097_NO_OPERATION:
         for (i = 0; i < n; i++)
@@ -1402,6 +1412,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         g_pb.min_x = g_pb.min_y = 1e30f;
         g_pb.max_x = g_pb.max_y = -1e30f;
     }
+    /* Frame interpolation: the stream as it is run (nv2a_interp.c). */
+    if (nv2a_interp_n() > 1 && !nv2a_interp_replaying())
+        nv2a_interp_rec_method(subch, method, param);
     /* Merged batches draw before anything that is not more of the same. */
     if (s_mg_held && !merge_passes(subch, method, param))
         nv2a_pb_merge_flush();
@@ -1452,6 +1465,19 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
+    }
+    if (nv2a_interp_replaying()) {
+        /* A frame drawn again (nv2a_interp.c): nothing the title sees. */
+        switch (method) {
+        case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        case 0x17C8: case 0x17CC: case 0x17D0:    /* visibility reports */
+        case NV097_SET_FLIP_READ: case NV097_SET_FLIP_WRITE:
+        case NV097_SET_FLIP_MODULO: case NV097_FLIP_INCREMENT_WRITE:
+        case NV097_FLIP_STALL:
+            return;
+        default:
+            break;
+        }
     }
     switch (method) {
     case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
@@ -1675,9 +1701,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(g_pb.draws - draws_at_flip);
             draws_at_flip = g_pb.draws;
         }
+        if (nv2a_interp_n() > 1)
+            nv2a_interp_flip_before(s_be);
         s_be->present();
         if (s_shadow)
             s_shadow->present();
+        if (nv2a_interp_n() > 1)
+            nv2a_interp_flip_after();
 
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;

@@ -2740,6 +2740,13 @@ const Nv2aVshOutput *pb_transform_batch(void)
     return s_xf_ok ? s_xf : NULL;
 }
 
+/* The batch transformed last is not the next one's, whatever its number: a
+ * frame drawn again (nv2a_interp.c) counts its batches from the same place. */
+void pb_transform_forget(void)
+{
+    s_xf_draw = (uint32_t)-1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = g_pb.idx_count;
