@@ -327,12 +327,13 @@ static int surface_scaled_now(void)
 /* Small render targets a title wants drawn bigger (Conker's shadow
  * pictures, 128x128: xbox_SetSurfaceBoost). The title's function names, for
  * a colour surface about to be drawn into, how many host pixels each guest
- * pixel gets on both axes: 2, 4 or 8 (anything else: 1, as before). Such a
- * surface keeps the texture every surface already has (ZETA_W x ZETA_H host
- * pixels, see GpuSurface) and so costs no more memory: its guest size is
- * padded to ZETA_W / k instead of ZETA_W, and a target too big for that at
- * k gets the next smaller factor. Its depth buffers are its own (GpuZeta
- * boost), ZETA_W x ZETA_H host pixels like the unscaled ones. Everything
+ * pixel gets on both axes: 2, 4, 8 or 16 (anything else: 1, as before). Its
+ * guest size is padded to ZETA_W / k instead of ZETA_W, so up to ZETA_W host
+ * pixels it keeps the texture every surface already has (ZETA_W x ZETA_H,
+ * see GpuSurface) and costs no more memory; bigger (a 128-pixel target at
+ * 16x: 2048) it is its own size, up to BOOST_MAX_HOST a side, and a target
+ * too big for that at k gets the next smaller factor. Its depth buffers are
+ * its own (GpuZeta boost), the size of its texture. Everything
  * else follows the per-surface scale (sx, sy) the render scale already
  * uses: viewport, scissors, clears, copies and direct reads as a texture
  * (coordinates stay in guest units), visibility counts. Never for a surface
@@ -353,6 +354,10 @@ void xbox_SetSurfaceBoost(xbox_SurfaceBoostFn fn)
     InterlockedIncrement(&s_boost_gen);
 }
 
+/* The biggest side of a boosted surface's texture, host pixels: 16 MB of
+ * B8G8R8A8 (and as much depth) at most per surface. */
+#define BOOST_MAX_HOST 2048u
+
 /* The factor for the current colour target at addr, its drawn extent w x h
  * guest pixels (before padding): 0 = none. */
 static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
@@ -363,9 +368,9 @@ static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
     if (!fn || surface_scaled_now())
         return 0;
     k = fn(addr, g_pb.format, g_pb.pitch, w, h);
-    if (k != 2 && k != 4 && k != 8)
+    if (k != 2 && k != 4 && k != 8 && k != 16)
         return 0;
-    while (k > 1 && (w * k > ZETA_W || h * k > ZETA_H))
+    while (k > 1 && (w * k > BOOST_MAX_HOST || h * k > BOOST_MAX_HOST))
         k >>= 1;
     return k > 1 ? k : 0;
 }
@@ -1321,11 +1326,12 @@ static float zeta_sy(int i)
  * given scale (scaled, or boosted by boost), made (depth 1, stencil 0, as
  * zbuf_slot fills its new buffers: farther than anything) when there is
  * none and create is set: its index, or -1. A boosted surface's buffer is
- * ZETA_W x ZETA_H host pixels, the size its texture is padded to.
+ * the size of its texture, bw x bh host pixels (ignored when not boosted).
  * ponytail: one made for a boosted surface after the guest cleared the
  * zeta surface starts at depth 1 rather than the clear value (Conker's
  * boosted shadow pictures draw without depth). */
-static int zeta_current(int create, uint32_t scaled, uint32_t boost)
+static int zeta_current(int create, uint32_t scaled, uint32_t boost,
+                        uint32_t bw, uint32_t bh)
 {
     D3D11_TEXTURE2D_DESC d;
     D3D11_DEPTH_STENCIL_VIEW_DESC dv;
@@ -1336,7 +1342,8 @@ static int zeta_current(int create, uint32_t scaled, uint32_t boost)
 
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset
-            && s_zeta[i].scaled == scaled && s_zeta[i].boost == boost) {
+            && s_zeta[i].scaled == scaled && s_zeta[i].boost == boost
+            && (!boost || (s_zeta[i].tw == bw && s_zeta[i].th == bh))) {
             s_zeta[i].zf = zeta_format();
             return i;
         }
@@ -1351,8 +1358,8 @@ static int zeta_current(int create, uint32_t scaled, uint32_t boost)
     memset(z, 0, sizeof *z);
 
     memset(&d, 0, sizeof d);
-    d.Width = to_host(ZETA_W, scaled && !boost ? s_rsx : 1.0f);
-    d.Height = to_host(ZETA_H, scaled && !boost ? s_rsy : 1.0f);
+    d.Width = boost ? bw : to_host(ZETA_W, scaled ? s_rsx : 1.0f);
+    d.Height = boost ? bh : to_host(ZETA_H, scaled ? s_rsy : 1.0f);
     d.MipLevels = 1;
     d.ArraySize = 1;
     d.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1421,7 +1428,7 @@ static void zeta_clear(uint32_t param)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset)
             break;
     if (i == GPU_ZETAS)
-        zeta_current(1, (uint32_t)surface_scaled_now(), 0);
+        zeta_current(1, (uint32_t)surface_scaled_now(), 0, 0, 0);
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset) {
             s_zeta[i].zf = zeta_format();
@@ -1557,6 +1564,7 @@ static ID3D11Buffer       *s_zcb;
 /* The stretch copy pass (blit_stretch): its pixel shader, constants and
  * bilinear sampler; the vertex shader is the zeta pass's. */
 static ID3D11PixelShader  *s_bps;
+static ID3D11PixelShader  *s_xps;       /* fill_blur's box pass */
 static ID3D11Buffer       *s_bcb;
 static ID3D11SamplerState *s_bsamp;
 
@@ -1952,6 +1960,15 @@ static int draw_setup(void)
         if (FAILED(bh)) {
             fail("stretch copy pass", bh);
             if (s_bps) { ID3D11PixelShader_Release(s_bps); s_bps = NULL; }
+        } else {
+            /* fill_blur's box pass (RECOMP_BOOST_FILL), on the same
+             * buffer and sampler; without it fills are not made. */
+            ID3DBlob *xps = compile("xps", "ps_4_0");
+            if (!xps || FAILED(ID3D11Device_CreatePixelShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(xps),
+                    ID3D10Blob_GetBufferSize(xps), NULL, &s_xps)))
+                s_xps = NULL;
+            if (xps) ID3D10Blob_Release(xps);
         }
     }
     if (SUCCEEDED(hr)) {
@@ -2592,6 +2609,7 @@ static struct {
     uint32_t w, h, used;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
+    ID3D11RenderTargetView *rtv;        /* made by fill_blur when needed */
 } s_rtt[4][RTT_SIZES];
 static uint32_t s_rtt_tick;
 
@@ -2825,26 +2843,144 @@ static int rtt_direct_ok(int st, int i, uint32_t tw, uint32_t th)
  * averaged the 2x2 texels between the pixel and it; at k times the size
  * the same tap is k/2 texels out with nothing between, and the blurred edge
  * came out as flat steps, a band (8x, 2026-11-06). Filled, it is a smooth
- * ramp as wide as before. n x n samples a tap, n = k/4 (at least 1): 16 a
- * pixel at 8x, 4 below. For copy-read stages (a target is never read as it
- * is): the copy's texel (x, y) is the target's pixel (x, y). */
+ * ramp as wide as before. For the half-texel taps the area is the d x d
+ * square (d = k/2 host texels) between the pixel and the tap, so the copy
+ * is box-blurred d x d once (fill_blur, two passes, shared by the batch's
+ * stages that read the same copy) and each tap reads it at the square's
+ * centre, (pixel + tap) / 2: one sample a tap. (Sampling the square in the
+ * shader, n x n taps, cost 0.8 ms a picture at 16x.) For copy-read stages
+ * (a target is never read as it is): the copy's texel (x, y) is the
+ * target's pixel (x, y). ponytail: a tap not on a diagonal reads the same
+ * d x d square round its midpoint, not the line between. */
 static int s_fill_on = -1;
+static uint32_t s_draw_seq;             /* d3d_draw's batches, for sharing */
+static struct {
+    uint32_t seq, tw, th;
+    int slot;
+    D3D11_BOX box;
+    ID3D11ShaderResourceView *srv;
+} s_fill_share;
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} s_fill_tmp;
 
 static int rtt_fill(int st, int i, uint32_t tw, uint32_t th)
 {
-    float n;
-
     if (s_fill_on < 0) {
         const char *e = getenv("RECOMP_BOOST_FILL");
         s_fill_on = !(e && e[0] == '0');
     }
     if (!s_fill_on || i != s_rtt_target || !s_surf[i].boost || !tw || !th)
         return 0;
-    n = (float)(s_surf[i].boost / 4u);
-    s_rtt_fill[st][0] = n < 1.0f ? 1.0f : n;
+    s_rtt_fill[st][0] = 1.0f;
     s_rtt_fill[st][1] = 1.0f / (float)tw;
     s_rtt_fill[st][2] = 1.0f / (float)th;
     s_rtt_fill[st][3] = 0.0f;
+    return 1;
+}
+
+/* One box pass: d texels along (dx, dy) of src (sw x sh) into dst over
+ * w x h pixels, as d/2 bilinear samples on texel corners. */
+static void fill_pass(ID3D11ShaderResourceView *src, uint32_t sw, uint32_t sh,
+                      ID3D11RenderTargetView *dst, uint32_t w, uint32_t h,
+                      int dx, int dy, uint32_t d)
+{
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+    float bk[8];
+
+    bk[0] = (float)dx / (float)sw;
+    bk[1] = (float)dy / (float)sh;
+    bk[2] = (float)(d / 2u);
+    bk[3] = 0.5f - (float)(d / 2u);
+    bk[4] = 1.0f / (float)sw;
+    bk[5] = 1.0f / (float)sh;
+    bk[6] = bk[7] = 0.0f;
+    if (!buf_fill(s_bcb, bk, sizeof bk))
+        return;
+    vp.TopLeftX = vp.TopLeftY = 0.0f;
+    vp.Width = (float)w;
+    vp.Height = (float)h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    sc.left = sc.top = 0;
+    sc.right = (LONG)w;
+    sc.bottom = (LONG)h;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &dst, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &src);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+}
+
+/* Copy c of stage st box-blurred d x d in place (through s_fill_tmp), for
+ * RECOMP_BOOST_FILL; d < 2 needs none (the midpoint's bilinear sample is
+ * the 2 x 2 square). 1 when the copy is ready to be read filled. */
+static int fill_blur(int st, int c, uint32_t d)
+{
+    uint32_t w = s_rtt[st][c].w, h = s_rtt[st][c].h;
+    ID3D11ShaderResourceView *none = NULL;
+
+    if (d < 2)
+        return 1;
+    if (!s_xps || !s_bcb || !s_bsamp)
+        return 0;
+    if (!s_rtt[st][c].rtv
+        && FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)s_rtt[st][c].tex, NULL, &s_rtt[st][c].rtv)))
+        return 0;
+    if (!s_fill_tmp.tex || s_fill_tmp.w < w || s_fill_tmp.h < h) {
+        D3D11_TEXTURE2D_DESC td;
+        uint32_t nw = w > s_fill_tmp.w ? w : s_fill_tmp.w;
+        uint32_t nh = h > s_fill_tmp.h ? h : s_fill_tmp.h;
+        if (s_fill_tmp.srv) ID3D11ShaderResourceView_Release(s_fill_tmp.srv);
+        if (s_fill_tmp.rtv) ID3D11RenderTargetView_Release(s_fill_tmp.rtv);
+        if (s_fill_tmp.tex) ID3D11Texture2D_Release(s_fill_tmp.tex);
+        memset(&s_fill_tmp, 0, sizeof s_fill_tmp);
+        memset(&td, 0, sizeof td);
+        td.Width = nw;
+        td.Height = nh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL,
+                                                &s_fill_tmp.tex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                    (ID3D11Resource *)s_fill_tmp.tex, NULL, &s_fill_tmp.rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_fill_tmp.tex, NULL, &s_fill_tmp.srv))) {
+            if (s_fill_tmp.rtv) ID3D11RenderTargetView_Release(s_fill_tmp.rtv);
+            if (s_fill_tmp.tex) ID3D11Texture2D_Release(s_fill_tmp.tex);
+            memset(&s_fill_tmp, 0, sizeof s_fill_tmp);
+            return 0;
+        }
+        s_fill_tmp.w = nw;
+        s_fill_tmp.h = nh;
+    }
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_xps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_bcb);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 4, 1, &s_bsamp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    fill_pass(s_rtt[st][c].srv, w, h, s_fill_tmp.rtv, w, h, 1, 0, d);
+    fill_pass(s_fill_tmp.srv, s_fill_tmp.w, s_fill_tmp.h, s_rtt[st][c].rtv,
+              w, h, 0, 1, d);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    gt_mark(GT_COPY, GT_KEYS);
     return 1;
 }
 
@@ -2877,7 +3013,7 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
     const Texture *t = &g_pb.texs[st];
     uint32_t swz = d3d8_format_is_swizzled(t->color) ? 1u : 0u, tw, th;
     D3D11_BOX box;
-    int i, r, c, old;
+    int i, r, c, old, fill;
 
     if (d3d8_format_dxt_block_bytes(t->color))
         return NULL;
@@ -2968,41 +3104,6 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
         s_rtt_slot = i;
         return s_surf[i].srv;
     }
-    for (c = 0, old = 0; c < RTT_SIZES; c++) {
-        if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
-            break;
-        if (s_rtt[st][c].used < s_rtt[st][old].used)
-            old = c;
-    }
-    if (c == RTT_SIZES) {
-        D3D11_TEXTURE2D_DESC d;
-        c = old;
-        if (s_rtt[st][c].srv) ID3D11ShaderResourceView_Release(s_rtt[st][c].srv);
-        if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
-        memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
-        memset(&d, 0, sizeof d);
-        d.Width = tw;
-        d.Height = th;
-        d.MipLevels = 1;
-        d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
-                                                &s_rtt[st][c].tex))
-            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
-                    (ID3D11Resource *)s_rtt[st][c].tex, NULL,
-                    &s_rtt[st][c].srv))) {
-            if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
-            memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
-            return NULL;
-        }
-        s_rtt[st][c].w = tw;
-        s_rtt[st][c].h = th;
-        s_stat.rtt_made++;
-    }
-    s_rtt[st][c].used = ++s_rtt_tick;
     /* What the surface has of the texture's rectangle, or of the part the
      * batch reads (rtt_read_rect); past it the copy keeps whatever it
      * held. */
@@ -3021,14 +3122,70 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             s_stat.rtt_rects++;
         }
     }
+    fill = rtt_fill(st, i, tw, th);
+    if (fill && s_fill_share.srv && s_fill_share.seq == s_draw_seq
+        && s_fill_share.slot == i && s_fill_share.tw == tw
+        && s_fill_share.th == th
+        && !memcmp(&s_fill_share.box, &box, sizeof box)) {
+        /* An earlier stage of this batch made the same filled copy. */
+        *flags = (uint32_t)r | RTT_FILL;
+        s_stat.rtt_filled++;
+        s_stat.rtt_binds++;
+        s_surf[i].used = ++s_surf_tick;
+        s_rtt_slot = i;
+        return s_fill_share.srv;
+    }
+    for (c = 0, old = 0; c < RTT_SIZES; c++) {
+        if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
+            break;
+        if (s_rtt[st][c].used < s_rtt[st][old].used)
+            old = c;
+    }
+    if (c == RTT_SIZES) {
+        D3D11_TEXTURE2D_DESC d;
+        c = old;
+        if (s_rtt[st][c].rtv) ID3D11RenderTargetView_Release(s_rtt[st][c].rtv);
+        if (s_rtt[st][c].srv) ID3D11ShaderResourceView_Release(s_rtt[st][c].srv);
+        if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+        memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
+        memset(&d, 0, sizeof d);
+        d.Width = tw;
+        d.Height = th;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        /* A target too, for fill_blur. */
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                &s_rtt[st][c].tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_rtt[st][c].tex, NULL,
+                    &s_rtt[st][c].srv))) {
+            if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+            memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
+            return NULL;
+        }
+        s_rtt[st][c].w = tw;
+        s_rtt[st][c].h = th;
+        s_stat.rtt_made++;
+    }
+    s_rtt[st][c].used = ++s_rtt_tick;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
             (ID3D11Resource *)s_rtt[st][c].tex, 0, box.left, box.top, 0,
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     gt_mark(GT_COPY, GT_KEYS);
     *flags = (uint32_t)r;
-    if (rtt_fill(st, i, tw, th)) {
+    if (fill && fill_blur(st, c, s_surf[i].boost / 2u)) {
         *flags |= RTT_FILL;
         s_stat.rtt_filled++;
+        s_fill_share.seq = s_draw_seq;
+        s_fill_share.slot = i;
+        s_fill_share.tw = tw;
+        s_fill_share.th = th;
+        s_fill_share.box = box;
+        s_fill_share.srv = s_rtt[st][c].srv;
     }
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
@@ -5021,6 +5178,7 @@ static void d3d_draw(void)
     memset(&k, 0, sizeof k);
     memset(&s_cbd, 0, sizeof s_cbd);
     s_rtt_target = si;
+    s_draw_seq++;
 
     if (program || combiners) {
         /* Through the title's own program, or the fixed-function vertex
@@ -5422,9 +5580,11 @@ static void d3d_draw(void)
     zi = -1;
     if (path != PATH_FLAT
         && (g_pb.depth_test || g_pb.depth_mask || g_pb.stencil_test)) {
-        uint32_t zb = s_surf[si].boost ? s_surf[si].boost : 1;
-        if (s_surf[si].w * zb == ZETA_W && s_surf[si].h * zb == ZETA_H)
-            zi = zeta_current(1, s_surf[si].scaled, s_surf[si].boost);
+        /* A boosted surface's buffer is made at its size. */
+        if (s_surf[si].boost
+            || (s_surf[si].w == ZETA_W && s_surf[si].h == ZETA_H))
+            zi = zeta_current(1, s_surf[si].scaled, s_surf[si].boost,
+                              s_surf[si].tw, s_surf[si].th);
         else
             s_stat.zeta_too_big++;
     }
@@ -6422,7 +6582,8 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();
-    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost) : -1;
+    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                                s_surf[si].tw, s_surf[si].th) : -1;
     dp.focus = host_float(p[0]);
     dp.range = host_float(p[1]);
     dp.zn = host_float(p[2]);
