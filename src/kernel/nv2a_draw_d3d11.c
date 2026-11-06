@@ -6097,7 +6097,8 @@ static int d3d_interp(int op, int slot)
                         10);
             /* Which picture each dump is (an unnamed one is slot 1, shown
              * by the frame's own present). */
-            fprintf(stderr, "[IDUMP] %05d slot %d%c", seq, slot, 10);
+            fprintf(stderr, "[IDUMP] %05d slot %d flip %u%c", seq, slot,
+                    g_pb.flips, 10);
         }
         if (!s_swap || !ensure_swap_chain())
             return 0;

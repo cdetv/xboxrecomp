@@ -37,8 +37,10 @@
  * Pairs: draws of N and N-1 with the same key, in their order among draws
  * with that key. The key is the program, the position array, the index
  * count, texture stage 0 and the colour target's shape. A draw without a pair, and a
- * frame with too few pairs (a load), or one the title marks as a camera cut
- * (NV_HOST_FX_INTERP_CUT in its stream), is drawn as N. Constants
+ * frame with too few pairs (a load), one the title marks as a camera cut
+ * (NV_HOST_FX_INTERP_CUT in its stream), or one whose camera jumped
+ * (camera_jumped: a cut the title does not mark; RECOMP_INTERP_AUTOCUT=0
+ * off) is drawn as N. Constants
  * that are the same in both, or all zero in one of them, are N's.
  *
  * Guest memory the frame read (vertex arrays, textures) is read again when
@@ -114,6 +116,7 @@ static int s_strict;                    /* RECOMP_INTERP_STRICT: no loose keys *
 static int s_underlay = 1;              /* RECOMP_INTERP_UNDER=0: clears as they are */
 static int s_near = 1;                  /* RECOMP_INTERP_NEAR=0: always frame N */
 static int s_union = 1;                 /* RECOMP_INTERP_UNION=0: no index unions */
+static double s_autocut = 0.5;          /* RECOMP_INTERP_AUTOCUT: share of jumps */
 static Frame s_fr[2];
 static int s_cur;                       /* s_fr[s_cur] is being recorded */
 static int s_recording;
@@ -145,7 +148,8 @@ static LARGE_INTEGER s_freq;
 static LONGLONG s_last_flip, s_period;  /* QPC; s_period: EMA of flip gaps */
 
 static struct {
-    uint32_t frames, interpolated, cuts, game_cuts, overflows, unpaired_frames;
+    uint32_t frames, interpolated, cuts, game_cuts, auto_cuts, overflows;
+    uint32_t unpaired_frames;
     uint64_t draws, paired, diverged, dup_draws, loose1, loose2, unions;
     double replay_ms, replay_max;
     uint32_t shown, late, dropped;
@@ -161,7 +165,8 @@ int nv2a_interp_n(void)
             n = 1;
         if (n > INTERP_MAX_N)
             n = INTERP_MAX_N;
-        s_log = getenv("RECOMP_INTERP_LOG") != NULL;
+        s_log = getenv("RECOMP_INTERP_LOG") ? atoi(getenv("RECOMP_INTERP_LOG"))
+                                            : 0;
         e = getenv("RECOMP_INTERP_MODE");
         s_mode = e ? atoi(e) : 0;
         s_unique = getenv("RECOMP_INTERP_UNIQUE") != NULL;
@@ -172,6 +177,9 @@ int nv2a_interp_n(void)
         s_near = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_UNION");
         s_union = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_AUTOCUT");
+        if (e)
+            s_autocut = atof(e);
         QueryPerformanceFrequency(&s_freq);
         s_period = s_freq.QuadPart / 30;
         if (n > 1)
@@ -563,6 +571,174 @@ static int cmp_keyidx(const void *a, const void *b)
 static KeyIdx *s_ka, *s_kb;
 static uint32_t s_kcap;
 
+/* Whether the registers rows marks jumped between a and b. A row whose
+ * x, y, z is a unit vector in both (a rotation's row) turned by more than 30
+ * degrees (a camera turning fast does 12 a frame): 1. With all (only the
+ * camera's shared rows): a projection-like row (one or two values, 1.5-100)
+ * scaled by more than half, 2; a translation (|v| >= 100) moved by more than
+ * half the largest translation among those rows, 3. 0 = no jump. Colours,
+ * fog and light values are left out: they flicker (It's War's gunfire). */
+static int pair_jumped(const float (*a)[4], const float (*b)[4],
+                       const uint8_t *rows, int all)
+{
+    uint32_t r, c;
+    float tmax = 0.0f;
+
+    if (all)
+        for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+            for (c = 0; rows[r] && c < 4; c++) {
+                if (fabsf(a[r][c]) >= 100.0f && fabsf(a[r][c]) > tmax)
+                    tmax = fabsf(a[r][c]);
+                if (fabsf(b[r][c]) >= 100.0f && fabsf(b[r][c]) > tmax)
+                    tmax = fabsf(b[r][c]);
+            }
+    for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+        float la, lb, d;
+        int nz = 0;
+        if (!rows[r] || !memcmp(a[r], b[r], sizeof a[r]) || all_zero(a[r])
+            || all_zero(b[r]))
+            continue;
+        la = a[r][0] * a[r][0] + a[r][1] * a[r][1] + a[r][2] * a[r][2];
+        lb = b[r][0] * b[r][0] + b[r][1] * b[r][1] + b[r][2] * b[r][2];
+        if (la > 0.9f && la < 1.1f && lb > 0.9f && lb < 1.1f) {
+            d = (a[r][0] * b[r][0] + a[r][1] * b[r][1] + a[r][2] * b[r][2])
+                / sqrtf(la * lb);
+            if (d < 0.866f)
+                return 1;
+        }
+        if (!all)
+            continue;
+        for (c = 0; c < 4; c++)
+            nz += a[r][c] != 0.0f;
+        for (c = 0; c < 4; c++) {
+            float x = a[r][c], y = b[r][c], ax = fabsf(x), ay = fabsf(y);
+            if (!isfinite(x) || !isfinite(y) || (ax <= 1.5f && ay <= 1.5f))
+                continue;
+            if (ax < 100.0f && ay < 100.0f) {
+                if (nz <= 2 && fabsf(y - x) > (ax > ay ? ax : ay) / 2.0f)
+                    return 2;
+            } else if (fabsf(y - x) > tmax / 2.0f) {
+                return 3;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Whether the camera jumped between prev and f: the registers nearly every
+ * paired draw shares, in both frames, and that changed (the camera's
+ * matrices: the same in every draw of a frame), by pair_jumped. Without
+ * such registers: no (the title's own cut marker still counts). */
+static int camera_jumped(const Frame *f, const Frame *prev)
+{
+    static uint32_t same[NV2A_VSH_CONSTANTS];
+    static uint8_t rows[NV2A_VSH_CONSTANTS];
+    uint32_t j, r, n = 0, nrows = 0;
+    int32_t j0 = -1;
+    int why;
+
+    memset(same, 0, sizeof same);
+    /* The reference: a paired draw from the middle of the frame (the first
+     * ones are often a shadow picture, drawn from the light). */
+    for (j = f->ndraws / 2; j < f->ndraws && j0 < 0; j++)
+        if (f->pair[j] >= 0)
+            j0 = (int32_t)j;
+    for (j = 0; j < f->ndraws && j0 < 0; j++)
+        if (f->pair[j] >= 0)
+            j0 = (int32_t)j;
+    for (j = 0; j < f->ndraws; j++) {
+        int32_t pj = f->pair[j];
+        if (pj < 0)
+            continue;
+        n++;
+        for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+            if (!memcmp(f->consts[j][r], f->consts[j0][r], 16)
+                && !memcmp(prev->consts[pj][r], prev->consts[f->pair[j0]][r],
+                           16))
+                same[r]++;
+    }
+    if (j0 < 0 || n < 8)
+        return 0;
+    for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+        rows[r] = same[r] * 10 >= n * 8
+                  && memcmp(f->consts[j0][r], prev->consts[f->pair[j0]][r], 16);
+        nrows += rows[r];
+    }
+    /* A camera is at least a 3-row view matrix (Uga Buga shares 2 rows of
+     * something else, which jumped in half its frames). */
+    why = nrows >= 3
+          ? pair_jumped((const float (*)[4])prev->consts[f->pair[j0]],
+                        (const float (*)[4])f->consts[j0], rows, 1) : 0;
+    if (!why) {
+        /* A shot drawn with its own matrices (It's War's valve close-up:
+         * the shared ones hardly moved): a third of the changed draws
+         * jumping is a cut too (3-23 % in a turning, shaking camera). */
+        /* Weighed by indices: a cut moves the level's big pieces, a crowd's
+         * animation only small ones (Uga Buga: half its frames otherwise). */
+        static uint8_t all[NV2A_VSH_CONSTANTS];
+        uint64_t changed = 0, jumped = 0;
+        uint32_t nchanged = 0;
+        if (!all[0])
+            memset(all, 1, sizeof all);
+        for (j = 0; j < f->ndraws; j++) {
+            int32_t pj = f->pair[j];
+            if (pj < 0 || !memcmp(f->consts[j], prev->consts[pj],
+                                   sizeof f->consts[j]))
+                continue;
+            nchanged++;
+            changed += f->ix[j][1];
+            if (pair_jumped((const float (*)[4])prev->consts[pj],
+                            (const float (*)[4])f->consts[j], all, 0))
+                jumped += f->ix[j][1];
+        }
+        if (nchanged >= 8 && jumped * 3 >= changed)
+            why = 4;
+    }
+    if (s_log >= 2) {
+        /* RECOMP_INTERP_LOG=2: the camera's change every frame. */
+        const float (*a)[4] = (const float (*)[4])prev->consts[f->pair[j0]];
+        const float (*b)[4] = (const float (*)[4])f->consts[j0];
+        float rot = 0, tr = 0, tmax = 0, sc = 0;
+        uint32_t c;
+        for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+            for (c = 0; rows[r] && c < 4; c++) {
+                float x = a[r][c], y = b[r][c], m = fabsf(x) > fabsf(y)
+                                                    ? fabsf(x) : fabsf(y);
+                if (m <= 1.5f) {
+                    if (fabsf(y - x) > rot) rot = fabsf(y - x);
+                } else if (m < 100.0f) {
+                    if (fabsf(y - x) / m > sc) sc = fabsf(y - x) / m;
+                } else {
+                    if (m > tmax) tmax = m;
+                    if (fabsf(y - x) > tr) tr = fabsf(y - x);
+                }
+            }
+        static uint8_t all[NV2A_VSH_CONSTANTS];
+        uint32_t changed = 0, jumped = 0;
+        if (!all[0])
+            memset(all, 1, sizeof all);
+        for (j = 0; j < f->ndraws; j++) {
+            int32_t pj = f->pair[j];
+            if (pj < 0 || !memcmp(f->consts[j], prev->consts[pj],
+                                   sizeof f->consts[j]))
+                continue;
+            changed++;
+            jumped += pair_jumped((const float (*)[4])prev->consts[pj],
+                                  (const float (*)[4])f->consts[j], all, 0) != 0;
+        }
+        fprintf(stderr, "[ICAM] flip %u: rows %u, turn %.3f, scale %.3f, move"
+                " %.1f of %.1f%s; pairs jumped %u of %u changed%c", g_pb.flips,
+                nrows, rot, sc, tr, tmax, why ? " CUT" : "", jumped, changed,
+                10);
+    }
+    if (why && s_log)
+        fprintf(stderr, "[ICUT] flip %u: camera jumped (%s, %u shared"
+                " registers)%c", g_pb.flips, why == 1 ? "turned"
+                : why == 2 ? "projection" : why == 3 ? "moved"
+                : "a third of the draws", nrows, 10);
+    return why != 0;
+}
+
 static uint8_t *s_taken;                /* prev's draws already paired */
 static uint32_t s_taken_cap;
 
@@ -724,14 +900,14 @@ static void stats_line(LONGLONG now)
         return;
     s_st_at = now + s_freq.QuadPart * 10;
     fprintf(stderr, "[INTERP] 10 s: %u frames, %u interpolated, %u cuts"
-            " (%u the title's), %u too big, %u without the frame before; %.1f"
-            " draws a frame, %.1f %%"
+            " (%u the title's, %u seen), %u too big, %u without the frame"
+            " before; %.1f draws a frame, %.1f %%"
             " paired (%.1f %% by the loose keys), %.1f %% of one key drawn"
             " more than once, %llu runs went another way, %llu index unions;"
             " replays %.2f ms a frame"
             " (most %.2f); %u pictures shown, %u late, %u dropped%c",
             s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
-            s_st.overflows,
+            s_st.auto_cuts, s_st.overflows,
             s_st.unpaired_frames,
             s_st.frames ? (double)s_st.draws / s_st.frames : 0.0,
             s_st.draws ? 100.0 * (double)s_st.paired / (double)s_st.draws : 0.0,
@@ -839,6 +1015,7 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     Frame *f = &s_fr[s_cur], *prev = &s_fr[s_cur ^ 1];
     LONGLONG now = qpc(), t0;
     uint32_t paired, k;
+    int n;
 
     if (nv2a_interp_n() < 2 || !be->interp)
         return;
@@ -881,6 +1058,10 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     if (s_cut) {
         s_rep_blend = 0;
         s_st.game_cuts++;
+    } else if (s_rep_blend && s_autocut > 0.0
+               && camera_jumped(f, prev)) {
+        s_rep_blend = 0;
+        s_st.auto_cuts++;
     }
     if (s_mode == 2)
         s_rep_blend = 0;
@@ -907,6 +1088,14 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
             }
         }
     }
+    /* As many pictures as make n x 30 a second at the title's own rate: a
+     * 60 Hz part (menus, the opening movies) gets half as many. */
+    n = (int)((double)s_n * (double)s_period * 30.0 / (double)s_freq.QuadPart
+              + 0.5);
+    if (n > s_n)
+        n = s_n;
+    if (n < 2)
+        return;
     if (!be->interp(NV_INTERP_SAVE, 0))
         return;                         /* nothing shown this frame */
     if (!s_end_pb) {
@@ -923,7 +1112,7 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
      * toward this one (RECOMP_INTERP_NEAR, on): what this frame culled at
      * its edge, and the frame before still drew, stays in the picture. The
      * others are this frame moved back. */
-    if (s_near && s_rep_blend && prev->start_pb && s_n > 2) {
+    if (s_near && s_rep_blend && prev->start_pb && n > 2) {
         uint32_t i;
         if (s_inv_cap < prev->ndraws) {
             int32_t *v = realloc(s_inv, prev->ndraws * sizeof *v);
@@ -940,9 +1129,9 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
                     s_inv[f->pair[i]] = (int32_t)i;
         }
     }
-    for (k = 1; k < (uint32_t)s_n; k++) {
-        float t = (float)k / (float)s_n;
-        int older = s_near && s_rep_blend && s_n > 2 && 2 * k < (uint32_t)s_n
+    for (k = 1; k < (uint32_t)n; k++) {
+        float t = (float)k / (float)n;
+        int older = s_near && s_rep_blend && n > 2 && 2 * k < (uint32_t)n
                   && s_inv_cap >= prev->ndraws && prev->start_pb;
         if (s_mode == 3 && k == 1) {
             older = 1;                  /* test: N-1 again, as it was */
@@ -968,7 +1157,7 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         if (ms > s_st.replay_max)
             s_st.replay_max = ms;
     }
-    if (k < (uint32_t)s_n) {
+    if (k < (uint32_t)n) {
         be->interp(NV_INTERP_LOAD, 0);  /* shown as it is */
         return;
     }
@@ -980,16 +1169,16 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     be->interp(NV_INTERP_LOAD, 1);
     now = qpc();
     {
-        LONGLONG step = s_period / s_n;
+        LONGLONG step = s_period / n;
         LONGLONG room = s_period - (now - s_last_flip)
                       - s_freq.QuadPart * 3 / 2000;
         if (room < 0)
             room = 0;
-        if (step * (s_n - 1) > room)
-            step = room / (s_n - 1);
+        if (step * (n - 1) > room)
+            step = room / (n - 1);
         s_q_n = 0;
-        for (k = 2; k <= (uint32_t)s_n; k++) {
-            s_q_slot[s_q_n] = k < (uint32_t)s_n ? (int)k : 0;
+        for (k = 2; k <= (uint32_t)n; k++) {
+            s_q_slot[s_q_n] = k < (uint32_t)n ? (int)k : 0;
             s_q_at[s_q_n] = now + step * (LONGLONG)(k - 1);
             s_q_n++;
         }
