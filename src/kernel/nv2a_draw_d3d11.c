@@ -1335,6 +1335,11 @@ static void zeta_clear(uint32_t param)
 }
 
 /* ponytail: all four colour channels whatever the mask bits say. */
+/* Frame interpolation's underlay (d3d_interp, NV_INTERP_UNDER). */
+static int s_under_on;
+static ID3D11Texture2D *s_under;
+static ID3D11Texture2D *s_under_for;    /* the surface texture it stands in */
+
 static void d3d_clear(uint32_t param)
 {
     D3D11_RECT r;
@@ -1374,8 +1379,23 @@ static void d3d_clear(uint32_t param)
     r.top = (LONG)to_host(g_pb.clip_y, surf_sy(i));
     r.right = (LONG)to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(i));
     r.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(i));
-    ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)s_surf[i].rtv, c,
-                                   &r, 1);
+    if (s_under_on && s_under && s_surf[i].tex == s_under_for) {
+        D3D11_TEXTURE2D_DESC d;
+        D3D11_BOX b;
+        ID3D11Texture2D_GetDesc(s_under, &d);
+        b.left = (UINT)r.left; b.top = (UINT)r.top; b.front = 0;
+        b.right = (UINT)r.right; b.bottom = (UINT)r.bottom; b.back = 1;
+        if (b.right > d.Width)
+            b.right = d.Width;
+        if (b.bottom > d.Height)
+            b.bottom = d.Height;
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                (ID3D11Resource *)s_surf[i].tex, 0, b.left, b.top, 0,
+                (ID3D11Resource *)s_under, 0, &b);
+    } else {
+        ID3D11DeviceContext1_ClearView(s_ctx1, (ID3D11View *)s_surf[i].rtv,
+                                       c, &r, 1);
+    }
     gt_frame_begin();
     gt_mark(GT_CLEAR, GT_KEYS);
     s_stat.clears++;
@@ -4119,12 +4139,23 @@ static ID3D11RasterizerState *offset_state(int zcull, float scale)
  * console keeps; culling at the Z16 maximum dropped every shadow pixel and
  * left the shadows blank (#8, 2026-11-03). So a range wider than the
  * format's is clamped too. */
+extern int nv2a_interp_replaying(void);  /* nv2a_interp.c */
+
 static ID3D11RasterizerState *raster_state(float scale)
 {
     static uint32_t seen[8][3];
     static int nseen;
+    static int zclamp = -1;
     float full = 1.0f / zeta_scale();
     int cull = ((g_pb.zminmax_control >> 4) & 0xF) == 0 && g_pb.clip_seen;
+    /* Frame interpolation (test, RECOMP_INTERP_ZCLAMP=1): an in-between
+     * picture clamps depth past the far limit instead of culling it. */
+    if (zclamp < 0) {
+        const char *e = getenv("RECOMP_INTERP_ZCLAMP");
+        zclamp = e && *e == '1';
+    }
+    if (zclamp && nv2a_interp_replaying())
+        cull = 0;
     int whole = g_pb.clip_min <= 0.5f && g_pb.clip_max >= full - 0.5f
                 && g_pb.clip_max <= full + 1.5f;
     uint32_t key[3], i;
@@ -5983,12 +6014,24 @@ static int d3d_interp(int op, int slot)
 {
     if (slot < 0 || slot >= INTERP_PICS || s_shadow)
         return 0;
+    if (op == NV_INTERP_UNDER) {
+        s_under_on = slot;
+        return 1;
+    }
     if (op == NV_INTERP_SAVE) {
         D3D11_TEXTURE2D_DESC d, h;
         ID3D11Texture2D *src;
         if (s_shown < 0 || !s_shown_w || !s_shown_h
             || !(src = s_surf[s_shown].tex))
             return 0;
+        if (slot == 0) {
+            /* The frame before's picture becomes the underlay, under the
+             * surface this frame is shown from. */
+            ID3D11Texture2D *t = s_under;
+            s_under = s_pic[0].tex;
+            s_pic[0].tex = t;
+            s_under_for = src;
+        }
         ID3D11Texture2D_GetDesc(src, &d);
         if (s_pic[slot].tex) {
             ID3D11Texture2D_GetDesc(s_pic[slot].tex, &h);
@@ -6024,8 +6067,15 @@ static int d3d_interp(int op, int slot)
         || s_surf[s_pic[slot].surf].tex != s_pic[slot].src)
         return 0;                       /* the surface is gone or remade */
     if (op == NV_INTERP_LOAD) {
+        /* And it is the surface shown next: a picture drawn from the frame
+         * before is in that frame's surface. */
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_pic[slot].src,
                                          (ID3D11Resource *)s_pic[slot].tex);
+        s_shown = s_pic[slot].surf;
+        s_shown_x = s_pic[slot].x;
+        s_shown_y = s_pic[slot].y;
+        s_shown_w = s_pic[slot].w;
+        s_shown_h = s_pic[slot].h;
         return 1;
     }
     if (op == NV_INTERP_SHOW) {

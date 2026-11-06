@@ -27,6 +27,12 @@ void nv2a_interp_rec_flush(void);
 /* Before each back-end draw (draw_primitive): records the draw, or, while
  * replaying, sets the blended constants for it. */
 void nv2a_interp_draw(void);
+/* After it (draw_primitive): while replaying, a second draw of the same
+ * vertices with the partner frame's index list, when the first armed one. */
+void nv2a_interp_after_draw(const Nv2aPbBackend *be);
+
+/* NV_HOST_FX_INTERP_CUT in the stream: the frame is a camera cut. */
+void nv2a_interp_note_cut(void);
 
 /* NV097_FLIP_STALL, after the wait and before the back end presents: draws
  * and presents the in-between pictures (before), then the next frame's

@@ -124,5 +124,7 @@ void nv2a_vsh_state_save(void *out);
 void nv2a_vsh_state_load(const void *in);
 const float (*nv2a_vsh_constants_all(void))[4];
 void nv2a_vsh_constants_set_all(const float (*c)[4]);
+/* The current program, disassembled to stderr ([VSH] lines). */
+void nv2a_vsh_dump_current(void);
 
 #endif

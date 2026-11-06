@@ -405,6 +405,8 @@ static void draw_primitive(void)
     s_be->draw();
     if (s_shadow)
         s_shadow->draw();
+    if (nv2a_interp_n() > 1)
+        nv2a_interp_after_draw(s_be);
 
     /* Read once: ~1,000 draws a frame made getenv ~7% of the executor. */
     static int verbose = -1;
@@ -1214,6 +1216,10 @@ static void host_method(uint32_t method, uint32_t param)
     }
     if (method != NV_HOST_EFFECT) {
         note_unhandled(method, param);
+        return;
+    }
+    if (param == NV_HOST_FX_INTERP_CUT) {
+        nv2a_interp_note_cut();
         return;
     }
     if (g_pb_ftrace == 2)

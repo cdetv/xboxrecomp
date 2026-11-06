@@ -223,6 +223,13 @@ void nv2a_vsh_state_load(const void *in)
     s_cdirty_hi = NV2A_VSH_CONSTANTS - 1;
 }
 
+static void dump_program(uint32_t start);
+
+void nv2a_vsh_dump_current(void)
+{
+    dump_program(s_start_slot);
+}
+
 const float (*nv2a_vsh_constants_all(void))[4]
 {
     return (const float (*)[4])s_const;

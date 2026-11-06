@@ -15,6 +15,18 @@
  * batch the CPU transforms (a program that writes constants, points) runs
  * through the interpreter on the blended constants too.
  *
+ * A paired draw whose partner drew the same vertex array with another
+ * index list (Conker builds its ground pieces' lists each frame from what
+ * that frame sees) is drawn with the partner's list too, if it is opaque:
+ * the in-between camera sees triangles either frame may have left out.
+ * (Also taking partners with other arrays drew shards: not the same
+ * pieces.)
+ *
+ * A replay's colour clear of the shown surface starts from the frame
+ * before's picture instead (NV_INTERP_UNDER): where the newer frame drew
+ * nothing (culled past its view, seen by an in-between camera), that shows
+ * instead of the clear colour.
+ *
  * Each picture is copied out of the frame's surface (the back end's
  * NV_INTERP_SAVE); the first is presented in place of N at the flip, N goes
  * back into its surface, and the rest -- N last -- are presented at even
@@ -25,7 +37,8 @@
  * Pairs: draws of N and N-1 with the same key, in their order among draws
  * with that key. The key is the program, the position array, the index
  * count, texture stage 0 and the colour target's shape. A draw without a pair, and a
- * frame with too few pairs (a camera cut, a load), is drawn as N. Constants
+ * frame with too few pairs (a load), or one the title marks as a camera cut
+ * (NV_HOST_FX_INTERP_CUT in its stream), is drawn as N. Constants
  * that are the same in both, or all zero in one of them, are N's.
  *
  * Guest memory the frame read (vertex arrays, textures) is read again when
@@ -35,7 +48,8 @@
  * RECOMP_INTERP_LOG=1: an [INTERP] line every 10 s (frames, draws, pairs,
  * replay time, pictures shown late or dropped). RECOMP_INTERP_MODE (tests):
  * 1 = every picture is N (pacing only, nothing drawn again), 2 = drawn again
- * with N's own constants (must come out as N). RECOMP_INTERP_TRACE=<file>:
+ * with N's own constants (must come out as N), 3 = the first picture is N-1
+ * drawn again as it was (must come out as N-1). RECOMP_INTERP_TRACE=<file>:
  * when that file appears, the next interpolated frame's draws are listed
  * ([ITRACE]: key parts and the constants that differ from the frame before).
  * RECOMP_INTERP_CTL_DIR=<dir> (tests): files only_<prog hex> / skip_<prog
@@ -73,8 +87,16 @@ typedef struct {
     uint32_t *words;
     size_t    nwords, capwords;
     uint64_t *key;
+    uint64_t (*loose)[2];               /* keys for draws left over: without
+                                         * index count and texture; and
+                                         * program and target only */
     uint32_t (*part)[6];                /* for traces: prog, attr0, n, prim,
                                          * tex0, target */
+    uint32_t (*ix)[2];                  /* each draw's index list: start, count */
+    VertexAttr (*attr)[NV_VERTEX_ATTRS]; /* and its vertex arrays */
+    uint8_t  *inl;                      /* drawn from INLINE_ARRAY / immediate */
+    uint32_t *idx;                      /* in here */
+    size_t    nidx, capidx;
     VshConsts *consts;
     int32_t  *pair;                     /* N's draw j -> N-1's, or -1 */
     uint32_t  ndraws, capdraws;
@@ -88,11 +110,18 @@ static int s_n = -1;
 static int s_log = -1;
 static int s_mode;                      /* RECOMP_INTERP_MODE */
 static int s_unique;                    /* RECOMP_INTERP_UNIQUE (test) */
+static int s_strict;                    /* RECOMP_INTERP_STRICT: no loose keys */
+static int s_underlay = 1;              /* RECOMP_INTERP_UNDER=0: clears as they are */
+static int s_near = 1;                  /* RECOMP_INTERP_NEAR=0: always frame N */
+static int s_union = 1;                 /* RECOMP_INTERP_UNION=0: no index unions */
 static Frame s_fr[2];
 static int s_cur;                       /* s_fr[s_cur] is being recorded */
 static int s_recording;
 static int s_rep;                       /* replaying */
-static Frame *s_rep_f, *s_rep_prev;
+static Frame *s_rep_f, *s_rep_prev;     /* run, and its partner frame */
+static const int32_t *s_rep_map;        /* s_rep_f's draw -> partner's, or -1 */
+static int32_t *s_inv;                  /* N-1's draws -> N's (replaying N-1) */
+static uint32_t s_inv_cap;
 static uint32_t s_rep_j;
 static float s_rep_t;
 static int s_rep_blend;                 /* this frame blends (not a cut) */
@@ -100,6 +129,8 @@ static VshConsts s_tmp;
 #define CTL_MAX 32
 static uint32_t s_only[CTL_MAX], s_skip[CTL_MAX];
 static int s_nonly, s_nskip;
+static int s_dump_progs;                /* the next frame's programs, once each */
+static int s_cut;                       /* this frame is a camera cut */
 static Nv2aPbState *s_end_pb;
 static void *s_end_vsh;
 static size_t s_vsh_size;
@@ -114,8 +145,8 @@ static LARGE_INTEGER s_freq;
 static LONGLONG s_last_flip, s_period;  /* QPC; s_period: EMA of flip gaps */
 
 static struct {
-    uint32_t frames, interpolated, cuts, overflows, unpaired_frames;
-    uint64_t draws, paired, diverged, dup_draws;
+    uint32_t frames, interpolated, cuts, game_cuts, overflows, unpaired_frames;
+    uint64_t draws, paired, diverged, dup_draws, loose1, loose2, unions;
     double replay_ms, replay_max;
     uint32_t shown, late, dropped;
 } s_st;
@@ -134,6 +165,13 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_MODE");
         s_mode = e ? atoi(e) : 0;
         s_unique = getenv("RECOMP_INTERP_UNIQUE") != NULL;
+        s_strict = getenv("RECOMP_INTERP_STRICT") != NULL;
+        e = getenv("RECOMP_INTERP_UNDER");
+        s_underlay = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_NEAR");
+        s_near = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_UNION");
+        s_union = !(e && *e == '0');
         QueryPerformanceFrequency(&s_freq);
         s_period = s_freq.QuadPart / 30;
         if (n > 1)
@@ -146,6 +184,12 @@ int nv2a_interp_n(void)
 int nv2a_interp_replaying(void)
 {
     return s_rep;
+}
+
+void nv2a_interp_note_cut(void)
+{
+    if (!s_rep)
+        s_cut = 1;
 }
 
 static int grow_words(Frame *f, size_t more)
@@ -209,23 +253,34 @@ static uint64_t fnv(uint64_t h, uint64_t v)
     return h;
 }
 
-/* What names a draw from one frame to the next. */
-static uint64_t draw_key(void)
+/* What names a draw from one frame to the next; loose (may be NULL): the
+ * looser keys draws left over are paired by (Frame.loose). */
+static uint64_t draw_key_loose(uint64_t loose[2])
 {
-    uint64_t h = 1469598103934665603ull, prog = 0;
+    uint64_t h = 1469598103934665603ull, prog = 0, t;
     uint32_t count;
 
     if ((g_pb.xf_mode & 3) == 2)
         nv2a_vsh_decoded(&count, &prog);
     h = fnv(h, prog);
-    h = fnv(h, g_pb.attr[0].offset);
-    h = fnv(h, (uint64_t)g_pb.idx_count << 32 | g_pb.prim);
-    h = fnv(h, g_pb.texs[0].offset);
     /* The target by its shape, not its address: a double-buffered frame
      * draws into the other buffer each time. */
     h = fnv(h, (uint64_t)g_pb.pitch << 32 | g_pb.format);
     h = fnv(h, (uint64_t)g_pb.clip_w << 32 | g_pb.clip_h);
+    t = h;
+    h = fnv(h, g_pb.attr[0].offset);
+    if (loose) {
+        loose[0] = h;
+        loose[1] = t;
+    }
+    h = fnv(h, (uint64_t)g_pb.idx_count << 32 | g_pb.prim);
+    h = fnv(h, g_pb.texs[0].offset);
     return h;
+}
+
+static uint64_t draw_key(void)
+{
+    return draw_key_loose(NULL);
 }
 
 static int all_zero(const float *v)
@@ -233,21 +288,55 @@ static int all_zero(const float *v)
     return v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f;
 }
 
-static void blend(VshConsts out, const VshConsts a, const VshConsts b, float t)
+/* out = own moved w of the way toward partner, register by register; a
+ * register zero in either is own's. */
+static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
+                  float w)
 {
     uint32_t r, c;
 
     for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
-        if (!memcmp(a[r], b[r], sizeof a[r]) || all_zero(a[r])
-            || all_zero(b[r])) {
-            memcpy(out[r], b[r], sizeof out[r]);
+        if (!memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
+            || all_zero(partner[r])) {
+            memcpy(out[r], own[r], sizeof out[r]);
             continue;
         }
         for (c = 0; c < 4; c++) {
-            float v = a[r][c] + (b[r][c] - a[r][c]) * t;
-            out[r][c] = isfinite(v) ? v : b[r][c];
+            float v = own[r][c] + (partner[r][c] - own[r][c]) * w;
+            out[r][c] = isfinite(v) ? v : own[r][c];
         }
     }
+}
+
+static int32_t s_extra = -1;            /* partner draw whose indices go next */
+static uint32_t s_extra_idx[NV_MAX_INDICES];
+static VertexAttr s_extra_attr[NV_VERTEX_ATTRS];
+
+/* After the back end drew a replayed draw: the partner frame's index list
+ * for the same vertices, if the draw armed it (nv2a_interp_draw). */
+void nv2a_interp_after_draw(const Nv2aPbBackend *be)
+{
+    const Frame *p = s_rep_prev;
+    int32_t pj = s_extra;
+    uint32_t n, keep;
+
+    if (!s_rep || pj < 0)
+        return;
+    s_extra = -1;
+    n = p->ix[pj][1];
+    keep = g_pb.idx_count;
+    memcpy(s_extra_idx, g_pb.idx, (size_t)keep * 4);
+    memcpy(s_extra_attr, g_pb.attr, sizeof g_pb.attr);
+    memcpy(g_pb.idx, p->idx + p->ix[pj][0], (size_t)n * 4);
+    memcpy(g_pb.attr, p->attr[pj], sizeof g_pb.attr);
+    g_pb.idx_count = n;
+    pb_transform_forget();
+    be->draw();
+    pb_transform_forget();
+    memcpy(g_pb.idx, s_extra_idx, (size_t)keep * 4);
+    memcpy(g_pb.attr, s_extra_attr, sizeof g_pb.attr);
+    g_pb.idx_count = keep;
+    s_st.unions++;
 }
 
 /* RECOMP_INTERP_CTL_DIR: whether draws of program prog are blended. */
@@ -325,10 +414,27 @@ void nv2a_interp_draw(void)
             s_rep_j = f->ndraws + 1;
             return;
         }
-        if (s_rep_blend && f->pair[j] >= 0 && ctl_blends(f->part[j][0])) {
-            blend(s_tmp, (const float (*)[4])s_rep_prev->consts[f->pair[j]],
-                  (const float (*)[4])f->consts[j], s_rep_t);
+        s_extra = -1;
+        if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])) {
+            int32_t pj = s_rep_map[j];
+            blend(s_tmp, (const float (*)[4])f->consts[j],
+                  (const float (*)[4])s_rep_prev->consts[pj],
+                  s_rep_t);
             nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
+            /* The same vertices drawn with another index list in the
+             * partner frame (a ground's pieces, each frame only what that
+             * frame sees): its triangles too, opaque draws only. */
+            if (s_union && !g_pb.blend_enable && !g_pb.merge_nparts
+                && !f->inl[j] && !s_rep_prev->inl[pj]
+                && f->part[j][0] == s_rep_prev->part[pj][0]
+                && f->part[j][1] && f->part[j][1] == s_rep_prev->part[pj][1]
+                && (f->ix[j][1] != s_rep_prev->ix[pj][1]
+                    || memcmp(f->idx + f->ix[j][0],
+                              s_rep_prev->idx + s_rep_prev->ix[pj][0],
+                              (size_t)f->ix[j][1] * 4))
+                && s_rep_prev->ix[pj][1]
+                && s_rep_prev->ix[pj][1] <= NV_MAX_INDICES)
+                s_extra = pj;
         } else {
             nv2a_vsh_constants_set_all((const float (*)[4])f->consts[j]);
         }
@@ -358,9 +464,22 @@ void nv2a_interp_draw(void)
                 f->pair = p;
             {
                 uint32_t (*pt)[6] = realloc(f->part, cap * sizeof *pt);
+                uint64_t (*lk)[2] = realloc(f->loose, cap * sizeof *lk);
+                uint32_t (*ix)[2] = realloc(f->ix, cap * sizeof *ix);
+                VertexAttr (*at)[NV_VERTEX_ATTRS] = realloc(f->attr,
+                                                            cap * sizeof *at);
+                uint8_t *il = realloc(f->inl, cap);
                 if (pt)
                     f->part = pt;
-                else
+                if (lk)
+                    f->loose = lk;
+                if (ix)
+                    f->ix = ix;
+                if (at)
+                    f->attr = at;
+                if (il)
+                    f->inl = il;
+                if (!pt || !lk || !ix || !at || !il)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -369,12 +488,53 @@ void nv2a_interp_draw(void)
             }
             f->capdraws = cap;
         }
-        f->key[f->ndraws] = draw_key();
+        f->key[f->ndraws] = draw_key_loose(f->loose[f->ndraws]);
+        {
+            /* Its index list and arrays, for the union below
+             * (nv2a_interp_after_draw). */
+            uint32_t n = g_pb.idx_count;
+            memcpy(f->attr[f->ndraws], g_pb.attr, sizeof g_pb.attr);
+            f->inl[f->ndraws] = (uint8_t)(g_pb.inline_active || g_pb.imm_count
+                                          || g_pb.inline_count);
+            if (f->nidx + n > f->capidx) {
+                size_t cap = f->capidx ? f->capidx * 2 : (1u << 20);
+                uint32_t *x;
+                while (cap < f->nidx + n)
+                    cap *= 2;
+                x = realloc(f->idx, cap * 4);
+                if (x) {
+                    f->idx = x;
+                    f->capidx = cap;
+                }
+            }
+            if (f->nidx + n <= f->capidx) {
+                memcpy(f->idx + f->nidx, g_pb.idx, (size_t)n * 4);
+                f->ix[f->ndraws][0] = (uint32_t)f->nidx;
+                f->ix[f->ndraws][1] = n;
+                f->nidx += n;
+            } else {
+                f->ix[f->ndraws][0] = 0;
+                f->ix[f->ndraws][1] = 0;
+            }
+        }
         {
             uint64_t prog = 0;
             uint32_t count;
             if ((g_pb.xf_mode & 3) == 2)
                 nv2a_vsh_decoded(&count, &prog);
+            if (s_dump_progs && prog) {
+                static uint32_t seen[256];
+                static int nseen;
+                int i;
+                for (i = 0; i < nseen && seen[i] != (uint32_t)prog; i++)
+                    ;
+                if (i == nseen && nseen < 256) {
+                    seen[nseen++] = (uint32_t)prog;
+                    fprintf(stderr, "[ITRACE] program %08X:%c", (uint32_t)prog,
+                            10);
+                    nv2a_vsh_dump_current();
+                }
+            }
             f->part[f->ndraws][0] = (uint32_t)prog;
             f->part[f->ndraws][1] = g_pb.attr[0].offset;
             f->part[f->ndraws][2] = g_pb.idx_count;
@@ -403,15 +563,44 @@ static int cmp_keyidx(const void *a, const void *b)
 static KeyIdx *s_ka, *s_kb;
 static uint32_t s_kcap;
 
+static uint8_t *s_taken;                /* prev's draws already paired */
+static uint32_t s_taken_cap;
+
+/* One pass of pairing on the draws still without a pair, by key k: 0 the
+ * strict key, 1-2 the loose ones. The draws paired. */
+static uint32_t pair_pass(Frame *f, const Frame *prev, int k);
+
 /* f->pair from prev; the number of draws paired. */
 static uint32_t pair_frames(Frame *f, const Frame *prev)
 {
-    uint32_t i, a, b, paired = 0;
+    uint32_t i, paired;
 
     for (i = 0; i < f->ndraws; i++)
         f->pair[i] = -1;
     if (!prev->ndraws || !f->ndraws)
         return 0;
+    if (s_taken_cap < prev->ndraws) {
+        uint8_t *t = realloc(s_taken, prev->ndraws);
+        if (!t)
+            return 0;
+        s_taken = t;
+        s_taken_cap = prev->ndraws;
+    }
+    memset(s_taken, 0, prev->ndraws);
+    paired = pair_pass(f, prev, 0);
+    if (!s_strict) {
+        uint32_t p1 = pair_pass(f, prev, 1);
+        uint32_t p2 = pair_pass(f, prev, 2);
+        s_st.loose1 += p1;
+        s_st.loose2 += p2;
+        paired += p1 + p2;
+    }
+    return paired;
+}
+
+static uint32_t pair_pass(Frame *f, const Frame *prev, int k)
+{
+    uint32_t i, a, b, na = 0, nb = 0, paired = 0;
     if (s_kcap < f->ndraws || s_kcap < prev->ndraws) {
         uint32_t cap = f->ndraws > prev->ndraws ? f->ndraws : prev->ndraws;
         KeyIdx *x = realloc(s_ka, cap * sizeof *x), *y;
@@ -425,16 +614,20 @@ static uint32_t pair_frames(Frame *f, const Frame *prev)
         s_kcap = cap;
     }
     for (i = 0; i < f->ndraws; i++) {
-        s_ka[i].key = f->key[i];
-        s_ka[i].i = i;
+        if (f->pair[i] >= 0)
+            continue;
+        s_ka[na].key = k ? f->loose[i][k - 1] : f->key[i];
+        s_ka[na++].i = i;
     }
     for (i = 0; i < prev->ndraws; i++) {
-        s_kb[i].key = prev->key[i];
-        s_kb[i].i = i;
+        if (s_taken[i])
+            continue;
+        s_kb[nb].key = k ? prev->loose[i][k - 1] : prev->key[i];
+        s_kb[nb++].i = i;
     }
-    qsort(s_ka, f->ndraws, sizeof *s_ka, cmp_keyidx);
-    qsort(s_kb, prev->ndraws, sizeof *s_kb, cmp_keyidx);
-    for (a = b = 0; a < f->ndraws && b < prev->ndraws; ) {
+    qsort(s_ka, na, sizeof *s_ka, cmp_keyidx);
+    qsort(s_kb, nb, sizeof *s_kb, cmp_keyidx);
+    for (a = b = 0; a < na && b < nb; ) {
         uint32_t a1, b1;
         if (s_ka[a].key < s_kb[b].key) {
             a++;
@@ -445,15 +638,16 @@ static uint32_t pair_frames(Frame *f, const Frame *prev)
             continue;
         }
         /* A group: the draws of one key in both frames. */
-        for (a1 = a; a1 < f->ndraws && s_ka[a1].key == s_ka[a].key; a1++)
+        for (a1 = a; a1 < na && s_ka[a1].key == s_ka[a].key; a1++)
             ;
-        for (b1 = b; b1 < prev->ndraws && s_kb[b1].key == s_kb[b].key; b1++)
+        for (b1 = b; b1 < nb && s_kb[b1].key == s_kb[b].key; b1++)
             ;
-        if (a1 - a > 1 || b1 - b > 1)
+        if (!k && (a1 - a > 1 || b1 - b > 1))
             s_st.dup_draws += a1 - a;
         if (!(s_unique && (a1 - a > 1 || b1 - b > 1)))
             for (; a < a1 && b < b1; a++, b++) {
                 f->pair[s_ka[a].i] = (int32_t)s_kb[b].i;
+                s_taken[s_kb[b].i] = 1;
                 paired++;
             }
         a = a1;
@@ -493,15 +687,18 @@ static void run_stream(const Frame *f)
     nv2a_pb_merge_flush();
 }
 
-static void replay(Frame *f, Frame *prev, float t)
+/* Frame f run again from its start, each paired draw's constants moved w of
+ * the way toward its partner's in frame partner (map: f's draw -> partner's). */
+static void replay(Frame *f, Frame *partner, const int32_t *map, float w)
 {
     memcpy(&g_pb, f->start_pb, sizeof g_pb);
     nv2a_vsh_state_load(f->start_vsh);
     pb_transform_forget();
     s_rep_f = f;
-    s_rep_prev = prev;
+    s_rep_prev = partner;
+    s_rep_map = map;
     s_rep_j = 0;
-    s_rep_t = t;
+    s_rep_t = w;
     s_rep = 1;
     run_stream(f);
     s_rep = 0;
@@ -526,18 +723,24 @@ static void stats_line(LONGLONG now)
     if (now < s_st_at)
         return;
     s_st_at = now + s_freq.QuadPart * 10;
-    fprintf(stderr, "[INTERP] 10 s: %u frames, %u interpolated, %u cuts, %u"
-            " too big, %u without the frame before; %.1f draws a frame, %.1f %%"
-            " paired, %.1f %% of one key drawn more than once, %llu runs went"
-            " another way; replays %.2f ms a frame"
+    fprintf(stderr, "[INTERP] 10 s: %u frames, %u interpolated, %u cuts"
+            " (%u the title's), %u too big, %u without the frame before; %.1f"
+            " draws a frame, %.1f %%"
+            " paired (%.1f %% by the loose keys), %.1f %% of one key drawn"
+            " more than once, %llu runs went another way, %llu index unions;"
+            " replays %.2f ms a frame"
             " (most %.2f); %u pictures shown, %u late, %u dropped%c",
-            s_st.frames, s_st.interpolated, s_st.cuts, s_st.overflows,
+            s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
+            s_st.overflows,
             s_st.unpaired_frames,
             s_st.frames ? (double)s_st.draws / s_st.frames : 0.0,
             s_st.draws ? 100.0 * (double)s_st.paired / (double)s_st.draws : 0.0,
+            s_st.draws ? 100.0 * (double)(s_st.loose1 + s_st.loose2)
+                         / (double)s_st.draws : 0.0,
             s_st.draws ? 100.0 * (double)s_st.dup_draws / (double)s_st.draws
                        : 0.0,
             (unsigned long long)s_st.diverged,
+            (unsigned long long)s_st.unions,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
             s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
     fflush(stderr);
@@ -587,7 +790,7 @@ static void trace_frame(const Frame *f, const Frame *prev)
         const uint32_t *pt = f->part[j];
         int32_t pj = f->pair[j];
         uint32_t ndiff = 0;
-        char line[1024];
+        char line[8192];
         int len;
         len = snprintf(line, sizeof line, "[ITRACE] %4u pair %5d prog %08X"
                        " attr0 %08X n %5u prim %X tex0 %08X target %08X:",
@@ -610,6 +813,23 @@ static void trace_frame(const Frame *f, const Frame *prev)
             }
         }
         fprintf(stderr, "%s [%u differ]%c", line, ndiff, 10);
+    }
+    {
+        /* The frame before's draws this frame has no pair for: what it
+         * stopped drawing (culled, gone). */
+        uint8_t *taken = calloc(prev->ndraws ? prev->ndraws : 1, 1);
+        for (j = 0; taken && j < f->ndraws; j++)
+            if (f->pair[j] >= 0)
+                taken[f->pair[j]] = 1;
+        for (j = 0; taken && j < prev->ndraws; j++) {
+            const uint32_t *pt = prev->part[j];
+            if (taken[j])
+                continue;
+            fprintf(stderr, "[ITRACE] gone %4u prog %08X attr0 %08X n %5u prim"
+                    " %X tex0 %08X target %08X%c", j, pt[0], pt[1], pt[2],
+                    pt[3], pt[4], pt[5], 10);
+        }
+        free(taken);
     }
     fflush(stderr);
 }
@@ -658,6 +878,10 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     s_rep_blend = f->ndraws && paired >= INTERP_MIN_PAIRED * f->ndraws;
     if (!s_rep_blend)
         s_st.cuts++;
+    if (s_cut) {
+        s_rep_blend = 0;
+        s_st.game_cuts++;
+    }
     if (s_mode == 2)
         s_rep_blend = 0;
     ctl_read();
@@ -670,11 +894,16 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
             FILE *t = fopen(tr, "rb");
             if (t) {
                 fclose(t);
-                if (armed)
+                if (armed) {
                     trace_frame(f, prev);
+                    s_dump_progs = 1;
+                } else {
+                    s_dump_progs = 0;
+                }
                 armed = 0;
             } else {
                 armed = 1;
+                s_dump_progs = 0;
             }
         }
     }
@@ -689,12 +918,48 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     memcpy(s_end_pb, &g_pb, sizeof g_pb);
     nv2a_vsh_state_save(s_end_vsh);
     t0 = qpc();
+    be->interp(NV_INTERP_UNDER, s_underlay);
+    /* A picture nearer the frame before is that frame drawn again, moved
+     * toward this one (RECOMP_INTERP_NEAR, on): what this frame culled at
+     * its edge, and the frame before still drew, stays in the picture. The
+     * others are this frame moved back. */
+    if (s_near && s_rep_blend && prev->start_pb && s_n > 2) {
+        uint32_t i;
+        if (s_inv_cap < prev->ndraws) {
+            int32_t *v = realloc(s_inv, prev->ndraws * sizeof *v);
+            if (v) {
+                s_inv = v;
+                s_inv_cap = prev->ndraws;
+            }
+        }
+        if (s_inv_cap >= prev->ndraws) {
+            for (i = 0; i < prev->ndraws; i++)
+                s_inv[i] = -1;
+            for (i = 0; i < f->ndraws; i++)
+                if (f->pair[i] >= 0)
+                    s_inv[f->pair[i]] = (int32_t)i;
+        }
+    }
     for (k = 1; k < (uint32_t)s_n; k++) {
-        if (s_mode != 1)
-            replay(f, prev, (float)k / (float)s_n);
+        float t = (float)k / (float)s_n;
+        int older = s_near && s_rep_blend && s_n > 2 && 2 * k < (uint32_t)s_n
+                  && s_inv_cap >= prev->ndraws && prev->start_pb;
+        if (s_mode == 3 && k == 1) {
+            older = 1;                  /* test: N-1 again, as it was */
+            s_rep_blend = 0;
+        }
+        if (s_mode != 1) {
+            if (older)
+                replay(prev, f, s_inv, t);
+            else
+                replay(f, prev, f->pair, 1.0f - t);
+        }
+        if (s_mode == 3 && k == 1)
+            s_rep_blend = 1;
         if (!be->interp(NV_INTERP_SAVE, (int)k))
             break;
     }
+    be->interp(NV_INTERP_UNDER, 0);
     memcpy(&g_pb, s_end_pb, sizeof g_pb);
     nv2a_vsh_state_load(s_end_vsh);
     {
@@ -745,9 +1010,11 @@ void nv2a_interp_flip_after(void)
         InterlockedExchange(&s_q_pending, 1);
     }
     /* Frame N+1 starts here. */
+    s_cut = 0;
     s_cur ^= 1;
     f = &s_fr[s_cur];
     f->nwords = 0;
+    f->nidx = 0;
     f->ndraws = 0;
     f->overflow = 0;
     if (!s_vsh_size)

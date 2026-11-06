@@ -371,6 +371,12 @@ typedef struct {
 #define NV_INTERP_SAVE 0
 #define NV_INTERP_LOAD 1
 #define NV_INTERP_SHOW 2
+/* NV_INTERP_UNDER: slot 1 = from now on a colour clear of the shown surface
+ * starts it from the frame before's picture (what picture 0 held before its
+ * last SAVE) rather than the clear colour, 0 = clears as they are. A frame
+ * drawn again with another camera then shows, where the newer frame drew
+ * nothing (culled past its edge), about what was there, not the clear. */
+#define NV_INTERP_UNDER 3
 
 /* Host methods: commands a game's own code (not the title's) puts in the
  * pushbuffer for the runtime, so that something the host draws lands at
@@ -396,6 +402,10 @@ typedef struct {
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u
+/* NV_HOST_FX_INTERP_CUT: the title's camera cut in this frame (no
+ * parameters): frame interpolation does not blend it with the frame before
+ * (nv2a_interp.c). Not a back end's. */
+#define NV_HOST_FX_INTERP_CUT 2u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 
