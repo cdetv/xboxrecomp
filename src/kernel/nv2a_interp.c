@@ -76,7 +76,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 int nv2a_pb_exec_draw_words(uint32_t method, const uint32_t *p, uint32_t n);
 void nv2a_pb_merge_flush(void);
 
-#define INTERP_MAX_N      8
+#define INTERP_MAX_N      4             /* two frames' pictures in 8 slots */
 #define INTERP_MAX_DRAWS  40000u        /* a frame with more is shown as is */
 #define INTERP_MAX_WORDS  (64u << 20)   /* ditto, stream words (256 MB) */
 #define INTERP_MIN_PAIRED 0.5           /* fewer draws paired: a cut */
@@ -143,9 +143,15 @@ static Nv2aPbState *s_end_pb;
 static void *s_end_vsh;
 static size_t s_vsh_size;
 
-/* Pictures waiting to be shown: slot and when (QPC). */
-static int s_q_slot[INTERP_MAX_N];
-static LONGLONG s_q_at[INTERP_MAX_N];
+/* Pictures waiting to be shown: slot and when (QPC); two frames' worth (the
+ * next frame's replays run while the last pictures of this one are due). */
+static int s_q_slot[2 * INTERP_MAX_N];
+static LONGLONG s_q_at[2 * INTERP_MAX_N];
+static int s_base;                      /* this frame's picture slots: 0 or 4 */
+static int s_q_shown_base = -1;         /* the slots just queued (flip_after) */
+static double s_lat_ms = -1.0;          /* flip -> first picture, ms (EMA) */
+void xbox_Nv2aIdle(DWORD ms);           /* xbox_memory_layout.c */
+static void show_due(int all);
 static int s_q_n, s_q_next;
 static volatile LONG s_q_pending;
 static const Nv2aPbBackend *s_be;
@@ -161,6 +167,10 @@ static struct {
     uint32_t shown, late, dropped;
 } s_st;
 static LONGLONG s_st_at;
+/* Gaps between pictures shown, ms: < 5, 5-7, 7-9.5, 9.5-12, 12-17, > 17
+ * (at 4 a frame each should be 8.3). */
+static uint32_t s_gap[6];
+static LONGLONG s_gap_last;
 
 int nv2a_interp_n(void)
 {
@@ -872,9 +882,12 @@ static uint32_t pair_pass(Frame *f, const Frame *prev, int k)
 static void run_stream(const Frame *f)
 {
     size_t i = 0;
+    uint32_t e = 0;
 
     while (i < f->nwords) {
         uint32_t w = f->words[i];
+        if (!(++e & 63) && s_q_pending)
+            show_due(0);                /* the frame before's last pictures */
         switch (w >> 29) {
         case TAG_METHOD:
             nv2a_pb_exec_method((w >> 16) & 7u, w & 0xFFFFu, f->words[i + 1]);
@@ -957,8 +970,23 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_st.teleports,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
             s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
+    fprintf(stderr, "[INTERP] gaps between pictures (ms) <5: %u, 5-7: %u, 7-9.5:"
+            " %u, 9.5-12: %u, 12-17: %u, >17: %u%c", s_gap[0], s_gap[1],
+            s_gap[2], s_gap[3], s_gap[4], s_gap[5], 10);
     fflush(stderr);
     memset(&s_st, 0, sizeof s_st);
+    memset(s_gap, 0, sizeof s_gap);
+}
+
+static void note_shown(void)
+{
+    LONGLONG now = qpc();
+    if (s_gap_last) {
+        double ms = (double)(now - s_gap_last) * 1000.0 / (double)s_freq.QuadPart;
+        s_gap[ms < 5.0 ? 0 : ms < 7.0 ? 1 : ms < 9.5 ? 2 : ms < 12.0 ? 3
+              : ms < 17.0 ? 4 : 5]++;
+    }
+    s_gap_last = now;
 }
 
 static void show_due(int all)
@@ -970,17 +998,36 @@ static void show_due(int all)
         if (now - s_q_at[s_q_next] > s_freq.QuadPart / 500)
             s_st.late++;
         s_be->interp(NV_INTERP_SHOW, s_q_slot[s_q_next]);
+        note_shown();
         s_st.shown++;
         s_q_next++;
     }
+    s_q_n = s_q_next = 0;
     InterlockedExchange(&s_q_pending, 0);
 }
 
 void nv2a_interp_tick(void)
 {
-    if (!s_q_pending || s_rep)
+    if (!s_q_pending)
         return;
     show_due(0);
+}
+
+/* Until QPC time t: pictures due meanwhile go out, the GPU's handshakes go
+ * on (xbox_Nv2aIdle). */
+static void wait_until(LONGLONG t)
+{
+    for (;;) {
+        LONGLONG now = qpc();
+        if (s_q_pending)
+            show_due(0);
+        if (now >= t)
+            return;
+        if (t - now > s_freq.QuadPart * 3 / 2000)
+            xbox_Nv2aIdle(1);
+        else
+            YieldProcessor();
+    }
 }
 
 int nv2a_interp_due_ms(void)
@@ -1062,16 +1109,20 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
     if (nv2a_interp_n() < 2 || !be->interp)
         return;
     s_be = be;
-    /* What is still waiting from the frame before is too late now, but for
-     * its last picture, the frame itself. */
+    /* Pictures of the frame before still waiting stay queued (they are due
+     * while this frame is drawn again); compacted to the front. */
     if (s_q_pending && s_q_next < s_q_n) {
-        s_st.dropped += (uint32_t)(s_q_n - 1 - s_q_next);
-        s_st.late++;
-        be->interp(NV_INTERP_SHOW, s_q_slot[s_q_n - 1]);
-        s_st.shown++;
-        s_q_next = s_q_n;
+        int i, m = s_q_n - s_q_next;
+        for (i = 0; i < m; i++) {
+            s_q_slot[i] = s_q_slot[s_q_next + i];
+            s_q_at[i] = s_q_at[s_q_next + i];
+        }
+        s_q_n = m;
+        s_q_next = 0;
+    } else {
+        s_q_n = s_q_next = 0;
+        InterlockedExchange(&s_q_pending, 0);
     }
-    InterlockedExchange(&s_q_pending, 0);
     if (s_last_flip) {
         LONGLONG gap = now - s_last_flip;
         if (gap > s_freq.QuadPart / 10)
@@ -1152,7 +1203,7 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         n = s_n;
     if (n < 2)
         return;
-    if (!be->interp(NV_INTERP_SAVE, 0))
+    if (!be->interp(NV_INTERP_SAVE, s_base))
         return;                         /* nothing shown this frame */
     if (!s_end_pb) {
         s_end_pb = malloc(sizeof *s_end_pb);
@@ -1201,7 +1252,7 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         }
         if (s_mode == 3 && k == 1)
             s_rep_blend = 1;
-        if (!be->interp(NV_INTERP_SAVE, (int)k))
+        if (!be->interp(NV_INTERP_SAVE, s_base + (int)k))
             break;
     }
     be->interp(NV_INTERP_UNDER, 0);
@@ -1212,34 +1263,37 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         s_st.replay_ms += ms;
         if (ms > s_st.replay_max)
             s_st.replay_max = ms;
+        /* The delay from the flip to the first picture: a little more than
+         * drawing them takes, the same every frame, so every picture is a
+         * period / n after the one before even when drawing takes most of
+         * the period (the mansion: 17 ms of 33). */
+        if (s_lat_ms < 0.0)
+            s_lat_ms = ms * 1.05 + 0.7;
+        else
+            s_lat_ms += (ms * 1.05 + 0.7 - s_lat_ms) / 16.0;
+        if (s_lat_ms > 28.0)
+            s_lat_ms = 28.0;
     }
     if (k < (uint32_t)n) {
-        be->interp(NV_INTERP_LOAD, 0);  /* shown as it is */
+        be->interp(NV_INTERP_LOAD, s_base);  /* shown as it is */
         return;
     }
     s_st.interpolated++;
-    /* The first in-between goes out now, in N's place (the back end's own
-     * present follows); then the rest, N last, a period / n apart -- or
-     * closer, so that N is out a little before the next frame's flip
-     * (drawing these took part of this period already). */
-    be->interp(NV_INTERP_LOAD, 1);
-    now = qpc();
+    /* The first in-between goes out at flip + the delay, in N's place (the
+     * back end's own present follows); the rest, N last, a period / n
+     * apart. The next frame's slots are the other four. */
+    wait_until(now + (LONGLONG)(s_lat_ms * (double)s_freq.QuadPart / 1000.0));
+    be->interp(NV_INTERP_LOAD, s_base + 1);
     {
-        LONGLONG step = s_period / n;
-        LONGLONG room = s_period - (now - s_last_flip)
-                      - s_freq.QuadPart * 3 / 2000;
-        if (room < 0)
-            room = 0;
-        if (step * (n - 1) > room)
-            step = room / (n - 1);
-        s_q_n = 0;
-        for (k = 2; k <= (uint32_t)n; k++) {
-            s_q_slot[s_q_n] = k < (uint32_t)n ? (int)k : 0;
-            s_q_at[s_q_n] = now + step * (LONGLONG)(k - 1);
+        LONGLONG step = s_period / n, at = qpc();
+        for (k = 2; k <= (uint32_t)n && s_q_n < 2 * INTERP_MAX_N; k++) {
+            s_q_slot[s_q_n] = s_base + (k < (uint32_t)n ? (int)k : 0);
+            s_q_at[s_q_n] = at + step * (LONGLONG)(k - 1);
             s_q_n++;
         }
     }
-    s_q_next = 0;
+    s_q_shown_base = s_base;
+    s_base ^= 4;
 }
 
 void nv2a_interp_flip_after(void)
@@ -1248,12 +1302,14 @@ void nv2a_interp_flip_after(void)
 
     if (nv2a_interp_n() < 2 || !s_be)
         return;
-    if (s_q_n && s_q_next == 0) {
-        /* N back into its surface (the next frame may read it), and the
-         * queue goes live. */
-        s_be->interp(NV_INTERP_LOAD, 0);
-        InterlockedExchange(&s_q_pending, 1);
+    note_shown();                       /* the frame's own present */
+    if (s_q_shown_base >= 0) {
+        /* N back into its surface (the next frame may read it). */
+        s_be->interp(NV_INTERP_LOAD, s_q_shown_base);
+        s_q_shown_base = -1;
     }
+    if (s_q_n > s_q_next)
+        InterlockedExchange(&s_q_pending, 1);
     /* Frame N+1 starts here. */
     s_cut = 0;
     s_cur ^= 1;

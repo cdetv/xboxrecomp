@@ -6024,12 +6024,10 @@ static int d3d_interp(int op, int slot)
         if (s_shown < 0 || !s_shown_w || !s_shown_h
             || !(src = s_surf[s_shown].tex))
             return 0;
-        if (slot == 0) {
-            /* The frame before's picture becomes the underlay, under the
-             * surface this frame is shown from. */
-            ID3D11Texture2D *t = s_under;
-            s_under = s_pic[0].tex;
-            s_pic[0].tex = t;
+        if ((slot & 3) == 0) {
+            /* The frame before's picture (the other four slots) is the
+             * underlay, under the surface this frame is shown from. */
+            s_under = s_pic[slot ^ 4].tex;
             s_under_for = src;
         }
         ID3D11Texture2D_GetDesc(src, &d);
