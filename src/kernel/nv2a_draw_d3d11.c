@@ -260,6 +260,7 @@ typedef struct {
     uint32_t w, h;                      /* in guest pixels */
     uint32_t tw, th;                    /* the texture, in host pixels */
     uint32_t scaled;                    /* drawn at the render scale */
+    uint32_t boost;                     /* or 2/4/8: xbox_SetSurfaceBoost */
     float    sx, sy;                    /* host pixels per guest pixel */
     uint32_t gen;                       /* s_scale_gen when made */
     uint32_t bpp, swz;                  /* guest pixel size, swizzled */
@@ -323,6 +324,52 @@ static int surface_scaled_now(void)
            && bpp && g_pb.pitch / bpp >= SC_W;
 }
 
+/* Small render targets a title wants drawn bigger (Conker's shadow
+ * pictures, 128x128: xbox_SetSurfaceBoost). The title's function names, for
+ * a colour surface about to be drawn into, how many host pixels each guest
+ * pixel gets on both axes: 2, 4 or 8 (anything else: 1, as before). Such a
+ * surface keeps the texture every surface already has (ZETA_W x ZETA_H host
+ * pixels, see GpuSurface) and so costs no more memory: its guest size is
+ * padded to ZETA_W / k instead of ZETA_W, and a target too big for that at
+ * k gets the next smaller factor. Its depth buffers are its own (GpuZeta
+ * boost), ZETA_W x ZETA_H host pixels like the unscaled ones. Everything
+ * else follows the per-surface scale (sx, sy) the render scale already
+ * uses: viewport, scissors, clears, copies and direct reads as a texture
+ * (coordinates stay in guest units), visibility counts. Never for a surface
+ * at the render scale. The function runs on the executor thread; setting
+ * one (also the same one again, after its answers changed) has every
+ * surface remade at its new factor when next drawn into, picture kept
+ * (s_scale_gen). NULL: none, every surface as before. */
+typedef unsigned (*xbox_SurfaceBoostFn)(uint32_t addr, uint32_t format,
+                                        uint32_t pitch, uint32_t w,
+                                        uint32_t h);
+static volatile xbox_SurfaceBoostFn s_boost_fn;
+static volatile LONG s_boost_gen;       /* bumped by every set */
+static LONG          s_boost_seen;      /* the one applied (executor) */
+
+void xbox_SetSurfaceBoost(xbox_SurfaceBoostFn fn)
+{
+    s_boost_fn = fn;
+    InterlockedIncrement(&s_boost_gen);
+}
+
+/* The factor for the current colour target at addr, its drawn extent w x h
+ * guest pixels (before padding): 0 = none. */
+static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
+{
+    xbox_SurfaceBoostFn fn = s_boost_fn;
+    uint32_t k;
+
+    if (!fn || surface_scaled_now())
+        return 0;
+    k = fn(addr, g_pb.format, g_pb.pitch, w, h);
+    if (k != 2 && k != 4 && k != 8)
+        return 0;
+    while (k > 1 && (w * k > ZETA_W || h * k > ZETA_H))
+        k >>= 1;
+    return k > 1 ? k : 0;
+}
+
 /* The surface to present: the biggest one cleared since the last flip, as
  * note_drawn picks the drawn one in the software path (a title also clears
  * small render targets, often after the main one). */
@@ -337,6 +384,8 @@ static struct {
     uint32_t verts_need_clip, tris_clipped, tris_behind, combined, tris_culled;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
+    uint32_t boosted;                   /* surfaces made boosted */
+    uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
@@ -996,15 +1045,18 @@ static void canvas_to_out(void)
     }
 }
 
-/* Surface i was made before the render scale last changed and is not at the
- * scale a surface made for the current target now would get. */
-static int surface_stale(int i)
+/* Surface i is not at the scale a surface made for the current target now
+ * would get: boosted by another factor (boost: surface_boost_now's), or made
+ * before the render scale last changed and at another one. */
+static int surface_stale(int i, uint32_t boost)
 {
     float want_x, want_y;
+    if (s_surf[i].boost != boost)
+        return 1;
     if (s_surf[i].gen == s_scale_gen)
         return 0;
-    want_x = surface_scaled_now() ? s_rsx : 1.0f;
-    want_y = surface_scaled_now() ? s_rsy : 1.0f;
+    want_x = boost ? (float)boost : surface_scaled_now() ? s_rsx : 1.0f;
+    want_y = boost ? (float)boost : surface_scaled_now() ? s_rsy : 1.0f;
     return s_surf[i].sx != want_x || s_surf[i].sy != want_y;
 }
 
@@ -1012,11 +1064,16 @@ static int surface_stale(int i)
  * current clip: its index, or -1 when there is no surface to speak of. */
 static int surface_current(void)
 {
-    uint32_t addr, w, h, scaled;
+    uint32_t addr, w, h, scaled, boost;
     int i, stale;
 
     if (!g_pb.color_offset || !g_pb.pitch || !g_pb.clip_w || !g_pb.clip_h)
         return -1;
+    if (s_boost_seen != s_boost_gen) {
+        /* xbox_SetSurfaceBoost: surfaces remade at their next draw. */
+        s_boost_seen = s_boost_gen;
+        s_scale_gen++;
+    }
     addr = pb_dma_resolve(g_pb.color_offset);
     w = g_pb.clip_x + g_pb.clip_w;
     h = g_pb.clip_y + g_pb.clip_h;
@@ -1026,8 +1083,10 @@ static int surface_current(void)
         if (w > sw) w = sw;
         if (h > sh) h = sh;
     }
-    if (w < ZETA_W) w = ZETA_W;
-    if (h < ZETA_H) h = ZETA_H;
+    /* Padded to the depth buffer's size: ZETA_W x ZETA_H host pixels. */
+    boost = surface_boost_now(addr, w, h);
+    if (w < ZETA_W / (boost ? boost : 1)) w = ZETA_W / (boost ? boost : 1);
+    if (h < ZETA_H / (boost ? boost : 1)) h = ZETA_H / (boost ? boost : 1);
     if (w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return -1;
@@ -1037,7 +1096,15 @@ static int surface_current(void)
         if (s_surf[i].tex && s_surf[i].addr == addr
             && s_surf[i].pitch == g_pb.pitch)
             break;
-    stale = i < GPU_SURFACES && surface_stale(i);
+    stale = i < GPU_SURFACES && surface_stale(i, boost);
+    if (stale && s_surf[i].boost != boost) {
+        static int said;
+        if (said++ < 16)
+            fprintf(stderr, "[GPU] d3d11: surface 0x%08X pitch %u remade"
+                    " boosted x%u -> x%u (fmt 0x%X clip %ux%u)%c", addr,
+                    g_pb.pitch, s_surf[i].boost, boost, g_pb.format,
+                    g_pb.clip_w, g_pb.clip_h, 10);
+    }
     if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h && !stale) {
         s_surf[i].bpp = pb_surface_bpp();
         s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
@@ -1050,6 +1117,10 @@ static int surface_current(void)
      * render scale is remade at the current one. */
     scaled = i < GPU_SURFACES && !stale ? s_surf[i].scaled
                                         : (uint32_t)surface_scaled_now();
+    if (boost) {
+        scaled = 0;
+        s_stat.boosted++;
+    }
     if (i == GPU_SURFACES) {
         /* An empty slot, or the one unused longest. Conker's menu room
          * draws into new render-target addresses every frame; a round
@@ -1061,15 +1132,20 @@ static int surface_current(void)
                 i = k;
         if (s_surf[i].tex)
             note_evicted(s_surf[i].addr);
-        if (s_stat.surfaces++ < 48)
+        if (s_stat.surfaces++ < 48) {
+            char bt[24] = "";
+            if (boost)
+                snprintf(bt, sizeof bt, ", boosted x%u", boost);
             fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
-                    " clip %ux%u+%u+%u fmt 0x%X (slot %d%s%s)%c",
+                    " clip %ux%u+%u+%u fmt 0x%X (slot %d%s%s%s)%c",
                     s_stat.surfaces, addr, g_pb.pitch, g_pb.clip_w,
                     g_pb.clip_h, g_pb.clip_x, g_pb.clip_y, g_pb.format, i,
                     s_surf[i].tex ? ", evicting" : "",
-                    scaled ? ", scaled" : "", 10);
-    } else {
-        /* Grow: keep the larger of old and new in each direction. */
+                    scaled ? ", scaled" : "", bt, 10);
+        }
+    } else if (s_surf[i].boost == boost) {
+        /* Grow: keep the larger of old and new in each direction (a
+         * boosted one remade at another factor is padded anew). */
         if (s_surf[i].w > w) w = s_surf[i].w;
         if (s_surf[i].h > h) h = s_surf[i].h;
     }
@@ -1081,7 +1157,8 @@ static int surface_current(void)
         D3D11_TEXTURE2D_DESC d;
         HRESULT hr;
         int shown = s_shown == i;
-        float sx = scaled ? s_rsx : 1.0f, sy = scaled ? s_rsy : 1.0f;
+        float sx = boost ? (float)boost : scaled ? s_rsx : 1.0f;
+        float sy = boost ? (float)boost : scaled ? s_rsy : 1.0f;
         memset(&s_surf[i], 0, sizeof s_surf[i]);
         memset(&d, 0, sizeof d);
         d.Width = to_host(w, sx);
@@ -1135,6 +1212,7 @@ static int surface_current(void)
     s_surf[i].w = w;
     s_surf[i].h = h;
     s_surf[i].scaled = scaled;
+    s_surf[i].boost = boost;
     s_surf[i].bpp = pb_surface_bpp();
     s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
     s_surf[i].used = s_surf_tick;
@@ -1195,6 +1273,7 @@ typedef struct {
     uint32_t offset;                    /* SURFACE_ZETA_OFFSET, as written */
     uint32_t zf;                        /* zeta format: 1 Z16, 2 Z24S8 */
     uint32_t scaled;                    /* for scaled colour surfaces */
+    uint32_t boost;                     /* for boosted ones: their factor */
     uint32_t tw, th;                    /* the texture, in host pixels */
     uint32_t used;                      /* s_zeta_tick at the last draw */
     ID3D11Texture2D          *tex;
@@ -1225,11 +1304,28 @@ static float zeta_scale(void)
     return zeta_format() == 1 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
 }
 
+/* Host pixels per guest pixel of depth buffer i. */
+static float zeta_sx(int i)
+{
+    return s_zeta[i].boost ? (float)s_zeta[i].boost
+                           : s_zeta[i].scaled ? s_rsx : 1.0f;
+}
+
+static float zeta_sy(int i)
+{
+    return s_zeta[i].boost ? (float)s_zeta[i].boost
+                           : s_zeta[i].scaled ? s_rsy : 1.0f;
+}
+
 /* The depth buffer of the current zeta surface for colour surfaces of the
- * given scale, made (depth 1, stencil 0, as zbuf_slot fills its new buffers:
- * farther than anything) when there is none and create is set: its index,
- * or -1. */
-static int zeta_current(int create, uint32_t scaled)
+ * given scale (scaled, or boosted by boost), made (depth 1, stencil 0, as
+ * zbuf_slot fills its new buffers: farther than anything) when there is
+ * none and create is set: its index, or -1. A boosted surface's buffer is
+ * ZETA_W x ZETA_H host pixels, the size its texture is padded to.
+ * ponytail: one made for a boosted surface after the guest cleared the
+ * zeta surface starts at depth 1 rather than the clear value (Conker's
+ * boosted shadow pictures draw without depth). */
+static int zeta_current(int create, uint32_t scaled, uint32_t boost)
 {
     D3D11_TEXTURE2D_DESC d;
     D3D11_DEPTH_STENCIL_VIEW_DESC dv;
@@ -1240,7 +1336,7 @@ static int zeta_current(int create, uint32_t scaled)
 
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset
-            && s_zeta[i].scaled == scaled) {
+            && s_zeta[i].scaled == scaled && s_zeta[i].boost == boost) {
             s_zeta[i].zf = zeta_format();
             return i;
         }
@@ -1255,8 +1351,8 @@ static int zeta_current(int create, uint32_t scaled)
     memset(z, 0, sizeof *z);
 
     memset(&d, 0, sizeof d);
-    d.Width = to_host(ZETA_W, scaled ? s_rsx : 1.0f);
-    d.Height = to_host(ZETA_H, scaled ? s_rsy : 1.0f);
+    d.Width = to_host(ZETA_W, scaled && !boost ? s_rsx : 1.0f);
+    d.Height = to_host(ZETA_H, scaled && !boost ? s_rsy : 1.0f);
     d.MipLevels = 1;
     d.ArraySize = 1;
     d.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1299,6 +1395,7 @@ static int zeta_current(int create, uint32_t scaled)
     z->offset = g_pb.zeta_offset;
     z->zf = zeta_format();
     z->scaled = scaled;
+    z->boost = boost;
     z->tw = d.Width;
     z->th = d.Height;
     s_stat.zeta_made++;
@@ -1320,8 +1417,11 @@ static void zeta_clear(uint32_t param)
     z = zeta_format() == 1 ? (float)(g_pb.zstencil_clear & 0xFFFF)
                            : (float)(g_pb.zstencil_clear >> 8);
     z *= zeta_scale();
-    if (zeta_current(0, 0) < 0 && zeta_current(0, 1) < 0)
-        zeta_current(1, (uint32_t)surface_scaled_now());
+    for (i = 0; i < GPU_ZETAS; i++)
+        if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset)
+            break;
+    if (i == GPU_ZETAS)
+        zeta_current(1, (uint32_t)surface_scaled_now(), 0);
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset) {
             s_zeta[i].zf = zeta_format();
@@ -1422,10 +1522,14 @@ static ID3D11Buffer       *s_cb;
 static ID3D11Buffer       *s_cb1;
 static struct {
     float tclamp[4][4];
+    float tfill[4][4];                  /* RECOMP_BOOST_FILL, see rtt_fill */
 } s_cbd;
 /* Per stage reading a surface as it is: coordinate scale x y, clamp x y
  * (texture_from_surface, RECOMP_RTT_DIRECT). */
 static float s_rtt_direct[4][4];
+/* Per stage reading a boosted surface in a pass drawing into it: the
+ * shader's tfill (texture_from_surface, rtt_fill). */
+static float s_rtt_fill[4][4];
 static ID3D11RasterizerState *s_rs;        /* depth clamped to 0..1 */
 static ID3D11RasterizerState *s_rs_zcull;  /* outside 0..1 dropped */
 
@@ -2467,6 +2571,7 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
 #define TEX_VOLUME    4u    /* a Texture3D view: bind it to the stage's 3D slot */
 #define TEX_CUBE      8u    /* a cube map's faces: bind to the stage's cube slot */
 #define RTT_DIRECT   16u    /* the surface itself: coordinates by s_rtt_direct */
+#define RTT_FILL     32u    /* taps filled in: s_rtt_fill (rtt_fill) */
 
 /* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
  * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
@@ -2713,6 +2818,36 @@ static int rtt_direct_ok(int st, int i, uint32_t tw, uint32_t th)
     return 1;
 }
 
+/* RECOMP_BOOST_FILL (on; =0 off): a boosted surface (xbox_SetSurfaceBoost)
+ * read by a pass that draws into it -- a blur in place, Conker's shadow
+ * pictures -- has each tap fill the area between the pixel and it. The
+ * guest's taps are texture coordinates: half a texel out, a bilinear tap
+ * averaged the 2x2 texels between the pixel and it; at k times the size
+ * the same tap is k/2 texels out with nothing between, and the blurred edge
+ * came out as flat steps, a band (8x, 2026-11-06). Filled, it is a smooth
+ * ramp as wide as before. n x n samples a tap, n = k/4 (at least 1): 16 a
+ * pixel at 8x, 4 below. For copy-read stages (a target is never read as it
+ * is): the copy's texel (x, y) is the target's pixel (x, y). */
+static int s_fill_on = -1;
+
+static int rtt_fill(int st, int i, uint32_t tw, uint32_t th)
+{
+    float n;
+
+    if (s_fill_on < 0) {
+        const char *e = getenv("RECOMP_BOOST_FILL");
+        s_fill_on = !(e && e[0] == '0');
+    }
+    if (!s_fill_on || i != s_rtt_target || !s_surf[i].boost || !tw || !th)
+        return 0;
+    n = (float)(s_surf[i].boost / 4u);
+    s_rtt_fill[st][0] = n < 1.0f ? 1.0f : n;
+    s_rtt_fill[st][1] = 1.0f / (float)tw;
+    s_rtt_fill[st][2] = 1.0f / (float)th;
+    s_rtt_fill[st][3] = 0.0f;
+    return 1;
+}
+
 /* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
  * or -1 when that reading is not handled. */
 static int rtt_reading(uint32_t fmt, uint32_t bpp)
@@ -2891,6 +3026,10 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     gt_mark(GT_COPY, GT_KEYS);
     *flags = (uint32_t)r;
+    if (rtt_fill(st, i, tw, th)) {
+        *flags |= RTT_FILL;
+        s_stat.rtt_filled++;
+    }
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
     s_stat.rtt_px += (uint64_t)(box.right - box.left) * (box.bottom - box.top);
@@ -3032,8 +3171,8 @@ static ID3D11ShaderResourceView *texture_from_zeta(int st)
     }
 
     /* At the buffer's scale, pixel for pixel, as texture_from_surface. */
-    tw = to_host(t->width, s_zeta[i].scaled ? s_rsx : 1.0f);
-    th = to_host(t->height, s_zeta[i].scaled ? s_rsy : 1.0f);
+    tw = to_host(t->width, zeta_sx(i));
+    th = to_host(t->height, zeta_sy(i));
     if (!s_zcopy[st].tex || s_zcopy[st].w != tw || s_zcopy[st].h != th) {
         D3D11_TEXTURE2D_DESC d;
         if (s_zcopy[st].srv) ID3D11ShaderResourceView_Release(s_zcopy[st].srv);
@@ -4962,6 +5101,9 @@ static void d3d_draw(void)
             k.tscale[st][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
             if (rtt & RTT_DIRECT)
                 tclamp_stage(&k, st);
+            if (rtt & RTT_FILL)
+                memcpy(s_cbd.tfill[st], s_rtt_fill[st],
+                       sizeof s_cbd.tfill[st]);
         }
         ct_add(CT_TEXTURES, ct0);
         if (g_pb.alpha_test) {
@@ -5008,6 +5150,9 @@ static void d3d_draw(void)
                 k.tscale[0][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
                 if (rtt & RTT_DIRECT)
                     tclamp_stage(&k, 0);
+                if (rtt & RTT_FILL)
+                    memcpy(s_cbd.tfill[0], s_rtt_fill[0],
+                           sizeof s_cbd.tfill[0]);
             } else {
                 srv[0] = NULL;
             }
@@ -5277,8 +5422,9 @@ static void d3d_draw(void)
     zi = -1;
     if (path != PATH_FLAT
         && (g_pb.depth_test || g_pb.depth_mask || g_pb.stencil_test)) {
-        if (s_surf[si].w == ZETA_W && s_surf[si].h == ZETA_H)
-            zi = zeta_current(1, s_surf[si].scaled);
+        uint32_t zb = s_surf[si].boost ? s_surf[si].boost : 1;
+        if (s_surf[si].w * zb == ZETA_W && s_surf[si].h * zb == ZETA_H)
+            zi = zeta_current(1, s_surf[si].scaled, s_surf[si].boost);
         else
             s_stat.zeta_too_big++;
     }
@@ -5541,7 +5687,7 @@ static int dump_tex(const char *path, ID3D11Texture2D *tex, uint32_t tw,
 static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
                      uint32_t w, uint32_t h)
 {
-    if (i >= 0 && s_surf[i].scaled) {
+    if (i >= 0 && (s_surf[i].scaled || s_surf[i].boost)) {
         float sx = surf_sx(i), sy = surf_sy(i);
         uint32_t x1 = to_host(x + w, sx), y1 = to_host(y + h, sy);
         x = to_host(x, sx);
@@ -6035,6 +6181,10 @@ static void d3d_report(void)
             s_stat.rtt_binds, s_stat.rtt_made,
             s_stat.rtt_unhandled, (double)s_stat.rtt_px / 1e6,
             s_stat.rtt_rects, s_stat.rtt_direct, 10);
+    if (s_stat.boosted)
+        fprintf(stderr, "[GPU] d3d11: boosted surfaces (xbox_SetSurfaceBoost):"
+                " %u made, %u stage reads filled in (RECOMP_BOOST_FILL)%c",
+                s_stat.boosted, s_stat.rtt_filled, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
@@ -6272,7 +6422,7 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();
-    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled) : -1;
+    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost) : -1;
     dp.focus = host_float(p[0]);
     dp.range = host_float(p[1]);
     dp.zn = host_float(p[2]);
@@ -6383,7 +6533,8 @@ static void d3d_poll(void)
             }
             return;
         }
-        if (s_scale_on && sum) {
+        /* Off (every area 1) this gives sum unchanged. */
+        if (sum) {
             scaled += 0.5;
             sum = scaled < 1.0 ? 1 : (uint64_t)scaled;
         }
