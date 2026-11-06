@@ -417,6 +417,7 @@ static struct {
     uint32_t boosted;                   /* surfaces made boosted */
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
+    uint32_t near_draws;                /* receiver_draw's two-pass draws */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
@@ -1557,6 +1558,7 @@ static struct {
     float tclamp[4][4];
     float tfill[4][4];                  /* RECOMP_BOOST_FILL, see rtt_fill */
     float tsmooth[4][4];                /* x: xbox_SetTextureSmooth's */
+    float tnear[4];                     /* receiver_draw's passes */
 } s_cbd;
 /* Per stage reading a surface as it is: coordinate scale x y, clamp x y
  * (texture_from_surface, RECOMP_RTT_DIRECT). */
@@ -5249,6 +5251,132 @@ static int cutout_parts(GpuConsts *k, int c, const uint32_t *end,
     return 1;
 }
 
+/* RECOMP_BOOST_NEAREST (on; =0 off, =2 on even frames only, for the
+ * held-picture check): a shadow projected onto the scene -- a multiply pass
+ * (DST_COLOR x ZERO, or ZERO x SRC_COLOR) reading a boosted surface
+ * (xbox_SetSurfaceBoost), depth tested, depth not written -- darkens each
+ * pixel once, from the nearest of its own triangles there. Conker's shadow
+ * receivers hold the floor and the rug laid over it a few units higher, and
+ * both passed the depth test (the rug's own draw leaves the floor's depth),
+ * so under the rug the shadow fell twice at two heights: a dark one and a
+ * lighter copy beside it (Berri's dance, user 2026-11-06). The original does
+ * it too; the blurred 128-pixel shadow hid it. Two draws: the batch writes
+ * its depth into s_near (R32F, blend MIN: the nearest), then draws with
+ * every fragment behind that discarded (shader tnear). Only for boosted
+ * surfaces: a title's original-size shadows stay as they were. */
+static int s_near_on = -1;
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} s_near;
+static ID3D11BlendState *s_bs_min;
+
+static int receiver_draw(int si, int zi, uint32_t bound, uint32_t nidx,
+                         ID3D11BlendState *bs, const float *bf)
+{
+    static const float far1[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    int st, boosted = 0;
+
+    if (s_near_on < 0) {
+        const char *e = getenv("RECOMP_BOOST_NEAREST");
+        UINT fs = 0;
+        s_near_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+        /* MIN on an R32F target: required from feature level 10.1. */
+        if (s_near_on && (FAILED(ID3D11Device_CheckFormatSupport(s_dev,
+                              DXGI_FORMAT_R32_FLOAT, &fs))
+                          || !(fs & D3D11_FORMAT_SUPPORT_BLENDABLE)))
+            s_near_on = 0;
+    }
+    if (!s_near_on || (s_near_on == 2 && (g_pb.flips & 1)) || zi < 0
+        || !g_pb.blend_enable || !g_pb.depth_test || g_pb.depth_mask
+        || g_pb.stencil_test || g_pb.merge_nparts > 1
+        || !((g_pb.blend_sfactor == 0x306 && g_pb.blend_dfactor == 0)
+             || (g_pb.blend_sfactor == 0 && g_pb.blend_dfactor == 0x300)))
+        return 0;
+    for (st = 0; st < 4; st++)
+        if (((bound >> st) & 1u) && s_tex_src[st] == 'S'
+            && s_tex_slot[st] >= 0 && s_surf[s_tex_slot[st]].boost)
+            boosted = 1;
+    if (!boosted)
+        return 0;
+
+    ID3D11Texture2D_GetDesc(s_surf[si].tex, &td);
+    if (!s_near.tex || s_near.w != td.Width || s_near.h != td.Height) {
+        D3D11_TEXTURE2D_DESC nd;
+        if (s_near.srv) ID3D11ShaderResourceView_Release(s_near.srv);
+        if (s_near.rtv) ID3D11RenderTargetView_Release(s_near.rtv);
+        if (s_near.tex) ID3D11Texture2D_Release(s_near.tex);
+        memset(&s_near, 0, sizeof s_near);
+        memset(&nd, 0, sizeof nd);
+        nd.Width = td.Width;
+        nd.Height = td.Height;
+        nd.MipLevels = 1;
+        nd.ArraySize = 1;
+        nd.Format = DXGI_FORMAT_R32_FLOAT;
+        nd.SampleDesc.Count = 1;
+        nd.Usage = D3D11_USAGE_DEFAULT;
+        nd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &nd, NULL, &s_near.tex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                    (ID3D11Resource *)s_near.tex, NULL, &s_near.rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_near.tex, NULL, &s_near.srv))) {
+            if (s_near.rtv) ID3D11RenderTargetView_Release(s_near.rtv);
+            if (s_near.tex) ID3D11Texture2D_Release(s_near.tex);
+            memset(&s_near, 0, sizeof s_near);
+            s_near_on = 0;
+            return 0;
+        }
+        s_near.w = td.Width;
+        s_near.h = td.Height;
+    }
+    if (!s_bs_min) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);
+        d.RenderTarget[0].BlendEnable = TRUE;
+        d.RenderTarget[0].SrcBlend = d.RenderTarget[0].SrcBlendAlpha
+                                   = D3D11_BLEND_ONE;
+        d.RenderTarget[0].DestBlend = d.RenderTarget[0].DestBlendAlpha
+                                    = D3D11_BLEND_ONE;
+        d.RenderTarget[0].BlendOp = d.RenderTarget[0].BlendOpAlpha
+                                  = D3D11_BLEND_OP_MIN;
+        d.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED;
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &s_bs_min))) {
+            s_bs_min = NULL;
+            s_near_on = 0;
+            return 0;
+        }
+    }
+
+    /* 1: the nearest depth of the batch's own fragments that pass. */
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_near.rtv, far1);
+    s_cbd.tnear[0] = 1.0f;
+    s_cbd.tnear[1] = 0.0f;
+    if (!tclamp_upload())
+        return 0;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_near.rtv,
+                                           s_zeta[zi].dsv);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_min, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    /* 2: the batch as the title drew it, at that depth only. */
+    s_cbd.tnear[0] = 0.0f;
+    s_cbd.tnear[1] = 1.0f;
+    tclamp_upload();
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
+                                           s_zeta[zi].dsv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 15, 1, &s_near.srv);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 15, 1, &none);
+    s_cbd.tnear[1] = 0.0f;
+    s_stat.near_draws++;
+    return 1;
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -5537,6 +5665,22 @@ static void d3d_draw(void)
             fprintf(stderr, "[FTRACE]     depth %g..%g w %g..%g | range"
                     " %g..%g Z%d%c", z0, z1, w0, w1, g_pb.clip_min,
                     g_pb.clip_max, zeta_format() == 1 ? 16 : 24, 10);
+        }
+        /* RECOMP_FTRACE_VERTS=1: every vertex of a small batch (at most
+         * 256): the title's position (attribute 0), the screen position
+         * and stage 0's coordinates, to see what a pass covers (two layers
+         * at different heights, ...). */
+        if (n <= 256 && getenv("RECOMP_FTRACE_VERTS")) {
+            for (i = 0; i < n; i++) {
+                float a[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i], a);
+                fprintf(stderr, "[FTRACE]     v%u in %g %g %g | pos %.1f %.1f"
+                        " %g w %g | t0 %g %g %g %g%c", i, a[0], a[1], a[2],
+                        verts[i].pos[0], verts[i].pos[1], verts[i].pos[2],
+                        verts[i].pos[3], verts[i].tex[0][0],
+                        verts[i].tex[0][1], verts[i].tex[0][2],
+                        verts[i].tex[0][3], 10);
+            }
         }
         fprintf(stderr, "[FTRACE]     cmask %08X | stencil func %X ref %02X"
                 " r %02X w %02X op %X/%X/%X | alpha func %X ref %02X | zmask"
@@ -5831,7 +5975,8 @@ static void d3d_draw(void)
             ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
                     zi >= 0 ? s_zeta[zi].dsv : NULL);
         }
-        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        if (!receiver_draw(si, zi, bound, nidx, bs, bf))
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
         if (tiny || adds || s_ftdump_zeta) {
             snprintf(what, sizeof what, "%08X%s", g_pb.color_offset,
                      s_ftdump_zeta ? "_reads_zeta" : adds ? "_after_add" : "");
@@ -5841,7 +5986,7 @@ static void d3d_draw(void)
         }
         s_ftdump_zeta = 0;
         s_ftdump_big = 0;
-    } else {
+    } else if (!receiver_draw(si, zi, bound, nidx, bs, bf)) {
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
     if (cut >= 0)
@@ -6490,8 +6635,9 @@ static void d3d_report(void)
             s_stat.rtt_rects, s_stat.rtt_direct, 10);
     if (s_stat.boosted)
         fprintf(stderr, "[GPU] d3d11: boosted surfaces (xbox_SetSurfaceBoost):"
-                " %u made, %u stage reads filled in (RECOMP_BOOST_FILL)%c",
-                s_stat.boosted, s_stat.rtt_filled, 10);
+                " %u made, %u stage reads filled in (RECOMP_BOOST_FILL), %u"
+                " projected nearest-only (RECOMP_BOOST_NEAREST)%c",
+                s_stat.boosted, s_stat.rtt_filled, s_stat.near_draws, 10);
     if (s_stat.tex_smooth)
         fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
                 " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
