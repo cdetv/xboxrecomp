@@ -45,13 +45,40 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 static DWORD     g_slot_of_port[XBOX_MAX_CONTROLLERS];
 static ULONGLONG g_next_scan;
 
+/* Pads are heard only while the game window is in front (fb_present.c),
+ * as keys already are: a pad left in a slot played the game while its
+ * owner used another program (2026-11-03). Out of focus a pad still
+ * answers, at rest, so the title sees no unplugged controller; scripted
+ * presses (the pad overlay) still arrive, since a test run has no window in
+ * front. RECOMP_PAD_FOCUS=0: pads drive the game in the background too. */
+extern int xbox_FramebufferInFront(void);
+
+static BOOL pads_heard(void)
+{
+    static int gate = -1;
+    static volatile LONG was = 1;
+    int now;
+    if (gate < 0) {
+        const char *v = getenv("RECOMP_PAD_FOCUS");
+        gate = (v && *v == '0') ? 0 : 1;
+    }
+    now = !gate || xbox_FramebufferInFront();
+    if (InterlockedExchange(&was, now) != now)
+        fprintf(stderr, now ? "[INPUT] window in front: controllers heard\n"
+                            : "[INPUT] window behind: controllers at rest\n");
+    return now ? TRUE : FALSE;
+}
+
 /* A host pad: XInput user index 0-3, or 4-7 for PlayStation pad 0-3
  * (sdl_pads.c), read in XInput's shape. */
 static DWORD host_get_state(DWORD slot, XINPUT_STATE *st)
 {
-    if (slot < XBOX_MAX_CONTROLLERS)
-        return XInputGetState(slot, st);
-    return xbox_SdlPadGetState((int)(slot - XBOX_MAX_CONTROLLERS), st);
+    DWORD rc = slot < XBOX_MAX_CONTROLLERS
+        ? XInputGetState(slot, st)
+        : xbox_SdlPadGetState((int)(slot - XBOX_MAX_CONTROLLERS), st);
+    if (rc == ERROR_SUCCESS && !pads_heard())
+        memset(&st->Gamepad, 0, sizeof(st->Gamepad));
+    return rc;
 }
 
 /* RECOMP_PAD_FOLLOW=1: port 0 is the pad last used, not the first one

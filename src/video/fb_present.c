@@ -333,6 +333,14 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* The game window is the one in front (pads are heard only then,
+ * xinput_device.c). No window yet: nothing to be behind, so yes. */
+int xbox_FramebufferInFront(void)
+{
+    HWND h = s_hwnd;
+    return !h || GetForegroundWindow() == h;
+}
+
 /* Full screen: F11 or Alt+Enter, or RECOMP_DISPLAY_MODE / RECOMP_FULLSCREEN
  * at start. Two kinds, chosen with xbox_FramebufferWindowSetDisplayMode
  * (a settings menu); the keys go between the chosen kind and a window:
@@ -1076,6 +1084,7 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+int xbox_FramebufferInFront(void) { return 1; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowSetAppTitle(const wchar_t *t, int s) { (void)t; (void)s; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
