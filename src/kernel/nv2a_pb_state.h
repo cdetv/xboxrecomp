@@ -377,6 +377,13 @@ typedef struct {
  * drawn again with another camera then shows, where the newer frame drew
  * nothing (culled past its edge), about what was there, not the clear. */
 #define NV_INTERP_UNDER 3
+/* NV_INTERP_DEPTH: the depth the shown surface was last drawn with is kept;
+ * NV_INTERP_BOTH: picture `slot` (drawn from one frame, its depth the kept
+ * one) and the shown surface (the same picture drawn from the other frame,
+ * with the current depth) made one, per pixel the nearer: what one frame
+ * culled the other fills in. */
+#define NV_INTERP_DEPTH 4
+#define NV_INTERP_BOTH  5
 
 /* Host methods: commands a game's own code (not the title's) puts in the
  * pushbuffer for the runtime, so that something the host draws lands at

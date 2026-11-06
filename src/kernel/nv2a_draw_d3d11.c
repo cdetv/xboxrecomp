@@ -1336,6 +1336,7 @@ static void zeta_clear(uint32_t param)
 
 /* ponytail: all four colour channels whatever the mask bits say. */
 /* Frame interpolation's underlay (d3d_interp, NV_INTERP_UNDER). */
+static int s_main_zi = -1;              /* the zeta last drawn with into s_shown */
 static int s_under_on;
 static ID3D11Texture2D *s_under;
 static ID3D11Texture2D *s_under_for;    /* the surface texture it stands in */
@@ -5318,6 +5319,8 @@ static void d3d_draw(void)
         zi = -1;
     if (zi >= 0)
         s_zeta[zi].used = ++s_zeta_tick;
+    if (zi >= 0 && si == s_shown)
+        s_main_zi = zi;                 /* frame interpolation, NV_INTERP_BOTH */
 
     /* Guest pixels to clip space over the whole surface; the viewport is
      * the texture's host size, so a scaled surface draws the same picture
@@ -6010,10 +6013,149 @@ static int dump_pic_rect(const char *path, int slot)
                     y1 - y);
 }
 
+/* NV_INTERP_DEPTH / NV_INTERP_BOTH: the kept depth and its view, the
+ * combining pass, a picture-sized texture to draw it into. */
+static ID3D11Texture2D *s_zkeep;
+static ID3D11ShaderResourceView *s_zkeep_srv;
+static ID3D11PixelShader *s_both_ps;
+static ID3D11Texture2D *s_both_tex;
+static int s_both_tried;
+
+static const char k_both_ps[] =
+    "Texture2D<float4> ca : register(t0);\n"
+    "Texture2D<float4> cb : register(t1);\n"
+    "Texture2D<float> za : register(t2);\n"
+    "Texture2D<float> zb : register(t3);\n"
+    "float4 both(float4 p : SV_Position) : SV_Target {\n"
+    "    int3 q = int3(int2(p.xy), 0);\n"
+    "    return za.Load(q) < zb.Load(q) ? ca.Load(q) : cb.Load(q);\n"
+    "}\n";
+
+static int interp_both(int slot)
+{
+    D3D11_TEXTURE2D_DESC d, dz;
+    ID3D11ShaderResourceView *srv[4] = {NULL, NULL, NULL, NULL};
+    ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
+    ID3D11RenderTargetView *rtv = NULL;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+    int ok = 0;
+
+    if (!s_both_tried) {
+        ID3DBlob *b = compile_src(k_both_ps, "both", "ps_4_0", 0, NULL);
+        s_both_tried = 1;
+        if (b) {
+            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
+                                           ID3D10Blob_GetBufferSize(b), NULL,
+                                           &s_both_ps);
+            ID3D10Blob_Release(b);
+        }
+    }
+    if (!s_both_ps || !s_zvs || !s_zkeep_srv || s_main_zi < 0 || s_shown < 0
+        || !s_zeta[s_main_zi].srv_z || !s_pic[slot].tex
+        || !s_surf[s_shown].tex)
+        return 0;
+    ID3D11Texture2D_GetDesc(s_pic[slot].tex, &d);
+    ID3D11Texture2D_GetDesc(s_zeta[s_main_zi].tex, &dz);
+    if (dz.Width < d.Width || dz.Height < d.Height)
+        return 0;                       /* not one pixel each */
+    if (s_both_tex) {
+        D3D11_TEXTURE2D_DESC h;
+        ID3D11Texture2D_GetDesc(s_both_tex, &h);
+        if (h.Width != d.Width || h.Height != d.Height || h.Format != d.Format) {
+            ID3D11Texture2D_Release(s_both_tex);
+            s_both_tex = NULL;
+        }
+    }
+    if (!s_both_tex && FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                           &s_both_tex)))
+        return 0;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+            (ID3D11Resource *)s_pic[slot].tex, NULL, &srv[0]))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+            (ID3D11Resource *)s_surf[s_shown].tex, NULL, &srv[1]))
+        || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+            (ID3D11Resource *)s_both_tex, NULL, &rtv)))
+        goto out;
+    srv[2] = s_zkeep_srv;
+    srv[3] = s_zeta[s_main_zi].srv_z;
+    vp.TopLeftX = vp.TopLeftY = 0.0f;
+    vp.Width = (float)d.Width;
+    vp.Height = (float)d.Height;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    sc.left = sc.top = 0;
+    sc.right = (LONG)d.Width;
+    sc.bottom = (LONG)d.Height;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_both_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_pic[slot].tex,
+                                     (ID3D11Resource *)s_both_tex);
+    ok = 1;
+out:
+    if (srv[0]) ID3D11ShaderResourceView_Release(srv[0]);
+    if (srv[1]) ID3D11ShaderResourceView_Release(srv[1]);
+    if (rtv) ID3D11RenderTargetView_Release(rtv);
+    return ok;
+}
+
+static int interp_depth(void)
+{
+    D3D11_TEXTURE2D_DESC d, h;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv;
+    ID3D11Texture2D *src;
+
+    if (s_main_zi < 0 || !(src = s_zeta[s_main_zi].tex)
+        || !s_zeta[s_main_zi].srv_z)
+        return 0;
+    ID3D11Texture2D_GetDesc(src, &d);
+    if (s_zkeep) {
+        ID3D11Texture2D_GetDesc(s_zkeep, &h);
+        if (h.Width != d.Width || h.Height != d.Height || h.Format != d.Format) {
+            ID3D11ShaderResourceView_Release(s_zkeep_srv);
+            ID3D11Texture2D_Release(s_zkeep);
+            s_zkeep = NULL;
+            s_zkeep_srv = NULL;
+        }
+    }
+    if (!s_zkeep) {
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_zkeep)))
+            return 0;
+        ID3D11ShaderResourceView_GetDesc(s_zeta[s_main_zi].srv_z, &sv);
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)s_zkeep, &sv, &s_zkeep_srv))) {
+            ID3D11Texture2D_Release(s_zkeep);
+            s_zkeep = NULL;
+            return 0;
+        }
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_zkeep,
+                                     (ID3D11Resource *)src);
+    return 1;
+}
+
 static int d3d_interp(int op, int slot)
 {
+    if (op == NV_INTERP_DEPTH)
+        return !s_shadow && interp_depth();
     if (slot < 0 || slot >= INTERP_PICS || s_shadow)
         return 0;
+    if (op == NV_INTERP_BOTH)
+        return interp_both(slot);
     if (op == NV_INTERP_UNDER) {
         s_under_on = slot;
         return 1;

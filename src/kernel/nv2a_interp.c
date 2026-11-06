@@ -122,6 +122,10 @@ static int s_union = 1;                 /* RECOMP_INTERP_UNION=0: no index union
 static double s_autocut = 0.5;          /* RECOMP_INTERP_AUTOCUT=0: no cut test */
 static uint8_t s_all_rows[NV2A_VSH_CONSTANTS];
 static int s_teleport = 1;              /* RECOMP_INTERP_JUMPS=0: blend them too */
+static int s_both;                      /* RECOMP_INTERP_BOTH: 1 (default) middle
+                                         * from both while replays leave room
+                                         * (delay < 14 ms), 2 all, 3 middle
+                                         * always, 0 off */
 static Frame s_fr[2];
 static int s_cur;                       /* s_fr[s_cur] is being recorded */
 static int s_recording;
@@ -163,7 +167,7 @@ static struct {
     uint32_t frames, interpolated, cuts, game_cuts, auto_cuts, overflows;
     uint32_t unpaired_frames;
     uint64_t draws, paired, diverged, dup_draws, loose1, loose2, unions;
-    uint64_t teleports;
+    uint64_t teleports, both;
     double replay_ms, replay_max;
     uint32_t shown, late, dropped;
 } s_st;
@@ -199,6 +203,8 @@ int nv2a_interp_n(void)
             s_autocut = atof(e);
         e = getenv("RECOMP_INTERP_JUMPS");
         s_teleport = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_BOTH");
+        s_both = e ? atoi(e) : 1;
         memset(s_all_rows, 1, sizeof s_all_rows);
         QueryPerformanceFrequency(&s_freq);
         s_period = s_freq.QuadPart / 30;
@@ -955,7 +961,8 @@ static void stats_line(LONGLONG now)
             " before; %.1f draws a frame, %.1f %%"
             " paired (%.1f %% by the loose keys), %.1f %% of one key drawn"
             " more than once, %llu runs went another way, %llu index unions,"
-            " %llu draws jumped (as N); replays %.2f ms a frame"
+            " %llu draws jumped (as N), %llu middles from both; replays %.2f"
+            " ms a frame"
             " (most %.2f); %u pictures shown, %u late, %u dropped%c",
             s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
             s_st.auto_cuts, s_st.overflows,
@@ -969,6 +976,7 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_st.diverged,
             (unsigned long long)s_st.unions,
             (unsigned long long)s_st.teleports,
+            (unsigned long long)s_st.both,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
             s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
     fprintf(stderr, "[INTERP] gaps between pictures (ms) <5: %u, 5-7: %u, 7-9.5:"
@@ -1275,7 +1283,23 @@ static void flip_before(const Nv2aPbBackend *be)
             older = 1;                  /* test: N-1 again, as it was */
             s_rep_blend = 0;
         }
-        if (s_mode != 1) {
+        if (s_mode != 1 && s_both && s_rep_blend && s_lat_ms < (s_both == 3 ? 99.0 : 14.0)
+            && (s_both == 2 || 2 * k == (uint32_t)n)
+            && s_inv_cap >= prev->ndraws && prev->start_pb) {
+            /* The middle picture from both frames, the nearer of the two
+             * per pixel (RECOMP_INTERP_BOTH): each fills what the other
+             * culled past its edge. */
+            replay(prev, f, s_inv, t);
+            if (be->interp(NV_INTERP_SAVE, s_base + (int)k)
+                && be->interp(NV_INTERP_DEPTH, 0)) {
+                replay(f, prev, f->pair, 1.0f - t);
+                if (be->interp(NV_INTERP_BOTH, s_base + (int)k)) {
+                    s_st.both++;
+                    continue;
+                }
+            }
+            replay(f, prev, f->pair, 1.0f - t);
+        } else if (s_mode != 1) {
             if (older)
                 replay(prev, f, s_inv, t);
             else
