@@ -158,6 +158,10 @@ int  xbox_InputHostPadOfPort(DWORD dwPort);
  *  (UTF-8), for a host menu: 1 if found, else 0 and out = "". Looked up
  *  again whenever the set of connected pads changes. */
 int  xbox_InputHostPadName(DWORD slot, char *out, int size);
+/** 1: host pads drive the title while another window is in front; 0 (the
+ *  default, RECOMP_PAD_BACKGROUND unset): they read at rest until the game
+ *  window is in front again. Takes effect on the next read. */
+void xbox_InputSetBackgroundPads(int on);
 /* ---- hooks on a port's controller state -----------------------------------
  *
  * Both run on the reading (USB) thread for every report, on the controller's

@@ -50,19 +50,28 @@ static ULONGLONG g_next_scan;
  * owner used another program (2026-11-03). Out of focus a pad still
  * answers, at rest, so the title sees no unplugged controller; scripted
  * presses (the pad overlay) still arrive, since a test run has no window in
- * front. RECOMP_PAD_FOCUS=0: pads drive the game in the background too. */
+ * front. RECOMP_PAD_BACKGROUND=1 or xbox_InputSetBackgroundPads(1) (a
+ * host's "control when out of focus" setting): pads drive the game in the
+ * background too. */
 extern int xbox_FramebufferInFront(void);
+
+static volatile LONG g_pads_background = -1;
+
+void xbox_InputSetBackgroundPads(int on)
+{
+    InterlockedExchange(&g_pads_background, on ? 1 : 0);
+}
 
 static BOOL pads_heard(void)
 {
-    static int gate = -1;
     static volatile LONG was = 1;
     int now;
-    if (gate < 0) {
-        const char *v = getenv("RECOMP_PAD_FOCUS");
-        gate = (v && *v == '0') ? 0 : 1;
+    if (g_pads_background < 0) {
+        const char *v = getenv("RECOMP_PAD_BACKGROUND");
+        InterlockedCompareExchange(&g_pads_background,
+                                   (v && *v && *v != '0') ? 1 : 0, -1);
     }
-    now = !gate || xbox_FramebufferInFront();
+    now = g_pads_background || xbox_FramebufferInFront();
     if (InterlockedExchange(&was, now) != now)
         fprintf(stderr, now ? "[INPUT] window in front: controllers heard\n"
                             : "[INPUT] window behind: controllers at rest\n");
@@ -906,6 +915,7 @@ int  xbox_InputAssignActive(void) { return 0; }
 unsigned xbox_InputPortsInUse(void) { return 1u; }
 void xbox_InputSetPadOverlay(xbox_InputPadHook fn) { (void)fn; }
 void xbox_InputSetPadFilter(xbox_InputPadHook fn) { (void)fn; }
+void xbox_InputSetBackgroundPads(int on) { (void)on; }
 BOOL xbox_InputHostPadConnected(DWORD slot)
 {
     return slot < XBOX_MAX_CONTROLLERS && g_pads[slot] ? TRUE : FALSE;
