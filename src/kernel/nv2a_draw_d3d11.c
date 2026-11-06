@@ -358,11 +358,34 @@ void xbox_SetSurfaceBoost(xbox_SurfaceBoostFn fn)
  * B8G8R8A8 (and as much depth) at most per surface. */
 #define BOOST_MAX_HOST 2048u
 
+/* Softness for boosted surfaces blurred in place (xbox_SetSurfaceBoostBlur;
+ * Conker's shadow pictures): a Gaussian of s_boost_blur guest pixels
+ * (sigma) laid over the fill's box (RECOMP_BOOST_FILL, fill_blur), so the
+ * picture is softer by the same amount at any factor; 0 = none, the title's
+ * own blur only. A picture blurred that much has no detail a bigger one
+ * would show, so a boosted surface is drawn at most at the factor where the
+ * sigma is BOOST_BLUR_HOST host pixels (never below 2x): soft at 16x costs
+ * what soft at 4x does and looks the same. Each draw asks the factor afresh
+ * (surface_boost_now), so a change remakes the surfaces at their next draw.
+ * Only for titles whose boosted surfaces are all blurred in place: the cap
+ * applies to every boosted surface. */
+static volatile float s_boost_blur;
+#define BOOST_BLUR_HOST 4.0f
+#define BOOST_BLUR_MAX  8.0f            /* guest pixels */
+
+void xbox_SetSurfaceBoostBlur(float sigma)
+{
+    if (!(sigma > 0.0f))                /* NaN too */
+        sigma = 0.0f;
+    s_boost_blur = sigma < BOOST_BLUR_MAX ? sigma : BOOST_BLUR_MAX;
+}
+
 /* The factor for the current colour target at addr, its drawn extent w x h
  * guest pixels (before padding): 0 = none. */
 static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
 {
     xbox_SurfaceBoostFn fn = s_boost_fn;
+    float blur = s_boost_blur;
     uint32_t k;
 
     if (!fn || surface_scaled_now())
@@ -371,6 +394,8 @@ static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
     if (k != 2 && k != 4 && k != 8 && k != 16)
         return 0;
     while (k > 1 && (w * k > BOOST_MAX_HOST || h * k > BOOST_MAX_HOST))
+        k >>= 1;
+    while (k > 2 && blur * (float)k > BOOST_BLUR_HOST)
         k >>= 1;
     return k > 1 ? k : 0;
 }
@@ -391,6 +416,7 @@ static struct {
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
     uint32_t boosted;                   /* surfaces made boosted */
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
+    uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
@@ -1530,6 +1556,7 @@ static ID3D11Buffer       *s_cb1;
 static struct {
     float tclamp[4][4];
     float tfill[4][4];                  /* RECOMP_BOOST_FILL, see rtt_fill */
+    float tsmooth[4][4];                /* x: xbox_SetTextureSmooth's */
 } s_cbd;
 /* Per stage reading a surface as it is: coordinate scale x y, clamp x y
  * (texture_from_surface, RECOMP_RTT_DIRECT). */
@@ -1561,10 +1588,22 @@ static ID3D11VertexShader *s_zvs;
 static ID3D11PixelShader  *s_zps;
 static ID3D11Buffer       *s_zcb;
 
+/* fill_blur's constants (s_hlsl_fill's cbuffer Xc): one pass of up to
+ * FILL_TAPS bilinear taps along one axis. */
+#define FILL_TAPS 64u
+typedef struct {
+    float inv[2];                       /* 1 / the source's size */
+    float dir[2];                       /* the pass's axis: (1,0) or (0,1) */
+    float lo[2], hi[2];                 /* first and last texel centre read */
+    float taps, pad[3];                 /* how many of tw are used */
+    float tw[FILL_TAPS][2];             /* per tap: offset (texels), weight */
+} FillConsts;
+
 /* The stretch copy pass (blit_stretch): its pixel shader, constants and
  * bilinear sampler; the vertex shader is the zeta pass's. */
 static ID3D11PixelShader  *s_bps;
-static ID3D11PixelShader  *s_xps;       /* fill_blur's box pass */
+static ID3D11PixelShader  *s_xps;       /* fill_blur's pass (s_hlsl_fill) */
+static ID3D11Buffer       *s_xcb;       /* its constants, FillConsts */
 static ID3D11Buffer       *s_bcb;
 static ID3D11SamplerState *s_bsamp;
 
@@ -1961,13 +2000,24 @@ static int draw_setup(void)
             fail("stretch copy pass", bh);
             if (s_bps) { ID3D11PixelShader_Release(s_bps); s_bps = NULL; }
         } else {
-            /* fill_blur's box pass (RECOMP_BOOST_FILL), on the same
-             * buffer and sampler; without it fills are not made. */
-            ID3DBlob *xps = compile("xps", "ps_4_0");
+            /* fill_blur's pass (RECOMP_BOOST_FILL), on the same sampler,
+             * its own source (a change to it re-keys no other shader) and
+             * constants; without it fills are not made. */
+            ID3DBlob *xps = compile_src(s_hlsl_fill, "xps", "ps_4_0", 0,
+                                        NULL);
             if (!xps || FAILED(ID3D11Device_CreatePixelShader(s_dev,
                     ID3D10Blob_GetBufferPointer(xps),
                     ID3D10Blob_GetBufferSize(xps), NULL, &s_xps)))
                 s_xps = NULL;
+            if (s_xps) {
+                bd.ByteWidth = (UINT)sizeof(FillConsts);
+                if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL,
+                                                     &s_xcb))) {
+                    ID3D11PixelShader_Release(s_xps);
+                    s_xps = NULL;
+                    s_xcb = NULL;
+                }
+            }
             if (xps) ID3D10Blob_Release(xps);
         }
     }
@@ -2882,25 +2932,76 @@ static int rtt_fill(int st, int i, uint32_t tw, uint32_t th)
     return 1;
 }
 
-/* One box pass: d texels along (dx, dy) of src (sw x sh) into dst over
- * w x h pixels, as d/2 bilinear samples on texel corners. */
+/* The 1D kernel of fill_blur's passes, in s_fill_k (taps, offsets and
+ * weights; the rest of FillConsts per pass): the fill's box of d texels
+ * (the texels -d/2 .. d/2 - 1 round the pixel's; d < 2: the pixel's own,
+ * the midpoint's bilinear read is the box then) with a Gaussian of sigma
+ * texels laid over it (xbox_SetSurfaceBoostBlur; cut at 3 sigma, or where
+ * FILL_TAPS ends), as bilinear taps: two neighbouring texels' weights in
+ * one read between them. 0 when there is nothing to blur. */
+static FillConsts s_fill_k;
+static uint32_t s_fill_k_d = ~0u;
+static float    s_fill_k_sigma = -1.0f;
+
+static uint32_t fill_kernel(uint32_t d, float sigma)
+{
+    float g[2 * FILL_TAPS + 1], w[2 * FILL_TAPS], sum = 0.0f;
+    int bn = d >= 2 ? (int)d : 1, b0 = d >= 2 ? -(int)(d / 2u) : 0;
+    int r = sigma >= 0.3f ? (int)ceilf(3.0f * sigma) : 0, len, t, n;
+
+    if (bn < 2 && !r)
+        return 0;
+    if (d == s_fill_k_d && sigma == s_fill_k_sigma)
+        return (uint32_t)s_fill_k.taps;
+    if (bn + 2 * r > (int)(2 * FILL_TAPS))
+        r = ((int)(2 * FILL_TAPS) - bn) / 2;
+    for (t = -r; t <= r; t++) {
+        g[t + r] = r ? expf(-(float)(t * t) / (2.0f * sigma * sigma)) : 1.0f;
+        sum += g[t + r];
+    }
+    len = bn + 2 * r;
+    for (t = 0; t < len; t++) {
+        int b;
+        w[t] = 0.0f;
+        for (b = 0; b < bn; b++)
+            if (t - b >= 0 && t - b <= 2 * r)
+                w[t] += g[t - b];
+        w[t] /= sum * (float)bn;
+    }
+    for (t = 0, n = 0; t < len; t += 2) {
+        float wa = w[t], wb = t + 1 < len ? w[t + 1] : 0.0f;
+        if (wa + wb <= 0.0f)
+            continue;
+        s_fill_k.tw[n][0] = (float)(b0 - r + t) + wb / (wa + wb);
+        s_fill_k.tw[n][1] = wa + wb;
+        n++;
+    }
+    s_fill_k.taps = (float)n;
+    s_fill_k_d = d;
+    s_fill_k_sigma = sigma;
+    return (uint32_t)n;
+}
+
+/* One pass of s_fill_k along (dx, dy) of src (sw x sh) into dst over
+ * w x h pixels, reading no texel of src outside box (edge texels stand in:
+ * the rest of a copy is another picture's). */
 static void fill_pass(ID3D11ShaderResourceView *src, uint32_t sw, uint32_t sh,
                       ID3D11RenderTargetView *dst, uint32_t w, uint32_t h,
-                      int dx, int dy, uint32_t d)
+                      int dx, int dy, const D3D11_BOX *box)
 {
     ID3D11ShaderResourceView *none = NULL;
     D3D11_VIEWPORT vp;
     D3D11_RECT sc;
-    float bk[8];
 
-    bk[0] = (float)dx / (float)sw;
-    bk[1] = (float)dy / (float)sh;
-    bk[2] = (float)(d / 2u);
-    bk[3] = 0.5f - (float)(d / 2u);
-    bk[4] = 1.0f / (float)sw;
-    bk[5] = 1.0f / (float)sh;
-    bk[6] = bk[7] = 0.0f;
-    if (!buf_fill(s_bcb, bk, sizeof bk))
+    s_fill_k.inv[0] = 1.0f / (float)sw;
+    s_fill_k.inv[1] = 1.0f / (float)sh;
+    s_fill_k.dir[0] = (float)dx;
+    s_fill_k.dir[1] = (float)dy;
+    s_fill_k.lo[0] = ((float)box->left + 0.5f) / (float)sw;
+    s_fill_k.lo[1] = ((float)box->top + 0.5f) / (float)sh;
+    s_fill_k.hi[0] = ((float)box->right - 0.5f) / (float)sw;
+    s_fill_k.hi[1] = ((float)box->bottom - 0.5f) / (float)sh;
+    if (!buf_fill(s_xcb, &s_fill_k, sizeof s_fill_k))
         return;
     vp.TopLeftX = vp.TopLeftY = 0.0f;
     vp.Width = (float)w;
@@ -2918,17 +3019,20 @@ static void fill_pass(ID3D11ShaderResourceView *src, uint32_t sw, uint32_t sh,
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
 }
 
-/* Copy c of stage st box-blurred d x d in place (through s_fill_tmp), for
- * RECOMP_BOOST_FILL; d < 2 needs none (the midpoint's bilinear sample is
- * the 2 x 2 square). 1 when the copy is ready to be read filled. */
-static int fill_blur(int st, int c, uint32_t d)
+/* Copy c of stage st, a surface boosted k times, blurred in place (through
+ * s_fill_tmp) for RECOMP_BOOST_FILL: the d x d box (d = k/2; d < 2 needs
+ * none, the midpoint's bilinear sample is the 2 x 2 square) and the
+ * softness of xbox_SetSurfaceBoostBlur, sigma guest pixels = sigma x k
+ * texels. Only the copied box is read. 1 when the copy is ready to be read
+ * filled. */
+static int fill_blur(int st, int c, uint32_t k, const D3D11_BOX *box)
 {
     uint32_t w = s_rtt[st][c].w, h = s_rtt[st][c].h;
     ID3D11ShaderResourceView *none = NULL;
 
-    if (d < 2)
+    if (!fill_kernel(k / 2u, s_boost_blur * (float)k))
         return 1;
-    if (!s_xps || !s_bcb || !s_bsamp)
+    if (!s_xps || !s_xcb || !s_bsamp)
         return 0;
     if (!s_rtt[st][c].rtv
         && FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
@@ -2972,12 +3076,12 @@ static int fill_blur(int st, int c, uint32_t d)
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_xps, NULL, 0);
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_bcb);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_xcb);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 4, 1, &s_bsamp);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
-    fill_pass(s_rtt[st][c].srv, w, h, s_fill_tmp.rtv, w, h, 1, 0, d);
+    fill_pass(s_rtt[st][c].srv, w, h, s_fill_tmp.rtv, w, h, 1, 0, box);
     fill_pass(s_fill_tmp.srv, s_fill_tmp.w, s_fill_tmp.h, s_rtt[st][c].rtv,
-              w, h, 0, 1, d);
+              w, h, 0, 1, box);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
     gt_mark(GT_COPY, GT_KEYS);
@@ -3177,7 +3281,7 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     gt_mark(GT_COPY, GT_KEYS);
     *flags = (uint32_t)r;
-    if (fill && fill_blur(st, c, s_surf[i].boost / 2u)) {
+    if (fill && fill_blur(st, c, s_surf[i].boost, &box)) {
         *flags |= RTT_FILL;
         s_stat.rtt_filled++;
         s_fill_share.seq = s_draw_seq;
@@ -3964,6 +4068,47 @@ typedef struct {
 #define SAMP_CACHE 64
 static SampEntry s_samp[SAMP_CACHE];
 static int s_nsamp;
+
+/* Textures a title wants read smoothly (xbox_SetTextureSmooth): fn(addr,
+ * format, w, h) is asked for each 2D texture a combiner stage reads with
+ * bilinear magnification (addr: the stage's offset as programmed, format
+ * the NV097 colour code, w x h level 0) and answers nonzero for one to read
+ * as a cubic B-spline over the 4 x 4 texels round the point (four bilinear
+ * reads, shader bspline) instead of one bilinear read. Meant for baked
+ * light maps: a low-resolution picture of the light stretched over a whole
+ * level, where bilinear shows the texel grid as steps along every shadow
+ * edge (Conker's fence shadows, to-do 106). The B-spline is a little
+ * softer than bilinear and has no steps or overshoot. Runs on the executor
+ * thread, per draw and stage; NULL (default): none. RECOMP_TEX_SMOOTH=2:
+ * on even frames only, for the held-picture check (as RECOMP_DRAW_MERGE=2:
+ * photo mode's held picture, RECOMP_FB_DUMP, neighbours differ only by
+ * this). */
+typedef int (*xbox_TextureSmoothFn)(uint32_t addr, uint32_t format,
+                                    uint32_t w, uint32_t h);
+static volatile xbox_TextureSmoothFn s_smooth_fn;
+static int s_smooth_alt = -1;
+
+void xbox_SetTextureSmooth(xbox_TextureSmoothFn fn)
+{
+    s_smooth_fn = fn;
+}
+
+static int texture_smooth(int st)
+{
+    const Texture *t = &g_pb.texs[st];
+    xbox_TextureSmoothFn fn = s_smooth_fn;
+    if (s_smooth_alt < 0) {
+        const char *e = getenv("RECOMP_TEX_SMOOTH");
+        s_smooth_alt = e && e[0] == '2';
+    }
+    if (!fn || ((t->filter >> 24) & 0xF) != 2 || tex_filter() == 0
+        || t->cube || t->depth > 1 || (s_smooth_alt && (g_pb.flips & 1)))
+        return 0;
+    if (!fn(t->offset, t->color, t->width, t->height))
+        return 0;
+    s_stat.tex_smooth++;
+    return 1;
+}
 
 static ID3D11SamplerState *sampler_stage(int st, int combiners)
 {
@@ -5262,6 +5407,8 @@ static void d3d_draw(void)
             if (rtt & RTT_FILL)
                 memcpy(s_cbd.tfill[st], s_rtt_fill[st],
                        sizeof s_cbd.tfill[st]);
+            if (combiners && !rtt && texture_smooth(st))
+                s_cbd.tsmooth[st][0] = 1.0f;
         }
         ct_add(CT_TEXTURES, ct0);
         if (g_pb.alpha_test) {
@@ -6345,6 +6492,9 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: boosted surfaces (xbox_SetSurfaceBoost):"
                 " %u made, %u stage reads filled in (RECOMP_BOOST_FILL)%c",
                 s_stat.boosted, s_stat.rtt_filled, 10);
+    if (s_stat.tex_smooth)
+        fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
+                " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
