@@ -149,6 +149,7 @@ static int s_q_slot[2 * INTERP_MAX_N];
 static LONGLONG s_q_at[2 * INTERP_MAX_N];
 static int s_base;                      /* this frame's picture slots: 0 or 4 */
 static int s_q_shown_base = -1;         /* the slots just queued (flip_after) */
+static int s_q_old;                     /* queue entries below: the frame before's */
 static double s_lat_ms = -1.0;          /* flip -> first picture, ms (EMA) */
 void xbox_Nv2aIdle(DWORD ms);           /* xbox_memory_layout.c */
 static void show_due(int all);
@@ -1002,8 +1003,28 @@ static void show_due(int all)
         s_st.shown++;
         s_q_next++;
     }
-    s_q_n = s_q_next = 0;
+    s_q_n = s_q_next = s_q_old = 0;
     InterlockedExchange(&s_q_pending, 0);
+}
+
+/* The frame before's pictures still waiting go out now, before anything of
+ * this frame (a frame that flips early -- a late one catching up -- would
+ * otherwise show the frame before's last picture after its own first: at a
+ * cut, the old shot for a picture). */
+static void flush_old(void)
+{
+    while (s_q_next < s_q_old && s_q_next < s_q_n) {
+        s_st.late++;
+        s_be->interp(NV_INTERP_SHOW, s_q_slot[s_q_next]);
+        note_shown();
+        s_st.shown++;
+        s_q_next++;
+    }
+    if (s_q_next >= s_q_n) {
+        s_q_n = s_q_next = 0;
+        InterlockedExchange(&s_q_pending, 0);
+    }
+    s_q_old = 0;
 }
 
 void nv2a_interp_tick(void)
@@ -1099,7 +1120,16 @@ static void trace_frame(const Frame *f, const Frame *prev)
     fflush(stderr);
 }
 
+static void flip_before(const Nv2aPbBackend *be);
+
 void nv2a_interp_flip_before(const Nv2aPbBackend *be)
+{
+    flip_before(be);
+    if (s_be && s_q_old)
+        flush_old();                    /* before this frame's own present */
+}
+
+static void flip_before(const Nv2aPbBackend *be)
 {
     Frame *f = &s_fr[s_cur], *prev = &s_fr[s_cur ^ 1];
     LONGLONG now = qpc(), t0;
@@ -1119,8 +1149,9 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         }
         s_q_n = m;
         s_q_next = 0;
+        s_q_old = m;
     } else {
-        s_q_n = s_q_next = 0;
+        s_q_n = s_q_next = s_q_old = 0;
         InterlockedExchange(&s_q_pending, 0);
     }
     if (s_last_flip) {
@@ -1283,6 +1314,8 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
      * back end's own present follows); the rest, N last, a period / n
      * apart. The next frame's slots are the other four. */
     wait_until(now + (LONGLONG)(s_lat_ms * (double)s_freq.QuadPart / 1000.0));
+    if (s_q_old)
+        flush_old();
     be->interp(NV_INTERP_LOAD, s_base + 1);
     {
         LONGLONG step = s_period / n, at = qpc();
