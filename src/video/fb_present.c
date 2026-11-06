@@ -536,6 +536,8 @@ extern void xbox_InputStopRumble(void);
 
 static int s_mouse_held;      /* pointer clipped and hidden */
 static int s_mouse_clicked;   /* windowed: a click asked for it */
+static UINT s_activate_click; /* WM_MOUSEACTIVATE: the button-down coming */
+static int s_click_activates; /* this button-down brought the window back */
 static int s_wheel_rest;      /* part of a notch (high-resolution wheels) */
 
 static void kbm_wake(void)
@@ -608,6 +610,19 @@ static int kbm_button(HWND h, UINT m, WPARAM w)
         || m == WM_MBUTTONDOWN || m == WM_XBUTTONDOWN;
     if (!xbox_KbmConfigured())
         return 0;
+    /* The click on the picture that brought the window back (after
+     * Alt+Tab, the Windows key, a click elsewhere) is not a press: full
+     * screen holds the mouse as the window comes to the front, so it took
+     * a photo or fired. Windowed it still takes the mouse, as any first
+     * click does. */
+    if (down && s_click_activates) {
+        s_click_activates = 0;
+        if (!s_mouse_held && m == WM_LBUTTONDOWN && xbox_KbmWantsMouse()) {
+            s_mouse_clicked = 1;
+            kbm_follow(h);
+        }
+        return 1;
+    }
     if (down && !s_mouse_held) {
         if (m == WM_LBUTTONDOWN && xbox_KbmWantsMouse()) {
             s_mouse_clicked = 1;
@@ -621,6 +636,13 @@ static int kbm_button(HWND h, UINT m, WPARAM w)
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    /* Before the hook: a menu that takes the click (click-through, as in
+     * any window) must not leave the mark on a later one. */
+    if (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN
+        || m == WM_XBUTTONDOWN) {
+        s_click_activates = m == s_activate_click;
+        s_activate_click = 0;
+    }
     {
         xbox_WindowMessageHook hook = s_msg_hook;
         intptr_t result = 0;
@@ -689,6 +711,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case FB_WM_KBM:
         kbm_follow(h);
         return 0;
+
+    /* A click activating the window: on the picture, the button-down that
+     * follows only brings it back (kbm_button). The title bar's is not one. */
+    case WM_MOUSEACTIVATE:
+        s_activate_click = LOWORD(l) == HTCLIENT ? HIWORD(l) : 0;
+        break;
 
     case WM_ACTIVATE:
     case WM_SETFOCUS:
