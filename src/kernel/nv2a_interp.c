@@ -41,7 +41,10 @@
  * (NV_HOST_FX_INTERP_CUT in its stream), or one whose camera jumped
  * (camera_jumped: a cut the title does not mark; RECOMP_INTERP_AUTOCUT=0
  * off) is drawn as N. Constants
- * that are the same in both, or all zero in one of them, are N's.
+ * that are the same in both, or all zero in one of them, are N's. A pair
+ * whose own matrices jumped (pair_jumped: turned > 30 degrees, moved by over
+ * half its translation -- a character put somewhere else between two shots,
+ * a fast spin) is drawn as N too (RECOMP_INTERP_JUMPS=0: blended).
  *
  * Guest memory the frame read (vertex arrays, textures) is read again when
  * the stream runs again; what the title has rewritten since is drawn as it is
@@ -116,7 +119,9 @@ static int s_strict;                    /* RECOMP_INTERP_STRICT: no loose keys *
 static int s_underlay = 1;              /* RECOMP_INTERP_UNDER=0: clears as they are */
 static int s_near = 1;                  /* RECOMP_INTERP_NEAR=0: always frame N */
 static int s_union = 1;                 /* RECOMP_INTERP_UNION=0: no index unions */
-static double s_autocut = 0.5;          /* RECOMP_INTERP_AUTOCUT: share of jumps */
+static double s_autocut = 0.5;          /* RECOMP_INTERP_AUTOCUT=0: no cut test */
+static uint8_t s_all_rows[NV2A_VSH_CONSTANTS];
+static int s_teleport = 1;              /* RECOMP_INTERP_JUMPS=0: blend them too */
 static Frame s_fr[2];
 static int s_cur;                       /* s_fr[s_cur] is being recorded */
 static int s_recording;
@@ -151,6 +156,7 @@ static struct {
     uint32_t frames, interpolated, cuts, game_cuts, auto_cuts, overflows;
     uint32_t unpaired_frames;
     uint64_t draws, paired, diverged, dup_draws, loose1, loose2, unions;
+    uint64_t teleports;
     double replay_ms, replay_max;
     uint32_t shown, late, dropped;
 } s_st;
@@ -180,6 +186,9 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_AUTOCUT");
         if (e)
             s_autocut = atof(e);
+        e = getenv("RECOMP_INTERP_JUMPS");
+        s_teleport = !(e && *e == '0');
+        memset(s_all_rows, 1, sizeof s_all_rows);
         QueryPerformanceFrequency(&s_freq);
         s_period = s_freq.QuadPart / 30;
         if (n > 1)
@@ -316,6 +325,8 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
     }
 }
 
+static int mats_jumped(const float (*a)[4], const float (*b)[4]);
+
 static int32_t s_extra = -1;            /* partner draw whose indices go next */
 static uint32_t s_extra_idx[NV_MAX_INDICES];
 static VertexAttr s_extra_attr[NV_VERTEX_ATTRS];
@@ -423,7 +434,12 @@ void nv2a_interp_draw(void)
             return;
         }
         s_extra = -1;
-        if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])) {
+        if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])
+            && !(s_teleport
+                 && mats_jumped((const float (*)[4])f->consts[j],
+                                (const float (*)[4])
+                                    s_rep_prev->consts[s_rep_map[j]])
+                 && ++s_st.teleports)) {
             int32_t pj = s_rep_map[j];
             blend(s_tmp, (const float (*)[4])f->consts[j],
                   (const float (*)[4])s_rep_prev->consts[pj],
@@ -625,6 +641,51 @@ static int pair_jumped(const float (*a)[4], const float (*b)[4],
     return 0;
 }
 
+/* Whether a draw's matrices jumped between a and b: each run of three rows
+ * whose x, y, z are unit vectors in both (a rotation, the translation in w:
+ * camera, object, bone) turned by more than 30 degrees in a row, or had its
+ * translation (the three w) move by more than half its length and more than
+ * 100 units. A character put somewhere else between two shots, a camera cut
+ * this draw sees, a fast spin. */
+static int mats_jumped(const float (*a)[4], const float (*b)[4])
+{
+    uint32_t r, k;
+
+    for (r = 0; r + 2 < NV2A_VSH_CONSTANTS; r++) {
+        float ta[3], tb[3], la = 0, lb = 0, d = 0;
+        int unit = 1, turned = 0;
+        for (k = 0; k < 3 && unit; k++) {
+            const float *x = a[r + k], *y = b[r + k];
+            float lx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+            float ly = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
+            if (!(lx > 0.9f && lx < 1.1f && ly > 0.9f && ly < 1.1f)) {
+                unit = 0;
+                break;
+            }
+            if ((x[0] * y[0] + x[1] * y[1] + x[2] * y[2]) / sqrtf(lx * ly)
+                < 0.866f)
+                turned = 1;
+            ta[k] = x[3];
+            tb[k] = y[3];
+        }
+        if (!unit)
+            continue;
+        if (turned)
+            return 1;
+        for (k = 0; k < 3; k++) {
+            la += ta[k] * ta[k];
+            lb += tb[k] * tb[k];
+            d += (tb[k] - ta[k]) * (tb[k] - ta[k]);
+        }
+        la = sqrtf(la > lb ? la : lb);
+        d = sqrtf(d);
+        if (d > 100.0f && d > la / 2.0f)
+            return 2;
+        r += 2;                         /* past this matrix */
+    }
+    return 0;
+}
+
 /* Whether the camera jumped between prev and f: the registers nearly every
  * paired draw shares, in both frames, and that changed (the camera's
  * matrices: the same in every draw of a frame), by pair_jumped. Without
@@ -669,31 +730,7 @@ static int camera_jumped(const Frame *f, const Frame *prev)
     why = nrows >= 3
           ? pair_jumped((const float (*)[4])prev->consts[f->pair[j0]],
                         (const float (*)[4])f->consts[j0], rows, 1) : 0;
-    if (!why) {
-        /* A shot drawn with its own matrices (It's War's valve close-up:
-         * the shared ones hardly moved): a third of the changed draws
-         * jumping is a cut too (3-23 % in a turning, shaking camera). */
-        /* Weighed by indices: a cut moves the level's big pieces, a crowd's
-         * animation only small ones (Uga Buga: half its frames otherwise). */
-        static uint8_t all[NV2A_VSH_CONSTANTS];
-        uint64_t changed = 0, jumped = 0;
-        uint32_t nchanged = 0;
-        if (!all[0])
-            memset(all, 1, sizeof all);
-        for (j = 0; j < f->ndraws; j++) {
-            int32_t pj = f->pair[j];
-            if (pj < 0 || !memcmp(f->consts[j], prev->consts[pj],
-                                   sizeof f->consts[j]))
-                continue;
-            nchanged++;
-            changed += f->ix[j][1];
-            if (pair_jumped((const float (*)[4])prev->consts[pj],
-                            (const float (*)[4])f->consts[j], all, 0))
-                jumped += f->ix[j][1];
-        }
-        if (nchanged >= 8 && jumped * 3 >= changed)
-            why = 4;
-    }
+
     if (s_log >= 2) {
         /* RECOMP_INTERP_LOG=2: the camera's change every frame. */
         const float (*a)[4] = (const float (*)[4])prev->consts[f->pair[j0]];
@@ -903,8 +940,8 @@ static void stats_line(LONGLONG now)
             " (%u the title's, %u seen), %u too big, %u without the frame"
             " before; %.1f draws a frame, %.1f %%"
             " paired (%.1f %% by the loose keys), %.1f %% of one key drawn"
-            " more than once, %llu runs went another way, %llu index unions;"
-            " replays %.2f ms a frame"
+            " more than once, %llu runs went another way, %llu index unions,"
+            " %llu draws jumped (as N); replays %.2f ms a frame"
             " (most %.2f); %u pictures shown, %u late, %u dropped%c",
             s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
             s_st.auto_cuts, s_st.overflows,
@@ -917,6 +954,7 @@ static void stats_line(LONGLONG now)
                        : 0.0,
             (unsigned long long)s_st.diverged,
             (unsigned long long)s_st.unions,
+            (unsigned long long)s_st.teleports,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
             s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
     fflush(stderr);
@@ -971,6 +1009,10 @@ static void trace_frame(const Frame *f, const Frame *prev)
         len = snprintf(line, sizeof line, "[ITRACE] %4u pair %5d prog %08X"
                        " attr0 %08X n %5u prim %X tex0 %08X target %08X:",
                        j, pj, pt[0], pt[1], pt[2], pt[3], pt[4], pt[5]);
+        if (pj >= 0 && f->key[j] != prev->key[pj])
+            len += snprintf(line + len, sizeof line - len, " LOOSE (before:"
+                            " attr0 %08X n %u tex0 %08X)", prev->part[pj][1],
+                            prev->part[pj][2], prev->part[pj][4]);
         if (pj >= 0) {
             const float (*a)[4] = (const float (*)[4])prev->consts[pj];
             const float (*b)[4] = (const float (*)[4])f->consts[j];
@@ -1071,6 +1113,20 @@ void nv2a_interp_flip_before(const Nv2aPbBackend *be)
         static int armed = 1;
         if (tr == (const char *)-1)
             tr = getenv("RECOMP_INTERP_TRACE");
+        {
+            /* RECOMP_INTERP_TRACE_FLIPS=<a>-<b>: every frame in that range. */
+            static int lo = -2, hi = -1;
+            if (lo == -2) {
+                const char *e = getenv("RECOMP_INTERP_TRACE_FLIPS");
+                lo = -1;
+                if (e)
+                    sscanf(e, "%d-%d", &lo, &hi);
+            }
+            if (lo >= 0 && (int)g_pb.flips >= lo && (int)g_pb.flips <= hi) {
+                fprintf(stderr, "[ITRACE] flip %u%c", g_pb.flips, 10);
+                trace_frame(f, prev);
+            }
+        }
         if (tr) {
             FILE *t = fopen(tr, "rb");
             if (t) {
