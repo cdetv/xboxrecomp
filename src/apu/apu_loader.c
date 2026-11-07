@@ -134,6 +134,11 @@ void apu_mixer_stop(int slot)
     if (apu()) s_apu->mixer_stop(slot);
 }
 
+void xbox_ApuSetOutputGain(float gain)
+{
+    if (apu()) s_apu->set_output_gain(gain);
+}
+
 #else
 
 MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr);
