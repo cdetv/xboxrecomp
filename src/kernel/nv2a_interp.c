@@ -145,6 +145,8 @@ static int s_nearest = 1;               /* RECOMP_INTERP_NEAREST=0: by order */
 static int s_jumplog;                   /* RECOMP_INTERP_JUMPLOG=1 (test) */
 static int s_hold_on = 1;               /* RECOMP_INTERP_HOLD=0: ignored */
 static int s_rot = 1;                   /* RECOMP_INTERP_ROT=0: plain lerp */
+static int s_pivot = 1;                 /* RECOMP_INTERP_PIVOT=0: translation
+                                         * blended straight */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
 static uint64_t s_spos_refused;
 #define SPOS_MAX_DRAWS 6000u            /* per frame: the rest go without */
@@ -307,6 +309,8 @@ int nv2a_interp_n(void)
         s_borrow = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_HOLD");
         s_hold_on = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_PIVOT");
+        s_pivot = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_ROT");
         s_rot = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_NEAREST");
@@ -619,6 +623,70 @@ static int rot_rows(const float (*m)[4], float l[3])
     return 1;
 }
 
+/* The translation of a turned matrix (rows m[0..2]: rotation, translation in
+ * w), from the point both frames agree on most: the model-space h with
+ * a h + ta = b h + tb (least squares, regularised: a pure move gives h = 0,
+ * the plain blend). Its world place is blended, and the turned rotation put
+ * back around it: out t = lerp(a h + ta, b h + tb) - out_R h. A wheel
+ * spinning about its hub (It's War's valve) kept its hub in place; a camera
+ * turning in place turns about its eye. */
+static void pivot_fix(float (*out)[4], const float (*a)[4],
+                      const float (*b)[4], float w)
+{
+    double M[3][3], d[3], g[3], h[3], tr = 0.0, det;
+    int i, j, k;
+
+    for (i = 0; i < 3; i++)
+        d[i] = (double)b[i][3] - (double)a[i][3];
+    /* M = A^T A + lambda I, g = A^T d, A = a - b (3x3). */
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) {
+            double sum = 0.0;
+            for (k = 0; k < 3; k++)
+                sum += ((double)a[k][i] - b[k][i]) * ((double)a[k][j] - b[k][j]);
+            M[i][j] = sum;
+        }
+        tr += M[i][i];
+    }
+    if (!(tr > 1e-8))
+        return;                         /* no turn: the plain blend */
+    for (i = 0; i < 3; i++) {
+        M[i][i] += 1e-3 * tr;
+        g[i] = 0.0;
+        for (k = 0; k < 3; k++)
+            g[i] += ((double)a[k][i] - b[k][i]) * d[k];
+    }
+    det = M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1])
+        - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+        + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]);
+    if (!(fabs(det) > 1e-30))
+        return;
+    for (i = 0; i < 3; i++) {           /* Cramer's rule */
+        double C[3][3];
+        memcpy(C, M, sizeof C);
+        for (k = 0; k < 3; k++)
+            C[k][i] = g[k];
+        h[i] = (C[0][0] * (C[1][1] * C[2][2] - C[1][2] * C[2][1])
+              - C[0][1] * (C[1][0] * C[2][2] - C[1][2] * C[2][0])
+              + C[0][2] * (C[1][0] * C[2][1] - C[1][1] * C[2][0])) / det;
+        if (!isfinite(h[i]))
+            return;
+    }
+    for (i = 0; i < 3; i++) {
+        double pa = a[i][3], pb = b[i][3], rh = 0.0;
+        for (k = 0; k < 3; k++) {
+            pa += (double)a[i][k] * h[k];
+            pb += (double)b[i][k] * h[k];
+            rh += (double)out[i][k] * h[k];
+        }
+        {
+            float t = (float)(pa + (pb - pa) * w - rh);
+            if (isfinite(t))
+                out[i][3] = t;
+        }
+    }
+}
+
 /* After a register-by-register blend: a matrix that turned shrinks (by
  * cos(angle/2): 30 % at 90 degrees), so a fast swinging limb or head of a
  * character collapsed for a picture and looked gone. Each row of a
@@ -639,15 +707,26 @@ static void rot_fix(VshConsts out, const VshConsts own, const VshConsts partner,
         if (!rot_rows((const float (*)[4])own[r], la)
             || !rot_rows((const float (*)[4])partner[r], lb))
             continue;
+        if ((!memcmp(out[r], own[r], 16) && !memcmp(out[r + 1], own[r + 1], 16)
+             && !memcmp(out[r + 2], own[r + 2], 16))
+            || (!memcmp(out[r], partner[r], 16)
+                && !memcmp(out[r + 1], partner[r + 1], 16)
+                && !memcmp(out[r + 2], partner[r + 2], 16))) {
+            r += 2;                     /* kept as one frame had it */
+            continue;
+        }
         for (i = 0; i < 3; i++) {
             float *o = out[r + i], lo = len3(o), want;
-            if (!memcmp(o, own[r + i], 16) || !(lo > 1e-6f))
-                continue;               /* kept as it was */
+            if (!(lo > 1e-6f))
+                continue;
             want = la[i] + (lb[i] - la[i]) * w;
             o[0] *= want / lo;
             o[1] *= want / lo;
             o[2] *= want / lo;
         }
+        if (s_pivot)
+            pivot_fix(out + r, (const float (*)[4])own + r,
+                      (const float (*)[4])partner + r, w);
         s_rot_fixed++;
         r += 2;                         /* past this matrix */
     }
@@ -658,6 +737,8 @@ static void rot_fix(VshConsts out, const VshConsts own, const VshConsts partner,
  * texture matrix registers, whose values that moved by about a whole number
  * (a scroll wrapped back by whole repeats) move the short way instead, and
  * that moved by more than half a repeat otherwise are the nearer frame's. */
+static int s_keep_partner;              /* blend(): kept rows take partner's */
+
 static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
                   float w, const uint64_t *texmat, const uint8_t *keep,
                   const uint64_t *reads)
@@ -665,6 +746,13 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
     uint32_t r, c;
 
     for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+        if (keep && keep[r] && s_keep_partner) {
+            /* A matrix that jumped: the frame nearer in time, the same in
+             * both replays of a middle picture (else the two were mixed
+             * per pixel: It's War's spinning valve with two hubs). */
+            memcpy(out[r], partner[r], sizeof out[r]);
+            continue;
+        }
         /* A register the program never reads: as it is (only speed). */
         if ((reads && !(reads[r >> 6] >> (r & 63) & 1))
             || !memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
@@ -900,6 +988,10 @@ void nv2a_interp_draw(void)
                                     keep);
             if (jumped)
                 s_st.teleports++;
+            /* Nearer in time: the frame drawn is the newer one (N) when it
+             * is s_fr[s_cur]; the frame before otherwise. */
+            s_keep_partner = f == &s_fr[s_cur] ? s_rep_t > 0.5f
+                                               : s_rep_t >= 0.5f;
             blend(s_tmp, (const float (*)[4])f->consts[j],
                   (const float (*)[4])s_rep_prev->consts[pj],
                   s_rep_t, f->prog[j] != PROG_NONE
