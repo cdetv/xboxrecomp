@@ -1191,12 +1191,40 @@ int nv2a_pb_exec_semaphore(uint32_t *value)
     return 1;
 }
 
+/* xbox_Nv2aPresentNow (xbox_memory_layout.h): a present with no flip.
+ *
+ * Presents happen at FLIP_STALL, so a picture a title draws straight into
+ * the buffer on screen (a loading screen drawn into the front buffer while
+ * the title loads, with no Swap) is drawn but never shown; on hardware the
+ * display scans it out as it is drawn. The title asks for one here; the
+ * executor presents at the top of its next pass, after what it has run so
+ * far (call it once the title's own fence wait says the drawing is done).
+ * black: present a black picture instead of the drawn one. */
+static volatile LONG s_present_req;
+int g_pb_present_black;                 /* read by the back end's present */
+
+void xbox_Nv2aPresentNow(int black)
+{
+    InterlockedExchange(&s_present_req, black ? 2 : 1);
+    xbox_Nv2aRing();
+}
+
 /* Called every tick of the executor's loop (xbox_memory_layout.c), on its
  * thread: lets a back end finish work the GPU completes later. */
 void nv2a_pb_exec_poll(void)
 {
+    LONG req;
+
     if (s_be->poll)
         s_be->poll();
+    req = InterlockedExchange(&s_present_req, 0);
+    if (req) {
+        g_pb_present_black = req == 2;
+        s_be->present();
+        if (s_shadow)
+            s_shadow->present();
+        g_pb_present_black = 0;
+    }
 }
 
 /* Host methods (nv2a_pb_state.h): parameters, then an effect run by the

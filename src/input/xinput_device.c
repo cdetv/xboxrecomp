@@ -637,6 +637,63 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     return ERROR_SUCCESS;
 }
 
+/* Stick dead zone (xbox_SetStickDeadZone): a title ignores the first part
+ * of each stick axis itself (its dead zone, a fraction of full tilt per
+ * stick). To give the player another one, each axis of a real pad is
+ * reshaped before the title reads it: tilt up to the wanted dead zone
+ * reads as 0, and from there to full tilt it is spread over the title's
+ * own live range, so the title's response past its dead zone is kept and
+ * only where it starts moves. Per axis, as such titles test. Keyboard,
+ * mouse and scripted presses are left as they are. */
+static struct {
+    volatile LONG set;                       /* 1: the fields below in use */
+    float title[2], want;                    /* left, right; wanted */
+} g_dz[XBOX_MAX_CONTROLLERS];
+
+void xbox_SetStickDeadZone(int port, float title_left, float title_right,
+                           float wanted)
+{
+    int p, on = !(wanted < 0.0f || title_left < 0.0f || title_right < 0.0f
+                  || title_left >= 1.0f || title_right >= 1.0f);
+    for (p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+        if (port >= 0 && port != p)
+            continue;
+        InterlockedExchange(&g_dz[p].set, 0);
+        if (!on)
+            continue;
+        g_dz[p].title[0] = title_left;
+        g_dz[p].title[1] = title_right;
+        g_dz[p].want = wanted > 0.9f ? 0.9f : wanted;
+        InterlockedExchange(&g_dz[p].set, 1);
+    }
+}
+
+static SHORT dz_axis(SHORT v, float title, float want)
+{
+    float p = v < 0 ? -(float)v / 32768.0f : (float)v / 32767.0f;
+    float q;
+    if (p <= want)
+        return 0;
+    q = title + (p - want) * (1.0f - title) / (1.0f - want);
+    if (q > 1.0f)
+        q = 1.0f;
+    return v < 0 ? (SHORT)(-(LONG)(q * 32768.0f + 0.5f) < -32768 ? -32768
+                           : -(LONG)(q * 32768.0f + 0.5f))
+                 : (SHORT)(LONG)(q * 32767.0f + 0.5f);
+}
+
+static void dz_apply(DWORD port, XBOX_GAMEPAD *g)
+{
+    float want;
+    if (port >= XBOX_MAX_CONTROLLERS || !g_dz[port].set)
+        return;
+    want = g_dz[port].want;
+    g->sThumbLX = dz_axis(g->sThumbLX, g_dz[port].title[0], want);
+    g->sThumbLY = dz_axis(g->sThumbLY, g_dz[port].title[0], want);
+    g->sThumbRX = dz_axis(g->sThumbRX, g_dz[port].title[1], want);
+    g->sThumbRY = dz_axis(g->sThumbRY, g_dz[port].title[1], want);
+}
+
 static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XINPUT_STATE xi_state = { 0 };
@@ -702,6 +759,7 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
     pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
     pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    dz_apply(dwPort, &pState->Gamepad);
     if (g_pad_overlay)
         g_pad_overlay(dwPort, pState);
 
@@ -788,6 +846,32 @@ static BOOL rumble_log(void)
     return on ? TRUE : FALSE;
 }
 
+/* Rumble strength per port, in percent of the title's motor speeds (0 = no
+ * rumble, above 100 stronger, capped at full speed; default 100), set by a
+ * settings layer through xbox_SetRumbleStrength. Applied to the speeds sent
+ * to the host pad; the title's own speeds are what the log prints. */
+static volatile LONG g_rumble_pct[XBOX_MAX_CONTROLLERS] = { 100, 100, 100, 100 };
+
+void xbox_SetRumbleStrength(int port, int percent)
+{
+    int p;
+    if (percent < 0) percent = 0;
+    if (percent > 200) percent = 200;
+    for (p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        if (port < 0 || port == p)
+            InterlockedExchange(&g_rumble_pct[p], percent);
+}
+
+static WORD rumble_scaled(DWORD port, WORD speed)
+{
+    LONG p = g_rumble_pct[port];
+    DWORD v;
+    if (p == 100)
+        return speed;
+    v = (DWORD)speed * (DWORD)p / 100u;
+    return (WORD)(v > 65535u ? 65535u : v);
+}
+
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     DWORD slot, speeds, rc;
@@ -797,8 +881,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     slot = slot_of_port(dwPort);
-    speeds = ((DWORD)pVibration->wLeftMotorSpeed << 16)
-           | pVibration->wRightMotorSpeed;
+    /* The speeds as the host pad gets them (g_rumble_pct): a strength
+     * change reaches a running rumble as a change, at once. */
+    speeds = ((DWORD)rumble_scaled(dwPort, pVibration->wLeftMotorSpeed) << 16)
+           | rumble_scaled(dwPort, pVibration->wRightMotorSpeed);
     now = GetTickCount64();
     if (slot != g_rumble_slot[dwPort] && g_rumble_slot[dwPort] != NO_SLOT)
         host_set_rumble(g_rumble_slot[dwPort], 0, 0);
@@ -821,8 +907,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
     if (speeds)
         InterlockedOr(&g_rumbled_slots, 1L << slot);
-    rc = host_set_rumble(slot, pVibration->wLeftMotorSpeed,
-                         pVibration->wRightMotorSpeed);
+    rc = host_set_rumble(slot, (WORD)(speeds >> 16), (WORD)speeds);
     if (rc != ERROR_SUCCESS)
         g_next_scan = 0;                /* unplugged: look again next time */
     return rc;
@@ -1013,6 +1098,17 @@ void xbox_InputStopRumble(void)
     for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
         if (g_pads[i])
             SDL_GameControllerRumble(g_pads[i], 0, 0, 0);
+}
+
+/* Not built on this path yet (the Windows path above has them). */
+void xbox_SetRumbleStrength(int port, int percent)
+{
+    (void)port; (void)percent;
+}
+void xbox_SetStickDeadZone(int port, float title_left, float title_right,
+                           float wanted)
+{
+    (void)port; (void)title_left; (void)title_right; (void)wanted;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)

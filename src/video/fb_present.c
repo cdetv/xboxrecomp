@@ -409,6 +409,85 @@ int xbox_FramebufferWindowIsFullscreen(void)
     return s_fullscreen;
 }
 
+/* The window's own size and place (a settings layer keeps it for the next
+ * start, RECOMP_WINDOW_RECT): its restored rectangle in workspace
+ * coordinates (as GetWindowPlacement gives it), and whether it is
+ * maximized; in full screen, the window's as it was before (what leaving
+ * full screen puts back). 0 while there is no window. */
+int xbox_FramebufferWindowPlacement(int *x, int *y, int *w, int *h,
+                                    int *maximized)
+{
+    WINDOWPLACEMENT wp;
+    HWND hw = s_hwnd;
+
+    if (!hw || !s_fb_running)
+        return 0;
+    if (s_fullscreen) {
+        wp = s_saved_place;
+        if (wp.length != sizeof(wp))
+            return 0;
+    } else {
+        wp.length = sizeof(wp);
+        if (!GetWindowPlacement(hw, &wp))
+            return 0;
+    }
+    *x = wp.rcNormalPosition.left;
+    *y = wp.rcNormalPosition.top;
+    *w = wp.rcNormalPosition.right - wp.rcNormalPosition.left;
+    *h = wp.rcNormalPosition.bottom - wp.rcNormalPosition.top;
+    *maximized = wp.showCmd == SW_SHOWMAXIMIZED;
+    return *w > 0 && *h > 0;
+}
+
+/* RECOMP_WINDOW_RECT="x,y,w,h[,max]" (xbox_FramebufferWindowPlacement's,
+ * from the last run): put the new window there, before the display mode
+ * takes it to full screen (which then keeps it for leaving full screen).
+ * Taken only when at least 200 x 100 pixels of it are on a monitor's
+ * work area, so a monitor since unplugged does not hide the window. */
+static void fb_remembered_place(HWND h)
+{
+    const char *e = getenv("RECOMP_WINDOW_RECT");
+    int x, y, w, ht, n;
+    char mx[8] = "";
+    RECT r, wa, in;
+    HMONITOR mon;
+    MONITORINFO mi;
+    WINDOWPLACEMENT wp;
+
+    if (!e || !*e)
+        return;
+    n = sscanf(e, "%d , %d , %d , %d , %7s", &x, &y, &w, &ht, mx);
+    if (n < 4 || w < 100 || ht < 100)
+        return;
+    /* Workspace to screen: the primary monitor's work area origin. */
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &wa, 0))
+        SetRectEmpty(&wa);
+    r.left = x + wa.left;
+    r.top = y + wa.top;
+    r.right = r.left + w;
+    r.bottom = r.top + ht;
+    mon = MonitorFromRect(&r, MONITOR_DEFAULTTONULL);
+    mi.cbSize = sizeof(mi);
+    if (!mon || !GetMonitorInfoA(mon, &mi)
+            || !IntersectRect(&in, &r, &mi.rcWork)
+            || in.right - in.left < 200 || in.bottom - in.top < 100) {
+        fprintf(stderr, "  [FBWIN] RECOMP_WINDOW_RECT=%s: not on a monitor"
+                " now, the default place instead\n", e);
+        return;
+    }
+    wp.length = sizeof(wp);
+    if (!GetWindowPlacement(h, &wp))
+        return;
+    wp.flags = 0;
+    wp.showCmd = n == 5 && !_stricmp(mx, "max") ? SW_SHOWMAXIMIZED
+                                                 : SW_SHOWNORMAL;
+    wp.rcNormalPosition.left = x;
+    wp.rcNormalPosition.top = y;
+    wp.rcNormalPosition.right = x + w;
+    wp.rcNormalPosition.bottom = y + ht;
+    SetWindowPlacement(h, &wp);
+}
+
 /* Where the GPU view sits in the frame window's client area: a host overlay
  * drawn into the swap chain needs it to turn mouse positions (reported to
  * the frame window) into back-buffer pixels. 0 while there is no view. */
@@ -998,6 +1077,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     hdc = GetDC(hwnd);
     s_hwnd = hwnd;
     kbm_register(hwnd);
+    fb_remembered_place(hwnd);
     fb_start_mode(hwnd);
 
     memset(&bi, 0, sizeof(bi));
@@ -1127,6 +1207,11 @@ void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h) { (void)w; (void
 int xbox_DisplayShape(unsigned *w, unsigned *h) { *w = 4; *h = 3; return 0; }
 void xbox_FramebufferWindowSetFullscreen(int on) { (void)on; }
 int xbox_FramebufferWindowIsFullscreen(void) { return 0; }
+int xbox_FramebufferWindowPlacement(int *x, int *y, int *w, int *h, int *m)
+{
+    (void)x; (void)y; (void)w; (void)h; (void)m;
+    return 0;
+}
 void xbox_FramebufferWindowSetDisplayMode(int mode) { (void)mode; }
 int xbox_FramebufferWindowExclusive(void) { return 0; }
 void xbox_FramebufferWindowReplace(void) { }
