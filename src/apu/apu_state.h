@@ -568,6 +568,11 @@ struct ApuProfile {
      * guest threads, and the longest gap between two loops. */
     double t_gate, max_gate, t_relock, max_relock, max_loop;
     unsigned long gate_busy;   /* ISR gate busy: delivery retried next frame */
+    /* Trapped / halted front end: waits that ended with it running again,
+     * waits given up after RECOMP_APU_TRAP_WAIT (silence follows), and the
+     * time spent waiting. idle_frames counts the silent frames. */
+    unsigned long trap_waits, trap_timeouts;
+    double t_trap, max_trap;
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;
