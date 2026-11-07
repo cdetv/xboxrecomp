@@ -47,6 +47,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>    /* IDXGIAdapter3: video memory use */
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
 #include "vsync_d3d11.h"
@@ -120,13 +121,23 @@ static uint32_t s_sc_w = SC_W, s_sc_h = SC_H;
 static uint32_t s_bb_w = SC_W, s_bb_h = SC_H;
 static uint32_t s_scale_gen;
 
-/* Render scale limits: a percent from 25 to 400 is taken (a menu offers
+/* Render scale limits: a percent from 25 to 1000 is taken (a menu offers
  * fewer). The frame stays inside render_res_ok's (fb_present.c) 10240 x
  * 7680, which keeps a scaled depth buffer inside D3D11's textures, and at
- * most RS_MAX_PIXELS (twice 4K's): bigger asks are capped (draw_size). */
+ * most s_rs_max_px pixels: bigger asks are capped (draw_size). That is
+ * what fits in 3/4 of the video memory budget Windows gives the process
+ * (rs_cap_from_memory), measured 2026-11-07 in the field at 1080p: 800 MB
+ * at 1x, 1469 MB at 2x, so ~108 bytes per frame pixel on ~580 MB; taken as
+ * RS_BYTES_PX on RS_BASE_MB for a margin (other levels have more surfaces).
+ * Never below RS_MIN_PIXELS (2x 1080p); RS_OLD_PIXELS (twice 4K's, the cap
+ * before) when the adapter can't say. */
 #define RS_MIN 25
-#define RS_MAX 400
-#define RS_MAX_PIXELS (3840.0 * 2160.0 * 2.0)
+#define RS_MAX 1000
+#define RS_OLD_PIXELS (3840.0 * 2160.0 * 2.0)
+#define RS_MIN_PIXELS (3840.0 * 2160.0)
+#define RS_BYTES_PX 128.0
+#define RS_BASE_MB 600.0
+static double s_rs_max_px = RS_OLD_PIXELS;
 static volatile LONG s_scale_pct = -1;  /* -1: environment not read yet */
 
 static int render_scale_pct(void)
@@ -169,7 +180,7 @@ int xbox_SetRenderScale(int percent)
 static void draw_size(uint32_t w, uint32_t h, int pct, uint32_t *dw,
                       uint32_t *dh)
 {
-    double f = pct / 100.0, cap = sqrt(RS_MAX_PIXELS / ((double)w * h));
+    double f = pct / 100.0, cap = sqrt(s_rs_max_px / ((double)w * h));
 
     if (f > 10240.0 / w) f = 10240.0 / w;
     if (f > 7680.0 / h) f = 7680.0 / h;
@@ -223,6 +234,8 @@ static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;    /* ClearView: clears a rectangle */
 static IDXGIFactory2        *s_factory;
+static IDXGIAdapter3        *s_adapter3;    /* video memory use; may be NULL */
+static uint64_t              s_vram_total;  /* dedicated video memory */
 static UINT                  s_swap_flags;  /* vsync_swap_flags */
 static int                   s_swap_flags_read;
 static IDXGISwapChain1      *s_swap;
@@ -6293,14 +6306,17 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
 
 /* The shown frame into the swap chain's back buffer, on black: copied, or
  * drawn through the filter chain (postfx_d3d11.c) when a filter is on or
- * the frame is drawn at another scale than the back buffer's. */
+ * the frame is drawn at another scale than the back buffer's. Only the
+ * black under a black present (xbox_Nv2aPresentNow). */
+extern int g_pb_present_black;
+
 static void shown_to_back(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
 
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    if (s_shown >= 0 && (back = back_tex())) {
+    if (s_shown >= 0 && !g_pb_present_black && (back = back_tex())) {
         /* The shown rectangle at its surface's scale; the back buffer's
          * scale (bx, by: host pixels per guest pixel, worked out as
          * set_render_scale does, so equal sizes give equal scales). An
@@ -6501,9 +6517,67 @@ static void apply_render_res(void)
             s_sc_h, s_rsx, s_rsy, 10);
 }
 
+static int gpu_mem(uint64_t *used, uint64_t *budget);
+
+/* The render scale's pixel cap from the video memory budget (see RS_MAX). */
+static void rs_cap_from_memory(void)
+{
+    uint64_t used, budget;
+    double px;
+
+    if (!gpu_mem(&used, &budget) || !budget)
+        return;
+    px = ((double)budget * 0.75 - RS_BASE_MB * 1048576.0) / RS_BYTES_PX;
+    if (px < RS_MIN_PIXELS)
+        px = RS_MIN_PIXELS;
+    s_rs_max_px = px;
+    fprintf(stderr, "[GPU] d3d11: render scale up to %.0f Mpx a frame (%u MB"
+            " video memory budget)%c", px / 1e6, (unsigned)(budget >> 20), 10);
+}
+
+/* Video memory in use by this process and the budget Windows gives it
+ * (IDXGIAdapter3, local segment); 0 when the adapter can't say. */
+static int gpu_mem(uint64_t *used, uint64_t *budget)
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi;
+
+    if (!s_adapter3 || FAILED(IDXGIAdapter3_QueryVideoMemoryInfo(s_adapter3,
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+        return 0;
+    *used = mi.CurrentUsage;
+    *budget = mi.Budget;
+    return 1;
+}
+
+/* RECOMP_GPU_MEM_LOG=1: every 5 s, [GPUMEM] video memory used / budget and
+ * the size the frame is drawn at (what a render scale costs). */
+static void gpu_mem_log(void)
+{
+    static int on = -1;
+    static ULONGLONG last;
+    ULONGLONG now;
+    uint64_t used, budget;
+
+    if (on < 0)
+        on = getenv("RECOMP_GPU_MEM_LOG") != NULL;
+    if (!on)
+        return;
+    now = GetTickCount64();
+    if (now - last < 5000)
+        return;
+    last = now;
+    if (gpu_mem(&used, &budget))
+        fprintf(stderr, "[GPUMEM] %u MB used of a %u MB budget (%u MB on"
+                " the card); frame drawn at %ux%u, shown at %ux%u%c",
+                (unsigned)(used >> 20), (unsigned)(budget >> 20),
+                (unsigned)(s_vram_total >> 20), s_sc_w, s_sc_h, s_bb_w,
+                s_bb_h, 10);
+}
+
 static void d3d_present(void)
 {
     heavy_report();
+    gpu_mem_log();
     {
         /* RECOMP_GPU_PACING: presents in each wall-clock second, ten to a
          * line -- how evenly the title paces its frames once drawing costs
@@ -7059,12 +7133,19 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
                                     (void **)&s_factory);
     if (adapter) {
         DXGI_ADAPTER_DESC ad;
-        if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)))
-            fprintf(stderr, "[GPU] d3d11: %ls, feature level %X.%X%c",
-                    ad.Description, (unsigned)got >> 12,
-                    ((unsigned)got >> 8) & 0xF, 10);
+        if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
+            fprintf(stderr, "[GPU] d3d11: %ls, feature level %X.%X, %u MB"
+                    " video memory%c", ad.Description, (unsigned)got >> 12,
+                    ((unsigned)got >> 8) & 0xF,
+                    (unsigned)(ad.DedicatedVideoMemory >> 20), 10);
+            s_vram_total = (uint64_t)ad.DedicatedVideoMemory;
+        }
+        if (FAILED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter3,
+                                               (void **)&s_adapter3)))
+            s_adapter3 = NULL;
         IDXGIAdapter_Release(adapter);
     }
+    rs_cap_from_memory();
     if (dxgi_dev)
         IDXGIDevice_Release(dxgi_dev);
     if (FAILED(hr)) {
