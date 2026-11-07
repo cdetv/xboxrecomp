@@ -532,10 +532,18 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
         }
-        default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
+        default: {
+            /* A game can ask thousands of times a second (Conker polls class 1
+             * while it waits in a load): a few lines, not a flood. */
+            static int warned;
+            if (warned < 3) {
+                warned++;
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "NtQueryVolumeInformationFile: unhandled class %d%s", FsInformationClass,
+                    warned == 3 ? " (not logged again)" : "");
+            }
             return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 
@@ -1149,10 +1157,18 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             IoStatusBlock->Information = sizeof(XBOX_FILE_FS_SIZE_INFORMATION);
             return STATUS_SUCCESS;
         }
-        default:
-            xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                "NtQueryVolumeInformationFile: unhandled class %d", FsInformationClass);
+        default: {
+            /* A game can ask thousands of times a second (Conker polls class 1
+             * while it waits in a load): a few lines, not a flood. */
+            static int warned;
+            if (warned < 3) {
+                warned++;
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
+                    "NtQueryVolumeInformationFile: unhandled class %d%s", FsInformationClass,
+                    warned == 3 ? " (not logged again)" : "");
+            }
             return STATUS_NOT_IMPLEMENTED;
+        }
     }
 }
 
