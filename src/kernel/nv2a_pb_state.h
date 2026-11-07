@@ -384,6 +384,20 @@ typedef struct {
  * culled the other fills in. */
 #define NV_INTERP_DEPTH 4
 #define NV_INTERP_BOTH  5
+/* NV_INTERP_BOTH with slot | NV_INTERP_PREFER_OLD: the picture is nearer in
+ * time to the frame `slot` was drawn from, so that one is kept wherever the
+ * other is not clearly nearer (else the shown surface's). Where both drew
+ * the same surface (or a layer that writes no depth over it), the depths tie
+ * up to rounding: one picture throughout, not a speckle of both. */
+#define NV_INTERP_PREFER_OLD 0x100
+/* NV_INTERP_KEEP: copies of the surfaces a frame read before it drew on them
+ * (left from an earlier frame: Conker's glow blends in the one before's)
+ * taken now, as generation `slot` (0-2); NV_INTERP_PUT: generation `slot`
+ * copied back into them. Taken at every flip, the frame's end is the next
+ * one's start: put back before a frame is drawn again, and the real end after
+ * the replays, each replay and the next frame read what the real frame did. */
+#define NV_INTERP_KEEP 6
+#define NV_INTERP_PUT  7
 
 /* Host methods: commands a game's own code (not the title's) puts in the
  * pushbuffer for the runtime, so that something the host draws lands at

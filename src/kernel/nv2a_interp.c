@@ -100,6 +100,8 @@ typedef struct {
     uint32_t (*ix)[2];                  /* each draw's index list: start, count */
     VertexAttr (*attr)[NV_VERTEX_ATTRS]; /* and its vertex arrays */
     uint8_t  *inl;                      /* drawn from INLINE_ARRAY / immediate */
+    uint16_t *prog;                     /* s_prog entry, or PROG_NONE */
+    uint64_t *vh;                       /* RECOMP_INTERP_VCHECK: vertex bytes */
     uint32_t *idx;                      /* in here */
     size_t    nidx, capidx;
     VshConsts *consts;
@@ -116,7 +118,16 @@ static int s_log = -1;
 static int s_mode;                      /* RECOMP_INTERP_MODE */
 static int s_unique;                    /* RECOMP_INTERP_UNIQUE (test) */
 static int s_strict;                    /* RECOMP_INTERP_STRICT: no loose keys */
-static int s_underlay = 1;              /* RECOMP_INTERP_UNDER=0: clears as they are */
+static int s_underlay;                  /* RECOMP_INTERP_UNDER=1: replays' clears
+                                         * start from the frame before's
+                                         * picture. Off: where a title draws
+                                         * no background (Conker's night
+                                         * sky is the clear colour), every
+                                         * in-between showed the frame
+                                         * before there, its lamp halos too,
+                                         * and the glow picked them up */
+static int s_carry = 1;                 /* RECOMP_INTERP_CARRY=0: no
+                                         * NV_INTERP_KEEP / _PUT */
 static int s_near = 1;                  /* RECOMP_INTERP_NEAR=0: always frame N */
 static int s_union = 1;                 /* RECOMP_INTERP_UNION=0: no index unions */
 static double s_autocut = 0.5;          /* RECOMP_INTERP_AUTOCUT=0: no cut test */
@@ -126,6 +137,67 @@ static int s_both;                      /* RECOMP_INTERP_BOTH: 1 (default) middl
                                          * from both while replays leave room
                                          * (delay < 14 ms), 2 all, 3 middle
                                          * always, 0 off */
+static int s_texwrap = 1;               /* RECOMP_INTERP_TEXWRAP=0: texture
+                                         * matrices blended straight */
+static int s_vcheck;                    /* RECOMP_INTERP_VCHECK=1 (test) */
+static uint32_t s_vdiff, s_vsaid;       /* replayed draws whose vertices
+                                         * changed since recorded (10 s) */
+ptrdiff_t xbox_GetMemoryOffset(void);   /* xbox_memory_layout.h */
+
+/* RECOMP_INTERP_VCHECK: a hash of the vertex bytes the current draw reads
+ * from guest memory (every array, the elements its indices reach); 0 for
+ * vertices in the pushbuffer (recorded with the stream). */
+static uint64_t vtx_hash(void)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint64_t h = 1469598103934665603ull;
+    uint32_t mn = ~0u, mx = 0, i, a;
+
+    if (g_pb.inline_active || g_pb.imm_count || g_pb.inline_count
+        || !g_pb.idx_count)
+        return 0;
+    for (i = 0; i < g_pb.idx_count; i++) {
+        if (g_pb.idx[i] < mn) mn = g_pb.idx[i];
+        if (g_pb.idx[i] > mx) mx = g_pb.idx[i];
+    }
+    for (a = 0; a < NV_VERTEX_ATTRS; a++) {
+        const VertexAttr *v = &g_pb.attr[a];
+        const uint8_t *p, *e;
+        if (!v->size || !v->stride || !v->offset)
+            continue;
+        p = mem + v->offset + (size_t)mn * v->stride;
+        e = mem + v->offset + (size_t)mx * v->stride
+            + (v->stride < 16 ? v->stride : 16);
+        h ^= a * 0x9E3779B97F4A7C15ull;
+        for (; p + 8 <= e; p += 8) {
+            uint64_t w;
+            memcpy(&w, p, 8);
+            h = (h ^ w) * 0x100000001B3ull;
+            h ^= h >> 29;
+        }
+        for (; p < e; p++)
+            h = (h ^ *p) * 0x100000001B3ull;
+    }
+    return h | 1;
+}
+
+/* What a vertex program does with its constants, worked out once per
+ * program from its instructions (prog_info): which registers are texture
+ * matrices -- read by an instruction whose other input comes from a texture
+ * coordinate (v9-v12) and whose result reaches oT0-oT3. A title scrolls a
+ * texture by moving such a matrix's translation and wraps it back by a whole
+ * repeat now and then (Conker: u, v jump by 2 past +-2, 0x003F91D0); the
+ * texture looks the same either side, but a straight blend crosses half the
+ * texture for a picture. */
+#define PROG_MAX 1024u
+typedef struct {
+    uint64_t hash;
+    uint64_t texmat[3];                 /* bit r: c[r] (192 bits) */
+    int used;
+} ProgInfo;
+static ProgInfo s_prog[PROG_MAX];
+static uint32_t s_nprog;
+#define PROG_NONE 0xFFFFu
 static Frame s_fr[2];
 static int s_cur;                       /* s_fr[s_cur] is being recorded */
 static int s_recording;
@@ -190,10 +262,18 @@ int nv2a_interp_n(void)
                                             : 0;
         e = getenv("RECOMP_INTERP_MODE");
         s_mode = e ? atoi(e) : 0;
-        s_unique = getenv("RECOMP_INTERP_UNIQUE") != NULL;
-        s_strict = getenv("RECOMP_INTERP_STRICT") != NULL;
+        e = getenv("RECOMP_INTERP_UNIQUE");
+        s_unique = e && *e && *e != '0';
+        e = getenv("RECOMP_INTERP_STRICT");
+        s_strict = e && *e && *e != '0';
+        e = getenv("RECOMP_INTERP_TEXWRAP");
+        s_texwrap = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_VCHECK");
+        s_vcheck = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_UNDER");
-        s_underlay = !(e && *e == '0');
+        s_underlay = e && *e && *e != '0';
+        e = getenv("RECOMP_INTERP_CARRY");
+        s_carry = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_NEAR");
         s_near = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_UNION");
@@ -218,6 +298,13 @@ int nv2a_interp_n(void)
 int nv2a_interp_replaying(void)
 {
     return s_rep;
+}
+
+static unsigned s_rep_id;
+
+unsigned nv2a_interp_replay_id(void)
+{
+    return s_rep_id;
 }
 
 void nv2a_interp_note_cut(void)
@@ -322,10 +409,114 @@ static int all_zero(const float *v)
     return v[0] == 0.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f;
 }
 
+/* Texture matrix registers of program ins (count instructions), into
+ * texmat: a register an instruction reads alongside a value that comes from
+ * a texture coordinate input (v9-v12, directly or through temps), when that
+ * instruction's result reaches oT0-oT3 (o[9]-o[12]), directly or through
+ * temps. Temps are followed whole (a partial write adds to what the temp
+ * carried). */
+static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
+                        uint64_t texmat[3])
+{
+    uint8_t tex[16];                    /* temp carries a texture coordinate */
+    uint64_t via[16][3];                /* constants that went into it */
+    uint32_t i, s, w;
+
+    memset(tex, 0, sizeof tex);
+    memset(via, 0, sizeof via);
+    texmat[0] = texmat[1] = texmat[2] = 0;
+    for (i = 0; i < count; i++) {
+        const Nv2aVshIns *I = &ins[i];
+        uint64_t c[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
+        int t = 0;
+        for (s = 0; s < 3; s++) {
+            const Nv2aVshSrc *S = &I->src[s];
+            if (!(I->need & (1u << s)))
+                continue;
+            if (S->mux == 2) {
+                if (I->iidx >= 9 && I->iidx <= 12)
+                    t = 1;
+            } else if (S->mux == 1) {
+                if (S->reg < 16 && tex[S->reg]) {
+                    t = 1;
+                    for (w = 0; w < 3; w++)
+                        c[w] |= via[S->reg][w];
+                }
+            } else if (S->mux == 3 && !I->rel && I->cidx < NV2A_VSH_CONSTANTS) {
+                cc[I->cidx >> 6] |= 1ull << (I->cidx & 63);
+            }
+        }
+        if (!t)
+            continue;
+        for (w = 0; w < 3; w++)
+            c[w] |= cc[w];
+        /* The temp written: the MAC's, or R1 for the ILU beside a MAC. */
+        if (I->mac && I->mac_mask && I->tdst < 16) {
+            if (I->mac_mask == 0xF)
+                memset(via[I->tdst], 0, sizeof via[I->tdst]);
+            tex[I->tdst] = 1;
+            for (w = 0; w < 3; w++)
+                via[I->tdst][w] |= c[w];
+        }
+        if (I->ilu && I->ilu_mask) {
+            uint32_t d = I->mac ? 1 : I->tdst;
+            if (d < 16) {
+                tex[d] = 1;
+                for (w = 0; w < 3; w++)
+                    via[d][w] |= c[w];
+            }
+        }
+        if (I->out_o && I->omask && I->oaddr >= 9 && I->oaddr <= 12)
+            for (w = 0; w < 3; w++)
+                texmat[w] |= c[w];
+    }
+}
+
+/* The s_prog entry of the current program (made on first sight), or
+ * PROG_NONE. */
+static uint16_t prog_info(void)
+{
+    const Nv2aVshIns *ins;
+    uint32_t count, i, h;
+    uint64_t hash = 0;
+
+    if ((g_pb.xf_mode & 3) != 2 || !(ins = nv2a_vsh_decoded(&count, &hash)))
+        return PROG_NONE;
+    /* Open addressing on the hash; the table never empties. */
+    h = (uint32_t)(hash ^ hash >> 29) & (PROG_MAX - 1);
+    for (i = 0; i < PROG_MAX; i++, h = (h + 1) & (PROG_MAX - 1)) {
+        if (!s_prog[h].used)
+            break;
+        if (s_prog[h].hash == hash)
+            return (uint16_t)h;
+    }
+    if (i == PROG_MAX || s_nprog >= PROG_MAX * 3 / 4)
+        return PROG_NONE;
+    s_prog[h].hash = hash;
+    s_prog[h].used = 1;
+    texmat_regs(ins, count, s_prog[h].texmat);
+    s_nprog++;
+    if (s_log && (s_prog[h].texmat[0] | s_prog[h].texmat[1]
+                  | s_prog[h].texmat[2])) {
+        uint32_t r;
+        fprintf(stderr, "[ITEXMAT] program %08X: texture matrices", (uint32_t)hash);
+        for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+            if (s_prog[h].texmat[r >> 6] >> (r & 63) & 1)
+                fprintf(stderr, " c%u", r);
+        fprintf(stderr, "%c", 10);
+    }
+    return (uint16_t)h;
+}
+
+static uint32_t s_wraps, s_wrap_snaps;  /* this 10 s: wraps blended short */
+
 /* out = own moved w of the way toward partner, register by register; a
- * register zero in either is own's. */
+ * register zero in either is own's. texmat (NULL: none): the program's
+ * texture matrix registers, whose values that moved by about a whole number
+ * (a scroll wrapped back by whole repeats) move the short way instead, and
+ * that moved by more than half a repeat otherwise are the nearer frame's. */
 static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
-                  float w)
+                  float w, const uint64_t *texmat)
 {
     uint32_t r, c;
 
@@ -333,6 +524,25 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
         if (!memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
             || all_zero(partner[r])) {
             memcpy(out[r], own[r], sizeof out[r]);
+            continue;
+        }
+        if (texmat && (texmat[r >> 6] >> (r & 63) & 1)) {
+            for (c = 0; c < 4; c++) {
+                float d = partner[r][c] - own[r][c], v;
+                if (fabsf(d) >= 0.5f) {
+                    float k = d - rintf(d);
+                    if (fabsf(k) <= 0.25f) {
+                        d = k;          /* wrapped: the short way */
+                        s_wraps++;
+                    } else {            /* a real jump: the nearer frame */
+                        out[r][c] = w < 0.5f ? own[r][c] : partner[r][c];
+                        s_wrap_snaps++;
+                        continue;
+                    }
+                }
+                v = own[r][c] + d * w;
+                out[r][c] = isfinite(v) ? v : own[r][c];
+            }
             continue;
         }
         for (c = 0; c < 4; c++) {
@@ -450,6 +660,18 @@ void nv2a_interp_draw(void)
             s_rep_j = f->ndraws + 1;
             return;
         }
+        if (s_vcheck && f->vh && f->vh[j]) {
+            uint64_t h = vtx_hash();
+            if (h != f->vh[j]) {
+                s_vdiff++;
+                if (s_vsaid++ < 40)
+                    fprintf(stderr, "[IVDIFF] flip %u draw %u prog %08X attr0"
+                            " %08X stride %u n %u: vertices changed since"
+                            " recorded%c", g_pb.flips, j, f->part[j][0],
+                            g_pb.attr[0].offset, g_pb.attr[0].stride,
+                            g_pb.idx_count, 10);
+            }
+        }
         s_extra = -1;
         if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])
             && !(s_teleport
@@ -460,7 +682,8 @@ void nv2a_interp_draw(void)
             int32_t pj = s_rep_map[j];
             blend(s_tmp, (const float (*)[4])f->consts[j],
                   (const float (*)[4])s_rep_prev->consts[pj],
-                  s_rep_t);
+                  s_rep_t, f->prog[j] != PROG_NONE
+                           ? s_prog[f->prog[j]].texmat : NULL);
             nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
             /* The same vertices drawn with another index list in the
              * partner frame (a ground's pieces, each frame only what that
@@ -510,6 +733,12 @@ void nv2a_interp_draw(void)
                 VertexAttr (*at)[NV_VERTEX_ATTRS] = realloc(f->attr,
                                                             cap * sizeof *at);
                 uint8_t *il = realloc(f->inl, cap);
+                uint16_t *pg = realloc(f->prog, cap * sizeof *pg);
+                uint64_t *vh = realloc(f->vh, cap * sizeof *vh);
+                if (pg)
+                    f->prog = pg;
+                if (vh)
+                    f->vh = vh;
                 if (pt)
                     f->part = pt;
                 if (lk)
@@ -520,7 +749,7 @@ void nv2a_interp_draw(void)
                     f->attr = at;
                 if (il)
                     f->inl = il;
-                if (!pt || !lk || !ix || !at || !il)
+                if (!pt || !lk || !ix || !at || !il || !pg || !vh)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -530,6 +759,8 @@ void nv2a_interp_draw(void)
             f->capdraws = cap;
         }
         f->key[f->ndraws] = draw_key_loose(f->loose[f->ndraws]);
+        f->prog[f->ndraws] = s_texwrap ? prog_info() : PROG_NONE;
+        f->vh[f->ndraws] = s_vcheck ? vtx_hash() : 0;
         {
             /* Its index list and arrays, for the union below
              * (nv2a_interp_after_draw). */
@@ -920,13 +1151,33 @@ static void run_stream(const Frame *f)
     nv2a_pb_merge_flush();
 }
 
-/* Frame f run again from its start, each paired draw's constants moved w of
- * the way toward its partner's in frame partner (map: f's draw -> partner's). */
-static void replay(Frame *f, Frame *partner, const int32_t *map, float w)
+/* Generations of the surfaces carried between frames (NV_INTERP_KEEP):
+ * taken at every flip, numbered; s_gen_seq[g] is the flip count generation g
+ * was taken at (0: none). A frame starts as the frame before ended. */
+static uint32_t s_keep_seq, s_gen_seq[3];
+static int s_keep_gen;
+
+static void put_seq(uint32_t seq)
 {
+    int g;
+    for (g = 0; g < 3 && seq; g++)
+        if (s_gen_seq[g] == seq) {
+            s_be->interp(NV_INTERP_PUT, g);
+            return;
+        }
+}
+
+/* Frame f run again from its start (start_seq: the generation it started
+ * from, put back first), each paired draw's constants moved w of the way
+ * toward its partner's in frame partner (map: f's draw -> partner's). */
+static void replay(Frame *f, Frame *partner, const int32_t *map, float w,
+                   uint32_t start_seq)
+{
+    put_seq(start_seq);
     memcpy(&g_pb, f->start_pb, sizeof g_pb);
     nv2a_vsh_state_load(f->start_vsh);
     pb_transform_forget();
+    s_rep_id++;
     s_rep_f = f;
     s_rep_prev = partner;
     s_rep_map = map;
@@ -961,7 +1212,8 @@ static void stats_line(LONGLONG now)
             " before; %.1f draws a frame, %.1f %%"
             " paired (%.1f %% by the loose keys), %.1f %% of one key drawn"
             " more than once, %llu runs went another way, %llu index unions,"
-            " %llu draws jumped (as N), %llu middles from both; replays %.2f"
+            " %llu draws jumped (as N), %llu middles from both, %u texture"
+            " wraps (%u snapped); replays %.2f"
             " ms a frame"
             " (most %.2f); %u pictures shown, %u late, %u dropped%c",
             s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
@@ -976,15 +1228,20 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_st.diverged,
             (unsigned long long)s_st.unions,
             (unsigned long long)s_st.teleports,
-            (unsigned long long)s_st.both,
+            (unsigned long long)s_st.both, s_wraps, s_wrap_snaps,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
             s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
+    if (s_vcheck)
+        fprintf(stderr, "[INTERP] %u replayed draws read vertices changed since"
+                " they were recorded%c", s_vdiff, 10);
+    s_vdiff = 0;
     fprintf(stderr, "[INTERP] gaps between pictures (ms) <5: %u, 5-7: %u, 7-9.5:"
             " %u, 9.5-12: %u, 12-17: %u, >17: %u%c", s_gap[0], s_gap[1],
             s_gap[2], s_gap[3], s_gap[4], s_gap[5], 10);
     fflush(stderr);
     memset(&s_st, 0, sizeof s_st);
     memset(s_gap, 0, sizeof s_gap);
+    s_wraps = s_wrap_snaps = 0;
 }
 
 static void note_shown(void)
@@ -1142,7 +1399,7 @@ static void flip_before(const Nv2aPbBackend *be)
     Frame *f = &s_fr[s_cur], *prev = &s_fr[s_cur ^ 1];
     LONGLONG now = qpc(), t0;
     uint32_t paired, k;
-    int n;
+    int n, inv_ok;
 
     if (nv2a_interp_n() < 2 || !be->interp)
         return;
@@ -1170,6 +1427,12 @@ static void flip_before(const Nv2aPbBackend *be)
     }
     s_last_flip = now;
     stats_line(now);
+    /* The surfaces carried from frame to frame, as this frame leaves them:
+     * the next one's start. */
+    s_keep_seq++;
+    s_keep_gen = (s_keep_gen + 1) % 3;
+    s_gen_seq[s_keep_gen] = s_carry && be->interp(NV_INTERP_KEEP, s_keep_gen)
+                            ? s_keep_seq : 0;
     if (!s_recording)
         return;
     s_st.frames++;
@@ -1257,8 +1520,12 @@ static void flip_before(const Nv2aPbBackend *be)
     /* A picture nearer the frame before is that frame drawn again, moved
      * toward this one (RECOMP_INTERP_NEAR, on): what this frame culled at
      * its edge, and the frame before still drew, stays in the picture. The
-     * others are this frame moved back. */
-    if (s_near && s_rep_blend && prev->start_pb && n > 2) {
+     * others are this frame moved back. The map from the frame before's
+     * draws to this one's is made for every frame that blends, whatever n
+     * is: the middle picture from both frames uses it at n = 2 too (a menu
+     * at 60 Hz), where an older frame's map paired wrong draws. */
+    inv_ok = 0;
+    if (s_rep_blend && prev->start_pb) {
         uint32_t i;
         if (s_inv_cap < prev->ndraws) {
             int32_t *v = realloc(s_inv, prev->ndraws * sizeof *v);
@@ -1273,37 +1540,41 @@ static void flip_before(const Nv2aPbBackend *be)
             for (i = 0; i < f->ndraws; i++)
                 if (f->pair[i] >= 0)
                     s_inv[f->pair[i]] = (int32_t)i;
+            inv_ok = 1;
         }
     }
     for (k = 1; k < (uint32_t)n; k++) {
         float t = (float)k / (float)n;
         int older = s_near && s_rep_blend && n > 2 && 2 * k < (uint32_t)n
-                  && s_inv_cap >= prev->ndraws && prev->start_pb;
+                  && inv_ok;
         if (s_mode == 3 && k == 1) {
             older = 1;                  /* test: N-1 again, as it was */
             s_rep_blend = 0;
         }
         if (s_mode != 1 && s_both && s_rep_blend && s_lat_ms < (s_both == 3 ? 99.0 : 14.0)
-            && (s_both == 2 || 2 * k == (uint32_t)n)
-            && s_inv_cap >= prev->ndraws && prev->start_pb) {
+            && (s_both == 2 || 2 * k == (uint32_t)n) && inv_ok) {
             /* The middle picture from both frames, the nearer of the two
              * per pixel (RECOMP_INTERP_BOTH): each fills what the other
              * culled past its edge. */
-            replay(prev, f, s_inv, t);
+            replay(prev, f, s_inv, t, s_keep_seq - 2);
             if (be->interp(NV_INTERP_SAVE, s_base + (int)k)
                 && be->interp(NV_INTERP_DEPTH, 0)) {
-                replay(f, prev, f->pair, 1.0f - t);
-                if (be->interp(NV_INTERP_BOTH, s_base + (int)k)) {
+                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
+                /* Ties to the frame nearer in time: N-1's picture before
+                 * the middle, N's from it on. */
+                if (be->interp(NV_INTERP_BOTH, (s_base + (int)k)
+                               | (2 * k < (uint32_t)n ? NV_INTERP_PREFER_OLD
+                                                      : 0))) {
                     s_st.both++;
                     continue;
                 }
             }
-            replay(f, prev, f->pair, 1.0f - t);
+            replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
         } else if (s_mode != 1) {
             if (older)
-                replay(prev, f, s_inv, t);
+                replay(prev, f, s_inv, t, s_keep_seq - 2);
             else
-                replay(f, prev, f->pair, 1.0f - t);
+                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
         }
         if (s_mode == 3 && k == 1)
             s_rep_blend = 1;
@@ -1311,6 +1582,7 @@ static void flip_before(const Nv2aPbBackend *be)
             break;
     }
     be->interp(NV_INTERP_UNDER, 0);
+    put_seq(s_keep_seq);                /* the real end, for the next frame */
     memcpy(&g_pb, s_end_pb, sizeof g_pb);
     nv2a_vsh_state_load(s_end_vsh);
     {

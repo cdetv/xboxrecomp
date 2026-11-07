@@ -122,6 +122,64 @@ int main(void)
             check(l == 316 && r == 316 && !out[0][1] && !out[1][0],
                   "mono voice at its loudest gain, columns to their sides as xemu", l, r);
         }
+    } else if (!strcmp(arm, "monitor_speakers")) {
+        /* The monitor mix's speaker rules (mcpx_apu_monitor_place_speakers,
+         * to-do 7). Gains as logged in Conker's field ([APUPROF] routing). */
+        float out[2][2], dry[2];
+        /* A 3D sound's source voice, "10:-21 31:-21", in the MP list
+         * (submix 31 skipped): xemu played it dry at its reverb send. */
+        static const int src_bin[8] = { 10, 31, 0, 0, 0, 0, 0, 0 };
+        float src_gain[8] = { 0.089f, 0.089f, 0, 0, 0, 0, 0, 0 };
+        mcpx_apu_monitor_place(src_bin, src_gain, 1, 31, out);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 89 && r == 89, "xemu: 3D source heard dry at its I3DL2 send", l, r);
+        mcpx_apu_monitor_place_speakers(src_bin, src_gain, 1, false, 31, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(!l && !r && !out[0][1] && !out[1][0],
+              "3D source: no dry copy (sends and submix left out)", l, r);
+        /* Its multipass HRTF voice, "2:-5 3:0 6:0 7:0 10:0": ears at the
+         * XTLK level, dry signal on the centre at -3 dB a side, LFE and
+         * I3DL2 left out. Slots 0-3 are the HRTF submixes 6, 8, 7, 9. */
+        static const int mp_bin[8] = { 6, 8, 7, 9, 2, 3, 10, 0 };
+        float mp_gain[8] = { 1.0f, 0, 1.0f, 0, 0.562f, 1.0f, 1.0f, 0 };
+        mcpx_apu_monitor_place_speakers(mp_bin, mp_gain, 1, true, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 1000 && r == 1000 && !out[0][1] && !out[1][0],
+              "HRTF voice: left ear left, right ear right at the XTLK gain", l, r);
+        l = (int)(dry[0] * 1000); r = (int)(dry[1] * 1000);
+        check(l == 397 && r == 397, "HRTF voice: dry centre -3 dB a side", l, r);
+        /* Same voice with XTLK at -6 dB and LFE / I3DL2 at 0 dB: the sends
+         * must not lift the ears (xemu placed it at 0 dB). */
+        float mp6_gain[8] = { 0.5f, 0, 0.5f, 0, 0.708f, 1.0f, 1.0f, 0 };
+        mcpx_apu_monitor_place_speakers(mp_bin, mp6_gain, 1, true, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 500 && r == 500, "HRTF voice: ears at XTLK, not at LFE / I3DL2", l, r);
+        /* A centre-only mono effect with a reverb send, "2:-4 10:-4". */
+        static const int c_bin[8] = { 2, 10, 0, 0, 0, 0, 0, 0 };
+        float c_gain[8] = { 0.631f, 0.631f, 0, 0, 0, 0, 0, 0 };
+        mcpx_apu_monitor_place_speakers(c_bin, c_gain, 1, false, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 446 && r == 446, "mono centre effect: -3 dB a side, send ignored", l, r);
+        /* A mono effect on the front left only. */
+        static const int fl_bin[8] = { 0, 10, 0, 0, 0, 0, 0, 0 };
+        float fl_gain[8] = { 0.5f, 0.9f, 0, 0, 0, 0, 0, 0 };
+        mcpx_apu_monitor_place_speakers(fl_bin, fl_gain, 1, false, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 500 && !r, "mono front-left effect stays left", l, r);
+        /* Music: a stereo voice to front and back pairs, "0:-18/0 1:-18/1
+         * 4:-24/0 5:-24/1", placed as before. */
+        static const int m_bin[8] = { 0, 1, 4, 5, 0, 1, 0, 1 };
+        float m_gain[8] = { 0.126f, 0.126f, 0.063f, 0.063f, 0, 0, 0, 0 };
+        mcpx_apu_monitor_place_speakers(m_bin, m_gain, 2, false, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[1][1] * 1000);
+        check(l == 126 && r == 126 && !out[0][1] && !out[1][0],
+              "stereo music: columns to their sides at the front gain", l, r);
+        /* The 5.1 song's centre column, as in the monitor arm. */
+        static const int cc_bin[8] = { 2, 3, 2, 3, 2, 3, 2, 3 };
+        float cc_gain[8] = { 0.316f, 0, 0, 0, 0, 0, 0, 0 };
+        mcpx_apu_monitor_place_speakers(cc_bin, cc_gain, 2, false, -1, out, dry);
+        l = (int)(out[0][0] * 1000); r = (int)(out[0][1] * 1000);
+        check(l && l == r, "stereo centre column on both sides", l, r);
     } else {
         fprintf(stderr, "unknown APU_MIXDOWN_ARM %s\n", arm);
         fails++;

@@ -18,6 +18,10 @@
 int  nv2a_interp_n(void);
 /* A recorded frame is being drawn again: no side effects the title sees. */
 int  nv2a_interp_replaying(void);
+/* Counts replays started: what a back end keeps per frame (by the flip
+ * number) it keeps per replay too -- a replay runs with its frame's flip
+ * number, after that frame (or another replay of it) already ran. */
+unsigned nv2a_interp_replay_id(void);
 
 /* The stream, as the executor runs it (not while replaying). */
 void nv2a_interp_rec_method(uint32_t subch, uint32_t method, uint32_t param);

@@ -31,3 +31,9 @@ set_tests_properties(apu_mixdown_monitor PROPERTIES
 add_test(NAME apu_mixdown_monitor_old COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_monitor_old PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MONITOR_STEREO=old;APU_MIXDOWN_ARM=monitor_old")
+# The monitor mix's speaker rules (to-do 7): sends and LFE left out, centre
+# -3 dB a side, an HRTF voice's ears at its XTLK level plus its dry centre;
+# the arm also checks xemu's placement still shows the defect (3D source dry).
+add_test(NAME apu_mixdown_monitor_speakers COMMAND apu_mixdown_test)
+set_tests_properties(apu_mixdown_monitor_speakers PROPERTIES
+                     ENVIRONMENT "APU_MIXDOWN_ARM=monitor_speakers")

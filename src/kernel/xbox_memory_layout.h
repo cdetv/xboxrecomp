@@ -213,6 +213,11 @@ void xbox_Nv2aWaitHandshake(volatile uint32_t *reg, uint32_t mask,
 /* Executor thread, between methods: acknowledge an answered vblank at once,
  * so D3D's vblank DPC does not spin for the rest of a long segment. */
 void xbox_Nv2aAnswerVblank(void);
+/* Present without a flip, on the executor's next pass (nv2a_pb_exec.c): what
+ * the title drew since the last present, e.g. a loading screen drawn into the
+ * front buffer with no Swap; black = a black picture instead. Ask once the
+ * title's fence wait says the drawing is done; at most once a refresh. */
+void xbox_Nv2aPresentNow(int black);
 
 void xbox_MemoryLayoutShutdown(void);
 

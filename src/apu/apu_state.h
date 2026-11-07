@@ -528,6 +528,16 @@ void mcpx_apu_monitor_place(const int bin[8], const float gain[8],
                             unsigned int channels, int skip_bin,
                             float out[2][2]);
 
+/* The monitor mix's default speaker rules (RECOMP_APU_MONITOR_RULES=old
+ * keeps mcpx_apu_monitor_place): only speaker bins count (not LFE 3, sends
+ * 10-30 or the submix 31); centre -3 dB on each side; an HRTF voice (hrtf)
+ * plays its ears by its XTLK slots 0-3 and its dry signal by its other
+ * speaker slots: dry_out[side]. See apu_vp.c. */
+void mcpx_apu_monitor_place_speakers(const int bin[8], const float gain[8],
+                                     unsigned int channels, bool hrtf,
+                                     int skip_bin, float out[2][2],
+                                     float dry_out[2]);
+
 /* XGSCNT, the global sample counter: advanced by the frame thread, one
  * frame's samples at a time (apu_core.c). */
 void mcpx_apu_xgscnt_advance(MCPXAPUState *d, uint32_t samples);
@@ -568,6 +578,11 @@ struct ApuProfile {
      * guest threads, and the longest gap between two loops. */
     double t_gate, max_gate, t_relock, max_relock, max_loop;
     unsigned long gate_busy;   /* ISR gate busy: delivery retried next frame */
+    /* Trapped / halted front end: waits that ended with it running again,
+     * waits given up after RECOMP_APU_TRAP_WAIT (silence follows), and the
+     * time spent waiting. idle_frames counts the silent frames. */
+    unsigned long trap_waits, trap_timeouts;
+    double t_trap, max_trap;
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;

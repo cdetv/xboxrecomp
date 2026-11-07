@@ -47,6 +47,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h>    /* IDXGIAdapter3: video memory use */
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
 #include "vsync_d3d11.h"
@@ -120,13 +121,23 @@ static uint32_t s_sc_w = SC_W, s_sc_h = SC_H;
 static uint32_t s_bb_w = SC_W, s_bb_h = SC_H;
 static uint32_t s_scale_gen;
 
-/* Render scale limits: a percent from 25 to 400 is taken (a menu offers
+/* Render scale limits: a percent from 25 to 1000 is taken (a menu offers
  * fewer). The frame stays inside render_res_ok's (fb_present.c) 10240 x
  * 7680, which keeps a scaled depth buffer inside D3D11's textures, and at
- * most RS_MAX_PIXELS (twice 4K's): bigger asks are capped (draw_size). */
+ * most s_rs_max_px pixels: bigger asks are capped (draw_size). That is
+ * what fits in 3/4 of the video memory budget Windows gives the process
+ * (rs_cap_from_memory), measured 2026-11-07 in the field at 1080p: 800 MB
+ * at 1x, 1469 MB at 2x, so ~108 bytes per frame pixel on ~580 MB; taken as
+ * RS_BYTES_PX on RS_BASE_MB for a margin (other levels have more surfaces).
+ * Never below RS_MIN_PIXELS (2x 1080p); RS_OLD_PIXELS (twice 4K's, the cap
+ * before) when the adapter can't say. */
 #define RS_MIN 25
-#define RS_MAX 400
-#define RS_MAX_PIXELS (3840.0 * 2160.0 * 2.0)
+#define RS_MAX 1000
+#define RS_OLD_PIXELS (3840.0 * 2160.0 * 2.0)
+#define RS_MIN_PIXELS (3840.0 * 2160.0)
+#define RS_BYTES_PX 128.0
+#define RS_BASE_MB 600.0
+static double s_rs_max_px = RS_OLD_PIXELS;
 static volatile LONG s_scale_pct = -1;  /* -1: environment not read yet */
 
 static int render_scale_pct(void)
@@ -169,7 +180,7 @@ int xbox_SetRenderScale(int percent)
 static void draw_size(uint32_t w, uint32_t h, int pct, uint32_t *dw,
                       uint32_t *dh)
 {
-    double f = pct / 100.0, cap = sqrt(RS_MAX_PIXELS / ((double)w * h));
+    double f = pct / 100.0, cap = sqrt(s_rs_max_px / ((double)w * h));
 
     if (f > 10240.0 / w) f = 10240.0 / w;
     if (f > 7680.0 / h) f = 7680.0 / h;
@@ -223,6 +234,8 @@ static ID3D11Device         *s_dev;
 static ID3D11DeviceContext  *s_ctx;
 static ID3D11DeviceContext1 *s_ctx1;    /* ClearView: clears a rectangle */
 static IDXGIFactory2        *s_factory;
+static IDXGIAdapter3        *s_adapter3;    /* video memory use; may be NULL */
+static uint64_t              s_vram_total;  /* dedicated video memory */
 static UINT                  s_swap_flags;  /* vsync_swap_flags */
 static int                   s_swap_flags_read;
 static IDXGISwapChain1      *s_swap;
@@ -260,6 +273,7 @@ typedef struct {
     uint32_t w, h;                      /* in guest pixels */
     uint32_t tw, th;                    /* the texture, in host pixels */
     uint32_t scaled;                    /* drawn at the render scale */
+    uint32_t boost;                     /* or 2/4/8: xbox_SetSurfaceBoost */
     float    sx, sy;                    /* host pixels per guest pixel */
     uint32_t gen;                       /* s_scale_gen when made */
     uint32_t bpp, swz;                  /* guest pixel size, swizzled */
@@ -323,6 +337,82 @@ static int surface_scaled_now(void)
            && bpp && g_pb.pitch / bpp >= SC_W;
 }
 
+/* Small render targets a title wants drawn bigger (Conker's shadow
+ * pictures, 128x128: xbox_SetSurfaceBoost). The title's function names, for
+ * a colour surface about to be drawn into, how many host pixels each guest
+ * pixel gets on both axes: 2, 4, 8 or 16 (anything else: 1, as before). Its
+ * guest size is padded to ZETA_W / k instead of ZETA_W, so up to ZETA_W host
+ * pixels it keeps the texture every surface already has (ZETA_W x ZETA_H,
+ * see GpuSurface) and costs no more memory; bigger (a 128-pixel target at
+ * 16x: 2048) it is its own size, up to BOOST_MAX_HOST a side, and a target
+ * too big for that at k gets the next smaller factor. Its depth buffers are
+ * its own (GpuZeta boost), the size of its texture. Everything
+ * else follows the per-surface scale (sx, sy) the render scale already
+ * uses: viewport, scissors, clears, copies and direct reads as a texture
+ * (coordinates stay in guest units), visibility counts. Never for a surface
+ * at the render scale. The function runs on the executor thread; setting
+ * one (also the same one again, after its answers changed) has every
+ * surface remade at its new factor when next drawn into, picture kept
+ * (s_scale_gen). NULL: none, every surface as before. */
+typedef unsigned (*xbox_SurfaceBoostFn)(uint32_t addr, uint32_t format,
+                                        uint32_t pitch, uint32_t w,
+                                        uint32_t h);
+static volatile xbox_SurfaceBoostFn s_boost_fn;
+static volatile LONG s_boost_gen;       /* bumped by every set */
+static LONG          s_boost_seen;      /* the one applied (executor) */
+
+void xbox_SetSurfaceBoost(xbox_SurfaceBoostFn fn)
+{
+    s_boost_fn = fn;
+    InterlockedIncrement(&s_boost_gen);
+}
+
+/* The biggest side of a boosted surface's texture, host pixels: 16 MB of
+ * B8G8R8A8 (and as much depth) at most per surface. */
+#define BOOST_MAX_HOST 2048u
+
+/* Softness for boosted surfaces blurred in place (xbox_SetSurfaceBoostBlur;
+ * Conker's shadow pictures): a Gaussian of s_boost_blur guest pixels
+ * (sigma) laid over the fill's box (RECOMP_BOOST_FILL, fill_blur), so the
+ * picture is softer by the same amount at any factor; 0 = none, the title's
+ * own blur only. A picture blurred that much has no detail a bigger one
+ * would show, so a boosted surface is drawn at most at the factor where the
+ * sigma is BOOST_BLUR_HOST host pixels (never below 2x): soft at 16x costs
+ * what soft at 4x does and looks the same. Each draw asks the factor afresh
+ * (surface_boost_now), so a change remakes the surfaces at their next draw.
+ * Only for titles whose boosted surfaces are all blurred in place: the cap
+ * applies to every boosted surface. */
+static volatile float s_boost_blur;
+#define BOOST_BLUR_HOST 4.0f
+#define BOOST_BLUR_MAX  8.0f            /* guest pixels */
+
+void xbox_SetSurfaceBoostBlur(float sigma)
+{
+    if (!(sigma > 0.0f))                /* NaN too */
+        sigma = 0.0f;
+    s_boost_blur = sigma < BOOST_BLUR_MAX ? sigma : BOOST_BLUR_MAX;
+}
+
+/* The factor for the current colour target at addr, its drawn extent w x h
+ * guest pixels (before padding): 0 = none. */
+static uint32_t surface_boost_now(uint32_t addr, uint32_t w, uint32_t h)
+{
+    xbox_SurfaceBoostFn fn = s_boost_fn;
+    float blur = s_boost_blur;
+    uint32_t k;
+
+    if (!fn || surface_scaled_now())
+        return 0;
+    k = fn(addr, g_pb.format, g_pb.pitch, w, h);
+    if (k != 2 && k != 4 && k != 8 && k != 16)
+        return 0;
+    while (k > 1 && (w * k > BOOST_MAX_HOST || h * k > BOOST_MAX_HOST))
+        k >>= 1;
+    while (k > 2 && blur * (float)k > BOOST_BLUR_HOST)
+        k >>= 1;
+    return k > 1 ? k : 0;
+}
+
 /* The surface to present: the biggest one cleared since the last flip, as
  * note_drawn picks the drawn one in the software path (a title also clears
  * small render targets, often after the main one). */
@@ -337,6 +427,10 @@ static struct {
     uint32_t verts_need_clip, tris_clipped, tris_behind, combined, tris_culled;
     uint32_t textured, tex_uploads, tex_reused, tex_unreadable, tex_made;
     uint32_t tex_bc;                    /* uploads kept compressed (BC1-3) */
+    uint32_t boosted;                   /* surfaces made boosted */
+    uint32_t rtt_filled;                /* RTT_FILL stage binds */
+    uint32_t tex_smooth;                /* stages read smoothly */
+    uint32_t near_draws;                /* receiver_draw's two-pass draws */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
@@ -996,27 +1090,39 @@ static void canvas_to_out(void)
     }
 }
 
-/* Surface i was made before the render scale last changed and is not at the
- * scale a surface made for the current target now would get. */
-static int surface_stale(int i)
+/* Surface i is not at the scale a surface made for the current target now
+ * would get: boosted by another factor (boost: surface_boost_now's), or made
+ * before the render scale last changed and at another one. */
+static int surface_stale(int i, uint32_t boost)
 {
     float want_x, want_y;
+    if (s_surf[i].boost != boost)
+        return 1;
     if (s_surf[i].gen == s_scale_gen)
         return 0;
-    want_x = surface_scaled_now() ? s_rsx : 1.0f;
-    want_y = surface_scaled_now() ? s_rsy : 1.0f;
+    want_x = boost ? (float)boost : surface_scaled_now() ? s_rsx : 1.0f;
+    want_y = boost ? (float)boost : surface_scaled_now() ? s_rsy : 1.0f;
     return s_surf[i].sx != want_x || s_surf[i].sy != want_y;
 }
+
+static void carry_add(int i, const char *why);  /* frame interpolation */
+static void carry_add_zeta(int zi);
+static int s_clearing;                  /* surface_current from d3d_clear */
 
 /* The GPU texture for the current colour surface, made or grown to cover the
  * current clip: its index, or -1 when there is no surface to speak of. */
 static int surface_current(void)
 {
-    uint32_t addr, w, h, scaled;
+    uint32_t addr, w, h, scaled, boost;
     int i, stale;
 
     if (!g_pb.color_offset || !g_pb.pitch || !g_pb.clip_w || !g_pb.clip_h)
         return -1;
+    if (s_boost_seen != s_boost_gen) {
+        /* xbox_SetSurfaceBoost: surfaces remade at their next draw. */
+        s_boost_seen = s_boost_gen;
+        s_scale_gen++;
+    }
     addr = pb_dma_resolve(g_pb.color_offset);
     w = g_pb.clip_x + g_pb.clip_w;
     h = g_pb.clip_y + g_pb.clip_h;
@@ -1026,8 +1132,10 @@ static int surface_current(void)
         if (w > sw) w = sw;
         if (h > sh) h = sh;
     }
-    if (w < ZETA_W) w = ZETA_W;
-    if (h < ZETA_H) h = ZETA_H;
+    /* Padded to the depth buffer's size: ZETA_W x ZETA_H host pixels. */
+    boost = surface_boost_now(addr, w, h);
+    if (w < ZETA_W / (boost ? boost : 1)) w = ZETA_W / (boost ? boost : 1);
+    if (h < ZETA_H / (boost ? boost : 1)) h = ZETA_H / (boost ? boost : 1);
     if (w > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || h > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
         return -1;
@@ -1037,8 +1145,22 @@ static int surface_current(void)
         if (s_surf[i].tex && s_surf[i].addr == addr
             && s_surf[i].pitch == g_pb.pitch)
             break;
-    stale = i < GPU_SURFACES && surface_stale(i);
+    stale = i < GPU_SURFACES && surface_stale(i, boost);
+    if (stale && s_surf[i].boost != boost) {
+        static int said;
+        if (said++ < 16)
+            fprintf(stderr, "[GPU] d3d11: surface 0x%08X pitch %u remade"
+                    " boosted x%u -> x%u (fmt 0x%X clip %ux%u)%c", addr,
+                    g_pb.pitch, s_surf[i].boost, boost, g_pb.format,
+                    g_pb.clip_w, g_pb.clip_h, 10);
+    }
     if (i < GPU_SURFACES && s_surf[i].w >= w && s_surf[i].h >= h && !stale) {
+        /* Drawn on before anything cleared it this frame: what it shows
+         * builds on an earlier frame's picture (frame interpolation keeps
+         * it for replays). A clear starts it afresh (over its clip: Conker's
+         * second back buffer clears 638x480+2, and only that is shown). */
+        if (s_surf[i].drawn_flip != g_pb.flips && !s_clearing)
+            carry_add(i, "drawn over");
         s_surf[i].bpp = pb_surface_bpp();
         s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
         s_surf[i].used = s_surf_tick;
@@ -1050,6 +1172,10 @@ static int surface_current(void)
      * render scale is remade at the current one. */
     scaled = i < GPU_SURFACES && !stale ? s_surf[i].scaled
                                         : (uint32_t)surface_scaled_now();
+    if (boost) {
+        scaled = 0;
+        s_stat.boosted++;
+    }
     if (i == GPU_SURFACES) {
         /* An empty slot, or the one unused longest. Conker's menu room
          * draws into new render-target addresses every frame; a round
@@ -1061,15 +1187,20 @@ static int surface_current(void)
                 i = k;
         if (s_surf[i].tex)
             note_evicted(s_surf[i].addr);
-        if (s_stat.surfaces++ < 48)
+        if (s_stat.surfaces++ < 48) {
+            char bt[24] = "";
+            if (boost)
+                snprintf(bt, sizeof bt, ", boosted x%u", boost);
             fprintf(stderr, "[GPU] d3d11: surface %u: 0x%08X pitch %u"
-                    " clip %ux%u+%u+%u fmt 0x%X (slot %d%s%s)%c",
+                    " clip %ux%u+%u+%u fmt 0x%X (slot %d%s%s%s)%c",
                     s_stat.surfaces, addr, g_pb.pitch, g_pb.clip_w,
                     g_pb.clip_h, g_pb.clip_x, g_pb.clip_y, g_pb.format, i,
                     s_surf[i].tex ? ", evicting" : "",
-                    scaled ? ", scaled" : "", 10);
-    } else {
-        /* Grow: keep the larger of old and new in each direction. */
+                    scaled ? ", scaled" : "", bt, 10);
+        }
+    } else if (s_surf[i].boost == boost) {
+        /* Grow: keep the larger of old and new in each direction (a
+         * boosted one remade at another factor is padded anew). */
         if (s_surf[i].w > w) w = s_surf[i].w;
         if (s_surf[i].h > h) h = s_surf[i].h;
     }
@@ -1081,7 +1212,8 @@ static int surface_current(void)
         D3D11_TEXTURE2D_DESC d;
         HRESULT hr;
         int shown = s_shown == i;
-        float sx = scaled ? s_rsx : 1.0f, sy = scaled ? s_rsy : 1.0f;
+        float sx = boost ? (float)boost : scaled ? s_rsx : 1.0f;
+        float sy = boost ? (float)boost : scaled ? s_rsy : 1.0f;
         memset(&s_surf[i], 0, sizeof s_surf[i]);
         memset(&d, 0, sizeof d);
         d.Width = to_host(w, sx);
@@ -1135,6 +1267,7 @@ static int surface_current(void)
     s_surf[i].w = w;
     s_surf[i].h = h;
     s_surf[i].scaled = scaled;
+    s_surf[i].boost = boost;
     s_surf[i].bpp = pb_surface_bpp();
     s_surf[i].swz = ((g_pb.format >> 8) & 0xF) == 2;
     s_surf[i].used = s_surf_tick;
@@ -1195,8 +1328,11 @@ typedef struct {
     uint32_t offset;                    /* SURFACE_ZETA_OFFSET, as written */
     uint32_t zf;                        /* zeta format: 1 Z16, 2 Z24S8 */
     uint32_t scaled;                    /* for scaled colour surfaces */
+    uint32_t boost;                     /* for boosted ones: their factor */
     uint32_t tw, th;                    /* the texture, in host pixels */
     uint32_t used;                      /* s_zeta_tick at the last draw */
+    uint32_t clear_flip, draw_flip;     /* g_pb.flips at the last full clear
+                                         * (depth and stencil), last draw */
     ID3D11Texture2D          *tex;
     ID3D11DepthStencilView   *dsv;
     ID3D11ShaderResourceView *srv_z, *srv_s;
@@ -1225,11 +1361,29 @@ static float zeta_scale(void)
     return zeta_format() == 1 ? 1.0f / 65535.0f : 1.0f / 16777215.0f;
 }
 
+/* Host pixels per guest pixel of depth buffer i. */
+static float zeta_sx(int i)
+{
+    return s_zeta[i].boost ? (float)s_zeta[i].boost
+                           : s_zeta[i].scaled ? s_rsx : 1.0f;
+}
+
+static float zeta_sy(int i)
+{
+    return s_zeta[i].boost ? (float)s_zeta[i].boost
+                           : s_zeta[i].scaled ? s_rsy : 1.0f;
+}
+
 /* The depth buffer of the current zeta surface for colour surfaces of the
- * given scale, made (depth 1, stencil 0, as zbuf_slot fills its new buffers:
- * farther than anything) when there is none and create is set: its index,
- * or -1. */
-static int zeta_current(int create, uint32_t scaled)
+ * given scale (scaled, or boosted by boost), made (depth 1, stencil 0, as
+ * zbuf_slot fills its new buffers: farther than anything) when there is
+ * none and create is set: its index, or -1. A boosted surface's buffer is
+ * the size of its texture, bw x bh host pixels (ignored when not boosted).
+ * ponytail: one made for a boosted surface after the guest cleared the
+ * zeta surface starts at depth 1 rather than the clear value (Conker's
+ * boosted shadow pictures draw without depth). */
+static int zeta_current(int create, uint32_t scaled, uint32_t boost,
+                        uint32_t bw, uint32_t bh)
 {
     D3D11_TEXTURE2D_DESC d;
     D3D11_DEPTH_STENCIL_VIEW_DESC dv;
@@ -1240,7 +1394,8 @@ static int zeta_current(int create, uint32_t scaled)
 
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset
-            && s_zeta[i].scaled == scaled) {
+            && s_zeta[i].scaled == scaled && s_zeta[i].boost == boost
+            && (!boost || (s_zeta[i].tw == bw && s_zeta[i].th == bh))) {
             s_zeta[i].zf = zeta_format();
             return i;
         }
@@ -1255,8 +1410,8 @@ static int zeta_current(int create, uint32_t scaled)
     memset(z, 0, sizeof *z);
 
     memset(&d, 0, sizeof d);
-    d.Width = to_host(ZETA_W, scaled ? s_rsx : 1.0f);
-    d.Height = to_host(ZETA_H, scaled ? s_rsy : 1.0f);
+    d.Width = boost ? bw : to_host(ZETA_W, scaled ? s_rsx : 1.0f);
+    d.Height = boost ? bh : to_host(ZETA_H, scaled ? s_rsy : 1.0f);
     d.MipLevels = 1;
     d.ArraySize = 1;
     d.Format = DXGI_FORMAT_R24G8_TYPELESS;
@@ -1299,6 +1454,7 @@ static int zeta_current(int create, uint32_t scaled)
     z->offset = g_pb.zeta_offset;
     z->zf = zeta_format();
     z->scaled = scaled;
+    z->boost = boost;
     z->tw = d.Width;
     z->th = d.Height;
     s_stat.zeta_made++;
@@ -1320,11 +1476,16 @@ static void zeta_clear(uint32_t param)
     z = zeta_format() == 1 ? (float)(g_pb.zstencil_clear & 0xFFFF)
                            : (float)(g_pb.zstencil_clear >> 8);
     z *= zeta_scale();
-    if (zeta_current(0, 0) < 0 && zeta_current(0, 1) < 0)
-        zeta_current(1, (uint32_t)surface_scaled_now());
+    for (i = 0; i < GPU_ZETAS; i++)
+        if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset)
+            break;
+    if (i == GPU_ZETAS)
+        zeta_current(1, (uint32_t)surface_scaled_now(), 0, 0, 0);
     for (i = 0; i < GPU_ZETAS; i++)
         if (s_zeta[i].tex && s_zeta[i].offset == g_pb.zeta_offset) {
             s_zeta[i].zf = zeta_format();
+            if ((param & 3) == 3)
+                s_zeta[i].clear_flip = g_pb.flips;
             ID3D11DeviceContext_ClearDepthStencilView(s_ctx, s_zeta[i].dsv,
                     flags, z > 1.0f ? 1.0f : z,
                     (UINT8)(g_pb.zstencil_clear & 0xFF));
@@ -1353,7 +1514,9 @@ static void d3d_clear(uint32_t param)
         zeta_clear(param);
     if (!(param & NV097_CLEAR_COLOR_MASK))
         return;
+    s_clearing = 1;
     i = surface_current();
+    s_clearing = 0;
     if (i < 0) {
         s_stat.clears_skipped++;
         return;
@@ -1443,10 +1606,16 @@ static ID3D11Buffer       *s_cb;
 static ID3D11Buffer       *s_cb1;
 static struct {
     float tclamp[4][4];
+    float tfill[4][4];                  /* RECOMP_BOOST_FILL, see rtt_fill */
+    float tsmooth[4][4];                /* x: xbox_SetTextureSmooth's */
+    float tnear[4];                     /* receiver_draw's passes */
 } s_cbd;
 /* Per stage reading a surface as it is: coordinate scale x y, clamp x y
  * (texture_from_surface, RECOMP_RTT_DIRECT). */
 static float s_rtt_direct[4][4];
+/* Per stage reading a boosted surface in a pass drawing into it: the
+ * shader's tfill (texture_from_surface, rtt_fill). */
+static float s_rtt_fill[4][4];
 static ID3D11RasterizerState *s_rs;        /* depth clamped to 0..1 */
 static ID3D11RasterizerState *s_rs_zcull;  /* outside 0..1 dropped */
 
@@ -1471,9 +1640,22 @@ static ID3D11VertexShader *s_zvs;
 static ID3D11PixelShader  *s_zps;
 static ID3D11Buffer       *s_zcb;
 
+/* fill_blur's constants (s_hlsl_fill's cbuffer Xc): one pass of up to
+ * FILL_TAPS bilinear taps along one axis. */
+#define FILL_TAPS 64u
+typedef struct {
+    float inv[2];                       /* 1 / the source's size */
+    float dir[2];                       /* the pass's axis: (1,0) or (0,1) */
+    float lo[2], hi[2];                 /* first and last texel centre read */
+    float taps, pad[3];                 /* how many of tw are used */
+    float tw[FILL_TAPS][2];             /* per tap: offset (texels), weight */
+} FillConsts;
+
 /* The stretch copy pass (blit_stretch): its pixel shader, constants and
  * bilinear sampler; the vertex shader is the zeta pass's. */
 static ID3D11PixelShader  *s_bps;
+static ID3D11PixelShader  *s_xps;       /* fill_blur's pass (s_hlsl_fill) */
+static ID3D11Buffer       *s_xcb;       /* its constants, FillConsts */
 static ID3D11Buffer       *s_bcb;
 static ID3D11SamplerState *s_bsamp;
 
@@ -1869,6 +2051,26 @@ static int draw_setup(void)
         if (FAILED(bh)) {
             fail("stretch copy pass", bh);
             if (s_bps) { ID3D11PixelShader_Release(s_bps); s_bps = NULL; }
+        } else {
+            /* fill_blur's pass (RECOMP_BOOST_FILL), on the same sampler,
+             * its own source (a change to it re-keys no other shader) and
+             * constants; without it fills are not made. */
+            ID3DBlob *xps = compile_src(s_hlsl_fill, "xps", "ps_4_0", 0,
+                                        NULL);
+            if (!xps || FAILED(ID3D11Device_CreatePixelShader(s_dev,
+                    ID3D10Blob_GetBufferPointer(xps),
+                    ID3D10Blob_GetBufferSize(xps), NULL, &s_xps)))
+                s_xps = NULL;
+            if (s_xps) {
+                bd.ByteWidth = (UINT)sizeof(FillConsts);
+                if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL,
+                                                     &s_xcb))) {
+                    ID3D11PixelShader_Release(s_xps);
+                    s_xps = NULL;
+                    s_xcb = NULL;
+                }
+            }
+            if (xps) ID3D10Blob_Release(xps);
         }
     }
     if (SUCCEEDED(hr)) {
@@ -2488,6 +2690,7 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
 #define TEX_VOLUME    4u    /* a Texture3D view: bind it to the stage's 3D slot */
 #define TEX_CUBE      8u    /* a cube map's faces: bind to the stage's cube slot */
 #define RTT_DIRECT   16u    /* the surface itself: coordinates by s_rtt_direct */
+#define RTT_FILL     32u    /* taps filled in: s_rtt_fill (rtt_fill) */
 
 /* Frame trace (RECOMP_FRAME_TRACE): where each stage's texture came from,
  * 'S' a GPU surface (slot s_tex_slot), 'Z' a zeta buffer, 'G' guest memory,
@@ -2508,6 +2711,7 @@ static struct {
     uint32_t w, h, used;
     ID3D11Texture2D *tex;
     ID3D11ShaderResourceView *srv;
+    ID3D11RenderTargetView *rtv;        /* made by fill_blur when needed */
 } s_rtt[4][RTT_SIZES];
 static uint32_t s_rtt_tick;
 
@@ -2734,6 +2938,208 @@ static int rtt_direct_ok(int st, int i, uint32_t tw, uint32_t th)
     return 1;
 }
 
+/* RECOMP_BOOST_FILL (on; =0 off): a boosted surface (xbox_SetSurfaceBoost)
+ * read by a pass that draws into it -- a blur in place, Conker's shadow
+ * pictures -- has each tap fill the area between the pixel and it. The
+ * guest's taps are texture coordinates: half a texel out, a bilinear tap
+ * averaged the 2x2 texels between the pixel and it; at k times the size
+ * the same tap is k/2 texels out with nothing between, and the blurred edge
+ * came out as flat steps, a band (8x, 2026-11-06). Filled, it is a smooth
+ * ramp as wide as before. For the half-texel taps the area is the d x d
+ * square (d = k/2 host texels) between the pixel and the tap, so the copy
+ * is box-blurred d x d once (fill_blur, two passes, shared by the batch's
+ * stages that read the same copy) and each tap reads it at the square's
+ * centre, (pixel + tap) / 2: one sample a tap. (Sampling the square in the
+ * shader, n x n taps, cost 0.8 ms a picture at 16x.) For copy-read stages
+ * (a target is never read as it is): the copy's texel (x, y) is the
+ * target's pixel (x, y). ponytail: a tap not on a diagonal reads the same
+ * d x d square round its midpoint, not the line between. */
+static int s_fill_on = -1;
+static uint32_t s_draw_seq;             /* d3d_draw's batches, for sharing */
+static struct {
+    uint32_t seq, tw, th;
+    int slot;
+    D3D11_BOX box;
+    ID3D11ShaderResourceView *srv;
+} s_fill_share;
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} s_fill_tmp;
+
+static int rtt_fill(int st, int i, uint32_t tw, uint32_t th)
+{
+    if (s_fill_on < 0) {
+        const char *e = getenv("RECOMP_BOOST_FILL");
+        s_fill_on = !(e && e[0] == '0');
+    }
+    if (!s_fill_on || i != s_rtt_target || !s_surf[i].boost || !tw || !th)
+        return 0;
+    s_rtt_fill[st][0] = 1.0f;
+    s_rtt_fill[st][1] = 1.0f / (float)tw;
+    s_rtt_fill[st][2] = 1.0f / (float)th;
+    s_rtt_fill[st][3] = 0.0f;
+    return 1;
+}
+
+/* The 1D kernel of fill_blur's passes, in s_fill_k (taps, offsets and
+ * weights; the rest of FillConsts per pass): the fill's box of d texels
+ * (the texels -d/2 .. d/2 - 1 round the pixel's; d < 2: the pixel's own,
+ * the midpoint's bilinear read is the box then) with a Gaussian of sigma
+ * texels laid over it (xbox_SetSurfaceBoostBlur; cut at 3 sigma, or where
+ * FILL_TAPS ends), as bilinear taps: two neighbouring texels' weights in
+ * one read between them. 0 when there is nothing to blur. */
+static FillConsts s_fill_k;
+static uint32_t s_fill_k_d = ~0u;
+static float    s_fill_k_sigma = -1.0f;
+
+static uint32_t fill_kernel(uint32_t d, float sigma)
+{
+    float g[2 * FILL_TAPS + 1], w[2 * FILL_TAPS], sum = 0.0f;
+    int bn = d >= 2 ? (int)d : 1, b0 = d >= 2 ? -(int)(d / 2u) : 0;
+    int r = sigma >= 0.3f ? (int)ceilf(3.0f * sigma) : 0, len, t, n;
+
+    if (bn < 2 && !r)
+        return 0;
+    if (d == s_fill_k_d && sigma == s_fill_k_sigma)
+        return (uint32_t)s_fill_k.taps;
+    if (bn + 2 * r > (int)(2 * FILL_TAPS))
+        r = ((int)(2 * FILL_TAPS) - bn) / 2;
+    for (t = -r; t <= r; t++) {
+        g[t + r] = r ? expf(-(float)(t * t) / (2.0f * sigma * sigma)) : 1.0f;
+        sum += g[t + r];
+    }
+    len = bn + 2 * r;
+    for (t = 0; t < len; t++) {
+        int b;
+        w[t] = 0.0f;
+        for (b = 0; b < bn; b++)
+            if (t - b >= 0 && t - b <= 2 * r)
+                w[t] += g[t - b];
+        w[t] /= sum * (float)bn;
+    }
+    for (t = 0, n = 0; t < len; t += 2) {
+        float wa = w[t], wb = t + 1 < len ? w[t + 1] : 0.0f;
+        if (wa + wb <= 0.0f)
+            continue;
+        s_fill_k.tw[n][0] = (float)(b0 - r + t) + wb / (wa + wb);
+        s_fill_k.tw[n][1] = wa + wb;
+        n++;
+    }
+    s_fill_k.taps = (float)n;
+    s_fill_k_d = d;
+    s_fill_k_sigma = sigma;
+    return (uint32_t)n;
+}
+
+/* One pass of s_fill_k along (dx, dy) of src (sw x sh) into dst over
+ * w x h pixels, reading no texel of src outside box (edge texels stand in:
+ * the rest of a copy is another picture's). */
+static void fill_pass(ID3D11ShaderResourceView *src, uint32_t sw, uint32_t sh,
+                      ID3D11RenderTargetView *dst, uint32_t w, uint32_t h,
+                      int dx, int dy, const D3D11_BOX *box)
+{
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT sc;
+
+    s_fill_k.inv[0] = 1.0f / (float)sw;
+    s_fill_k.inv[1] = 1.0f / (float)sh;
+    s_fill_k.dir[0] = (float)dx;
+    s_fill_k.dir[1] = (float)dy;
+    s_fill_k.lo[0] = ((float)box->left + 0.5f) / (float)sw;
+    s_fill_k.lo[1] = ((float)box->top + 0.5f) / (float)sh;
+    s_fill_k.hi[0] = ((float)box->right - 0.5f) / (float)sw;
+    s_fill_k.hi[1] = ((float)box->bottom - 0.5f) / (float)sh;
+    if (!buf_fill(s_xcb, &s_fill_k, sizeof s_fill_k))
+        return;
+    vp.TopLeftX = vp.TopLeftY = 0.0f;
+    vp.Width = (float)w;
+    vp.Height = (float)h;
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    sc.left = sc.top = 0;
+    sc.right = (LONG)w;
+    sc.bottom = (LONG)h;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &dst, NULL);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &src);
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+}
+
+/* Copy c of stage st, a surface boosted k times, blurred in place (through
+ * s_fill_tmp) for RECOMP_BOOST_FILL: the d x d box (d = k/2; d < 2 needs
+ * none, the midpoint's bilinear sample is the 2 x 2 square) and the
+ * softness of xbox_SetSurfaceBoostBlur, sigma guest pixels = sigma x k
+ * texels. Only the copied box is read. 1 when the copy is ready to be read
+ * filled. */
+static int fill_blur(int st, int c, uint32_t k, const D3D11_BOX *box)
+{
+    uint32_t w = s_rtt[st][c].w, h = s_rtt[st][c].h;
+    ID3D11ShaderResourceView *none = NULL;
+
+    if (!fill_kernel(k / 2u, s_boost_blur * (float)k))
+        return 1;
+    if (!s_xps || !s_xcb || !s_bsamp)
+        return 0;
+    if (!s_rtt[st][c].rtv
+        && FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)s_rtt[st][c].tex, NULL, &s_rtt[st][c].rtv)))
+        return 0;
+    if (!s_fill_tmp.tex || s_fill_tmp.w < w || s_fill_tmp.h < h) {
+        D3D11_TEXTURE2D_DESC td;
+        uint32_t nw = w > s_fill_tmp.w ? w : s_fill_tmp.w;
+        uint32_t nh = h > s_fill_tmp.h ? h : s_fill_tmp.h;
+        if (s_fill_tmp.srv) ID3D11ShaderResourceView_Release(s_fill_tmp.srv);
+        if (s_fill_tmp.rtv) ID3D11RenderTargetView_Release(s_fill_tmp.rtv);
+        if (s_fill_tmp.tex) ID3D11Texture2D_Release(s_fill_tmp.tex);
+        memset(&s_fill_tmp, 0, sizeof s_fill_tmp);
+        memset(&td, 0, sizeof td);
+        td.Width = nw;
+        td.Height = nh;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL,
+                                                &s_fill_tmp.tex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                    (ID3D11Resource *)s_fill_tmp.tex, NULL, &s_fill_tmp.rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_fill_tmp.tex, NULL, &s_fill_tmp.srv))) {
+            if (s_fill_tmp.rtv) ID3D11RenderTargetView_Release(s_fill_tmp.rtv);
+            if (s_fill_tmp.tex) ID3D11Texture2D_Release(s_fill_tmp.tex);
+            memset(&s_fill_tmp, 0, sizeof s_fill_tmp);
+            return 0;
+        }
+        s_fill_tmp.w = nw;
+        s_fill_tmp.h = nh;
+    }
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
+            D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_xps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 2, 1, &s_xcb);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 4, 1, &s_bsamp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
+    fill_pass(s_rtt[st][c].srv, w, h, s_fill_tmp.rtv, w, h, 1, 0, box);
+    fill_pass(s_fill_tmp.srv, s_fill_tmp.w, s_fill_tmp.h, s_rtt[st][c].rtv,
+              w, h, 0, 1, box);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 6, 1, &none);
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    gt_mark(GT_COPY, GT_KEYS);
+    return 1;
+}
+
 /* How texture format fmt reads a surface of bpp bytes a pixel: RTT_* flags,
  * or -1 when that reading is not handled. */
 static int rtt_reading(uint32_t fmt, uint32_t bpp)
@@ -2758,12 +3164,183 @@ static int rtt_reading(uint32_t fmt, uint32_t bpp)
 /* Stage st's texture as a copy of the GPU surface it starts at, with its
  * reading in *flags; NULL when no GPU surface is there (or one is, read in a
  * way not handled: counted, and guest memory is used as before). */
+/* Frame interpolation (NV_INTERP_KEEP / _PUT): the surfaces a frame read
+ * as a texture before drawing on them in that frame, so what it read was
+ * left from an earlier frame. A replay has to find them as the real frame
+ * did, not as the real frame (or another replay) left them. */
+extern int nv2a_interp_replaying(void);  /* nv2a_interp.c */
+extern int nv2a_interp_n(void);
+#define CARRY_MAX 64
+#define CARRY_GENS 3
+static struct {
+    uint32_t addr, pitch;               /* zeta: offset, and scaled | boost << 8 */
+    int zeta;                           /* a depth buffer (s_zeta) */
+    uint32_t tw, th;                    /* zeta: its texture's size */
+    uint32_t seen;                      /* g_pb.flips when last read so */
+    ID3D11Texture2D *keep[CARRY_GENS];  /* the copies */
+    ID3D11Texture2D *from[CARRY_GENS];  /* the surface texture each is of */
+} s_carry[CARRY_MAX];
+static int s_ncarry;
+static uint32_t s_carry_puts;
+
+static void carry_add(int i, const char *why)
+{
+    int k, g;
+
+    if (nv2a_interp_replaying() || nv2a_interp_n() < 2)
+        return;
+    for (k = 0; k < s_ncarry; k++)
+        if (!s_carry[k].zeta && s_carry[k].addr == s_surf[i].addr
+            && s_carry[k].pitch == s_surf[i].pitch)
+            break;
+    if (k == s_ncarry) {
+        if (s_ncarry < CARRY_MAX) {
+            s_ncarry++;
+        } else {                        /* the one read longest ago goes */
+            int o;
+            for (o = k = 0; o < CARRY_MAX; o++)
+                if (s_carry[o].seen < s_carry[k].seen)
+                    k = o;
+            for (g = 0; g < CARRY_GENS; g++)
+                if (s_carry[k].keep[g])
+                    ID3D11Texture2D_Release(s_carry[k].keep[g]);
+        }
+        memset(&s_carry[k], 0, sizeof s_carry[k]);
+        s_carry[k].addr = s_surf[i].addr;
+        s_carry[k].pitch = s_surf[i].pitch;
+        fprintf(stderr, "[ICARRY] surface 0x%08X pitch %u (%ux%u, %ux%u on"
+                " the GPU) %s, last drawn %u flips ago: kept for replays"
+                " (flip %u)%c", s_surf[i].addr, s_surf[i].pitch, s_surf[i].w,
+                s_surf[i].h, s_surf[i].tw, s_surf[i].th, why,
+                g_pb.flips - s_surf[i].drawn_flip, g_pb.flips, 10);
+    }
+    s_carry[k].seen = g_pb.flips;
+}
+
+static void carry_note(int i)
+{
+    if (s_surf[i].drawn_flip != g_pb.flips)
+        carry_add(i, "read before drawn");
+}
+
+static void carry_add_zeta(int zi)
+{
+    int k;
+    uint32_t key = s_zeta[zi].scaled | s_zeta[zi].boost << 8;
+
+    if (nv2a_interp_replaying() || nv2a_interp_n() < 2)
+        return;
+    for (k = 0; k < s_ncarry; k++)
+        if (s_carry[k].zeta && s_carry[k].addr == s_zeta[zi].offset
+            && s_carry[k].pitch == key && s_carry[k].tw == s_zeta[zi].tw
+            && s_carry[k].th == s_zeta[zi].th)
+            break;
+    if (k == s_ncarry) {
+        int g;
+        if (s_ncarry < CARRY_MAX) {
+            s_ncarry++;
+        } else {
+            int o;
+            for (o = k = 0; o < CARRY_MAX; o++)
+                if (s_carry[o].seen < s_carry[k].seen)
+                    k = o;
+            for (g = 0; g < CARRY_GENS; g++)
+                if (s_carry[k].keep[g])
+                    ID3D11Texture2D_Release(s_carry[k].keep[g]);
+        }
+        memset(&s_carry[k], 0, sizeof s_carry[k]);
+        s_carry[k].zeta = 1;
+        s_carry[k].addr = s_zeta[zi].offset;
+        s_carry[k].pitch = key;
+        s_carry[k].tw = s_zeta[zi].tw;
+        s_carry[k].th = s_zeta[zi].th;
+        fprintf(stderr, "[ICARRY] depth buffer 0x%08X (%ux%u%s) drawn with"
+                " before a full clear, last cleared %u flips ago: kept for"
+                " replays (flip %u)%c", s_zeta[zi].offset, s_zeta[zi].tw,
+                s_zeta[zi].th, s_zeta[zi].boost ? ", boosted" : "",
+                g_pb.flips - s_zeta[zi].clear_flip, g_pb.flips, 10);
+    }
+    s_carry[k].seen = g_pb.flips;
+}
+
+/* The texture of carried entry k as it is now, or NULL. */
+static ID3D11Texture2D *carry_tex(int k)
+{
+    int i;
+    if (s_carry[k].zeta) {
+        for (i = 0; i < GPU_ZETAS; i++)
+            if (s_zeta[i].tex && s_zeta[i].offset == s_carry[k].addr
+                && (s_zeta[i].scaled | s_zeta[i].boost << 8) == s_carry[k].pitch
+                && s_zeta[i].tw == s_carry[k].tw && s_zeta[i].th == s_carry[k].th)
+                return s_zeta[i].tex;
+        return NULL;
+    }
+    for (i = 0; i < GPU_SURFACES; i++)
+        if (s_surf[i].tex && s_surf[i].addr == s_carry[k].addr
+            && s_surf[i].pitch == s_carry[k].pitch)
+            return s_surf[i].tex;
+    return NULL;
+}
+
+static void carry_keep(int g)
+{
+    int k;
+
+    for (k = 0; k < s_ncarry; k++) {
+        D3D11_TEXTURE2D_DESC d, h;
+        ID3D11Texture2D *src;
+        s_carry[k].from[g] = NULL;
+        if (g_pb.flips - s_carry[k].seen > 300 || !(src = carry_tex(k)))
+            continue;
+        ID3D11Texture2D_GetDesc(src, &d);
+        if (s_carry[k].keep[g]) {
+            ID3D11Texture2D_GetDesc(s_carry[k].keep[g], &h);
+            if (h.Width != d.Width || h.Height != d.Height
+                || h.Format != d.Format) {
+                ID3D11Texture2D_Release(s_carry[k].keep[g]);
+                s_carry[k].keep[g] = NULL;
+            }
+        }
+        if (!s_carry[k].keep[g]) {
+            /* Same bindings as the original: D3D copies a depth buffer
+             * only into another depth buffer. */
+            d.MiscFlags = 0;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                    &s_carry[k].keep[g]))) {
+                s_carry[k].keep[g] = NULL;
+                continue;
+            }
+        }
+        ID3D11DeviceContext_CopyResource(s_ctx,
+                (ID3D11Resource *)s_carry[k].keep[g], (ID3D11Resource *)src);
+        s_carry[k].from[g] = src;
+    }
+}
+
+static void carry_put(int g)
+{
+    int k;
+
+    for (k = 0; k < s_ncarry; k++) {
+        ID3D11Texture2D *dst;
+        if (!s_carry[k].from[g] || !(dst = carry_tex(k))
+            || dst != s_carry[k].from[g])
+            continue;
+        /* A depth buffer must not be bound while it is copied into. */
+        if (s_carry[k].zeta)
+            ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)dst,
+                                         (ID3D11Resource *)s_carry[k].keep[g]);
+        s_carry_puts++;
+    }
+}
+
 static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
 {
     const Texture *t = &g_pb.texs[st];
     uint32_t swz = d3d8_format_is_swizzled(t->color) ? 1u : 0u, tw, th;
     D3D11_BOX box;
-    int i, r, c, old;
+    int i, r, c, old, fill;
 
     if (d3d8_format_dxt_block_bytes(t->color))
         return NULL;
@@ -2784,6 +3361,7 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             break;
     if (i == GPU_SURFACES)
         return NULL;
+    carry_note(i);
     {
         /* Diagnostic: a surface not drawn on this flip or the last, or a
          * second surface at the same address (another pitch) that the
@@ -2854,41 +3432,6 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
         s_rtt_slot = i;
         return s_surf[i].srv;
     }
-    for (c = 0, old = 0; c < RTT_SIZES; c++) {
-        if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
-            break;
-        if (s_rtt[st][c].used < s_rtt[st][old].used)
-            old = c;
-    }
-    if (c == RTT_SIZES) {
-        D3D11_TEXTURE2D_DESC d;
-        c = old;
-        if (s_rtt[st][c].srv) ID3D11ShaderResourceView_Release(s_rtt[st][c].srv);
-        if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
-        memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
-        memset(&d, 0, sizeof d);
-        d.Width = tw;
-        d.Height = th;
-        d.MipLevels = 1;
-        d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
-                                                &s_rtt[st][c].tex))
-            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
-                    (ID3D11Resource *)s_rtt[st][c].tex, NULL,
-                    &s_rtt[st][c].srv))) {
-            if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
-            memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
-            return NULL;
-        }
-        s_rtt[st][c].w = tw;
-        s_rtt[st][c].h = th;
-        s_stat.rtt_made++;
-    }
-    s_rtt[st][c].used = ++s_rtt_tick;
     /* What the surface has of the texture's rectangle, or of the part the
      * batch reads (rtt_read_rect); past it the copy keeps whatever it
      * held. */
@@ -2907,11 +3450,71 @@ static ID3D11ShaderResourceView *texture_from_surface(int st, uint32_t *flags)
             s_stat.rtt_rects++;
         }
     }
+    fill = rtt_fill(st, i, tw, th);
+    if (fill && s_fill_share.srv && s_fill_share.seq == s_draw_seq
+        && s_fill_share.slot == i && s_fill_share.tw == tw
+        && s_fill_share.th == th
+        && !memcmp(&s_fill_share.box, &box, sizeof box)) {
+        /* An earlier stage of this batch made the same filled copy. */
+        *flags = (uint32_t)r | RTT_FILL;
+        s_stat.rtt_filled++;
+        s_stat.rtt_binds++;
+        s_surf[i].used = ++s_surf_tick;
+        s_rtt_slot = i;
+        return s_fill_share.srv;
+    }
+    for (c = 0, old = 0; c < RTT_SIZES; c++) {
+        if (s_rtt[st][c].tex && s_rtt[st][c].w == tw && s_rtt[st][c].h == th)
+            break;
+        if (s_rtt[st][c].used < s_rtt[st][old].used)
+            old = c;
+    }
+    if (c == RTT_SIZES) {
+        D3D11_TEXTURE2D_DESC d;
+        c = old;
+        if (s_rtt[st][c].rtv) ID3D11RenderTargetView_Release(s_rtt[st][c].rtv);
+        if (s_rtt[st][c].srv) ID3D11ShaderResourceView_Release(s_rtt[st][c].srv);
+        if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+        memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
+        memset(&d, 0, sizeof d);
+        d.Width = tw;
+        d.Height = th;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        /* A target too, for fill_blur. */
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL,
+                                                &s_rtt[st][c].tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_rtt[st][c].tex, NULL,
+                    &s_rtt[st][c].srv))) {
+            if (s_rtt[st][c].tex) ID3D11Texture2D_Release(s_rtt[st][c].tex);
+            memset(&s_rtt[st][c], 0, sizeof s_rtt[st][c]);
+            return NULL;
+        }
+        s_rtt[st][c].w = tw;
+        s_rtt[st][c].h = th;
+        s_stat.rtt_made++;
+    }
+    s_rtt[st][c].used = ++s_rtt_tick;
     ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
             (ID3D11Resource *)s_rtt[st][c].tex, 0, box.left, box.top, 0,
             (ID3D11Resource *)s_surf[i].tex, 0, &box);
     gt_mark(GT_COPY, GT_KEYS);
     *flags = (uint32_t)r;
+    if (fill && fill_blur(st, c, s_surf[i].boost, &box)) {
+        *flags |= RTT_FILL;
+        s_stat.rtt_filled++;
+        s_fill_share.seq = s_draw_seq;
+        s_fill_share.slot = i;
+        s_fill_share.tw = tw;
+        s_fill_share.th = th;
+        s_fill_share.box = box;
+        s_fill_share.srv = s_rtt[st][c].srv;
+    }
     s_surf[i].used = ++s_surf_tick;
     s_stat.rtt_binds++;
     s_stat.rtt_px += (uint64_t)(box.right - box.left) * (box.bottom - box.top);
@@ -3053,8 +3656,8 @@ static ID3D11ShaderResourceView *texture_from_zeta(int st)
     }
 
     /* At the buffer's scale, pixel for pixel, as texture_from_surface. */
-    tw = to_host(t->width, s_zeta[i].scaled ? s_rsx : 1.0f);
-    th = to_host(t->height, s_zeta[i].scaled ? s_rsy : 1.0f);
+    tw = to_host(t->width, zeta_sx(i));
+    th = to_host(t->height, zeta_sy(i));
     if (!s_zcopy[st].tex || s_zcopy[st].w != tw || s_zcopy[st].h != th) {
         D3D11_TEXTURE2D_DESC d;
         if (s_zcopy[st].srv) ID3D11ShaderResourceView_Release(s_zcopy[st].srv);
@@ -3690,6 +4293,47 @@ typedef struct {
 static SampEntry s_samp[SAMP_CACHE];
 static int s_nsamp;
 
+/* Textures a title wants read smoothly (xbox_SetTextureSmooth): fn(addr,
+ * format, w, h) is asked for each 2D texture a combiner stage reads with
+ * bilinear magnification (addr: the stage's offset as programmed, format
+ * the NV097 colour code, w x h level 0) and answers nonzero for one to read
+ * as a cubic B-spline over the 4 x 4 texels round the point (four bilinear
+ * reads, shader bspline) instead of one bilinear read. Meant for baked
+ * light maps: a low-resolution picture of the light stretched over a whole
+ * level, where bilinear shows the texel grid as steps along every shadow
+ * edge (Conker's fence shadows, to-do 106). The B-spline is a little
+ * softer than bilinear and has no steps or overshoot. Runs on the executor
+ * thread, per draw and stage; NULL (default): none. RECOMP_TEX_SMOOTH=2:
+ * on even frames only, for the held-picture check (as RECOMP_DRAW_MERGE=2:
+ * photo mode's held picture, RECOMP_FB_DUMP, neighbours differ only by
+ * this). */
+typedef int (*xbox_TextureSmoothFn)(uint32_t addr, uint32_t format,
+                                    uint32_t w, uint32_t h);
+static volatile xbox_TextureSmoothFn s_smooth_fn;
+static int s_smooth_alt = -1;
+
+void xbox_SetTextureSmooth(xbox_TextureSmoothFn fn)
+{
+    s_smooth_fn = fn;
+}
+
+static int texture_smooth(int st)
+{
+    const Texture *t = &g_pb.texs[st];
+    xbox_TextureSmoothFn fn = s_smooth_fn;
+    if (s_smooth_alt < 0) {
+        const char *e = getenv("RECOMP_TEX_SMOOTH");
+        s_smooth_alt = e && e[0] == '2';
+    }
+    if (!fn || ((t->filter >> 24) & 0xF) != 2 || tex_filter() == 0
+        || t->cube || t->depth > 1 || (s_smooth_alt && (g_pb.flips & 1)))
+        return 0;
+    if (!fn(t->offset, t->color, t->width, t->height))
+        return 0;
+    s_stat.tex_smooth++;
+    return 1;
+}
+
 static ID3D11SamplerState *sampler_stage(int st, int combiners)
 {
     const Texture *t = &g_pb.texs[st];
@@ -4140,7 +4784,7 @@ static ID3D11RasterizerState *offset_state(int zcull, float scale)
  * console keeps; culling at the Z16 maximum dropped every shadow pixel and
  * left the shadows blank (#8, 2026-11-03). So a range wider than the
  * format's is clamped too. */
-extern int nv2a_interp_replaying(void);  /* nv2a_interp.c */
+extern unsigned nv2a_interp_replay_id(void);
 
 static ID3D11RasterizerState *raster_state(float scale)
 {
@@ -4685,7 +5329,7 @@ static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
 static struct {
     uint32_t offset, func, ref;
 } s_cut[CUT_TEX];
-static uint32_t s_cut_n, s_cut_flip = ~0u;
+static uint32_t s_cut_n, s_cut_flip = ~0u, s_cut_rep;
 static ID3D11BlendState *s_bs_no_colour;
 
 static int cutout_on(void)
@@ -4706,8 +5350,12 @@ static int cutout_match(int zi, uint32_t bound)
 {
     uint32_t i, off = g_pb.texs[0].offset;
 
-    if (s_cut_flip != g_pb.flips) {
+    /* Per frame, and per replay of one (frame interpolation): a replay
+     * runs with its frame's flip number, after the frame itself filled the
+     * table. */
+    if (s_cut_flip != g_pb.flips || s_cut_rep != nv2a_interp_replay_id()) {
         s_cut_flip = g_pb.flips;
+        s_cut_rep = nv2a_interp_replay_id();
         s_cut_n = 0;
     }
     if (zi < 0 || !(bound & 1u) || !g_pb.depth_test)
@@ -4840,6 +5488,132 @@ static int cutout_parts(GpuConsts *k, int c, const uint32_t *end,
     return 1;
 }
 
+/* RECOMP_BOOST_NEAREST (on; =0 off, =2 on even frames only, for the
+ * held-picture check): a shadow projected onto the scene -- a multiply pass
+ * (DST_COLOR x ZERO, or ZERO x SRC_COLOR) reading a boosted surface
+ * (xbox_SetSurfaceBoost), depth tested, depth not written -- darkens each
+ * pixel once, from the nearest of its own triangles there. Conker's shadow
+ * receivers hold the floor and the rug laid over it a few units higher, and
+ * both passed the depth test (the rug's own draw leaves the floor's depth),
+ * so under the rug the shadow fell twice at two heights: a dark one and a
+ * lighter copy beside it (Berri's dance, user 2026-11-06). The original does
+ * it too; the blurred 128-pixel shadow hid it. Two draws: the batch writes
+ * its depth into s_near (R32F, blend MIN: the nearest), then draws with
+ * every fragment behind that discarded (shader tnear). Only for boosted
+ * surfaces: a title's original-size shadows stay as they were. */
+static int s_near_on = -1;
+static struct {
+    uint32_t w, h;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} s_near;
+static ID3D11BlendState *s_bs_min;
+
+static int receiver_draw(int si, int zi, uint32_t bound, uint32_t nidx,
+                         ID3D11BlendState *bs, const float *bf)
+{
+    static const float far1[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_TEXTURE2D_DESC td;
+    int st, boosted = 0;
+
+    if (s_near_on < 0) {
+        const char *e = getenv("RECOMP_BOOST_NEAREST");
+        UINT fs = 0;
+        s_near_on = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
+        /* MIN on an R32F target: required from feature level 10.1. */
+        if (s_near_on && (FAILED(ID3D11Device_CheckFormatSupport(s_dev,
+                              DXGI_FORMAT_R32_FLOAT, &fs))
+                          || !(fs & D3D11_FORMAT_SUPPORT_BLENDABLE)))
+            s_near_on = 0;
+    }
+    if (!s_near_on || (s_near_on == 2 && (g_pb.flips & 1)) || zi < 0
+        || !g_pb.blend_enable || !g_pb.depth_test || g_pb.depth_mask
+        || g_pb.stencil_test || g_pb.merge_nparts > 1
+        || !((g_pb.blend_sfactor == 0x306 && g_pb.blend_dfactor == 0)
+             || (g_pb.blend_sfactor == 0 && g_pb.blend_dfactor == 0x300)))
+        return 0;
+    for (st = 0; st < 4; st++)
+        if (((bound >> st) & 1u) && s_tex_src[st] == 'S'
+            && s_tex_slot[st] >= 0 && s_surf[s_tex_slot[st]].boost)
+            boosted = 1;
+    if (!boosted)
+        return 0;
+
+    ID3D11Texture2D_GetDesc(s_surf[si].tex, &td);
+    if (!s_near.tex || s_near.w != td.Width || s_near.h != td.Height) {
+        D3D11_TEXTURE2D_DESC nd;
+        if (s_near.srv) ID3D11ShaderResourceView_Release(s_near.srv);
+        if (s_near.rtv) ID3D11RenderTargetView_Release(s_near.rtv);
+        if (s_near.tex) ID3D11Texture2D_Release(s_near.tex);
+        memset(&s_near, 0, sizeof s_near);
+        memset(&nd, 0, sizeof nd);
+        nd.Width = td.Width;
+        nd.Height = td.Height;
+        nd.MipLevels = 1;
+        nd.ArraySize = 1;
+        nd.Format = DXGI_FORMAT_R32_FLOAT;
+        nd.SampleDesc.Count = 1;
+        nd.Usage = D3D11_USAGE_DEFAULT;
+        nd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &nd, NULL, &s_near.tex))
+            || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                    (ID3D11Resource *)s_near.tex, NULL, &s_near.rtv))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_near.tex, NULL, &s_near.srv))) {
+            if (s_near.rtv) ID3D11RenderTargetView_Release(s_near.rtv);
+            if (s_near.tex) ID3D11Texture2D_Release(s_near.tex);
+            memset(&s_near, 0, sizeof s_near);
+            s_near_on = 0;
+            return 0;
+        }
+        s_near.w = td.Width;
+        s_near.h = td.Height;
+    }
+    if (!s_bs_min) {
+        D3D11_BLEND_DESC d;
+        memset(&d, 0, sizeof d);
+        d.RenderTarget[0].BlendEnable = TRUE;
+        d.RenderTarget[0].SrcBlend = d.RenderTarget[0].SrcBlendAlpha
+                                   = D3D11_BLEND_ONE;
+        d.RenderTarget[0].DestBlend = d.RenderTarget[0].DestBlendAlpha
+                                    = D3D11_BLEND_ONE;
+        d.RenderTarget[0].BlendOp = d.RenderTarget[0].BlendOpAlpha
+                                  = D3D11_BLEND_OP_MIN;
+        d.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_RED;
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &d, &s_bs_min))) {
+            s_bs_min = NULL;
+            s_near_on = 0;
+            return 0;
+        }
+    }
+
+    /* 1: the nearest depth of the batch's own fragments that pass. */
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_near.rtv, far1);
+    s_cbd.tnear[0] = 1.0f;
+    s_cbd.tnear[1] = 0.0f;
+    if (!tclamp_upload())
+        return 0;
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_near.rtv,
+                                           s_zeta[zi].dsv);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_min, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    /* 2: the batch as the title drew it, at that depth only. */
+    s_cbd.tnear[0] = 0.0f;
+    s_cbd.tnear[1] = 1.0f;
+    tclamp_upload();
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
+                                           s_zeta[zi].dsv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 15, 1, &s_near.srv);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
+    ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 15, 1, &none);
+    s_cbd.tnear[1] = 0.0f;
+    s_stat.near_draws++;
+    return 1;
+}
+
 static void d3d_draw(void)
 {
     static int ready = -1, no_rc = -1, no_vsh = -1;
@@ -4914,6 +5688,7 @@ static void d3d_draw(void)
     memset(&k, 0, sizeof k);
     memset(&s_cbd, 0, sizeof s_cbd);
     s_rtt_target = si;
+    s_draw_seq++;
 
     if (program || combiners) {
         /* Through the title's own program, or the fixed-function vertex
@@ -4994,6 +5769,11 @@ static void d3d_draw(void)
             k.tscale[st][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
             if (rtt & RTT_DIRECT)
                 tclamp_stage(&k, st);
+            if (rtt & RTT_FILL)
+                memcpy(s_cbd.tfill[st], s_rtt_fill[st],
+                       sizeof s_cbd.tfill[st]);
+            if (combiners && !rtt && texture_smooth(st))
+                s_cbd.tsmooth[st][0] = 1.0f;
         }
         ct_add(CT_TEXTURES, ct0);
         if (g_pb.alpha_test) {
@@ -5040,6 +5820,9 @@ static void d3d_draw(void)
                 k.tscale[0][3] = (rtt & RTT_SWAP_RB) ? 1.0f : 0.0f;
                 if (rtt & RTT_DIRECT)
                     tclamp_stage(&k, 0);
+                if (rtt & RTT_FILL)
+                    memcpy(s_cbd.tfill[0], s_rtt_fill[0],
+                           sizeof s_cbd.tfill[0]);
             } else {
                 srv[0] = NULL;
             }
@@ -5119,6 +5902,22 @@ static void d3d_draw(void)
             fprintf(stderr, "[FTRACE]     depth %g..%g w %g..%g | range"
                     " %g..%g Z%d%c", z0, z1, w0, w1, g_pb.clip_min,
                     g_pb.clip_max, zeta_format() == 1 ? 16 : 24, 10);
+        }
+        /* RECOMP_FTRACE_VERTS=1: every vertex of a small batch (at most
+         * 256): the title's position (attribute 0), the screen position
+         * and stage 0's coordinates, to see what a pass covers (two layers
+         * at different heights, ...). */
+        if (n <= 256 && getenv("RECOMP_FTRACE_VERTS")) {
+            for (i = 0; i < n; i++) {
+                float a[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i], a);
+                fprintf(stderr, "[FTRACE]     v%u in %g %g %g | pos %.1f %.1f"
+                        " %g w %g | t0 %g %g %g %g%c", i, a[0], a[1], a[2],
+                        verts[i].pos[0], verts[i].pos[1], verts[i].pos[2],
+                        verts[i].pos[3], verts[i].tex[0][0],
+                        verts[i].tex[0][1], verts[i].tex[0][2],
+                        verts[i].tex[0][3], 10);
+            }
         }
         fprintf(stderr, "[FTRACE]     cmask %08X | stencil func %X ref %02X"
                 " r %02X w %02X op %X/%X/%X | alpha func %X ref %02X | zmask"
@@ -5309,16 +6108,26 @@ static void d3d_draw(void)
     zi = -1;
     if (path != PATH_FLAT
         && (g_pb.depth_test || g_pb.depth_mask || g_pb.stencil_test)) {
-        if (s_surf[si].w == ZETA_W && s_surf[si].h == ZETA_H)
-            zi = zeta_current(1, s_surf[si].scaled);
+        /* A boosted surface's buffer is made at its size. */
+        if (s_surf[si].boost
+            || (s_surf[si].w == ZETA_W && s_surf[si].h == ZETA_H))
+            zi = zeta_current(1, s_surf[si].scaled, s_surf[si].boost,
+                              s_surf[si].tw, s_surf[si].th);
         else
             s_stat.zeta_too_big++;
     }
     ds = zi >= 0 ? ds_state() : NULL;
     if (!ds)
         zi = -1;
-    if (zi >= 0)
+    if (zi >= 0) {
         s_zeta[zi].used = ++s_zeta_tick;
+        /* Drawn with before a full clear this frame: depth or stencil left
+         * from an earlier frame (frame interpolation keeps it for replays). */
+        if (s_zeta[zi].draw_flip != g_pb.flips
+            && s_zeta[zi].clear_flip != g_pb.flips)
+            carry_add_zeta(zi);
+        s_zeta[zi].draw_flip = g_pb.flips;
+    }
     if (zi >= 0 && si == s_shown)
         s_main_zi = zi;                 /* frame interpolation, NV_INTERP_BOTH */
 
@@ -5412,7 +6221,8 @@ static void d3d_draw(void)
             ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_surf[si].rtv,
                     zi >= 0 ? s_zeta[zi].dsv : NULL);
         }
-        ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
+        if (!receiver_draw(si, zi, bound, nidx, bs, bf))
+            ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
         if (tiny || adds || s_ftdump_zeta) {
             snprintf(what, sizeof what, "%08X%s", g_pb.color_offset,
                      s_ftdump_zeta ? "_reads_zeta" : adds ? "_after_add" : "");
@@ -5422,7 +6232,7 @@ static void d3d_draw(void)
         }
         s_ftdump_zeta = 0;
         s_ftdump_big = 0;
-    } else {
+    } else if (!receiver_draw(si, zi, bound, nidx, bs, bf)) {
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
     }
     if (cut >= 0)
@@ -5575,7 +6385,7 @@ static int dump_tex(const char *path, ID3D11Texture2D *tex, uint32_t tw,
 static int dump_rect(const char *path, int i, uint32_t x, uint32_t y,
                      uint32_t w, uint32_t h)
 {
-    if (i >= 0 && s_surf[i].scaled) {
+    if (i >= 0 && (s_surf[i].scaled || s_surf[i].boost)) {
         float sx = surf_sx(i), sy = surf_sy(i);
         uint32_t x1 = to_host(x + w, sx), y1 = to_host(y + h, sy);
         x = to_host(x, sx);
@@ -5738,7 +6548,9 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
 
 /* The shown frame into the swap chain's back buffer, on black: copied, or
  * drawn through the filter chain (postfx_d3d11.c) when a filter is on or
- * the frame is drawn at another scale than the back buffer's. */
+ * the frame is drawn at another scale than the back buffer's. Only the
+ * black under a black present (xbox_Nv2aPresentNow). */
+extern int g_pb_present_black;
 /* Rectangle x,y,w,h (guest pixels) of tex, drawn at scale sx, sy, into the
  * back buffer as shown_to_back describes; tex NULL: black only. */
 static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
@@ -5755,7 +6567,7 @@ static void shown_to_back(void)
                     " render scale is on%c", s_surf[s_shown].addr,
                     s_surf[s_shown].pitch, s_shown_w, s_shown_h, 10);
     }
-    if (s_shown >= 0)
+    if (s_shown >= 0 && !g_pb_present_black)
         tex_to_back(s_surf[s_shown].tex, surf_sx(s_shown), surf_sy(s_shown),
                     s_shown_x, s_shown_y, s_shown_w, s_shown_h);
     else
@@ -6017,10 +6829,18 @@ static int dump_pic_rect(const char *path, int slot)
  * combining pass, a picture-sized texture to draw it into. */
 static ID3D11Texture2D *s_zkeep;
 static ID3D11ShaderResourceView *s_zkeep_srv;
-static ID3D11PixelShader *s_both_ps;
+static ID3D11PixelShader *s_both_ps[2];
 static ID3D11Texture2D *s_both_tex;
 static int s_both_tried;
 
+/* ca, za: picture `slot` and its kept depth; cb, zb: the shown surface and
+ * its depth. Variant 0 keeps cb unless ca is nearer by more than EPS (or cb
+ * is the cleared far depth there and ca is not); variant 1 the other way
+ * round. Same surfaces drawn from the two frames' blended constants come out
+ * at the same depth up to rounding, so a plain "nearer" flipped between the
+ * two pictures pixel by pixel over decals, see-through layers and anything
+ * that writes no depth (RECOMP_INTERP_BOTH_EPS: the margin, default 2e-6;
+ * 0 = the old plain test). */
 static const char k_both_ps[] =
     "Texture2D<float4> ca : register(t0);\n"
     "Texture2D<float4> cb : register(t1);\n"
@@ -6028,11 +6848,15 @@ static const char k_both_ps[] =
     "Texture2D<float> zb : register(t3);\n"
     "float4 both(float4 p : SV_Position) : SV_Target {\n"
     "    int3 q = int3(int2(p.xy), 0);\n"
-    "    return za.Load(q) < zb.Load(q) ? ca.Load(q) : cb.Load(q);\n"
+    "    float a = za.Load(q), b = zb.Load(q);\n"
+    "    bool takea = PREFER_A ? !(b < a - EPS || (a >= HOLE && b < a))\n"
+    "                          : (a < b - EPS || (b >= HOLE && a < b));\n"
+    "    return takea ? ca.Load(q) : cb.Load(q);\n"
     "}\n";
 
 static int interp_both(int slot)
 {
+    int pa = (slot & NV_INTERP_PREFER_OLD) != 0;
     D3D11_TEXTURE2D_DESC d, dz;
     ID3D11ShaderResourceView *srv[4] = {NULL, NULL, NULL, NULL};
     ID3D11ShaderResourceView *none[4] = {NULL, NULL, NULL, NULL};
@@ -6041,17 +6865,32 @@ static int interp_both(int slot)
     D3D11_RECT sc;
     int ok = 0;
 
+    slot &= ~NV_INTERP_PREFER_OLD;
+    if (slot < 0 || slot >= INTERP_PICS)
+        return 0;
     if (!s_both_tried) {
-        ID3DBlob *b = compile_src(k_both_ps, "both", "ps_4_0", 0, NULL);
+        const char *e = getenv("RECOMP_INTERP_BOTH_EPS");
+        double eps = e ? atof(e) : 2e-6;
+        int v;
         s_both_tried = 1;
-        if (b) {
-            ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(b),
-                                           ID3D10Blob_GetBufferSize(b), NULL,
-                                           &s_both_ps);
-            ID3D10Blob_Release(b);
+        for (v = 0; v < 2; v++) {
+            char src[1024];
+            ID3DBlob *b;
+            /* EPS 0: the old plain test (ties to the shown surface). */
+            snprintf(src, sizeof src, "#define PREFER_A %d\n#define EPS %.9g\n"
+                     "#define HOLE %s\n%s", eps > 0.0 ? v : 0,
+                     eps > 0.0 ? eps : 0.0, eps > 0.0 ? "0.9999999" : "2.0",
+                     k_both_ps);
+            b = compile_src(src, "both", "ps_4_0", 0, NULL);
+            if (b) {
+                ID3D11Device_CreatePixelShader(s_dev,
+                        ID3D10Blob_GetBufferPointer(b),
+                        ID3D10Blob_GetBufferSize(b), NULL, &s_both_ps[v]);
+                ID3D10Blob_Release(b);
+            }
         }
     }
-    if (!s_both_ps || !s_zvs || !s_zkeep_srv || s_main_zi < 0 || s_shown < 0
+    if (!s_both_ps[pa] || !s_zvs || !s_zkeep_srv || s_main_zi < 0 || s_shown < 0
         || !s_zeta[s_main_zi].srv_z || !s_pic[slot].tex
         || !s_surf[s_shown].tex)
         return 0;
@@ -6094,7 +6933,7 @@ static int interp_both(int slot)
     ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ID3D11DeviceContext_VSSetShader(s_ctx, s_zvs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_both_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_both_ps[pa], NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 4, srv);
     ID3D11DeviceContext_RSSetState(s_ctx, s_rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
@@ -6152,13 +6991,75 @@ static int d3d_interp(int op, int slot)
 {
     if (op == NV_INTERP_DEPTH)
         return !s_shadow && interp_depth();
+    if (op == NV_INTERP_BOTH)
+        return !s_shadow && interp_both(slot);
+    if (op == NV_INTERP_KEEP || op == NV_INTERP_PUT) {
+        static int dbg = -1, said;
+        uint32_t before = s_carry_puts;
+        if (s_shadow || slot < 0 || slot >= CARRY_GENS)
+            return 0;
+        if (dbg < 0)
+            dbg = getenv("RECOMP_INTERP_CARRY_LOG") != NULL;
+        if (op == NV_INTERP_KEEP)
+            carry_keep(slot);
+        else
+            carry_put(slot);
+        if (dbg && said < 400) {
+            int k, kept = 0;
+            for (k = 0; k < s_ncarry; k++)
+                kept += s_carry[k].from[slot] != NULL;
+            said++;
+            fprintf(stderr, "[ICARRY] flip %u %s gen %d: %u of %d entries"
+                    " (%d kept in it)%c", g_pb.flips,
+                    op == NV_INTERP_KEEP ? "keep" : "put", slot,
+                    op == NV_INTERP_KEEP ? (unsigned)kept
+                                         : s_carry_puts - before,
+                    s_ncarry, kept, 10);
+        }
+        return 1;
+    }
     if (slot < 0 || slot >= INTERP_PICS || s_shadow)
         return 0;
-    if (op == NV_INTERP_BOTH)
-        return interp_both(slot);
     if (op == NV_INTERP_UNDER) {
         s_under_on = slot;
         return 1;
+    }
+    if (op == NV_INTERP_SAVE && flip_dump_on() && getenv("RECOMP_FB_DUMP")
+        && getenv("RECOMP_INTERP_SURFDUMP")) {
+        /* RECOMP_INTERP_SURFDUMP=<hex addr>[,...] (test): those colour
+         * surfaces as each picture is saved -- the real frame (slot 0 / 4)
+         * and each replay -- to <RECOMP_FB_DUMP>sd_<addr>_<flip>_<slot>.bmp:
+         * where a replay starts to differ from its frame. */
+        const char *e = getenv("RECOMP_INTERP_SURFDUMP");
+        if (strchr(e, 'Z')) {
+            /* Z: the zeta copies (texture_from_zeta) as last made. */
+            int st;
+            for (st = 0; st < 4; st++)
+                if (s_zcopy[st].tex) {
+                    char path[512];
+                    snprintf(path, sizeof path, "%szc%d_%u_%d.bmp",
+                             getenv("RECOMP_FB_DUMP"), st, g_pb.flips, slot);
+                    dump_tex(path, s_zcopy[st].tex, s_zcopy[st].w,
+                             s_zcopy[st].h, 0, 0, s_zcopy[st].w, s_zcopy[st].h);
+                }
+        }
+        while (*e) {
+            uint32_t a = (uint32_t)strtoul(e, NULL, 16);
+            int i;
+            for (i = 0; i < GPU_SURFACES; i++)
+                if (s_surf[i].tex && s_surf[i].addr == a) {
+                    char path[512];
+                    snprintf(path, sizeof path, "%ssd_%08X_%u_%d.bmp",
+                             getenv("RECOMP_FB_DUMP"), a, g_pb.flips, slot);
+                    dump_rect(path, i, 0, 0, s_surf[i].w > 256 ? 256
+                              : s_surf[i].w, s_surf[i].h > 256 ? 256
+                              : s_surf[i].h);
+                }
+            while (*e && *e != ',')
+                e++;
+            if (*e)
+                e++;
+        }
     }
     if (op == NV_INTERP_SAVE) {
         D3D11_TEXTURE2D_DESC d, h;
@@ -6257,10 +7158,68 @@ static int d3d_interp(int op, int slot)
     return 0;
 }
 
+static int gpu_mem(uint64_t *used, uint64_t *budget);
+
+/* The render scale's pixel cap from the video memory budget (see RS_MAX). */
+static void rs_cap_from_memory(void)
+{
+    uint64_t used, budget;
+    double px;
+
+    if (!gpu_mem(&used, &budget) || !budget)
+        return;
+    px = ((double)budget * 0.75 - RS_BASE_MB * 1048576.0) / RS_BYTES_PX;
+    if (px < RS_MIN_PIXELS)
+        px = RS_MIN_PIXELS;
+    s_rs_max_px = px;
+    fprintf(stderr, "[GPU] d3d11: render scale up to %.0f Mpx a frame (%u MB"
+            " video memory budget)%c", px / 1e6, (unsigned)(budget >> 20), 10);
+}
+
+/* Video memory in use by this process and the budget Windows gives it
+ * (IDXGIAdapter3, local segment); 0 when the adapter can't say. */
+static int gpu_mem(uint64_t *used, uint64_t *budget)
+{
+    DXGI_QUERY_VIDEO_MEMORY_INFO mi;
+
+    if (!s_adapter3 || FAILED(IDXGIAdapter3_QueryVideoMemoryInfo(s_adapter3,
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mi)))
+        return 0;
+    *used = mi.CurrentUsage;
+    *budget = mi.Budget;
+    return 1;
+}
+
+/* RECOMP_GPU_MEM_LOG=1: every 5 s, [GPUMEM] video memory used / budget and
+ * the size the frame is drawn at (what a render scale costs). */
+static void gpu_mem_log(void)
+{
+    static int on = -1;
+    static ULONGLONG last;
+    ULONGLONG now;
+    uint64_t used, budget;
+
+    if (on < 0)
+        on = getenv("RECOMP_GPU_MEM_LOG") != NULL;
+    if (!on)
+        return;
+    now = GetTickCount64();
+    if (now - last < 5000)
+        return;
+    last = now;
+    if (gpu_mem(&used, &budget))
+        fprintf(stderr, "[GPUMEM] %u MB used of a %u MB budget (%u MB on"
+                " the card); frame drawn at %ux%u, shown at %ux%u%c",
+                (unsigned)(used >> 20), (unsigned)(budget >> 20),
+                (unsigned)(s_vram_total >> 20), s_sc_w, s_sc_h, s_bb_w,
+                s_bb_h, 10);
+}
+
 static void d3d_present(void)
 {
     heavy_report();
     pace_count();
+    gpu_mem_log();
 
     int seq = -1;
 
@@ -6363,6 +7322,14 @@ static void d3d_report(void)
             s_stat.rtt_binds, s_stat.rtt_made,
             s_stat.rtt_unhandled, (double)s_stat.rtt_px / 1e6,
             s_stat.rtt_rects, s_stat.rtt_direct, 10);
+    if (s_stat.boosted)
+        fprintf(stderr, "[GPU] d3d11: boosted surfaces (xbox_SetSurfaceBoost):"
+                " %u made, %u stage reads filled in (RECOMP_BOOST_FILL), %u"
+                " projected nearest-only (RECOMP_BOOST_NEAREST)%c",
+                s_stat.boosted, s_stat.rtt_filled, s_stat.near_draws, 10);
+    if (s_stat.tex_smooth)
+        fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
+                " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
@@ -6600,7 +7567,8 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();
-    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled) : -1;
+    zi = si >= 0 ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                                s_surf[si].tw, s_surf[si].th) : -1;
     dp.focus = host_float(p[0]);
     dp.range = host_float(p[1]);
     dp.zn = host_float(p[2]);
@@ -6711,7 +7679,8 @@ static void d3d_poll(void)
             }
             return;
         }
-        if (s_scale_on && sum) {
+        /* Off (every area 1) this gives sum unchanged. */
+        if (sum) {
             scaled += 0.5;
             sum = scaled < 1.0 ? 1 : (uint64_t)scaled;
         }
@@ -6779,12 +7748,19 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
                                     (void **)&s_factory);
     if (adapter) {
         DXGI_ADAPTER_DESC ad;
-        if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad)))
-            fprintf(stderr, "[GPU] d3d11: %ls, feature level %X.%X%c",
-                    ad.Description, (unsigned)got >> 12,
-                    ((unsigned)got >> 8) & 0xF, 10);
+        if (SUCCEEDED(IDXGIAdapter_GetDesc(adapter, &ad))) {
+            fprintf(stderr, "[GPU] d3d11: %ls, feature level %X.%X, %u MB"
+                    " video memory%c", ad.Description, (unsigned)got >> 12,
+                    ((unsigned)got >> 8) & 0xF,
+                    (unsigned)(ad.DedicatedVideoMemory >> 20), 10);
+            s_vram_total = (uint64_t)ad.DedicatedVideoMemory;
+        }
+        if (FAILED(IDXGIAdapter_QueryInterface(adapter, &IID_IDXGIAdapter3,
+                                               (void **)&s_adapter3)))
+            s_adapter3 = NULL;
         IDXGIAdapter_Release(adapter);
     }
+    rs_cap_from_memory();
     if (dxgi_dev)
         IDXGIDevice_Release(dxgi_dev);
     if (FAILED(hr)) {

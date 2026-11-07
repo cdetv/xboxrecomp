@@ -203,6 +203,42 @@ static bool apu_hrtf_enabled(void)
     return on != 0;
 }
 
+/* RECOMP_APU_DECLICK: smooth the steps the frame-based mix makes, default
+ * on (0 = off, the xemu output, for A/B). A voice's gains (volume per bin,
+ * amplitude envelope) are set once per 32-sample frame, so every change was
+ * a step; a voice that stops (VOICE_OFF, a forced release, a pause) left the
+ * output at once from whatever value it had; and a voice whose data ended
+ * inside a frame lost that whole frame. Each is a click (Conker: a few a
+ * minute in the It's War opening once the silent frames were gone). Now:
+ *  - gains ramp across the frame from last frame's value (a voice that
+ *    played last frame; a new voice starts at its gain, as on hardware);
+ *  - a voice that ended inside a frame keeps the samples it made, and the
+ *    rest of the frame decays from its last one;
+ *  - a voice that played last frame and not in this one hands its last
+ *    output sample to a tail that decays to zero (~1.5 ms time constant)
+ *    instead of dropping to it (monitor mix, the default output).
+ * The last two change the sound by less than 1 ms of fade; hardware has
+ * neither, but the clicks are worth more than the match. */
+static bool apu_declick_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_DECLICK");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+        fprintf(stderr, "[APU] declick (gain ramps, stop fades): %s\n",
+                on ? "on" : "off");
+    }
+    return on != 0;
+}
+
+#define DECLICK_DECAY 0.98620f            /* exp(-1/72): 1.5 ms at 48 kHz */
+static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
+static uint32_t s_dc_frame[MCPX_HW_MAX_VOICES];     /* frame a voice last mixed */
+static float    s_dc_bin_g[MCPX_HW_MAX_VOICES][8];  /* its bin gains then */
+static float    s_dc_mon_g[MCPX_HW_MAX_VOICES][6];  /* its monitor gains then */
+static float    s_dc_last[MCPX_HW_MAX_VOICES][2];   /* its last monitor sample */
+static float    s_dc_tail[2];                       /* stopped voices, decaying */
+
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
@@ -1220,6 +1256,43 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* RECOMP_APU_MONITOR_RULES=old: the monitor mix as xemu places voices (each
+ * at its loudest bin, sends included), for A/B against the speaker rules
+ * (mcpx_apu_monitor_place_speakers). RECOMP_APU_MONITOR_RULES_FILE=<path>:
+ * live A/B by ear, the old rules while that file exists (checked every
+ * ~0.5 s of audio). */
+static bool monitor_rules_old(void)
+{
+    static int old = -1;
+    static const char *file;
+    static uint32_t checked;
+    if (old < 0) {
+        const char *e = getenv("RECOMP_APU_MONITOR_RULES");
+        old = (e && !strcmp(e, "old")) ? 1 : 0;
+        file = getenv("RECOMP_APU_MONITOR_RULES_FILE");
+        if (file && !*file)
+            file = NULL;
+        checked = s_vp_frame;
+        fprintf(stderr, "[APU] monitor mix rules: %s%s\n",
+                old ? "old (xemu: loudest bin, sends included)"
+                    : "speakers (sends and LFE left out, centre -3 dB a side)",
+                file ? " (live switch file: old rules while it exists)" : "");
+    }
+    if (file && s_vp_frame - checked >= 750) {
+        checked = s_vp_frame;
+        FILE *f = fopen(file, "rb");
+        int now = f != NULL;
+        if (f)
+            fclose(f);
+        if (now != old) {
+            old = now;
+            fprintf(stderr, "[APU] monitor mix rules now %s\n",
+                    old ? "old (xemu)" : "speakers");
+        }
+    }
+    return old != 0;
+}
+
 /* xemu's peek_ahead_multipass_bin: from v along the list, the bin of the
  * first multipass voice after it (-1 if v is multipass itself or none). */
 static int peek_ahead_multipass_bin(MCPXAPUState *d, uint16_t v)
@@ -1285,6 +1358,10 @@ static void voice_process(MCPXAPUState *d,
 
     float samples[NUM_SAMPLES_PER_FRAME][2];
     memset(samples, 0, sizeof(samples));
+    const bool dc = apu_declick_on();
+    /* Played last frame: its gains ramp from there (apu_declick_on). */
+    const bool dc_ramp = dc && s_dc_frame[v] == s_vp_frame - 1;
+    int got = 0;                              /* samples this frame */
 
     bool multipass = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS) != 0;
@@ -1306,25 +1383,41 @@ static void voice_process(MCPXAPUState *d,
         }
     } else {
         int empty = 0;
-        for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
+        while (got < NUM_SAMPLES_PER_FRAME) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) return;
-            int count = voice_resample(d, v, &samples[sample_count],
-                                       NUM_SAMPLES_PER_FRAME - sample_count, rate);
+            if (!active) {
+                if (!dc) return;
+                break;                    /* keep what it made (declick) */
+            }
+            int count = voice_resample(d, v, &samples[got],
+                                       NUM_SAMPLES_PER_FRAME - got, rate);
             if (count < 0) break;
             /* An active voice that keeps producing nothing is an underrun,
              * not a reason to spin. Asking it again at once cannot change the
              * answer, and this loop holds d->lock: Burnout 3's vehicle select
              * sat here indefinitely while the title waited in voice_lock. */
             if (count == 0 && ++empty > 4) break;
-            sample_count += count;
+            got += count;
+        }
+        /* Ended (or ran dry) inside the frame: decay from the last sample
+         * rather than drop to zero. */
+        if (dc && got > 0 && got < NUM_SAMPLES_PER_FRAME) {
+            float y0 = samples[got - 1][0], y1 = samples[got - 1][1];
+            for (int i = got; i < NUM_SAMPLES_PER_FRAME; i++) {
+                y0 *= DECLICK_DECAY;
+                y1 *= DECLICK_DECAY;
+                samples[i][0] = y0;
+                samples[i][1] = y1;
+            }
         }
     }
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-    if (!active) return;
+    /* A voice that ended this frame is mixed once more with the samples it
+     * made (declick); one with none is left to the stop tail. */
+    if (!active && !(dc && !multipass && got > 0)) return;
 
     if (g_apu_prof_on && !multipass)
         prof_voice_clicks(v, samples,
@@ -1456,14 +1549,22 @@ static void voice_process(MCPXAPUState *d,
         }
         g *= attenuate(vol[b]) / hr;
         bin_gain[b] = g;
+        /* Ramp from last frame's gain (apu_declick_on): gi reaches g on
+         * the frame's last sample. */
+        float gi = dc_ramp ? s_dc_bin_g[v][b] : g;
+        float dg = (g - gi) / NUM_SAMPLES_PER_FRAME;
+        s_dc_bin_g[v][b] = g;
         if (hrtf_on) {
-            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
-                mixbins[bin[b]][i] += g * (b < 4 ? samples[i][b >> 1]
-                                                 : dry[i][b % channels]);
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                gi += dg;
+                mixbins[bin[b]][i] += gi * (b < 4 ? samples[i][b >> 1]
+                                                  : dry[i][b % channels]);
+            }
             continue;
         }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            mixbins[bin[b]][i] += g * samples[i][b % channels];
+            gi += dg;
+            mixbins[bin[b]][i] += gi * samples[i][b % channels];
         }
     }
 
@@ -1478,19 +1579,50 @@ static void voice_process(MCPXAPUState *d,
         int mp_bin = -1;
         if (voice_list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_MP_TOP - 1)
             mp_bin = peek_ahead_multipass_bin(d, v);
-        float raw[8], place[2][2];
+        float raw[8], place[2][2], dry_place[2] = { 0.0f, 0.0f };
         for (int b = 0; b < 8; b++) {
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
             raw[b] = attenuate(vol[b]) / hr;
         }
-        /* An HRTF voice's columns are ears, not source channels. */
-        mcpx_apu_monitor_place(bin, raw, hrtf_on ? 1 : channels, mp_bin, place);
-        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            float s0 = ea_value * samples[i][0], s1 = ea_value * samples[i][1];
-            sample_buf[i][0] += place[0][0] * s0 + place[1][0] * s1;
-            sample_buf[i][1] += place[0][1] * s0 + place[1][1] * s1;
+        if (monitor_rules_old()) {
+            /* An HRTF voice's columns are ears, not source channels. */
+            mcpx_apu_monitor_place(bin, raw, hrtf_on ? 1 : channels, mp_bin,
+                                   place);
+        } else {
+            mcpx_apu_monitor_place_speakers(bin, raw, channels, hrtf_on,
+                                            mp_bin, place, dry_place);
         }
+        /* Envelope and placement as one gain per column and side (and for
+         * an HRTF voice's dry signal), ramped from last frame's
+         * (apu_declick_on). */
+        float gm[6] = { ea_value * place[0][0], ea_value * place[0][1],
+                        ea_value * place[1][0], ea_value * place[1][1],
+                        ea_value * dry_place[0], ea_value * dry_place[1] };
+        float gc[6], gd[6];
+        for (int k = 0; k < 6; k++) {
+            gc[k] = dc_ramp ? s_dc_mon_g[v][k] : gm[k];
+            gd[k] = (gm[k] - gc[k]) / NUM_SAMPLES_PER_FRAME;
+            s_dc_mon_g[v][k] = gm[k];
+        }
+        const bool with_dry = hrtf_on && (gm[4] != 0.0f || gm[5] != 0.0f ||
+                                          gc[4] != 0.0f || gc[5] != 0.0f);
+        float o0 = 0.0f, o1 = 0.0f;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            for (int k = 0; k < 6; k++)
+                gc[k] += gd[k];
+            o0 = gc[0] * samples[i][0] + gc[2] * samples[i][1];
+            o1 = gc[1] * samples[i][0] + gc[3] * samples[i][1];
+            if (with_dry) {
+                o0 += gc[4] * dry[i][0];
+                o1 += gc[5] * dry[i][0];
+            }
+            sample_buf[i][0] += o0;
+            sample_buf[i][1] += o1;
+        }
+        s_dc_last[v][0] = o0;            /* for the stop tail */
+        s_dc_last[v][1] = o1;
     }
+    s_dc_frame[v] = s_vp_frame;
 }
 
 /* RECOMP_APU_MONITOR_STEREO=old: stereo voices as xemu plays them (A/B). */
@@ -1554,6 +1686,106 @@ void mcpx_apu_monitor_place(const int bin[8], const float gain[8],
     }
 }
 
+/* Where a mix bin sits for the speaker rules: 0 left (front, back, XTLK
+ * left), 1 right, 2 both at -3 dB (centre), -1 not a speaker (LFE 3, the
+ * I3DL2 reverb send 10, effect sends 11-30, submix 31). */
+static int monitor_side(int bin)
+{
+    switch (bin) {
+    case 0: case 4: case 6: case 8: return 0;
+    case 1: case 5: case 7: case 9: return 1;
+    case 2: return 2;
+    default: return -1;
+    }
+}
+
+/* The monitor mix's default rules (to-do 7, effects too loud next to
+ * music). xemu's monitor mix (mcpx_apu_monitor_place) plays a voice at its
+ * loudest bin, sends included. That favours effects over music:
+ * - a 3D sound's source voice sends to submix 31 (read by a multipass HRTF
+ *   voice) and to the I3DL2 reverb send 10 at the same level. With 31
+ *   skipped, it was heard dry, centred, at its reverb-send level, on top of
+ *   its HRTF copy. On the console bin 10 only feeds the reverb (wet).
+ * - the multipass HRTF voice was placed at its loudest bin, which is its
+ *   LFE / I3DL2 send (0 dB), not its XTLK (ears) level, and its dry centre
+ *   send was left out;
+ * - a centre-only mono voice played full on both sides (+3 dB against a
+ *   -3 dB centre split), a single-speaker one on both (position lost).
+ * Here only speaker bins count: sends, LFE and the submix are left out
+ * (the sound reaches the speakers through the multipass voice or not at
+ * all, as without the DSP's reverb). Each side takes its loudest speaker
+ * bin, the centre at -3 dB on both. An HRTF voice (hrtf) plays its ears
+ * (columns 0/1) at its loudest XTLK slot (0-3) and its dry signal, which
+ * the caller mixes with dry_out[side], by its other speaker slots (4-7).
+ * Stereo voices keep the per-column placement (music was right). */
+void mcpx_apu_monitor_place_speakers(const int bin[8], const float gain[8],
+                                     unsigned int channels, bool hrtf,
+                                     int skip_bin, float out[2][2],
+                                     float dry_out[2])
+{
+    memset(out, 0, sizeof(float) * 4);
+    dry_out[0] = dry_out[1] = 0.0f;
+    if (channels < 1) channels = 1;
+    if (channels > 2) channels = 2;
+
+    if (hrtf) {
+        float e = 0.0f;
+        for (int b = 0; b < 4; b++)
+            if (bin[b] != skip_bin && monitor_side(bin[b]) >= 0 &&
+                gain[b] > e)
+                e = gain[b];
+        out[0][0] = e;                    /* left ear */
+        out[1][1] = e;                    /* right ear */
+        for (int b = 4; b < 8; b++) {
+            int s = bin[b] == skip_bin ? -1 : monitor_side(bin[b]);
+            if (s < 0)
+                continue;
+            float g = s == 2 ? gain[b] * 0.70710678f : gain[b];
+            for (int k = 0; k < 2; k++)
+                if ((s == 2 || s == k) && g > dry_out[k])
+                    dry_out[k] = g;
+        }
+        return;
+    }
+
+    if (channels == 1) {
+        float side[2] = { 0.0f, 0.0f };
+        for (int b = 0; b < 8; b++) {
+            int s = bin[b] == skip_bin ? -1 : monitor_side(bin[b]);
+            if (s < 0)
+                continue;
+            float g = s == 2 ? gain[b] * 0.70710678f : gain[b];
+            for (int k = 0; k < 2; k++)
+                if ((s == 2 || s == k) && g > side[k])
+                    side[k] = g;
+        }
+        out[0][0] = side[0];              /* mono: both columns the same */
+        out[1][1] = side[1];
+        return;
+    }
+
+    float g[2] = { 0.0f, 0.0f };
+    int gb[2] = { -1, -1 };
+    for (int b = 0; b < 8; b++) {
+        if (bin[b] == skip_bin || monitor_side(bin[b]) < 0)
+            continue;
+        unsigned int c = (unsigned int)b % 2;
+        if (gain[b] > g[c]) {
+            g[c] = gain[b];
+            gb[c] = bin[b];
+        }
+    }
+    for (int c = 0; c < 2; c++) {
+        if (gb[c] < 0)
+            continue;
+        int s = monitor_side(gb[c]);
+        if (s == 2)
+            out[c][0] = out[c][1] = g[c] * 0.70710678f;
+        else
+            out[c][s] = g[c];
+    }
+}
+
 /* ============================================================
  * VP Frame - Process all voice lists
  *
@@ -1564,6 +1796,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    s_vp_frame++;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1617,6 +1850,26 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             const char *e = getenv("RECOMP_APU_GAIN_DB");
             gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -6.0f) / 20.0f);
             fprintf(stderr, "[APU] monitor mix output gain %.2f\n", gain);
+        }
+        /* Voices that played last frame and not in this one: their last
+         * sample decays instead of dropping to zero (apu_declick_on). */
+        if (apu_declick_on()) {
+            for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+                if (s_dc_frame[v] == s_vp_frame - 1) {
+                    s_dc_tail[0] += s_dc_last[v][0];
+                    s_dc_tail[1] += s_dc_last[v][1];
+                }
+            }
+            if (s_dc_tail[0] != 0.0f || s_dc_tail[1] != 0.0f) {
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                    s_dc_tail[0] *= DECLICK_DECAY;
+                    s_dc_tail[1] *= DECLICK_DECAY;
+                    d->vp.sample_buf[i][0] += s_dc_tail[0];
+                    d->vp.sample_buf[i][1] += s_dc_tail[1];
+                }
+                if (fabsf(s_dc_tail[0]) < 1e-6f) s_dc_tail[0] = 0.0f;
+                if (fabsf(s_dc_tail[1]) < 1e-6f) s_dc_tail[1] = 0.0f;
+            }
         }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             d->vp.sample_buf[i][0] *= gain;
