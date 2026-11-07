@@ -143,6 +143,7 @@ static int s_texwrap = 1;               /* RECOMP_INTERP_TEXWRAP=0: texture
                                          * matrices blended straight */
 static int s_nearest = 1;               /* RECOMP_INTERP_NEAREST=0: by order */
 static int s_jumplog;                   /* RECOMP_INTERP_JUMPLOG=1 (test) */
+static int s_hold_on = 1;               /* RECOMP_INTERP_HOLD=0: ignored */
 static int s_rot = 1;                   /* RECOMP_INTERP_ROT=0: plain lerp */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
 static uint64_t s_spos_refused;
@@ -220,6 +221,14 @@ static int s_recording;
 static int s_rep;                       /* replaying */
 static Frame *s_rep_f, *s_rep_prev;     /* run, and its partner frame */
 static const int32_t *s_rep_map;        /* s_rep_f's draw -> partner's, or -1 */
+static const int32_t *s_rep_donor;      /* unpaired draw -> paired one it
+                                         * borrows the camera from, or -1 */
+static int32_t *s_donor_f, *s_donor_p;  /* for N's draws, N-1's */
+static uint32_t s_donor_fcap, s_donor_pcap;
+static int s_borrow = 1;                /* RECOMP_INTERP_BORROW=0: off */
+static int s_donors_ok, s_donors_p_ok;  /* this frame's donor lists made */
+static uint32_t s_borrowed;             /* draws that borrowed (10 s) */
+static VshConsts s_tmp2;
 static int32_t *s_inv;                  /* N-1's draws -> N's (replaying N-1) */
 static uint32_t s_inv_cap;
 static uint32_t s_rep_j;
@@ -294,6 +303,10 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_SPOS_MAX");
         if (e)
             s_spos_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_BORROW");
+        s_borrow = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_HOLD");
+        s_hold_on = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_ROT");
         s_rot = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_NEAREST");
@@ -335,6 +348,14 @@ static unsigned s_rep_id;
 unsigned nv2a_interp_replay_id(void)
 {
     return s_rep_id;
+}
+
+static int s_hold;                      /* NV_HOST_FX_INTERP_HOLD_ON .. _OFF */
+static uint32_t s_held;                 /* draws drawn as their frame (10 s) */
+
+void nv2a_interp_hold(int on)
+{
+    s_hold = on && s_hold_on;
 }
 
 void nv2a_interp_note_cut(void)
@@ -605,12 +626,14 @@ static int rot_rows(const float (*m)[4], float l[3])
  * is scaled back to its blended length; its direction stays the blend's
  * (halfway turned). The w (translation) is left alone. */
 static void rot_fix(VshConsts out, const VshConsts own, const VshConsts partner,
-                    float w)
+                    float w, const uint64_t *reads)
 {
     uint32_t r, i;
     float la[3], lb[3];
 
     for (r = 0; r + 2 < NV2A_VSH_CONSTANTS; r++) {
+        if (reads && !(reads[r >> 6] >> (r & 63) & 1))
+            continue;
         if (!memcmp(own[r], partner[r], 48))
             continue;                   /* all three the same: nothing */
         if (!rot_rows((const float (*)[4])own[r], la)
@@ -636,12 +659,15 @@ static void rot_fix(VshConsts out, const VshConsts own, const VshConsts partner,
  * (a scroll wrapped back by whole repeats) move the short way instead, and
  * that moved by more than half a repeat otherwise are the nearer frame's. */
 static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
-                  float w, const uint64_t *texmat, const uint8_t *keep)
+                  float w, const uint64_t *texmat, const uint8_t *keep,
+                  const uint64_t *reads)
 {
     uint32_t r, c;
 
     for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
-        if (!memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
+        /* A register the program never reads: as it is (only speed). */
+        if ((reads && !(reads[r >> 6] >> (r & 63) & 1))
+            || !memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
             || all_zero(partner[r]) || (keep && keep[r])) {
             memcpy(out[r], own[r], sizeof out[r]);
             continue;
@@ -673,7 +699,7 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
         }
     }
     if (s_rot)
-        rot_fix(out, own, partner, w);
+        rot_fix(out, own, partner, w, reads);
 }
 
 static int mats_jumped(const float (*a)[4], const float (*b)[4]);
@@ -851,7 +877,10 @@ void nv2a_interp_draw(void)
             }
         }
         s_extra = -1;
+        if (s_hold)
+            s_held++;
         if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])
+            && !s_hold
             && !(s_teleport == 2
                  && mats_jumped((const float (*)[4])f->consts[j],
                                 (const float (*)[4])
@@ -875,7 +904,8 @@ void nv2a_interp_draw(void)
                   (const float (*)[4])s_rep_prev->consts[pj],
                   s_rep_t, f->prog[j] != PROG_NONE
                            ? s_prog[f->prog[j]].texmat : NULL,
-                  jumped ? keep : NULL);
+                  jumped ? keep : NULL,
+                  f->prog[j] != PROG_NONE ? s_prog[f->prog[j]].reads : NULL);
             nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
             /* The same vertices drawn with another index list in the
              * partner frame (a ground's pieces, each frame only what that
@@ -891,6 +921,25 @@ void nv2a_interp_draw(void)
                 && s_rep_prev->ix[pj][1]
                 && s_rep_prev->ix[pj][1] <= NV_MAX_INDICES)
                 s_extra = pj;
+        } else if (s_rep_blend && s_rep_map[j] < 0 && s_rep_donor
+                   && s_rep_donor[j] >= 0 && !s_hold
+                   && ctl_blends(f->part[j][0])) {
+            /* No partner (culled in the other frame, new, gone): it moves
+             * with the camera at least -- the registers it shares bit for
+             * bit with a paired draw of its program take that draw's
+             * blend, the rest stay its own. Without this, the pieces the
+             * newer frame culled at the edge of a turn stayed where the
+             * older frame saw them, and the sky showed beside them. */
+            int32_t d = s_rep_donor[j], pd = s_rep_map[d];
+            uint32_t r;
+            blend(s_tmp2, (const float (*)[4])f->consts[d],
+                  (const float (*)[4])s_rep_prev->consts[pd], s_rep_t,
+                  NULL, NULL, NULL);
+            for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+                memcpy(s_tmp[r], !memcmp(f->consts[j][r], f->consts[d][r], 16)
+                                 ? s_tmp2[r] : f->consts[j][r], 16);
+            nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
+            s_borrowed++;
         } else {
             nv2a_vsh_constants_set_all((const float (*)[4])f->consts[j]);
         }
@@ -1689,13 +1738,15 @@ static void put_seq(uint32_t seq)
  * from, put back first), each paired draw's constants moved w of the way
  * toward its partner's in frame partner (map: f's draw -> partner's). */
 static void replay(Frame *f, Frame *partner, const int32_t *map, float w,
-                   uint32_t start_seq)
+                   uint32_t start_seq, const int32_t *donor)
 {
     put_seq(start_seq);
+    s_rep_donor = donor;
     memcpy(&g_pb, f->start_pb, sizeof g_pb);
     nv2a_vsh_state_load(f->start_vsh);
     pb_transform_forget();
     s_rep_id++;
+    s_hold = 0;
     s_rep_f = f;
     s_rep_prev = partner;
     s_rep_map = map;
@@ -1704,6 +1755,7 @@ static void replay(Frame *f, Frame *partner, const int32_t *map, float w,
     s_rep = 1;
     run_stream(f);
     s_rep = 0;
+    s_hold = 0;
     pb_transform_forget();
 }
 
@@ -1754,14 +1806,18 @@ static void stats_line(LONGLONG now)
                 " they were recorded%c", s_vdiff, 10);
     fprintf(stderr, "[INTERP] nearest pairing: %llu groups, %llu draws paired"
             " out of order; %llu strict and %llu loose pairs refused as too"
-            " unlike, %llu as moved across the picture; %u"
+            " unlike, %llu as moved across the picture; %u held draws; %u"
+            " unpaired draws moved with the camera; %u"
             " turned matrices kept their size%c",
             (unsigned long long)s_near_groups,
             (unsigned long long)s_near_moved,
             (unsigned long long)s_pair_refused,
             (unsigned long long)s_loose_refused,
-            (unsigned long long)s_spos_refused, s_rot_fixed, 10);
+            (unsigned long long)s_spos_refused, s_held, s_borrowed,
+            s_rot_fixed, 10);
+    s_borrowed = 0;
     s_pair_refused = s_spos_refused = 0;
+    s_held = 0;
     fprintf(stderr, "[INTERP] pair distances <.01 <.05 <.1 <.25 <.5 <1 <2"
             " more: strict %u %u %u %u %u %u %u %u, loose %u %u %u %u %u %u"
             " %u %u%c", s_dhist[0][0], s_dhist[0][1], s_dhist[0][2],
@@ -1928,6 +1984,40 @@ static void trace_frame(const Frame *f, const Frame *prev)
         free(taken);
     }
     fflush(stderr);
+}
+
+/* For each draw of a without a partner (map[j] < 0), the nearest paired
+ * draw of the same program in draw order (within 256) that shares with it,
+ * bit for bit, a register its own pair changed (the camera's): out[j], or
+ * -1. */
+static void find_donors(const Frame *a, const int32_t *map, const Frame *b,
+                        int32_t *out)
+{
+    uint32_t j, k, r;
+
+    for (j = 0; j < a->ndraws; j++) {
+        out[j] = -1;
+        if (map[j] >= 0)
+            continue;
+        for (k = 1; k <= 256 && out[j] < 0; k++) {
+            int s2;
+            for (s2 = 0; s2 < 2 && out[j] < 0; s2++) {
+                int64_t d = s2 ? (int64_t)j + k : (int64_t)j - k;
+                const float (*x)[4], (*y)[4];
+                if (d < 0 || d >= a->ndraws || map[d] < 0
+                    || a->part[d][0] != a->part[j][0])
+                    continue;
+                x = (const float (*)[4])a->consts[d];
+                y = (const float (*)[4])b->consts[map[d]];
+                for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+                    if (memcmp(x[r], y[r], 16)
+                        && !memcmp(x[r], a->consts[j][r], 16)) {
+                        out[j] = (int32_t)d;
+                        break;
+                    }
+            }
+        }
+    }
 }
 
 static void flip_before(const Nv2aPbBackend *be);
@@ -2111,6 +2201,28 @@ static void flip_before(const Nv2aPbBackend *be)
             inv_ok = 1;
         }
     }
+    {
+        /* Who unpaired draws borrow the camera from (find_donors). */
+        int ok = s_borrow && s_rep_blend;
+        if (ok && s_donor_fcap < f->ndraws) {
+            int32_t *v = realloc(s_donor_f, f->ndraws * sizeof *v);
+            if (v) { s_donor_f = v; s_donor_fcap = f->ndraws; } else ok = 0;
+        }
+        if (ok && inv_ok && s_donor_pcap < prev->ndraws) {
+            int32_t *v = realloc(s_donor_p, prev->ndraws * sizeof *v);
+            if (v) { s_donor_p = v; s_donor_pcap = prev->ndraws; } else ok = 0;
+        }
+        if (ok) {
+            find_donors(f, f->pair, prev, s_donor_f);
+            if (inv_ok)
+                find_donors(prev, s_inv, f, s_donor_p);
+        }
+        if (!ok || !inv_ok) {
+            /* None this frame: replay() is given NULL below. */
+        }
+        s_donors_ok = ok;
+        s_donors_p_ok = ok && inv_ok;
+    }
     for (k = 1; k < (uint32_t)n; k++) {
         float t = (float)k / (float)n;
         int older = s_near && s_rep_blend && n > 2 && 2 * k < (uint32_t)n
@@ -2124,10 +2236,10 @@ static void flip_before(const Nv2aPbBackend *be)
             /* The middle picture from both frames, the nearer of the two
              * per pixel (RECOMP_INTERP_BOTH): each fills what the other
              * culled past its edge. */
-            replay(prev, f, s_inv, t, s_keep_seq - 2);
+            replay(prev, f, s_inv, t, s_keep_seq - 2, s_donors_p_ok ? s_donor_p : NULL);
             if (be->interp(NV_INTERP_SAVE, s_base + (int)k)
                 && be->interp(NV_INTERP_DEPTH, 0)) {
-                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
+                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1, s_donors_ok ? s_donor_f : NULL);
                 /* Ties to the frame nearer in time: N-1's picture before
                  * the middle, N's from it on. */
                 if (be->interp(NV_INTERP_BOTH, (s_base + (int)k)
@@ -2137,12 +2249,12 @@ static void flip_before(const Nv2aPbBackend *be)
                     continue;
                 }
             }
-            replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
+            replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1, s_donors_ok ? s_donor_f : NULL);
         } else if (s_mode != 1) {
             if (older)
-                replay(prev, f, s_inv, t, s_keep_seq - 2);
+                replay(prev, f, s_inv, t, s_keep_seq - 2, s_donors_p_ok ? s_donor_p : NULL);
             else
-                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1);
+                replay(f, prev, f->pair, 1.0f - t, s_keep_seq - 1, s_donors_ok ? s_donor_f : NULL);
         }
         if (s_mode == 3 && k == 1)
             s_rep_blend = 1;
@@ -2209,6 +2321,7 @@ void nv2a_interp_flip_after(void)
         InterlockedExchange(&s_q_pending, 1);
     /* Frame N+1 starts here. */
     s_cut = 0;
+    s_hold = 0;
     s_cur ^= 1;
     f = &s_fr[s_cur];
     f->nwords = 0;

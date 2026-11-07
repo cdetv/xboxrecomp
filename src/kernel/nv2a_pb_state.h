@@ -427,6 +427,12 @@ typedef struct {
  * parameters): frame interpolation does not blend it with the frame before
  * (nv2a_interp.c). Not a back end's. */
 #define NV_HOST_FX_INTERP_CUT 2u
+/* NV_HOST_FX_INTERP_HOLD_ON / _OFF: frame interpolation draws the batches
+ * between the two as their own frame, never blended -- a game's particles,
+ * whose per-particle constants shift whenever one is born or dies, so a
+ * blend mixed different particles (streaks). */
+#define NV_HOST_FX_INTERP_HOLD_ON  3u
+#define NV_HOST_FX_INTERP_HOLD_OFF 4u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 

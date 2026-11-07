@@ -37,6 +37,8 @@ void nv2a_interp_after_draw(const Nv2aPbBackend *be);
 
 /* NV_HOST_FX_INTERP_CUT in the stream: the frame is a camera cut. */
 void nv2a_interp_note_cut(void);
+/* NV_HOST_FX_INTERP_HOLD_ON / _OFF met in the stream (1 / 0). */
+void nv2a_interp_hold(int on);
 
 /* NV097_FLIP_STALL, after the wait and before the back end presents: draws
  * and presents the in-between pictures (before), then the next frame's

@@ -1250,6 +1250,11 @@ static void host_method(uint32_t method, uint32_t param)
         nv2a_interp_note_cut();
         return;
     }
+    if (param == NV_HOST_FX_INTERP_HOLD_ON || param == NV_HOST_FX_INTERP_HOLD_OFF) {
+        nv2a_pb_merge_flush();          /* not merged across the mark */
+        nv2a_interp_hold(param == NV_HOST_FX_INTERP_HOLD_ON);
+        return;
+    }
     if (g_pb_ftrace == 2)
         fprintf(stderr, "[FTRACE] host effect %u: %08X %08X %08X %08X %08X"
                 " %08X%c", param, p[0], p[1], p[2], p[3], p[4], p[5], 10);
