@@ -51,6 +51,12 @@ uint64_t g_dbg_muted_voices[4] = { 0 };
 /* Global audio mute — disables all AWD/mixer sound playback */
 volatile int g_audio_muted = 0;  /* 0 = audio enabled */
 
+/* RECOMP_APU_MUTE=1: silence at the speakers only. Everything is mixed as
+ * usual (voices advance, streams complete, the title's waits on sounds end
+ * as they would) and the finished samples are zeroed before output. For
+ * runs nobody listens to, such as a title's shader pre-compile pass. */
+static int g_out_muted;
+
 /* xbox_ApuSetPaused: the frame thread idles while this is set. */
 static volatile LONG g_host_paused = 0;
 
@@ -634,6 +640,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(d->monitor.frame_buf, n);
     }
+    if (g_out_muted) {
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    }
     wav_append((const int16_t (*)[2])d->monitor.frame_buf, n);
 
     if (xa2_is_active()) {
@@ -1046,6 +1055,13 @@ MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr)
     g_apu_ram_ptr = ram_ptr;
     g_state = d;
     g_apu_prof_on = getenv("RECOMP_APU_PROFILE") != NULL;
+    {
+        const char *e = getenv("RECOMP_APU_MUTE");
+        g_out_muted = e && atoi(e) != 0;
+        if (g_out_muted) {
+            fprintf(stderr, "[APU] output muted (RECOMP_APU_MUTE)\n");
+        }
+    }
     d->ram_ptr = ram_ptr;
 
     d->set_irq = false;

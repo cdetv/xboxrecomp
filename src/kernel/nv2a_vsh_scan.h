@@ -58,4 +58,11 @@ uint64_t nv2a_vsh_scan_hash(const uint32_t *ins, uint32_t count);
  * on runs the scans; both unset, the request does nothing. */
 void nv2a_vsh_prescan_request(const char *why);
 
+/* 1 while a request has not been scanned yet (waiting or scanning), so
+ * what it finds may still be on its way to the compile queue; 0 with both
+ * switches unset. For a title's shader pre-compile pass, which moves on
+ * only when this, nv2a_vsh_gpu_precompile_stats' waiting and
+ * nv2a_d3d11_ps_spec_pending (nv2a_draw_d3d11.c) are all 0. */
+int nv2a_vsh_prescan_busy(void);
+
 #endif
