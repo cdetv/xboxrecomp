@@ -102,6 +102,7 @@ typedef struct {
     uint8_t  *inl;                      /* drawn from INLINE_ARRAY / immediate */
     uint16_t *prog;                     /* s_prog entry, or PROG_NONE */
     uint64_t *vh;                       /* RECOMP_INTERP_VCHECK: vertex bytes */
+    uint8_t  *held;                     /* drawn between HOLD_ON and _OFF */
     float   (*spos)[3];                 /* first vertex on the target: x, y
                                          * (0..1 of the clip), valid (0/1) */
     uint32_t *idx;                      /* in here */
@@ -974,7 +975,6 @@ void nv2a_interp_draw(void)
         if (s_hold)
             s_held++;
         if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])
-            && !s_hold
             && !(s_teleport == 2
                  && mats_jumped((const float (*)[4])f->consts[j],
                                 (const float (*)[4])
@@ -1020,8 +1020,7 @@ void nv2a_interp_draw(void)
                 && s_rep_prev->ix[pj][1] <= NV_MAX_INDICES)
                 s_extra = pj;
         } else if (s_rep_blend && s_rep_map[j] < 0 && s_rep_donor
-                   && s_rep_donor[j] >= 0 && !s_hold
-                   && ctl_blends(f->part[j][0])) {
+                   && s_rep_donor[j] >= 0 && ctl_blends(f->part[j][0])) {
             /* No partner (culled in the other frame, new, gone): it moves
              * with the camera at least -- the registers it shares bit for
              * bit with a paired draw of its program take that draw's
@@ -1075,8 +1074,11 @@ void nv2a_interp_draw(void)
                 uint16_t *pg = realloc(f->prog, cap * sizeof *pg);
                 uint64_t *vh = realloc(f->vh, cap * sizeof *vh);
                 float (*sp)[3] = realloc(f->spos, cap * sizeof *sp);
+                uint8_t *hd = realloc(f->held, cap);
                 if (sp)
                     f->spos = sp;
+                if (hd)
+                    f->held = hd;
                 if (pg)
                     f->prog = pg;
                 if (vh)
@@ -1091,7 +1093,7 @@ void nv2a_interp_draw(void)
                     f->attr = at;
                 if (il)
                     f->inl = il;
-                if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp)
+                if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp || !hd)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -1104,6 +1106,7 @@ void nv2a_interp_draw(void)
         f->prog[f->ndraws] = s_texwrap ? prog_info() : PROG_NONE;
         f->vh[f->ndraws] = s_vcheck ? vtx_hash() : 0;
         spos_note(f->spos[f->ndraws], f->ndraws);
+        f->held[f->ndraws] = (uint8_t)s_hold;
         {
             /* Its index list and arrays, for the union below
              * (nv2a_interp_after_draw). */
@@ -1764,6 +1767,19 @@ static uint32_t pair_frames(Frame *f, const Frame *prev)
     memset(s_taken, 0, prev->ndraws);
     paired = pair_pass(f, prev, 0);
     paired -= pair_refuse(f, prev);
+    if (s_hold_on) {
+        /* Held draws (a game's particles and effects, HOLD_ON .. _OFF):
+         * no partner -- each frame's own per-particle values, only the
+         * camera borrowed (find_donors), so they follow a turn smoothly
+         * without mixing different particles. */
+        uint32_t j;
+        for (j = 0; j < f->ndraws; j++)
+            if (f->held[j] && f->pair[j] >= 0) {
+                s_taken[f->pair[j]] = 1;    /* not for a loose pair either */
+                f->pair[j] = -1;
+                paired--;
+            }
+    }
     if (!s_strict) {
         uint32_t p1 = pair_pass(f, prev, 1);
         uint32_t p2 = pair_pass(f, prev, 2);
