@@ -1438,6 +1438,52 @@ static int camera_jumped(const Frame *f, const Frame *prev)
     why = nrows >= 3
           ? pair_jumped((const float (*)[4])prev->consts[f->pair[j0]],
                         (const float (*)[4])f->consts[j0], rows, 1) : 0;
+    {
+        /* The eye itself: from three shared rows that are a rotation in
+         * both frames (the view matrix, translation in w), eye = -sum t_i
+         * R_i. A step far beyond the last one (more than 60 units and 4x
+         * the last + 20) is a cut: Conker past a wall, the camera snapping
+         * close, sat an in-between camera where neither frame drew. */
+        static float vlast[3];
+        static int have;
+        const float (*a)[4] = (const float (*)[4])prev->consts[f->pair[j0]];
+        const float (*b)[4] = (const float (*)[4])f->consts[j0];
+        uint32_t r0;
+        for (r0 = 0; r0 + 2 < NV2A_VSH_CONSTANTS; r0++) {
+            float ea[3] = {0, 0, 0}, eb[3] = {0, 0, 0}, v[3], vl, ll;
+            uint32_t i, c;
+            int ok = rows[r0] && rows[r0 + 1] && rows[r0 + 2];
+            for (i = 0; ok && i < 3; i++) {
+                float la = len3(a[r0 + i]), lb = len3(b[r0 + i]);
+                ok = la > 0.98f && la < 1.02f && lb > 0.98f && lb < 1.02f;
+            }
+            if (!ok)
+                continue;
+            for (i = 0; i < 3; i++)
+                for (c = 0; c < 3; c++) {
+                    ea[c] -= a[r0 + i][3] * a[r0 + i][c];
+                    eb[c] -= b[r0 + i][3] * b[r0 + i][c];
+                }
+            for (c = 0; c < 3; c++)
+                v[c] = eb[c] - ea[c];
+            vl = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+            ll = sqrtf(vlast[0] * vlast[0] + vlast[1] * vlast[1]
+                       + vlast[2] * vlast[2]);
+            /* Opt-in (RECOMP_INTERP_EYECUT=1): in Sunny Days the rows at
+             * c96 gave 80-100 units a frame while running, so they are not
+             * a pure view matrix there; unverified. */
+            if (have && !why && vl > 60.0f && vl > 4.0f * ll + 20.0f
+                && getenv("RECOMP_INTERP_EYECUT"))
+                why = 4;
+            if (s_log >= 2)
+                fprintf(stderr, "[IEYE] flip %u rows c%u: eye %.1f,%.1f,%.1f"
+                        " step %.1f (last %.1f)%c", g_pb.flips, r0, eb[0],
+                        eb[1], eb[2], vl, ll, 10);
+            memcpy(vlast, v, sizeof v);
+            have = 1;
+            break;
+        }
+    }
 
     if (s_log >= 2) {
         /* RECOMP_INTERP_LOG=2: the camera's change every frame. */
@@ -1480,7 +1526,7 @@ static int camera_jumped(const Frame *f, const Frame *prev)
         fprintf(stderr, "[ICUT] flip %u: camera jumped (%s, %u shared"
                 " registers)%c", g_pb.flips, why == 1 ? "turned"
                 : why == 2 ? "projection" : why == 3 ? "moved"
-                : "a third of the draws", nrows, 10);
+                : why == 4 ? "eye jumped" : "?", nrows, 10);
     return why != 0;
 }
 
@@ -1567,6 +1613,10 @@ static uint32_t pair_refuse(Frame *f, const Frame *prev)
     if (ns) {
         qsort(sds, ns, sizeof *sds, cmp_float);
         s_sd_med = sds[ns / 2];
+        if (s_log >= 2)
+            fprintf(stderr, "[ISPOSMED] flip %u: %u draws, screen move median"
+                    " %.3f, 75%% %.3f, 90%% %.3f%c", g_pb.flips, ns, s_sd_med,
+                    sds[ns * 3 / 4], sds[ns * 9 / 10], 10);
     }
     for (j = 0; j < f->ndraws; j++) {
         int32_t pj = f->pair[j];
