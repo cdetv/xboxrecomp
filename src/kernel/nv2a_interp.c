@@ -102,6 +102,8 @@ typedef struct {
     uint8_t  *inl;                      /* drawn from INLINE_ARRAY / immediate */
     uint16_t *prog;                     /* s_prog entry, or PROG_NONE */
     uint64_t *vh;                       /* RECOMP_INTERP_VCHECK: vertex bytes */
+    float   (*spos)[3];                 /* first vertex on the target: x, y
+                                         * (0..1 of the clip), valid (0/1) */
     uint32_t *idx;                      /* in here */
     size_t    nidx, capidx;
     VshConsts *consts;
@@ -140,6 +142,17 @@ static int s_both;                      /* RECOMP_INTERP_BOTH: 1 (default) middl
 static int s_texwrap = 1;               /* RECOMP_INTERP_TEXWRAP=0: texture
                                          * matrices blended straight */
 static int s_nearest = 1;               /* RECOMP_INTERP_NEAREST=0: by order */
+static int s_jumplog;                   /* RECOMP_INTERP_JUMPLOG=1 (test) */
+static int s_rot = 1;                   /* RECOMP_INTERP_ROT=0: plain lerp */
+static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
+static uint64_t s_spos_refused;
+#define SPOS_MAX_DRAWS 6000u            /* per frame: the rest go without */
+static uint32_t s_rot_fixed;            /* matrices rescaled (10 s) */
+static float s_pair_max = 1.0f;         /* RECOMP_INTERP_PAIR_MAX: strict
+                                         * pairs less alike are refused */
+static uint64_t s_pair_refused;
+static float s_loose_max = 1.0f;        /* RECOMP_INTERP_LOOSE_MAX: loose pairs
+                                         * less alike are refused (draw_dist) */
 static int s_vcheck;                    /* RECOMP_INTERP_VCHECK=1 (test) */
 static uint32_t s_vdiff, s_vsaid;       /* replayed draws whose vertices
                                          * changed since recorded (10 s) */
@@ -194,6 +207,8 @@ static uint64_t vtx_hash(void)
 typedef struct {
     uint64_t hash;
     uint64_t texmat[3];                 /* bit r: c[r] (192 bits) */
+    uint64_t reads[3];                  /* registers it reads (relative:
+                                         * from the base to the end) */
     int used;
 } ProgInfo;
 static ProgInfo s_prog[PROG_MAX];
@@ -269,6 +284,18 @@ int nv2a_interp_n(void)
         s_strict = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_TEXWRAP");
         s_texwrap = !(e && *e == '0');
+        s_jumplog = getenv("RECOMP_INTERP_JUMPLOG") != NULL;
+        e = getenv("RECOMP_INTERP_PAIR_MAX");
+        if (e)
+            s_pair_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_LOOSE_MAX");
+        if (e)
+            s_loose_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_SPOS_MAX");
+        if (e)
+            s_spos_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_ROT");
+        s_rot = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_NEAREST");
         s_nearest = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_VCHECK");
@@ -429,7 +456,7 @@ static int all_zero(const float *v)
  * the camera's (a "wrap" there moved the picture). Temps are followed whole
  * (a partial write adds to what the temp carried). */
 static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
-                        uint64_t texmat[3])
+                        uint64_t texmat[3], uint64_t reads[3])
 {
     uint64_t via[16][3];                /* texture matrix candidates in it */
     uint64_t all[16][3];                /* every constant that went into it */
@@ -439,6 +466,7 @@ static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
     memset(via, 0, sizeof via);
     memset(all, 0, sizeof all);
     texmat[0] = texmat[1] = texmat[2] = 0;
+    reads[0] = reads[1] = reads[2] = 0;
     for (i = 0; i < count; i++) {
         const Nv2aVshIns *I = &ins[i];
         uint64_t c[3] = {0, 0, 0}, a[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
@@ -447,6 +475,11 @@ static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
             const Nv2aVshSrc *S = &I->src[s];
             if (!(I->need & (1u << s)))
                 continue;
+            if (S->mux == 3 && I->cidx < NV2A_VSH_CONSTANTS) {
+                uint32_t r = I->cidx, e = I->rel ? NV2A_VSH_CONSTANTS : r + 1;
+                for (; r < e; r++)
+                    reads[r >> 6] |= 1ull << (r & 63);
+            }
             if (S->mux == 2) {
                 if (I->iidx >= 9 && I->iidx <= 12)
                     texin = 1;
@@ -525,7 +558,7 @@ static uint16_t prog_info(void)
         return PROG_NONE;
     s_prog[h].hash = hash;
     s_prog[h].used = 1;
-    texmat_regs(ins, count, s_prog[h].texmat);
+    texmat_regs(ins, count, s_prog[h].texmat, s_prog[h].reads);
     s_nprog++;
     if (s_log && (s_prog[h].texmat[0] | s_prog[h].texmat[1]
                   | s_prog[h].texmat[2])) {
@@ -540,6 +573,62 @@ static uint16_t prog_info(void)
 }
 
 static uint32_t s_wraps, s_wrap_snaps;  /* this 10 s: wraps blended short */
+
+/* Length of x, y, z of a row. */
+static float len3(const float *v)
+{
+    return sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+/* Whether rows m[0..2] look like a rotation, maybe scaled: x, y, z of each
+ * longer than 1e-3, lengths within 1.5x of each other, near orthogonal. */
+static int rot_rows(const float (*m)[4], float l[3])
+{
+    int i, j;
+    for (i = 0; i < 3; i++)
+        if (!((l[i] = len3(m[i])) > 1e-3f) || !isfinite(l[i]))
+            return 0;
+    for (i = 0; i < 3; i++)
+        for (j = i + 1; j < 3; j++) {
+            float a = l[i] > l[j] ? l[i] : l[j], b = l[i] > l[j] ? l[j] : l[i];
+            float d = m[i][0] * m[j][0] + m[i][1] * m[j][1] + m[i][2] * m[j][2];
+            if (a > 1.5f * b || fabsf(d) > 0.1f * l[i] * l[j])
+                return 0;
+        }
+    return 1;
+}
+
+/* After a register-by-register blend: a matrix that turned shrinks (by
+ * cos(angle/2): 30 % at 90 degrees), so a fast swinging limb or head of a
+ * character collapsed for a picture and looked gone. Each row of a
+ * rotation (three rows near orthogonal, of like lengths, in both frames)
+ * is scaled back to its blended length; its direction stays the blend's
+ * (halfway turned). The w (translation) is left alone. */
+static void rot_fix(VshConsts out, const VshConsts own, const VshConsts partner,
+                    float w)
+{
+    uint32_t r, i;
+    float la[3], lb[3];
+
+    for (r = 0; r + 2 < NV2A_VSH_CONSTANTS; r++) {
+        if (!memcmp(own[r], partner[r], 48))
+            continue;                   /* all three the same: nothing */
+        if (!rot_rows((const float (*)[4])own[r], la)
+            || !rot_rows((const float (*)[4])partner[r], lb))
+            continue;
+        for (i = 0; i < 3; i++) {
+            float *o = out[r + i], lo = len3(o), want;
+            if (!memcmp(o, own[r + i], 16) || !(lo > 1e-6f))
+                continue;               /* kept as it was */
+            want = la[i] + (lb[i] - la[i]) * w;
+            o[0] *= want / lo;
+            o[1] *= want / lo;
+            o[2] *= want / lo;
+        }
+        s_rot_fixed++;
+        r += 2;                         /* past this matrix */
+    }
+}
 
 /* out = own moved w of the way toward partner, register by register; a
  * register zero in either is own's. texmat (NULL: none): the program's
@@ -583,6 +672,8 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
             out[r][c] = isfinite(v) ? v : own[r][c];
         }
     }
+    if (s_rot)
+        rot_fix(out, own, partner, w);
 }
 
 static int mats_jumped(const float (*a)[4], const float (*b)[4]);
@@ -680,6 +771,58 @@ static void ctl_read(void)
             fprintf(stderr, "%c", 10);
         }
     }
+}
+
+/* Where the draw's first vertex lands on its target (the program run on
+ * it once, as the title's constants are now), as x, y in 0..1 of the
+ * clip; out[2] = 1 when known (in front of the camera, finite). Two
+ * draws of one mesh pair by this: Conker's bar room has several of one
+ * bottle, and as the camera turns one leaves at one side while another
+ * comes in at the other -- paired by their constants, one flew across the
+ * picture. Not for programs that write constants. */
+static void spos_note(float out[3], uint32_t j)
+{
+    float in[NV2A_VSH_INPUTS][4];
+    Nv2aVshOutput o;
+    uint32_t a;
+
+    out[0] = out[1] = out[2] = 0.0f;
+    if (s_spos_max <= 0.0f || j >= SPOS_MAX_DRAWS || (g_pb.xf_mode & 3) != 2
+        || nv2a_vsh_cxt_write() || !g_pb.idx_count || !g_pb.clip_w
+        || !g_pb.clip_h || g_pb.merge_nparts)
+        return;
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        if (a < NV_VERTEX_ATTRS)
+            pb_fetch_attr(&g_pb.attr[a], g_pb.idx[0], in[a]);
+        else
+            in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
+    }
+    if (!nv2a_vsh_run((const float (*)[4])in, &o) || !isfinite(o.pos[0])
+        || !isfinite(o.pos[1]) || !(o.pos[3] > 0.0f))
+        return;
+    out[0] = (o.pos[0] - (float)g_pb.clip_x) / (float)g_pb.clip_w;
+    out[1] = (o.pos[1] - (float)g_pb.clip_y) / (float)g_pb.clip_h;
+    out[2] = isfinite(out[0]) && isfinite(out[1]) ? 1.0f : 0.0f;
+}
+
+/* How far draw ia of f and ib of prev moved on their target (0..1 units of
+ * the clip), or -1 when not known for both. */
+static float spos_dist(const Frame *f, const Frame *prev, uint32_t ia,
+                       uint32_t ib)
+{
+    float dx, dy;
+    if (!f->spos || !prev->spos || !f->spos[ia][2] || !prev->spos[ib][2])
+        return -1.0f;
+    /* Only near the picture: a big mesh's first vertex beside or behind the
+     * camera swings far for a small camera move. */
+    if (f->spos[ia][0] < -0.25f || f->spos[ia][0] > 1.25f
+        || f->spos[ia][1] < -0.25f || f->spos[ia][1] > 1.25f
+        || prev->spos[ib][0] < -0.25f || prev->spos[ib][0] > 1.25f
+        || prev->spos[ib][1] < -0.25f || prev->spos[ib][1] > 1.25f)
+        return -1.0f;
+    dx = f->spos[ia][0] - prev->spos[ib][0];
+    dy = f->spos[ia][1] - prev->spos[ib][1];
+    return sqrtf(dx * dx + dy * dy);
 }
 
 void nv2a_interp_draw(void)
@@ -784,6 +927,9 @@ void nv2a_interp_draw(void)
                 uint8_t *il = realloc(f->inl, cap);
                 uint16_t *pg = realloc(f->prog, cap * sizeof *pg);
                 uint64_t *vh = realloc(f->vh, cap * sizeof *vh);
+                float (*sp)[3] = realloc(f->spos, cap * sizeof *sp);
+                if (sp)
+                    f->spos = sp;
                 if (pg)
                     f->prog = pg;
                 if (vh)
@@ -798,7 +944,7 @@ void nv2a_interp_draw(void)
                     f->attr = at;
                 if (il)
                     f->inl = il;
-                if (!pt || !lk || !ix || !at || !il || !pg || !vh)
+                if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -810,6 +956,7 @@ void nv2a_interp_draw(void)
         f->key[f->ndraws] = draw_key_loose(f->loose[f->ndraws]);
         f->prog[f->ndraws] = s_texwrap ? prog_info() : PROG_NONE;
         f->vh[f->ndraws] = s_vcheck ? vtx_hash() : 0;
+        spos_note(f->spos[f->ndraws], f->ndraws);
         {
             /* Its index list and arrays, for the union below
              * (nv2a_interp_after_draw). */
@@ -899,6 +1046,93 @@ typedef struct { float d; uint16_t a, b; } NearCand;
 static NearCand s_near_c[NEAR_MAX * NEAR_MAX];
 static uint64_t s_near_groups, s_near_moved;
 
+/* How unlike two draws' constants are: the sum over the components that
+ * differ of |a - b| / (1 + |a| + |b|), over 16 (a whole four-row matrix
+ * changed completely counts about 1). Small for one object moved; big for
+ * two different objects (other bones, another place). */
+static float draw_dist(const float (*a)[4], const float (*b)[4],
+                       const uint64_t *reads)
+{
+    uint32_t r, c;
+    float d = 0.0f;
+
+    for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+        if (reads && !(reads[r >> 6] >> (r & 63) & 1)) {
+            if (!(reads[r >> 6] >> (r & 63)))
+                r |= 63;                /* none left in this word */
+            continue;
+        }
+        if (!memcmp(a[r], b[r], 16))
+            continue;
+        for (c = 0; c < 4; c++) {
+            float e = fabsf(a[r][c] - b[r][c])
+                      / (1.0f + fabsf(a[r][c]) + fabsf(b[r][c]));
+            d += isfinite(e) ? e : 1.0f;
+        }
+    }
+    return d / 16.0f;
+}
+
+/* s_loose_max: above (switches) */
+static uint64_t s_loose_refused;
+
+/* N's draw ia paired with N-1's ib by key k (0 strict, 1-2 loose): 1, or 0
+ * when a loose pair is too unlike (two different objects that only share
+ * a program: a character coming into view paired with another, drawn
+ * halfway between them). */
+static uint32_t s_dhist[2][8];          /* strict / loose pairs by distance */
+
+static int pair_set(Frame *f, const Frame *prev, uint32_t ia, uint32_t ib,
+                    int k)
+{
+    float d = draw_dist((const float (*)[4])f->consts[ia],
+                        (const float (*)[4])prev->consts[ib],
+                        f->prog[ia] != PROG_NONE ? s_prog[f->prog[ia]].reads
+                                                 : NULL);
+    if (s_log)
+        s_dhist[k != 0][d < 0.01f ? 0 : d < 0.05f ? 1 : d < 0.1f ? 2
+                        : d < 0.25f ? 3 : d < 0.5f ? 4 : d < 1.0f ? 5
+                        : d < 2.0f ? 6 : 7]++;
+    {
+        float sd = spos_dist(f, prev, ia, ib);
+        if (s_spos_max > 0.0f && sd > s_spos_max) {
+            if (s_jumplog)
+                fprintf(stderr, "[ISPOS] flip %u key %d prog %08X attr0 %08X n"
+                        " %u tex0 %08X target %08X: %.3f,%.3f <- %.3f,%.3f"
+                        " (d %.3f)%c", g_pb.flips, k, f->part[ia][0],
+                        f->part[ia][1], f->part[ia][2], f->part[ia][4],
+                        f->part[ia][5], f->spos[ia][0], f->spos[ia][1],
+                        prev->spos[ib][0], prev->spos[ib][1], d, 10);
+            /* Its first vertex jumped across the picture: not the same
+             * object (or a teleport) -- drawn as its own frame. */
+            s_spos_refused++;
+            return 0;
+        }
+    }
+    if (!k && d > s_pair_max) {
+        /* One mesh in two unlike places (a model reused for another
+         * character, a teleport): blended, it flew through the picture. */
+        s_pair_refused++;
+        return 0;
+    }
+    if (k) {
+        if (s_jumplog)
+            fprintf(stderr, "[ILOOSE] flip %u key %d d %.3f prog %08X attr0"
+                    " %08X <- %08X n %u <- %u tex0 %08X target %08X%s%c",
+                    g_pb.flips, k, d, f->part[ia][0], f->part[ia][1],
+                    prev->part[ib][1], f->part[ia][2], prev->part[ib][2],
+                    f->part[ia][4], f->part[ia][5],
+                    d > s_loose_max ? " REFUSED" : "", 10);
+        if (d > s_loose_max) {
+            s_loose_refused++;
+            return 0;
+        }
+    }
+    f->pair[ia] = (int32_t)ib;
+    s_taken[ib] = 1;
+    return 1;
+}
+
 static int cmp_near(const void *x, const void *y)
 {
     float a = ((const NearCand *)x)->d, b = ((const NearCand *)y)->d;
@@ -907,7 +1141,7 @@ static int cmp_near(const void *x, const void *y)
 
 /* Pairs the group s_ka[a0..a1) with s_kb[b0..b1); the draws paired. */
 static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
-                             uint32_t a1, uint32_t b0, uint32_t b1)
+                             uint32_t a1, uint32_t b0, uint32_t b1, int kk)
 {
     static uint8_t vary[NV2A_VSH_CONSTANTS];
     static uint16_t rows[NV2A_VSH_CONSTANTS];
@@ -949,9 +1183,9 @@ static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
         const NearCand *k = &s_near_c[x];
         if (useda[k->a] || usedb[k->b])
             continue;
+        if (!pair_set(f, prev, s_ka[a0 + k->a].i, s_kb[b0 + k->b].i, kk))
+            continue;
         useda[k->a] = usedb[k->b] = 1;
-        f->pair[s_ka[a0 + k->a].i] = (int32_t)s_kb[b0 + k->b].i;
-        s_taken[s_kb[b0 + k->b].i] = 1;
         paired++;
         s_near_moved += k->a != k->b;
     }
@@ -1279,13 +1513,10 @@ static uint32_t pair_pass(Frame *f, const Frame *prev, int k)
             s_st.dup_draws += a1 - a;
         if (s_nearest && (a1 - a > 1 || b1 - b > 1)
             && a1 - a <= NEAR_MAX && b1 - b <= NEAR_MAX && !s_unique)
-            paired += pair_nearest(f, prev, a, a1, b, b1);
+            paired += pair_nearest(f, prev, a, a1, b, b1, k);
         else if (!(s_unique && (a1 - a > 1 || b1 - b > 1)))
-            for (; a < a1 && b < b1; a++, b++) {
-                f->pair[s_ka[a].i] = (int32_t)s_kb[b].i;
-                s_taken[s_kb[b].i] = 1;
-                paired++;
-            }
+            for (; a < a1 && b < b1; a++, b++)
+                paired += pair_set(f, prev, s_ka[a].i, s_kb[b].i, k);
         a = a1;
         b = b1;
     }
@@ -1410,9 +1641,25 @@ static void stats_line(LONGLONG now)
         fprintf(stderr, "[INTERP] %u replayed draws read vertices changed since"
                 " they were recorded%c", s_vdiff, 10);
     fprintf(stderr, "[INTERP] nearest pairing: %llu groups, %llu draws paired"
-            " out of order%c", (unsigned long long)s_near_groups,
-            (unsigned long long)s_near_moved, 10);
-    s_near_groups = s_near_moved = 0;
+            " out of order; %llu strict and %llu loose pairs refused as too"
+            " unlike, %llu as moved across the picture; %u"
+            " turned matrices kept their size%c",
+            (unsigned long long)s_near_groups,
+            (unsigned long long)s_near_moved,
+            (unsigned long long)s_pair_refused,
+            (unsigned long long)s_loose_refused,
+            (unsigned long long)s_spos_refused, s_rot_fixed, 10);
+    s_pair_refused = s_spos_refused = 0;
+    fprintf(stderr, "[INTERP] pair distances <.01 <.05 <.1 <.25 <.5 <1 <2"
+            " more: strict %u %u %u %u %u %u %u %u, loose %u %u %u %u %u %u"
+            " %u %u%c", s_dhist[0][0], s_dhist[0][1], s_dhist[0][2],
+            s_dhist[0][3], s_dhist[0][4], s_dhist[0][5], s_dhist[0][6],
+            s_dhist[0][7], s_dhist[1][0], s_dhist[1][1], s_dhist[1][2],
+            s_dhist[1][3], s_dhist[1][4], s_dhist[1][5], s_dhist[1][6],
+            s_dhist[1][7], 10);
+    memset(s_dhist, 0, sizeof s_dhist);
+    s_near_groups = s_near_moved = s_loose_refused = 0;
+    s_rot_fixed = 0;
     s_vdiff = 0;
     fprintf(stderr, "[INTERP] gaps between pictures (ms) <5: %u, 5-7: %u, 7-9.5:"
             " %u, 9.5-12: %u, 12-17: %u, >17: %u%c", s_gap[0], s_gap[1],
