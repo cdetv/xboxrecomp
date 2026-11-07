@@ -235,7 +235,7 @@ static bool apu_declick_on(void)
 static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
 static uint32_t s_dc_frame[MCPX_HW_MAX_VOICES];     /* frame a voice last mixed */
 static float    s_dc_bin_g[MCPX_HW_MAX_VOICES][8];  /* its bin gains then */
-static float    s_dc_mon_g[MCPX_HW_MAX_VOICES][4];  /* its monitor gains then */
+static float    s_dc_mon_g[MCPX_HW_MAX_VOICES][6];  /* its monitor gains then */
 static float    s_dc_last[MCPX_HW_MAX_VOICES][2];   /* its last monitor sample */
 static float    s_dc_tail[2];                       /* stopped voices, decaying */
 
@@ -1256,6 +1256,43 @@ static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
  * Voice processing (main per-voice function)
  * ============================================================ */
 
+/* RECOMP_APU_MONITOR_RULES=old: the monitor mix as xemu places voices (each
+ * at its loudest bin, sends included), for A/B against the speaker rules
+ * (mcpx_apu_monitor_place_speakers). RECOMP_APU_MONITOR_RULES_FILE=<path>:
+ * live A/B by ear, the old rules while that file exists (checked every
+ * ~0.5 s of audio). */
+static bool monitor_rules_old(void)
+{
+    static int old = -1;
+    static const char *file;
+    static uint32_t checked;
+    if (old < 0) {
+        const char *e = getenv("RECOMP_APU_MONITOR_RULES");
+        old = (e && !strcmp(e, "old")) ? 1 : 0;
+        file = getenv("RECOMP_APU_MONITOR_RULES_FILE");
+        if (file && !*file)
+            file = NULL;
+        checked = s_vp_frame;
+        fprintf(stderr, "[APU] monitor mix rules: %s%s\n",
+                old ? "old (xemu: loudest bin, sends included)"
+                    : "speakers (sends and LFE left out, centre -3 dB a side)",
+                file ? " (live switch file: old rules while it exists)" : "");
+    }
+    if (file && s_vp_frame - checked >= 750) {
+        checked = s_vp_frame;
+        FILE *f = fopen(file, "rb");
+        int now = f != NULL;
+        if (f)
+            fclose(f);
+        if (now != old) {
+            old = now;
+            fprintf(stderr, "[APU] monitor mix rules now %s\n",
+                    old ? "old (xemu)" : "speakers");
+        }
+    }
+    return old != 0;
+}
+
 /* xemu's peek_ahead_multipass_bin: from v along the list, the bin of the
  * first multipass voice after it (-1 if v is multipass itself or none). */
 static int peek_ahead_multipass_bin(MCPXAPUState *d, uint16_t v)
@@ -1542,29 +1579,43 @@ static void voice_process(MCPXAPUState *d,
         int mp_bin = -1;
         if (voice_list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_MP_TOP - 1)
             mp_bin = peek_ahead_multipass_bin(d, v);
-        float raw[8], place[2][2];
+        float raw[8], place[2][2], dry_place[2] = { 0.0f, 0.0f };
         for (int b = 0; b < 8; b++) {
             float hr = (float)(1 << d->vp.submix_headroom[bin[b]]);
             raw[b] = attenuate(vol[b]) / hr;
         }
-        /* An HRTF voice's columns are ears, not source channels. */
-        mcpx_apu_monitor_place(bin, raw, hrtf_on ? 1 : channels, mp_bin, place);
-        /* Envelope and placement as one gain per column and side, ramped
-         * from last frame's (apu_declick_on). */
-        float gm[4] = { ea_value * place[0][0], ea_value * place[0][1],
-                        ea_value * place[1][0], ea_value * place[1][1] };
-        float gc[4], gd[4];
-        for (int k = 0; k < 4; k++) {
+        if (monitor_rules_old()) {
+            /* An HRTF voice's columns are ears, not source channels. */
+            mcpx_apu_monitor_place(bin, raw, hrtf_on ? 1 : channels, mp_bin,
+                                   place);
+        } else {
+            mcpx_apu_monitor_place_speakers(bin, raw, channels, hrtf_on,
+                                            mp_bin, place, dry_place);
+        }
+        /* Envelope and placement as one gain per column and side (and for
+         * an HRTF voice's dry signal), ramped from last frame's
+         * (apu_declick_on). */
+        float gm[6] = { ea_value * place[0][0], ea_value * place[0][1],
+                        ea_value * place[1][0], ea_value * place[1][1],
+                        ea_value * dry_place[0], ea_value * dry_place[1] };
+        float gc[6], gd[6];
+        for (int k = 0; k < 6; k++) {
             gc[k] = dc_ramp ? s_dc_mon_g[v][k] : gm[k];
             gd[k] = (gm[k] - gc[k]) / NUM_SAMPLES_PER_FRAME;
             s_dc_mon_g[v][k] = gm[k];
         }
+        const bool with_dry = hrtf_on && (gm[4] != 0.0f || gm[5] != 0.0f ||
+                                          gc[4] != 0.0f || gc[5] != 0.0f);
         float o0 = 0.0f, o1 = 0.0f;
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            for (int k = 0; k < 4; k++)
+            for (int k = 0; k < 6; k++)
                 gc[k] += gd[k];
             o0 = gc[0] * samples[i][0] + gc[2] * samples[i][1];
             o1 = gc[1] * samples[i][0] + gc[3] * samples[i][1];
+            if (with_dry) {
+                o0 += gc[4] * dry[i][0];
+                o1 += gc[5] * dry[i][0];
+            }
             sample_buf[i][0] += o0;
             sample_buf[i][1] += o1;
         }
@@ -1632,6 +1683,106 @@ void mcpx_apu_monitor_place(const int bin[8], const float gain[8],
             break;
         default: out[c][c] = g[c]; break;
         }
+    }
+}
+
+/* Where a mix bin sits for the speaker rules: 0 left (front, back, XTLK
+ * left), 1 right, 2 both at -3 dB (centre), -1 not a speaker (LFE 3, the
+ * I3DL2 reverb send 10, effect sends 11-30, submix 31). */
+static int monitor_side(int bin)
+{
+    switch (bin) {
+    case 0: case 4: case 6: case 8: return 0;
+    case 1: case 5: case 7: case 9: return 1;
+    case 2: return 2;
+    default: return -1;
+    }
+}
+
+/* The monitor mix's default rules (to-do 7, effects too loud next to
+ * music). xemu's monitor mix (mcpx_apu_monitor_place) plays a voice at its
+ * loudest bin, sends included. That favours effects over music:
+ * - a 3D sound's source voice sends to submix 31 (read by a multipass HRTF
+ *   voice) and to the I3DL2 reverb send 10 at the same level. With 31
+ *   skipped, it was heard dry, centred, at its reverb-send level, on top of
+ *   its HRTF copy. On the console bin 10 only feeds the reverb (wet).
+ * - the multipass HRTF voice was placed at its loudest bin, which is its
+ *   LFE / I3DL2 send (0 dB), not its XTLK (ears) level, and its dry centre
+ *   send was left out;
+ * - a centre-only mono voice played full on both sides (+3 dB against a
+ *   -3 dB centre split), a single-speaker one on both (position lost).
+ * Here only speaker bins count: sends, LFE and the submix are left out
+ * (the sound reaches the speakers through the multipass voice or not at
+ * all, as without the DSP's reverb). Each side takes its loudest speaker
+ * bin, the centre at -3 dB on both. An HRTF voice (hrtf) plays its ears
+ * (columns 0/1) at its loudest XTLK slot (0-3) and its dry signal, which
+ * the caller mixes with dry_out[side], by its other speaker slots (4-7).
+ * Stereo voices keep the per-column placement (music was right). */
+void mcpx_apu_monitor_place_speakers(const int bin[8], const float gain[8],
+                                     unsigned int channels, bool hrtf,
+                                     int skip_bin, float out[2][2],
+                                     float dry_out[2])
+{
+    memset(out, 0, sizeof(float) * 4);
+    dry_out[0] = dry_out[1] = 0.0f;
+    if (channels < 1) channels = 1;
+    if (channels > 2) channels = 2;
+
+    if (hrtf) {
+        float e = 0.0f;
+        for (int b = 0; b < 4; b++)
+            if (bin[b] != skip_bin && monitor_side(bin[b]) >= 0 &&
+                gain[b] > e)
+                e = gain[b];
+        out[0][0] = e;                    /* left ear */
+        out[1][1] = e;                    /* right ear */
+        for (int b = 4; b < 8; b++) {
+            int s = bin[b] == skip_bin ? -1 : monitor_side(bin[b]);
+            if (s < 0)
+                continue;
+            float g = s == 2 ? gain[b] * 0.70710678f : gain[b];
+            for (int k = 0; k < 2; k++)
+                if ((s == 2 || s == k) && g > dry_out[k])
+                    dry_out[k] = g;
+        }
+        return;
+    }
+
+    if (channels == 1) {
+        float side[2] = { 0.0f, 0.0f };
+        for (int b = 0; b < 8; b++) {
+            int s = bin[b] == skip_bin ? -1 : monitor_side(bin[b]);
+            if (s < 0)
+                continue;
+            float g = s == 2 ? gain[b] * 0.70710678f : gain[b];
+            for (int k = 0; k < 2; k++)
+                if ((s == 2 || s == k) && g > side[k])
+                    side[k] = g;
+        }
+        out[0][0] = side[0];              /* mono: both columns the same */
+        out[1][1] = side[1];
+        return;
+    }
+
+    float g[2] = { 0.0f, 0.0f };
+    int gb[2] = { -1, -1 };
+    for (int b = 0; b < 8; b++) {
+        if (bin[b] == skip_bin || monitor_side(bin[b]) < 0)
+            continue;
+        unsigned int c = (unsigned int)b % 2;
+        if (gain[b] > g[c]) {
+            g[c] = gain[b];
+            gb[c] = bin[b];
+        }
+    }
+    for (int c = 0; c < 2; c++) {
+        if (gb[c] < 0)
+            continue;
+        int s = monitor_side(gb[c]);
+        if (s == 2)
+            out[c][0] = out[c][1] = g[c] * 0.70710678f;
+        else
+            out[c][s] = g[c];
     }
 }
 
