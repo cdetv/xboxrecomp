@@ -1919,6 +1919,20 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
     return e->ps;
 }
 
+/* Combiner setups seen whose shader is not ready yet (queued or being
+ * made or loaded); 0 with RECOMP_PS_SPEC off. compiled (may be NULL): how
+ * many were compiled this run (not loaded from the cache). Any thread, a
+ * moment's count: a title's shader pre-compile pass waits for 0 before it
+ * moves on (Conker's --precompile-shaders). */
+uint32_t nv2a_d3d11_ps_spec_pending(uint32_t *compiled)
+{
+    uint32_t done = (uint32_t)(s_pss_compiled + s_pss_loaded + s_pss_failed);
+    uint32_t seen = s_pss_n;
+    if (compiled)
+        *compiled = (uint32_t)s_pss_compiled;
+    return seen > done ? seen - done : 0;
+}
+
 /* The fixed pipeline objects. 0 when they cannot be made; batches are then
  * counted and skipped as before. */
 static int draw_setup(void)
@@ -7186,6 +7200,13 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
 {
     (void)shadow;
     return NULL;
+}
+
+uint32_t nv2a_d3d11_ps_spec_pending(uint32_t *compiled)
+{
+    if (compiled)
+        *compiled = 0;
+    return 0;
 }
 
 int xbox_SetRenderScale(int percent)

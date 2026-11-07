@@ -42,7 +42,8 @@ static CRITICAL_SECTION s_cs;
 static CONDITION_VARIABLE s_cv;
 static char s_why[WHY_MAX][64];          /* requests waiting, under s_cs */
 static uint32_t s_why_head, s_why_tail;
-static uint32_t s_scans;                 /* scans done */
+static uint32_t s_scans;                 /* scans started */
+static uint32_t s_scans_done;            /* scans finished, under s_cs */
 static char s_last_why[WHY_MAX * 8][64]; /* why of scan n, n % size */
 static int s_on = -1;
 static int s_count, s_pre;               /* RECOMP_VSH_SCAN, _PRECOMPILE */
@@ -211,7 +212,21 @@ static DWORD WINAPI scan_thread(LPVOID arg)
                 s_nset, k_range[0], c.r_found[0], c.r_fresh[0], c.r_mb[0],
                 k_range[1], c.r_found[1], c.r_fresh[1], c.r_mb[1],
                 k_range[2], c.r_found[2], c.r_fresh[2], c.r_mb[2]);
+        EnterCriticalSection(&s_cs);
+        s_scans_done++;
+        LeaveCriticalSection(&s_cs);
     }
+}
+
+int nv2a_vsh_prescan_busy(void)
+{
+    int busy;
+    if (s_on <= 0)
+        return 0;
+    EnterCriticalSection(&s_cs);
+    busy = s_scans_done != s_why_tail;
+    LeaveCriticalSection(&s_cs);
+    return busy;
 }
 
 static void on_new_program(uint64_t hash)
