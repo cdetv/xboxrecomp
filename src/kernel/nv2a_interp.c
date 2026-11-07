@@ -2459,14 +2459,30 @@ static void flip_before(const Nv2aPbBackend *be)
              * of the period; one more when the extra one (ms / (n - 1)
              * each) still keeps them under 33 %. */
             double per = (double)s_period * 1000.0 / (double)s_freq.QuadPart;
+            /* Replays a frame of n pictures: n - 1, and one more for a
+             * middle picture drawn from both frames (even n). */
+            int both = s_both && s_lat_ms < 14.0;
+            double r_now = n - 1 + (n % 2 == 0 && both);
+            double r_dn = n - 2 + ((n - 1) % 2 == 0 && both);
+            double r_up = n + ((n + 1) % 2 == 0 && both);
             s_rep_ema = s_rep_ema < 0.0 ? ms : s_rep_ema + (ms - s_rep_ema) / 8.0;
             if (s_adapt && n >= 2) {
-                if (s_rep_ema > 0.45 * per && n > 2) {
+                /* Down while the title falls behind with replays taking a
+                 * good share (its 30 fps matter more than the 4th picture),
+                 * or while replays take most of the frame; up while it keeps
+                 * pace and the next count's replays still fit half of it. */
+                static int hold_off;    /* frames before a step up */
+                if (hold_off > 0)
+                    hold_off--;
+                if (n > 2 && ((per > 34.5 && s_rep_ema > 0.25 * per)
+                              || s_rep_ema > 0.6 * per)) {
                     s_n_eff = n - 1;
-                    s_rep_ema *= (double)(n - 2) / (double)(n - 1);
-                } else if (n < s_n && s_rep_ema * n / (n - 1) < 0.33 * per) {
+                    s_rep_ema *= r_dn / r_now;
+                    hold_off = 60;      /* 2 s: no flapping 2 <-> 3 */
+                } else if (n < s_n && !hold_off && per < 33.8
+                           && s_rep_ema * r_up / r_now < 0.4 * per) {
                     s_n_eff = n + 1;
-                    s_rep_ema *= (double)n / (double)(n - 1);
+                    s_rep_ema *= r_up / r_now;
                 }
             }
         }
