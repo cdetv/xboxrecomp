@@ -145,6 +145,9 @@ static int s_nearest = 1;               /* RECOMP_INTERP_NEAREST=0: by order */
 static int s_jumplog;                   /* RECOMP_INTERP_JUMPLOG=1 (test) */
 static int s_hold_on = 1;               /* RECOMP_INTERP_HOLD=0: ignored */
 static int s_rot = 1;                   /* RECOMP_INTERP_ROT=0: plain lerp */
+static int s_adapt = 1;                 /* RECOMP_INTERP_ADAPT=0: always n */
+static int s_n_eff = 99;                /* pictures a frame while adapting */
+static double s_rep_ema = -1.0;         /* replay ms, averaged */
 static int s_pivot = 1;                 /* RECOMP_INTERP_PIVOT=0: translation
                                          * blended straight */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
@@ -267,6 +270,7 @@ static struct {
     uint32_t unpaired_frames;
     uint64_t draws, paired, diverged, dup_draws, loose1, loose2, unions;
     uint64_t teleports, both;
+    uint32_t pics;                      /* pictures planned, all frames */
     double replay_ms, replay_max;
     uint32_t shown, late, dropped;
 } s_st;
@@ -309,6 +313,8 @@ int nv2a_interp_n(void)
         s_borrow = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_HOLD");
         s_hold_on = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_ADAPT");
+        s_adapt = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_PIVOT");
         s_pivot = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_ROT");
@@ -1927,7 +1933,8 @@ static void stats_line(LONGLONG now)
             " %llu draws jumped (as N), %llu middles from both, %u texture"
             " wraps (%u snapped); replays %.2f"
             " ms a frame"
-            " (most %.2f); %u pictures shown, %u late, %u dropped%c",
+            " (most %.2f); %u pictures shown, %u late, %u dropped; %.2f pictures"
+            " a frame%c",
             s_st.frames, s_st.interpolated, s_st.cuts, s_st.game_cuts,
             s_st.auto_cuts, s_st.overflows,
             s_st.unpaired_frames,
@@ -1942,7 +1949,8 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_st.teleports,
             (unsigned long long)s_st.both, s_wraps, s_wrap_snaps,
             s_st.interpolated ? s_st.replay_ms / s_st.interpolated : 0.0,
-            s_st.replay_max, s_st.shown, s_st.late, s_st.dropped, 10);
+            s_st.replay_max, s_st.shown, s_st.late, s_st.dropped,
+            s_st.interpolated ? (double)s_st.pics / s_st.frames : 0.0, 10);
     if (s_vcheck)
         fprintf(stderr, "[INTERP] %u replayed draws read vertices changed since"
                 " they were recorded%c", s_vdiff, 10);
@@ -2303,8 +2311,12 @@ static void flip_before(const Nv2aPbBackend *be)
               + 0.5);
     if (n > s_n)
         n = s_n;
+    /* Fewer pictures while the replays do not fit (s_n_eff, below). */
+    if (s_adapt && s_n_eff >= 2 && n > s_n_eff)
+        n = s_n_eff;
     if (n < 2)
         return;
+    s_st.pics += (uint32_t)n;
     if (!be->interp(NV_INTERP_SAVE, s_base))
         return;                         /* nothing shown this frame */
     if (!s_end_pb) {
@@ -2422,6 +2434,26 @@ static void flip_before(const Nv2aPbBackend *be)
             s_lat_ms += (ms * 1.05 + 0.7 - s_lat_ms) / 16.0;
         if (s_lat_ms > 28.0)
             s_lat_ms = 28.0;
+        {
+            /* Adaptive picture count (RECOMP_INTERP_ADAPT, on): replays
+             * over ~half the title's frame (with the real frame's own work
+             * besides) slowed the title: It's War's gunfire, 680 draws,
+             * 27 ms of replays, the game at 19-24 fps. One picture fewer
+             * while the replays (an average over ~8 frames) stay over 45 %
+             * of the period; one more when the extra one (ms / (n - 1)
+             * each) still keeps them under 33 %. */
+            double per = (double)s_period * 1000.0 / (double)s_freq.QuadPart;
+            s_rep_ema = s_rep_ema < 0.0 ? ms : s_rep_ema + (ms - s_rep_ema) / 8.0;
+            if (s_adapt && n >= 2) {
+                if (s_rep_ema > 0.45 * per && n > 2) {
+                    s_n_eff = n - 1;
+                    s_rep_ema *= (double)(n - 2) / (double)(n - 1);
+                } else if (n < s_n && s_rep_ema * n / (n - 1) < 0.33 * per) {
+                    s_n_eff = n + 1;
+                    s_rep_ema *= (double)n / (double)(n - 1);
+                }
+            }
+        }
     }
     if (k < (uint32_t)n) {
         be->interp(NV_INTERP_LOAD, s_base);  /* shown as it is */
