@@ -1082,48 +1082,53 @@ static uint64_t s_loose_refused;
  * halfway between them). */
 static uint32_t s_dhist[2][8];          /* strict / loose pairs by distance */
 
+/* The frame's yardsticks for refusing pairs (pair_refuse): each program's
+ * median strict-pair distance (-1: none), and the median screen move. In a
+ * camera turn every ground piece's constants change a lot (point lights in
+ * view space swing round), so a fixed limit refused them all: drawn
+ * unblended beside blended neighbours, the ground cracked white. A pair is
+ * refused only when it is far less alike than its program's typical one. */
+static float s_prog_med[PROG_MAX];
+static float s_sd_med;
+
+static float pair_limit(const Frame *f, uint32_t ia, float abs_max)
+{
+    float m = f->prog[ia] != PROG_NONE ? s_prog_med[f->prog[ia]] : -1.0f;
+    return m >= 0.0f && 4.0f * m > abs_max ? 4.0f * m : abs_max;
+}
+
+static float spos_limit(void)
+{
+    return 4.0f * s_sd_med > s_spos_max ? 4.0f * s_sd_med : s_spos_max;
+}
+
+/* N's draw ia paired with N-1's ib by key k (0 strict, 1-2 loose): 1, or 0
+ * when a loose pair is too unlike (pair_limit, spos_limit). Strict pairs
+ * are all made, and refused afterwards with the frame's medians
+ * (pair_refuse). */
 static int pair_set(Frame *f, const Frame *prev, uint32_t ia, uint32_t ib,
                     int k)
 {
-    float d = draw_dist((const float (*)[4])f->consts[ia],
-                        (const float (*)[4])prev->consts[ib],
-                        f->prog[ia] != PROG_NONE ? s_prog[f->prog[ia]].reads
-                                                 : NULL);
-    if (s_log)
-        s_dhist[k != 0][d < 0.01f ? 0 : d < 0.05f ? 1 : d < 0.1f ? 2
-                        : d < 0.25f ? 3 : d < 0.5f ? 4 : d < 1.0f ? 5
-                        : d < 2.0f ? 6 : 7]++;
-    {
-        float sd = spos_dist(f, prev, ia, ib);
-        if (s_spos_max > 0.0f && sd > s_spos_max) {
-            if (s_jumplog)
-                fprintf(stderr, "[ISPOS] flip %u key %d prog %08X attr0 %08X n"
-                        " %u tex0 %08X target %08X: %.3f,%.3f <- %.3f,%.3f"
-                        " (d %.3f)%c", g_pb.flips, k, f->part[ia][0],
-                        f->part[ia][1], f->part[ia][2], f->part[ia][4],
-                        f->part[ia][5], f->spos[ia][0], f->spos[ia][1],
-                        prev->spos[ib][0], prev->spos[ib][1], d, 10);
-            /* Its first vertex jumped across the picture: not the same
-             * object (or a teleport) -- drawn as its own frame. */
-            s_spos_refused++;
-            return 0;
-        }
-    }
-    if (!k && d > s_pair_max) {
-        /* One mesh in two unlike places (a model reused for another
-         * character, a teleport): blended, it flew through the picture. */
-        s_pair_refused++;
-        return 0;
-    }
     if (k) {
+        float d = draw_dist((const float (*)[4])f->consts[ia],
+                            (const float (*)[4])prev->consts[ib],
+                            f->prog[ia] != PROG_NONE
+                            ? s_prog[f->prog[ia]].reads : NULL);
+        float sd = spos_dist(f, prev, ia, ib);
+        int refuse = d > pair_limit(f, ia, s_loose_max)
+                     || (s_spos_max > 0.0f && sd > spos_limit());
+        if (s_log)
+            s_dhist[1][d < 0.01f ? 0 : d < 0.05f ? 1 : d < 0.1f ? 2
+                       : d < 0.25f ? 3 : d < 0.5f ? 4 : d < 1.0f ? 5
+                       : d < 2.0f ? 6 : 7]++;
         if (s_jumplog)
-            fprintf(stderr, "[ILOOSE] flip %u key %d d %.3f prog %08X attr0"
-                    " %08X <- %08X n %u <- %u tex0 %08X target %08X%s%c",
-                    g_pb.flips, k, d, f->part[ia][0], f->part[ia][1],
+            fprintf(stderr, "[ILOOSE] flip %u key %d d %.3f sd %.3f prog %08X"
+                    " attr0 %08X <- %08X n %u <- %u tex0 %08X target %08X%s%c",
+                    g_pb.flips, k, d, sd, f->part[ia][0], f->part[ia][1],
                     prev->part[ib][1], f->part[ia][2], prev->part[ib][2],
                     f->part[ia][4], f->part[ia][5],
-                    d > s_loose_max ? " REFUSED" : "", 10);
-        if (d > s_loose_max) {
+                    refuse ? " REFUSED" : "", 10);
+        if (refuse) {
             s_loose_refused++;
             return 0;
         }
@@ -1438,6 +1443,112 @@ static uint32_t s_taken_cap;
 static uint32_t pair_pass(Frame *f, const Frame *prev, int k);
 
 /* f->pair from prev; the number of draws paired. */
+typedef struct { uint16_t prog; float d; } ProgDist;
+
+static int cmp_progdist(const void *x, const void *y)
+{
+    const ProgDist *a = x, *b = y;
+    if (a->prog != b->prog)
+        return a->prog < b->prog ? -1 : 1;
+    return a->d < b->d ? -1 : a->d > b->d;
+}
+
+static int cmp_float(const void *x, const void *y)
+{
+    float a = *(const float *)x, b = *(const float *)y;
+    return a < b ? -1 : a > b;
+}
+
+/* After the strict pass: the frame's medians (s_prog_med, s_sd_med), then
+ * the strict pairs far less alike than their program's typical one
+ * (RECOMP_INTERP_PAIR_MAX, at least, 1.0), or whose first vertex moved far
+ * more across the picture than the frame's typical one
+ * (RECOMP_INTERP_SPOS_MAX, at least, 0.3), unpaired: one mesh in two unlike
+ * places (a model reused, a teleport, identical bottles leaving and coming
+ * in) flew through the picture. The draws unpaired. */
+static uint32_t pair_refuse(Frame *f, const Frame *prev)
+{
+    static ProgDist *pd;
+    static float *dd, *sds;
+    static uint32_t cap;
+    uint32_t j, n = 0, ns = 0, a, b, refused = 0;
+
+    for (j = 0; j < PROG_MAX; j++)
+        s_prog_med[j] = -1.0f;
+    s_sd_med = 0.0f;
+    if (cap < f->ndraws) {
+        ProgDist *x = realloc(pd, f->ndraws * sizeof *x);
+        float *y = realloc(dd, f->ndraws * sizeof *y);
+        float *z = realloc(sds, f->ndraws * sizeof *z);
+        if (x) pd = x;
+        if (y) dd = y;
+        if (z) sds = z;
+        if (!x || !y || !z)
+            return 0;
+        cap = f->ndraws;
+    }
+    for (j = 0; j < f->ndraws; j++) {
+        int32_t pj = f->pair[j];
+        float sd;
+        dd[j] = 0.0f;
+        if (pj < 0)
+            continue;
+        dd[j] = draw_dist((const float (*)[4])f->consts[j],
+                          (const float (*)[4])prev->consts[pj],
+                          f->prog[j] != PROG_NONE ? s_prog[f->prog[j]].reads
+                                                  : NULL);
+        if (s_log)
+            s_dhist[0][dd[j] < 0.01f ? 0 : dd[j] < 0.05f ? 1
+                       : dd[j] < 0.1f ? 2 : dd[j] < 0.25f ? 3
+                       : dd[j] < 0.5f ? 4 : dd[j] < 1.0f ? 5
+                       : dd[j] < 2.0f ? 6 : 7]++;
+        if (f->prog[j] != PROG_NONE) {
+            pd[n].prog = f->prog[j];
+            pd[n++].d = dd[j];
+        }
+        if ((sd = spos_dist(f, prev, j, (uint32_t)pj)) >= 0.0f)
+            sds[ns++] = sd;
+    }
+    qsort(pd, n, sizeof *pd, cmp_progdist);
+    for (a = 0; a < n; a = b) {
+        for (b = a; b < n && pd[b].prog == pd[a].prog; b++)
+            ;
+        s_prog_med[pd[a].prog] = pd[a + (b - a) / 2].d;
+    }
+    if (ns) {
+        qsort(sds, ns, sizeof *sds, cmp_float);
+        s_sd_med = sds[ns / 2];
+    }
+    for (j = 0; j < f->ndraws; j++) {
+        int32_t pj = f->pair[j];
+        float sd;
+        int why;
+        if (pj < 0)
+            continue;
+        sd = spos_dist(f, prev, j, (uint32_t)pj);
+        why = dd[j] > pair_limit(f, j, s_pair_max) ? 1
+            : s_spos_max > 0.0f && sd > spos_limit() ? 2 : 0;
+        if (!why)
+            continue;
+        if (s_jumplog)
+            fprintf(stderr, "[IREFUSE] flip %u draw %u %s: d %.3f (median %.3f)"
+                    " sd %.3f (median %.3f) prog %08X attr0 %08X n %u tex0"
+                    " %08X target %08X%c", g_pb.flips, j,
+                    why == 1 ? "unlike" : "moved", dd[j],
+                    f->prog[j] != PROG_NONE ? s_prog_med[f->prog[j]] : -1.0f,
+                    sd, s_sd_med, f->part[j][0], f->part[j][1], f->part[j][2],
+                    f->part[j][4], f->part[j][5], 10);
+        if (why == 1)
+            s_pair_refused++;
+        else
+            s_spos_refused++;
+        s_taken[pj] = 0;
+        f->pair[j] = -1;
+        refused++;
+    }
+    return refused;
+}
+
 static uint32_t pair_frames(Frame *f, const Frame *prev)
 {
     uint32_t i, paired;
@@ -1455,6 +1566,7 @@ static uint32_t pair_frames(Frame *f, const Frame *prev)
     }
     memset(s_taken, 0, prev->ndraws);
     paired = pair_pass(f, prev, 0);
+    paired -= pair_refuse(f, prev);
     if (!s_strict) {
         uint32_t p1 = pair_pass(f, prev, 1);
         uint32_t p2 = pair_pass(f, prev, 2);
