@@ -410,66 +410,87 @@ static int all_zero(const float *v)
 }
 
 /* Texture matrix registers of program ins (count instructions), into
- * texmat: a register an instruction reads alongside a value that comes from
- * a texture coordinate input (v9-v12, directly or through temps), when that
- * instruction's result reaches oT0-oT3 (o[9]-o[12]), directly or through
- * temps. Temps are followed whole (a partial write adds to what the temp
- * carried). */
+ * texmat: a register an instruction reads together with a texture
+ * coordinate input (v9-v12 read directly), when that instruction's result
+ * reaches oT0-oT3 (o[9]-o[12]), directly or through temps, and the register
+ * plays no part in the position (oPos). Not through temps on the input side:
+ * Conker's skinned programs feed v9 into the position and then project the
+ * position into a texture coordinate with c104-c107, whose translation is
+ * the camera's (a "wrap" there moved the picture). Temps are followed whole
+ * (a partial write adds to what the temp carried). */
 static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
                         uint64_t texmat[3])
 {
-    uint8_t tex[16];                    /* temp carries a texture coordinate */
-    uint64_t via[16][3];                /* constants that went into it */
+    uint64_t via[16][3];                /* texture matrix candidates in it */
+    uint64_t all[16][3];                /* every constant that went into it */
+    uint64_t pos[3] = {0, 0, 0};
     uint32_t i, s, w;
 
-    memset(tex, 0, sizeof tex);
     memset(via, 0, sizeof via);
+    memset(all, 0, sizeof all);
     texmat[0] = texmat[1] = texmat[2] = 0;
     for (i = 0; i < count; i++) {
         const Nv2aVshIns *I = &ins[i];
-        uint64_t c[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
-        int t = 0;
+        uint64_t c[3] = {0, 0, 0}, a[3] = {0, 0, 0}, cc[3] = {0, 0, 0};
+        int texin = 0;
         for (s = 0; s < 3; s++) {
             const Nv2aVshSrc *S = &I->src[s];
             if (!(I->need & (1u << s)))
                 continue;
             if (S->mux == 2) {
                 if (I->iidx >= 9 && I->iidx <= 12)
-                    t = 1;
+                    texin = 1;
             } else if (S->mux == 1) {
-                if (S->reg < 16 && tex[S->reg]) {
-                    t = 1;
-                    for (w = 0; w < 3; w++)
+                if (S->reg < 16)
+                    for (w = 0; w < 3; w++) {
                         c[w] |= via[S->reg][w];
-                }
-            } else if (S->mux == 3 && !I->rel && I->cidx < NV2A_VSH_CONSTANTS) {
+                        a[w] |= all[S->reg][w];
+                    }
+            } else if (S->mux == 3 && !I->rel
+                       && I->cidx < NV2A_VSH_CONSTANTS) {
+                /* Relative reads (a bone palette) are left out: never a
+                 * texture matrix, and their range can't be named. */
                 cc[I->cidx >> 6] |= 1ull << (I->cidx & 63);
             }
         }
-        if (!t)
-            continue;
-        for (w = 0; w < 3; w++)
-            c[w] |= cc[w];
+        for (w = 0; w < 3; w++) {
+            a[w] |= cc[w];
+            if (texin)
+                c[w] |= cc[w];
+        }
         /* The temp written: the MAC's, or R1 for the ILU beside a MAC. */
         if (I->mac && I->mac_mask && I->tdst < 16) {
-            if (I->mac_mask == 0xF)
+            if (I->mac_mask == 0xF) {
                 memset(via[I->tdst], 0, sizeof via[I->tdst]);
-            tex[I->tdst] = 1;
-            for (w = 0; w < 3; w++)
+                memset(all[I->tdst], 0, sizeof all[I->tdst]);
+            }
+            for (w = 0; w < 3; w++) {
                 via[I->tdst][w] |= c[w];
+                all[I->tdst][w] |= a[w];
+            }
+            if (I->tdst == 12)          /* R12 is oPos */
+                for (w = 0; w < 3; w++)
+                    pos[w] |= a[w];
         }
         if (I->ilu && I->ilu_mask) {
             uint32_t d = I->mac ? 1 : I->tdst;
-            if (d < 16) {
-                tex[d] = 1;
-                for (w = 0; w < 3; w++)
+            if (d < 16)
+                for (w = 0; w < 3; w++) {
                     via[d][w] |= c[w];
-            }
+                    all[d][w] |= a[w];
+                }
         }
-        if (I->out_o && I->omask && I->oaddr >= 9 && I->oaddr <= 12)
-            for (w = 0; w < 3; w++)
-                texmat[w] |= c[w];
+        if (I->out_o && I->omask) {
+            if (I->oaddr >= 9 && I->oaddr <= 12)
+                for (w = 0; w < 3; w++)
+                    texmat[w] |= c[w];
+            else if (I->oaddr == 0)
+                for (w = 0; w < 3; w++)
+                    pos[w] |= a[w];
+        }
     }
+    for (w = 0; w < 3; w++)
+        texmat[w] &= ~pos[w];
 }
 
 /* The s_prog entry of the current program (made on first sight), or
@@ -529,7 +550,9 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
         if (texmat && (texmat[r >> 6] >> (r & 63) & 1)) {
             for (c = 0; c < 4; c++) {
                 float d = partner[r][c] - own[r][c], v;
-                if (fabsf(d) >= 0.5f) {
+                /* Conker's scrolls stay within +-2 (and wrap there). */
+                if (fabsf(d) >= 0.5f && fabsf(own[r][c]) <= 4.0f
+                    && fabsf(partner[r][c]) <= 4.0f) {
                     float k = d - rintf(d);
                     if (fabsf(k) <= 0.25f) {
                         d = k;          /* wrapped: the short way */
