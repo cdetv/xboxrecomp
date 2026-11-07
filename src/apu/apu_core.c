@@ -57,6 +57,23 @@ volatile int g_audio_muted = 0;  /* 0 = audio enabled */
  * runs nobody listens to, such as a title's shader pre-compile pass. */
 static int g_out_muted;
 
+/* xbox_ApuSetOutputGain: a gain on the finished samples, for a host volume
+ * setting (a master volume, a boost in some scenes). The target is set from
+ * any thread; the frame thread glides to it (time constant OUT_GAIN_MS) so
+ * a change never clicks. At exactly 1 the samples are untouched. Above 1 a
+ * peak limiter keeps them under OUT_LIMIT_CEIL of full scale: a peak that
+ * would pass it turns both channels down at once by just enough, and they
+ * come back up over OUT_LIMIT_MS. (A soft clip, the first try, flattened
+ * every gunshot of It's War's opening at +12 dB: distortion.) */
+#define OUT_GAIN_MS    15.0f
+#define OUT_GAIN_MAX   8.0f      /* +18 dB */
+#define OUT_LIMIT_CEIL 0.95f
+#define OUT_LIMIT_MS   150.0f
+static volatile float g_out_gain_target = 1.0f;
+static float g_out_gain = 1.0f;
+static float g_out_limit = 1.0f;   /* the limiter's gain now, 0..1 */
+static unsigned g_out_limited;     /* samples it turned down (log) */
+
 /* xbox_ApuSetPaused: the frame thread idles while this is set. */
 static volatile LONG g_host_paused = 0;
 
@@ -604,6 +621,56 @@ static int16_t g_xa2_stage[1024][2];  /* matches XA2_BUF_SAMPLES max */
 static int     g_xa2_stage_fill = 0;
 static int     g_waveout_fill = 0;
 
+/* xbox_ApuSetOutputGain's gain on one monitor frame (48 kHz samples). */
+static void out_gain_apply(int16_t (*buf)[2], int n)
+{
+    const float glide = 1.0f - expf(-1000.0f / (OUT_GAIN_MS * 48000.0f));
+    const float release = 1.0f - expf(-1000.0f / (OUT_LIMIT_MS * 48000.0f));
+    float target = g_out_gain_target;
+
+    if (target == 1.0f && g_out_gain == 1.0f) {
+        g_out_limit = 1.0f;
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        float l, r, peak, g;
+        g_out_gain += (target - g_out_gain) * glide;
+        if (fabsf(target - g_out_gain) < 1e-5f)
+            g_out_gain = target;
+        l = (float)buf[i][0] * (g_out_gain / 32768.0f);
+        r = (float)buf[i][1] * (g_out_gain / 32768.0f);
+        if (g_out_gain > 1.0f || g_out_limit < 1.0f) {
+            g_out_limit += (1.0f - g_out_limit) * release;
+            peak = fmaxf(fabsf(l), fabsf(r));
+            if (peak * g_out_limit > OUT_LIMIT_CEIL) {
+                g_out_limit = OUT_LIMIT_CEIL / peak;
+                g_out_limited++;
+            }
+            l *= g_out_limit;
+            r *= g_out_limit;
+        }
+        /* x 32768: a sample at gain 1 comes back exactly as it was. */
+        g = 32768.0f;
+        buf[i][0] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, l * g));
+        buf[i][1] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, r * g));
+    }
+}
+
+void xbox_ApuSetOutputGain(float gain)
+{
+    if (!(gain >= 0.0f))
+        gain = 1.0f;
+    if (gain > OUT_GAIN_MAX)
+        gain = OUT_GAIN_MAX;
+    if (gain == g_out_gain_target)
+        return;
+    fprintf(stderr, "[APU] output gain %.3f (%+.1f dB); limiter turned down "
+            "%u samples at the gain before\n", gain,
+            gain > 0.0f ? 20.0f * log10f(gain) : -100.0f, g_out_limited);
+    g_out_limited = 0;
+    g_out_gain_target = gain;
+}
+
 /* Called once every 8 se_frames, i.e. every 256 samples (EP_FRAME_US).
  *
  * frame_buf holds those 256 samples: mcpx_apu_dsp_frame wrote one 32-sample
@@ -640,6 +707,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(d->monitor.frame_buf, n);
     }
+    out_gain_apply(d->monitor.frame_buf, n);
     if (g_out_muted) {
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
     }

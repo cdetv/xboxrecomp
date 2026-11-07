@@ -88,5 +88,6 @@ int xemu_apu_connect(const ApuHost *host, ApuApi *api)
     api->mixer_get_state    = apu_mixer_get_state;
     api->mixer_play         = apu_mixer_play;
     api->mixer_stop         = apu_mixer_stop;
+    api->set_output_gain    = xbox_ApuSetOutputGain;
     return 1;
 }
