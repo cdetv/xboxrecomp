@@ -118,6 +118,22 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 void xbox_InputStopRumble(void);
 
 /**
+ * Rumble strength of a controller port (0-3; -1 = all), percent of the
+ * title's motor speeds (0 = off, 100 = as the title asks (default), up to
+ * 200). From any thread; reaches a running rumble at the title's next call.
+ */
+void xbox_SetRumbleStrength(int port, int percent);
+
+/**
+ * Stick dead zone of a controller port (0-3; -1 = all): the title's own per
+ * stick (fractions of full tilt it ignores, per axis) and the one wanted
+ * instead (a fraction; < 0 = the title's own, nothing changed). Real pads
+ * only; from any thread.
+ */
+void xbox_SetStickDeadZone(int port, float title_left, float title_right,
+                           float wanted);
+
+/**
  * Check if a controller is connected.
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
