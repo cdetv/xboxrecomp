@@ -149,6 +149,7 @@ static int s_rot = 1;                   /* RECOMP_INTERP_ROT=0: plain lerp */
 static int s_adapt = 1;                 /* RECOMP_INTERP_ADAPT=0: always n */
 static int s_n_eff = 99;                /* pictures a frame while adapting */
 static double s_rep_ema = -1.0;         /* replay ms, averaged */
+static int s_both_rest;                 /* frames without both-frame middles */
 static int s_pivot = 1;                 /* RECOMP_INTERP_PIVOT=0: translation
                                          * blended straight */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
@@ -2401,7 +2402,8 @@ static void flip_before(const Nv2aPbBackend *be)
             older = 1;                  /* test: N-1 again, as it was */
             s_rep_blend = 0;
         }
-        if (s_mode != 1 && s_both && s_rep_blend && s_lat_ms < (s_both == 3 ? 99.0 : 14.0)
+        if (s_mode != 1 && s_both && s_rep_blend && !s_both_rest
+            && s_lat_ms < (s_both == 3 ? 99.0 : 14.0)
             && (s_both == 2 || 2 * k == (uint32_t)n) && inv_ok) {
             /* The middle picture from both frames, the nearer of the two
              * per pixel (RECOMP_INTERP_BOTH): each fills what the other
@@ -2474,6 +2476,13 @@ static void flip_before(const Nv2aPbBackend *be)
                 static int hold_off;    /* frames before a step up */
                 if (hold_off > 0)
                     hold_off--;
+                /* The title falling behind: the middle picture from one
+                 * frame only for 2 s (its second replay is the costliest
+                 * thing to drop: It's War's gunfire). */
+                if (s_adapt && per > 34.5 && s_rep_ema > 0.25 * per)
+                    s_both_rest = 60;
+                else if (s_both_rest > 0)
+                    s_both_rest--;
                 if (n > 2 && ((per > 34.5 && s_rep_ema > 0.25 * per)
                               || s_rep_ema > 0.6 * per)) {
                     s_n_eff = n - 1;
