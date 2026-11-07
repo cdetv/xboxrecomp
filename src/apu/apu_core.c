@@ -126,10 +126,12 @@ static void prof_report(void)
         fprintf(stderr, "  [APUPROF] out: xa2 starved %lu dropped %lu | throttle"
                 " resets %lu, %.0f ms given up | waits: isr gate %.0f ms (max"
                 " %.1f, busy %lu), d->lock %.0f ms (max %.1f), longest loop"
-                " %.1f ms\n",
+                " %.1f ms | fe trap waits %lu (%.0f ms, max %.1f), given up"
+                " %lu\n",
                 p->xa2_starved, p->xa2_dropped, p->throttle_resets,
                 p->throttle_lost_ms, p->t_gate, p->max_gate, p->gate_busy,
-                p->t_relock, p->max_relock, p->max_loop);
+                p->t_relock, p->max_relock, p->max_loop, p->trap_waits,
+                p->t_trap, p->max_trap, p->trap_timeouts);
         double n = p->mix_samples ? (double)p->mix_samples : 1.0;
         double rl = sqrt(p->mix_l2 / n), rr = sqrt(p->mix_r2 / n);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
@@ -774,12 +776,98 @@ static void se_frame(MCPXAPUState *d)
 }
 
 /* ============================================================
+ * Trapped front end: wait, don't play silence
+ * ============================================================ */
+
+/* RECOMP_APU_TRAP_WAIT=<ms>: how long the frame thread waits for a trapped
+ * or halted front end before it plays silence (default 40, about what
+ * throttle() can catch up; 0 = never wait: the old silent frames). */
+static int64_t apu_trap_wait_us(void)
+{
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = getenv("RECOMP_APU_TRAP_WAIT");
+        int ms = (e && *e) ? atoi(e) : 40;
+        if (ms < 0) ms = 0;
+        if (ms > 1000) ms = 1000;
+        v = (int64_t)ms * 1000;
+    }
+    return v;
+}
+
+static bool fe_stopped(MCPXAPUState *d)
+{
+    uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+    return (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) ||
+           (fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+}
+
+/* The front end is trapped -- the title's service routine has to answer a
+ * notification, e.g. the idle-voice one after every sound that ends -- or
+ * halted. The voice processor must not run then (a second notification would
+ * overwrite the trapped method and argument), and this thread used to hand
+ * that frame's 32 samples to the output anyway, as silence: 0.67 ms of
+ * digital zero in the middle of whatever was playing, 4-16 frames in a row
+ * while the interrupt was held off by a guest thread at raised IRQL. That was
+ * the crackle, at any frame rate (Conker: Live & Reloaded, worst in busy
+ * scenes: many short sounds, many traps). xemu waits instead, its output
+ * paced by the audio device. So do we now: no frame is made, the interrupt
+ * keeps being offered, and once the front end runs again throttle() renders
+ * the missed frames back to back while the XAudio2 queue bridges the wait.
+ * A trap longer than RECOMP_APU_TRAP_WAIT still turns into silence, with the
+ * clock running on (what a long stop sounded like before too). *since_us is
+ * when the front end was first seen stopped (0 = running). Returns with
+ * d->lock held; the caller re-reads FECTL. */
+static void wait_fe_trap(MCPXAPUState *d, int64_t *since_us)
+{
+    const int64_t limit = apu_trap_wait_us();
+    int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    double t0 = 0.0;
+    bool waited = false;
+
+    if (limit <= 0)
+        return;
+    if (*since_us == 0)
+        *since_us = now;
+    if (now - *since_us >= limit)
+        return;                       /* given up on this one already */
+    if (g_apu_prof_on) t0 = prof_now_ms();
+
+    while (!qatomic_read(&d->exiting) && !d->pause_requested &&
+           !qatomic_read(&g_host_paused)) {
+        mcpx_apu_dsp_ack_poll(d);
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        apu_deliver_irq(d);           /* the routine that clears the trap */
+        if (!fe_stopped(d))
+            break;
+        now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (now - *since_us >= limit) {
+            if (g_apu_prof_on) g_apu_prof.trap_timeouts++;
+            break;
+        }
+        /* d->lock is free meanwhile: guest register writes get in. */
+        qemu_cond_timedwait(&d->cond, &d->lock, 1);
+        waited = true;
+    }
+    if (g_apu_prof_on && waited) {
+        double ms = prof_now_ms() - t0;
+        g_apu_prof.trap_waits++;
+        g_apu_prof.t_trap += ms;
+        if (ms > g_apu_prof.max_trap) g_apu_prof.max_trap = ms;
+    }
+}
+
+/* ============================================================
  * APU frame thread (background processing)
  * ============================================================ */
 
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+    int64_t fe_stop_since = 0;      /* wait_fe_trap: 0 = front end running */
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {
@@ -816,16 +904,27 @@ static void *mcpx_apu_frame_thread(void *arg)
 
         int xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
                                 NV_PAPU_SECTL_XCNTMODE);
-        uint32_t fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+        if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF && !g_test_tone.active &&
+            fe_stopped(d)) {
+            /* Wait for the title's service routine rather than play
+             * silence (wait_fe_trap). Inside this frame's slot, after
+             * throttle(), so the clock is not advanced twice. */
+            wait_fe_trap(d, &fe_stop_since);
+            xcntmode = GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                NV_PAPU_SECTL_XCNTMODE);
+        }
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
-                          !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+                          !fe_stopped(d);
+        if (apu_active)
+            fe_stop_since = 0;
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
         } else {
-            /* Lightweight: just monitor frame (test tone + software mixer) */
+            /* Lightweight: just monitor frame (test tone + software mixer).
+             * A silent 32-sample slice of the output: the APU switched off,
+             * or a front end stopped longer than RECOMP_APU_TRAP_WAIT. */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
             if (g_apu_prof_on) g_apu_prof.idle_frames++;
