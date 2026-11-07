@@ -139,6 +139,7 @@ static int s_both;                      /* RECOMP_INTERP_BOTH: 1 (default) middl
                                          * always, 0 off */
 static int s_texwrap = 1;               /* RECOMP_INTERP_TEXWRAP=0: texture
                                          * matrices blended straight */
+static int s_nearest = 1;               /* RECOMP_INTERP_NEAREST=0: by order */
 static int s_vcheck;                    /* RECOMP_INTERP_VCHECK=1 (test) */
 static uint32_t s_vdiff, s_vsaid;       /* replayed draws whose vertices
                                          * changed since recorded (10 s) */
@@ -268,6 +269,8 @@ int nv2a_interp_n(void)
         s_strict = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_TEXWRAP");
         s_texwrap = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_NEAREST");
+        s_nearest = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_VCHECK");
         s_vcheck = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_UNDER");
@@ -282,7 +285,7 @@ int nv2a_interp_n(void)
         if (e)
             s_autocut = atof(e);
         e = getenv("RECOMP_INTERP_JUMPS");
-        s_teleport = !(e && *e == '0');
+        s_teleport = e ? atoi(e) : 1;
         e = getenv("RECOMP_INTERP_BOTH");
         s_both = e ? atoi(e) : 1;
         memset(s_all_rows, 1, sizeof s_all_rows);
@@ -388,6 +391,13 @@ static uint64_t draw_key_loose(uint64_t loose[2])
      * draws into the other buffer each time. */
     h = fnv(h, (uint64_t)g_pb.pitch << 32 | g_pb.format);
     h = fnv(h, (uint64_t)g_pb.clip_w << 32 | g_pb.clip_h);
+    /* A small target by its address too: Conker's menu room and
+     * characters draw many 32x32 lighting maps of one shape, a few each
+     * frame in turn, and by shape alone map X paired with map Y (their
+     * matrices "jumped", drawn unblended among blended ones). Full-screen
+     * ones by shape only: the back buffers take turns. */
+    if (g_pb.clip_w < 320 || g_pb.clip_h < 240)
+        h = fnv(h, g_pb.color_offset);
     t = h;
     h = fnv(h, g_pb.attr[0].offset);
     if (loose) {
@@ -537,13 +547,13 @@ static uint32_t s_wraps, s_wrap_snaps;  /* this 10 s: wraps blended short */
  * (a scroll wrapped back by whole repeats) move the short way instead, and
  * that moved by more than half a repeat otherwise are the nearer frame's. */
 static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
-                  float w, const uint64_t *texmat)
+                  float w, const uint64_t *texmat, const uint8_t *keep)
 {
     uint32_t r, c;
 
     for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
         if (!memcmp(own[r], partner[r], sizeof own[r]) || all_zero(own[r])
-            || all_zero(partner[r])) {
+            || all_zero(partner[r]) || (keep && keep[r])) {
             memcpy(out[r], own[r], sizeof out[r]);
             continue;
         }
@@ -576,6 +586,8 @@ static void blend(VshConsts out, const VshConsts own, const VshConsts partner,
 }
 
 static int mats_jumped(const float (*a)[4], const float (*b)[4]);
+static int mats_jumped_rows(const float (*a)[4], const float (*b)[4],
+                            uint8_t *keep);
 
 static int32_t s_extra = -1;            /* partner draw whose indices go next */
 static uint32_t s_extra_idx[NV_MAX_INDICES];
@@ -697,16 +709,30 @@ void nv2a_interp_draw(void)
         }
         s_extra = -1;
         if (s_rep_blend && s_rep_map[j] >= 0 && ctl_blends(f->part[j][0])
-            && !(s_teleport
+            && !(s_teleport == 2
                  && mats_jumped((const float (*)[4])f->consts[j],
                                 (const float (*)[4])
                                     s_rep_prev->consts[s_rep_map[j]])
                  && ++s_st.teleports)) {
             int32_t pj = s_rep_map[j];
+            /* A matrix that jumped (turned > 30 degrees, moved far) keeps
+             * the drawn frame's value; the rest still blends. Conker's
+             * characters carry a light's matrix (c159-c161) that changes
+             * light every frame: drawing the whole character unblended slid
+             * it against the blended room. RECOMP_INTERP_JUMPS=2: the whole
+             * draw as its frame (as before), 0: blend everything. */
+            static uint8_t keep[NV2A_VSH_CONSTANTS];
+            int jumped = s_teleport == 1
+                && mats_jumped_rows((const float (*)[4])f->consts[j],
+                                    (const float (*)[4])s_rep_prev->consts[pj],
+                                    keep);
+            if (jumped)
+                s_st.teleports++;
             blend(s_tmp, (const float (*)[4])f->consts[j],
                   (const float (*)[4])s_rep_prev->consts[pj],
                   s_rep_t, f->prog[j] != PROG_NONE
-                           ? s_prog[f->prog[j]].texmat : NULL);
+                           ? s_prog[f->prog[j]].texmat : NULL,
+                  jumped ? keep : NULL);
             nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
             /* The same vertices drawn with another index list in the
              * partner frame (a ground's pieces, each frame only what that
@@ -856,6 +882,82 @@ static int cmp_keyidx(const void *a, const void *b)
 }
 
 static KeyIdx *s_ka, *s_kb;
+
+/* Nearest-constants pairing (RECOMP_INTERP_NEAREST, on): the draws of one
+ * key in both frames are paired by how alike their constants are, nearest
+ * first, not by their order. One mesh drawn several times (Conker's menu
+ * room: one model eight times in a row) comes in another order once the
+ * camera turns, and by order copy 3 paired with copy 5: matrices "jumped",
+ * drawn unblended among blended ones (doubled heads, a candle left behind).
+ * Only the registers that vary within the group count (the per-object ones;
+ * the camera's are the same for all), each component as
+ * |a - b| / (1 + |a| + |b|). Groups bigger than NEAR_MAX x NEAR_MAX pair by
+ * order. */
+#define NEAR_MAX 64
+static uint8_t *s_taken;                /* below: prev's draws paired */
+typedef struct { float d; uint16_t a, b; } NearCand;
+static NearCand s_near_c[NEAR_MAX * NEAR_MAX];
+static uint64_t s_near_groups, s_near_moved;
+
+static int cmp_near(const void *x, const void *y)
+{
+    float a = ((const NearCand *)x)->d, b = ((const NearCand *)y)->d;
+    return a < b ? -1 : a > b;
+}
+
+/* Pairs the group s_ka[a0..a1) with s_kb[b0..b1); the draws paired. */
+static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
+                             uint32_t a1, uint32_t b0, uint32_t b1)
+{
+    static uint8_t vary[NV2A_VSH_CONSTANTS];
+    static uint16_t rows[NV2A_VSH_CONSTANTS];
+    static uint8_t useda[NEAR_MAX], usedb[NEAR_MAX];
+    const float (*ref)[4] = (const float (*)[4])f->consts[s_ka[a0].i];
+    uint32_t na = a1 - a0, nb = b1 - b0, nr = 0, n = 0, r, x, y, c, paired = 0;
+
+    for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
+        vary[r] = 0;
+        for (x = a0 + 1; x < a1 && !vary[r]; x++)
+            vary[r] = memcmp(f->consts[s_ka[x].i][r], ref[r], 16) != 0;
+        for (x = b0 + 1; x < b1 && !vary[r]; x++)
+            vary[r] = memcmp(prev->consts[s_kb[x].i][r],
+                             prev->consts[s_kb[b0].i][r], 16) != 0;
+        if (vary[r])
+            rows[nr++] = (uint16_t)r;
+    }
+    for (x = 0; x < na; x++)
+        for (y = 0; y < nb; y++) {
+            const float (*p)[4] = (const float (*)[4])f->consts[s_ka[a0 + x].i];
+            const float (*q)[4] = (const float (*)[4])prev->consts[s_kb[b0 + y].i];
+            float d = 0.0f;
+            for (r = 0; r < nr; r++)
+                for (c = 0; c < 4; c++) {
+                    float u = p[rows[r]][c], v = q[rows[r]][c];
+                    float e = fabsf(u - v) / (1.0f + fabsf(u) + fabsf(v));
+                    d += isfinite(e) ? e : 1.0f;
+                }
+            /* Ties (nothing varies) keep the order. */
+            s_near_c[n].d = d + (float)(x > y ? x - y : y - x) * 1e-6f;
+            s_near_c[n].a = (uint16_t)x;
+            s_near_c[n].b = (uint16_t)y;
+            n++;
+        }
+    qsort(s_near_c, n, sizeof *s_near_c, cmp_near);
+    memset(useda, 0, na);
+    memset(usedb, 0, nb);
+    for (x = 0; x < n && paired < na && paired < nb; x++) {
+        const NearCand *k = &s_near_c[x];
+        if (useda[k->a] || usedb[k->b])
+            continue;
+        useda[k->a] = usedb[k->b] = 1;
+        f->pair[s_ka[a0 + k->a].i] = (int32_t)s_kb[b0 + k->b].i;
+        s_taken[s_kb[b0 + k->b].i] = 1;
+        paired++;
+        s_near_moved += k->a != k->b;
+    }
+    s_near_groups++;
+    return paired;
+}
 static uint32_t s_kcap;
 
 /* Whether the registers rows marks jumped between a and b. A row whose
@@ -910,6 +1012,53 @@ static int pair_jumped(const float (*a)[4], const float (*b)[4],
         }
     }
     return 0;
+}
+
+/* The rows of a draw's matrices that jumped between a and b, as mats_jumped
+ * finds them, marked in keep (cleared first): the number of matrices. */
+static int mats_jumped_rows(const float (*a)[4], const float (*b)[4],
+                            uint8_t *keep)
+{
+    uint32_t r, k;
+    int n = 0;
+
+    memset(keep, 0, NV2A_VSH_CONSTANTS);
+    for (r = 0; r + 2 < NV2A_VSH_CONSTANTS; r++) {
+        float ta[3], tb[3], la = 0, lb = 0, d = 0;
+        int unit = 1, turned = 0;
+        for (k = 0; k < 3 && unit; k++) {
+            const float *x = a[r + k], *y = b[r + k];
+            float lx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+            float ly = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
+            if (!(lx > 0.9f && lx < 1.1f && ly > 0.9f && ly < 1.1f)) {
+                unit = 0;
+                break;
+            }
+            if ((x[0] * y[0] + x[1] * y[1] + x[2] * y[2]) / sqrtf(lx * ly)
+                < 0.866f)
+                turned = 1;
+            ta[k] = x[3];
+            tb[k] = y[3];
+        }
+        if (!unit)
+            continue;
+        if (!turned) {
+            for (k = 0; k < 3; k++) {
+                la += ta[k] * ta[k];
+                lb += tb[k] * tb[k];
+                d += (tb[k] - ta[k]) * (tb[k] - ta[k]);
+            }
+            la = sqrtf(la > lb ? la : lb);
+            d = sqrtf(d);
+            turned = d > 100.0f && d > la / 2.0f;
+        }
+        if (turned) {
+            keep[r] = keep[r + 1] = keep[r + 2] = 1;
+            n++;
+        }
+        r += 2;                         /* past this matrix */
+    }
+    return n;
 }
 
 /* Whether a draw's matrices jumped between a and b: each run of three rows
@@ -1128,7 +1277,10 @@ static uint32_t pair_pass(Frame *f, const Frame *prev, int k)
             ;
         if (!k && (a1 - a > 1 || b1 - b > 1))
             s_st.dup_draws += a1 - a;
-        if (!(s_unique && (a1 - a > 1 || b1 - b > 1)))
+        if (s_nearest && (a1 - a > 1 || b1 - b > 1)
+            && a1 - a <= NEAR_MAX && b1 - b <= NEAR_MAX && !s_unique)
+            paired += pair_nearest(f, prev, a, a1, b, b1);
+        else if (!(s_unique && (a1 - a > 1 || b1 - b > 1)))
             for (; a < a1 && b < b1; a++, b++) {
                 f->pair[s_ka[a].i] = (int32_t)s_kb[b].i;
                 s_taken[s_kb[b].i] = 1;
@@ -1257,6 +1409,10 @@ static void stats_line(LONGLONG now)
     if (s_vcheck)
         fprintf(stderr, "[INTERP] %u replayed draws read vertices changed since"
                 " they were recorded%c", s_vdiff, 10);
+    fprintf(stderr, "[INTERP] nearest pairing: %llu groups, %llu draws paired"
+            " out of order%c", (unsigned long long)s_near_groups,
+            (unsigned long long)s_near_moved, 10);
+    s_near_groups = s_near_moved = 0;
     s_vdiff = 0;
     fprintf(stderr, "[INTERP] gaps between pictures (ms) <5: %u, 5-7: %u, 7-9.5:"
             " %u, 9.5-12: %u, 12-17: %u, >17: %u%c", s_gap[0], s_gap[1],
@@ -1365,6 +1521,13 @@ static void trace_frame(const Frame *f, const Frame *prev)
         len = snprintf(line, sizeof line, "[ITRACE] %4u pair %5d prog %08X"
                        " attr0 %08X n %5u prim %X tex0 %08X target %08X:",
                        j, pj, pt[0], pt[1], pt[2], pt[3], pt[4], pt[5]);
+        if (pj >= 0) {
+            int why = mats_jumped((const float (*)[4])f->consts[j],
+                                  (const float (*)[4])prev->consts[pj]);
+            if (why)
+                len += snprintf(line + len, sizeof line - len, " JUMPED(%s)",
+                                why == 1 ? "turned" : "moved");
+        }
         if (pj >= 0 && f->key[j] != prev->key[pj])
             len += snprintf(line + len, sizeof line - len, " LOOSE (before:"
                             " attr0 %08X n %u tex0 %08X)", prev->part[pj][1],
@@ -1483,6 +1646,29 @@ static void flip_before(const Nv2aPbBackend *be)
     }
     if (s_mode == 2)
         s_rep_blend = 0;
+    {
+        /* RECOMP_INTERP_JUMPLOG=1 (test): a line per paired draw whose
+         * matrices jumped (drawn as its own frame among blended ones). */
+        static int jl = -1;
+        uint32_t j;
+        if (jl < 0)
+            jl = getenv("RECOMP_INTERP_JUMPLOG") != NULL;
+        for (j = 0; jl && s_rep_blend && j < f->ndraws; j++) {
+            int32_t pj = f->pair[j], why;
+            if (pj < 0)
+                continue;
+            why = mats_jumped((const float (*)[4])f->consts[j],
+                              (const float (*)[4])prev->consts[pj]);
+            if (why)
+                fprintf(stderr, "[IJUMP] flip %u draw %u/%u pair %d %s prog"
+                        " %08X attr0 %08X n %u tex0 %08X target %08X%s%c",
+                        g_pb.flips, j, f->ndraws, pj,
+                        why == 1 ? "turned" : "moved", f->part[j][0],
+                        f->part[j][1], f->part[j][2], f->part[j][4],
+                        f->part[j][5], f->key[j] != prev->key[pj]
+                        ? " (loose pair)" : "", 10);
+        }
+    }
     ctl_read();
     {
         static const char *tr = (const char *)-1;
