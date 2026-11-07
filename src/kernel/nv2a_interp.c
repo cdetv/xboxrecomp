@@ -2489,7 +2489,7 @@ static void flip_before(const Nv2aPbBackend *be)
                     s_rep_ema *= r_dn / r_now;
                     hold_off = 60;      /* 2 s: no flapping 2 <-> 3 */
                 } else if (n < s_n && !hold_off && per < 33.8
-                           && s_rep_ema * r_up / r_now < 0.4 * per) {
+                           && s_rep_ema * r_up / r_now < 0.5 * per) {
                     s_n_eff = n + 1;
                     s_rep_ema *= r_up / r_now;
                 }
