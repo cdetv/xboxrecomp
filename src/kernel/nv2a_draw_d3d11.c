@@ -1684,6 +1684,7 @@ static ID3DBlob *compile_src(const char *src, const char *entry,
         if (code) {
             if (loaded)
                 *loaded = 1;
+            nv2a_vsh_gpu_cache_touch(path);   /* a pre-compile pass: used */
             return code;
         }
     }
