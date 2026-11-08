@@ -1997,12 +1997,21 @@ extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
 
-static uint32_t *s_watchdog_esp;
-/* The other guest registers are thread-local too, so the watchdog has to be
- * handed the guest thread's copies rather than reading its own -- which are
- * always zero, and read as "every register is null" at exactly the moment the
- * registers are the thing being asked about. */
-static uint32_t *s_watchdog_regs[6];
+/* Every thread that runs guest code, for xbox_WatchdogDump. The guest registers
+ * are thread-local, so the watchdog has to be handed each thread's copies
+ * rather than reading its own -- which are always zero, and read as "every
+ * register is null" at exactly the moment the registers are the thing being
+ * asked about. A slot is taken with `claimed` and readable once `esp` is set. */
+#define WD_MAX_THREADS 32
+typedef struct {
+    volatile LONG claimed;
+    uint32_t * volatile esp;
+    uint32_t *regs[6];
+    const char *name;
+    DWORD tid;
+    uint32_t stack_top;
+} WdThread;
+static WdThread  s_wd_threads[WD_MAX_THREADS];
 static unsigned  s_watchdog_secs;
 static const char *s_watchdog_file;   /* RECOMP_WATCHDOG_FILE */
 
@@ -2366,37 +2375,57 @@ void xbox_PeekSample(const char *label)
     fflush(stderr);
 }
 
-static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+/* Called on the thread: `name` must outlive it. */
+void xbox_WatchdogAddThread(const char *name, uint32_t stack_top)
 {
-    const uint8_t *mem;
-    uint32_t esp, i;
+    int i;
 
-    (void)unused;
-    if (s_watchdog_file) {
-        /* RECOMP_WATCHDOG_FILE: dump when the file appears, not after a
-         * fixed time. A hang that comes at an unpredictable point -- while a
-         * level loads, minutes in, with someone at the pad -- is caught when
-         * it is seen, which a timer set at launch cannot do. */
-        ULONGLONG t0 = GetTickCount64();
-        while (GetFileAttributesA(s_watchdog_file) == INVALID_FILE_ATTRIBUTES)
-            Sleep(500);
-        s_watchdog_secs = (unsigned)((GetTickCount64() - t0) / 1000u);
-        fprintf(stderr, "[WATCHDOG] %s appeared\n", s_watchdog_file);
-    } else {
-        Sleep(s_watchdog_secs * 1000u);
+    for (i = 0; i < WD_MAX_THREADS; i++) {
+        WdThread *t = &s_wd_threads[i];
+        if (InterlockedCompareExchange(&t->claimed, 1, 0))
+            continue;
+        t->name = name;
+        t->tid = GetCurrentThreadId();
+        t->stack_top = stack_top;
+        t->regs[0] = &g_eax; t->regs[1] = &g_ecx;
+        t->regs[2] = &g_edx; t->regs[3] = &g_ebx;
+        t->regs[4] = &g_esi; t->regs[5] = &g_edi;
+        t->esp = &g_esp;
+        return;
     }
+}
 
-    mem = (const uint8_t *)g_memory_offset;
-    esp = s_watchdog_esp ? *s_watchdog_esp : 0;
-    fprintf(stderr, "[WATCHDOG] no exit after %us; guest esp=0x%08X\n"
-            "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
-            s_watchdog_secs, esp,
-            s_watchdog_regs[0] ? *s_watchdog_regs[0] : 0,
-            s_watchdog_regs[1] ? *s_watchdog_regs[1] : 0,
-            s_watchdog_regs[2] ? *s_watchdog_regs[2] : 0,
-            s_watchdog_regs[3] ? *s_watchdog_regs[3] : 0,
-            s_watchdog_regs[4] ? *s_watchdog_regs[4] : 0,
-            s_watchdog_regs[5] ? *s_watchdog_regs[5] : 0);
+/* Called on the thread before it ends: its registers go with it. */
+void xbox_WatchdogRemoveThread(void)
+{
+    int i;
+    DWORD me = GetCurrentThreadId();
+
+    for (i = 0; i < WD_MAX_THREADS; i++) {
+        WdThread *t = &s_wd_threads[i];
+        if (t->esp && t->tid == me) {
+            t->esp = NULL;
+            InterlockedExchange(&t->claimed, 0);
+            return;
+        }
+    }
+}
+
+/* Is the guest address readable right now? The stack dump must not fault: a
+ * dump of a game that merely froze would become a crash. */
+static int wd_readable(const void *p)
+{
+    MEMORY_BASIC_INFORMATION m;
+
+    return VirtualQuery(p, &m, sizeof m) == sizeof m && m.State == MEM_COMMIT
+           && !(m.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+}
+
+void xbox_WatchdogDump(void)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    int t;
+
     /* The recent indirect-call targets name whatever is spinning: a stuck loop
      * inside a function reached through a pointer leaves no clue on the stack
      * beyond the return address of the call that entered it. */
@@ -2446,12 +2475,55 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 #undef WD_NV2A
     }
 
-    for (i = 0; i < 400 && esp; i++) {
-        uint32_t a = esp + i * 4;
-        if (a < XBOX_STACK_BASE || a >= XBOX_STACK_TOP) break;
-        fprintf(stderr, "    GS %08X %08X\n", a,
-                *(const uint32_t *)(mem + a));
+    /* Each guest thread: its registers and its stack, in the GS format
+     * tools/stackwalk.py reads. */
+    for (t = 0; t < WD_MAX_THREADS; t++) {
+        const WdThread *w = &s_wd_threads[t];
+        uint32_t * const *regs = w->regs;
+        uint32_t esp, i;
+
+        if (!w->esp)
+            continue;
+        esp = *w->esp;
+        fprintf(stderr, "[WATCHDOG] thread \"%s\" (id %lu): guest esp=0x%08X\n"
+                "  regs: eax=%08X ecx=%08X edx=%08X ebx=%08X esi=%08X edi=%08X\n",
+                w->name, (unsigned long)w->tid, esp, *regs[0], *regs[1],
+                *regs[2], *regs[3], *regs[4], *regs[5]);
+        for (i = 0; i < 400 && esp; i++) {
+            uint32_t a = esp + i * 4;
+            if (a >= w->stack_top)
+                break;
+            if ((i == 0 || !(a & 0xFFFu)) && !wd_readable(mem + a))
+                break;
+            fprintf(stderr, "    GS %08X %08X\n", a,
+                    *(const uint32_t *)(mem + a));
+        }
     }
+    fflush(stderr);
+}
+
+static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
+{
+    const uint8_t *mem;
+
+    (void)unused;
+    if (s_watchdog_file) {
+        /* RECOMP_WATCHDOG_FILE: dump when the file appears, not after a
+         * fixed time. A hang that comes at an unpredictable point -- while a
+         * level loads, minutes in, with someone at the pad -- is caught when
+         * it is seen, which a timer set at launch cannot do. */
+        ULONGLONG t0 = GetTickCount64();
+        while (GetFileAttributesA(s_watchdog_file) == INVALID_FILE_ATTRIBUTES)
+            Sleep(500);
+        s_watchdog_secs = (unsigned)((GetTickCount64() - t0) / 1000u);
+        fprintf(stderr, "[WATCHDOG] %s appeared\n", s_watchdog_file);
+    } else {
+        Sleep(s_watchdog_secs * 1000u);
+    }
+
+    mem = (const uint8_t *)g_memory_offset;
+    fprintf(stderr, "[WATCHDOG] no exit after %us\n", s_watchdog_secs);
+    xbox_WatchdogDump();
     /* RECOMP_WATCHDOG_RAM=<file>: write the contiguous window (file offset =
      * physical address) so it can be compared byte for byte with an xemu RAM
      * dump of the same scene. A peek answers "what is at this address"; it
@@ -2478,6 +2550,11 @@ void xbox_WatchdogStart(void)
     const char *file = getenv("RECOMP_WATCHDOG_FILE");
     HANDLE h;
 
+    /* Taken on the guest thread: g_esp is thread-local, so the dump has to be
+     * handed the address of the one that matters rather than reading its own,
+     * which is always zero. Always: xbox_WatchdogDump works without the timer. */
+    xbox_WatchdogAddThread("main", XBOX_STACK_TOP);
+
     if (file && *file) {
         s_watchdog_file = file;
     } else {
@@ -2488,13 +2565,6 @@ void xbox_WatchdogStart(void)
             return;
     }
 
-    /* Taken on the guest thread: g_esp is thread-local, so the watchdog has to
-     * be handed the address of the one that matters rather than reading its
-     * own, which is always zero. */
-    s_watchdog_esp = &g_esp;
-    s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
-    s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
-    s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
     h = CreateThread(NULL, 0, xbox_watchdog_thread, NULL, 0, NULL);
     if (h)
         CloseHandle(h);
