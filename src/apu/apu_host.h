@@ -94,6 +94,8 @@ typedef struct ApuApi {
                                 int *looping);
     void     (*mixer_play)(int slot, int looping);
     void     (*mixer_stop)(int slot);
+
+    void     (*set_output_gain)(float gain);
 } ApuApi;
 
 /* The DLL's one export. Keeps host (it must outlive the APU) and fills api.

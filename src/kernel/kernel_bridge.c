@@ -513,12 +513,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
             fprintf(stderr, "  [KERNEL] worker thread has no TIB of its own;"
                             " it shares the main thread's\n");
     }
+    xbox_WatchdogAddThread("worker", s->stack_top);
     free(s);
 
     guest_cpu_join();
     bridge_run_thread_inline(fn, ctx1, ctx2);
     guest_cpu_part();
 
+    xbox_WatchdogRemoveThread();
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
@@ -1997,6 +1999,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        xbox_WatchdogRemoveThread();
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -3142,6 +3145,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         return 0;
     }
     g_esp = XBOX_WORKER_STACK_TOP(slot);
+    xbox_WatchdogAddThread("kernel timers", XBOX_WORKER_STACK_TOP(slot));
     {
         /* Its own TIB, for the same reason bridge_thread_main gives one to
          * every worker: a DPC routine with an SEH prologue reads fs:[0],

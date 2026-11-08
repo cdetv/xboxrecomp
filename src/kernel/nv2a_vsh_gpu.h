@@ -122,6 +122,12 @@ int nv2a_vsh_gpu_precompile(const uint32_t *words, uint32_t count);
 void nv2a_vsh_gpu_precompile_stats(uint32_t *compiled, uint32_t *had,
                                    uint32_t *failed, uint32_t *waiting);
 
+/* RECOMP_SHADER_CACHE_TOUCH=1: a shader cache file (.vso or .cso) a level
+ * actually used gets its write time set to now; a title's pre-compile pass
+ * then deletes what is older than its start. Off (or path NULL): nothing.
+ * The startup load of every .vso is not a use. */
+void nv2a_vsh_gpu_cache_touch(const char *path);
+
 /* Called (when set) with each program's hash the first time a drawing
  * shader is asked for it: nv2a_vsh_prescan.c's way to see what is drawn
  * without this file depending on it. */

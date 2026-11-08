@@ -36,6 +36,11 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d);
  * where it is; 0 = both carry on from there. Any thread. */
 void xbox_ApuSetPaused(int on);
 
+/* A gain on everything the APU outputs, for a host volume setting: 1 =
+ * untouched (default), 0 = silent, above 1 louder with a soft limiter (at
+ * most 8, +18 dB). Changes glide over ~15 ms. Any thread. */
+void xbox_ApuSetOutputGain(float gain);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

@@ -18,6 +18,7 @@ import re
 import sys
 
 FUNCTIONS, GS_LINE = sys.argv[1], re.compile(r"GS ([0-9A-Fa-f]{8}) ([0-9A-Fa-f]{8})")
+THREAD_LINE = re.compile(r'\[WATCHDOG\] thread "([^"]*)" \(id (?:\d+)\)')
 
 
 def load(path):
@@ -31,8 +32,15 @@ def load(path):
 
 def main():
     funcs, starts = load(FUNCTIONS)
-    depth = 0
+    depth = shown = 0
     for line in sys.stdin:
+        # xbox_WatchdogDump lists every guest thread: one backtrace each.
+        t = THREAD_LINE.search(line)
+        if t:
+            print(f"thread {t.group(1)}")
+            shown += depth
+            depth = 0
+            continue
         m = GS_LINE.search(line)
         if not m:
             continue
@@ -45,7 +53,7 @@ def main():
             continue
         depth += 1
         print(f"  #{depth:<3} {slot:08X} -> {word:08X}  {name}+0x{word - start:X}")
-    if not depth:
+    if not depth and not shown:
         print("  no guest return addresses on the stack")
 
 

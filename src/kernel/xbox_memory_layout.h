@@ -245,8 +245,20 @@ void xbox_ProtectMirrorsForDebug(void);
 
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
- * does nothing unless that variable is set. */
+ * without that variable it only enters this thread for xbox_WatchdogDump. */
 void xbox_WatchdogStart(void);
+
+/* To stderr, without stopping anything: where every guest thread is right now
+ * (registers, guest stack in tools/stackwalk.py's GS format), the recent
+ * indirect calls and the pushbuffer pointers. Any thread may call it, also
+ * with the game hung: "the game froze, where is it?" while it stays as it is. */
+void xbox_WatchdogDump(void);
+
+/* The calling thread runs guest code on a stack ending at stack_top: list it
+ * for xbox_WatchdogDump. Remove it before the thread ends (its registers go
+ * with it). `name` must outlive the thread. */
+void xbox_WatchdogAddThread(const char *name, uint32_t stack_top);
+void xbox_WatchdogRemoveThread(void);
 
 /* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */

@@ -536,6 +536,41 @@ static ID3D11VertexShader *disk_add(uint64_t key, ID3D11VertexShader *vs,
     return vs;
 }
 
+/* RECOMP_SHADER_CACHE_TOUCH=1 (a title's shader pre-compile pass): a cache
+ * file a level actually uses -- found by a scan, loaded for a draw, drawn
+ * from the startup load -- gets its write time set to now, so the pass can
+ * tell what nothing used (older than its start) and delete it. The startup
+ * loader, which reads every file, touches nothing. Off: files are never
+ * written to after their compile. */
+void nv2a_vsh_gpu_cache_touch(const char *path)
+{
+    static int on = -1;
+    HANDLE h;
+    FILETIME now;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SHADER_CACHE_TOUCH");
+        on = e && atoi(e) != 0;
+    }
+    if (!on || !path || !path[0])
+        return;
+    h = CreateFileA(path, FILE_WRITE_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    GetSystemTimeAsFileTime(&now);
+    SetFileTime(h, NULL, NULL, &now);
+    CloseHandle(h);
+}
+
+static void cache_touch(uint64_t key)
+{
+    char path[MAX_PATH];
+    cache_path(path, sizeof path, key);
+    nv2a_vsh_gpu_cache_touch(path);
+}
+
 /* <key>.vso as a shader, or NULL (absent, unreadable or rejected). */
 static ID3D11VertexShader *cache_load_file(uint64_t key)
 {
@@ -626,6 +661,7 @@ static void compile_draw(DrawJob *j)
 
     /* The loader may not have reached this one yet: its file first. */
     if (cache_on() && (vs = cache_load_file(j->key)) != NULL) {
+        cache_touch(j->key);
         EnterCriticalSection(&s_q_cs);
         vs = disk_add(j->key, vs, 0);
         LeaveCriticalSection(&s_q_cs);
@@ -750,6 +786,8 @@ static void precompile_job(PreJob *pj)
         LeaveCriticalSection(&s_q_cs);
         if (!had && (vs = cache_load_file(key)) != NULL)
             loaded = 1;
+        if (had || loaded)
+            cache_touch(key);           /* a scan found it: used */
         if (!had && !loaded) {
             hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL, s_dentry,
                             VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, &code, &err);
@@ -994,6 +1032,7 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
             s_dcompiled++;
             LeaveCriticalSection(&s_q_cs);
             free(j.src);
+            cache_touch(j.key);         /* drawn: used */
             fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
                     " cache%s\n", (unsigned long long)p->hash,
                     pre ? " (pre-compiled)" : "");
