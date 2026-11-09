@@ -377,12 +377,16 @@ typedef struct {
  *                     style (0 = blur with the square of the depth
  *                     distance, as Conker's; 1 = cinematic, as a lens), p5
  *                     the most blur in guest pixels (radius). All floats
- *                     but p4. */
+ *                     but p4.
+ *   NV_HOST_FX_WIRE   from here on the title's draws fill as lines (p0 != 0)
+ *                     or solid (p0 = 0): a debug view; the frame's own passes
+ *                     (the back end's copies and filters) stay solid. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   8u
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u
+#define NV_HOST_FX_WIRE  2u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 

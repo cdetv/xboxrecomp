@@ -5071,6 +5071,32 @@ static struct {
 } s_cull[CULL_STATES];
 static int s_ncull;
 
+/* NV_HOST_FX_WIRE: the same state filling as lines; each kept once made. */
+#define WIRE_STATES 64
+static int s_wire;
+static struct {
+    ID3D11RasterizerState *base, *rs;
+} s_wires[WIRE_STATES];
+static int s_nwires;
+
+static ID3D11RasterizerState *wire_state(ID3D11RasterizerState *base)
+{
+    D3D11_RASTERIZER_DESC rd;
+    int i;
+
+    for (i = 0; i < s_nwires; i++)
+        if (s_wires[i].base == base)
+            return s_wires[i].rs;
+    if (s_nwires == WIRE_STATES)
+        return base;
+    ID3D11RasterizerState_GetDesc(base, &rd);
+    rd.FillMode = D3D11_FILL_WIREFRAME;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_wires[s_nwires].rs)))
+        return base;
+    s_wires[s_nwires].base = base;
+    return s_wires[s_nwires++].rs;
+}
+
 static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
 {
     D3D11_RASTERIZER_DESC rd;
@@ -5978,7 +6004,8 @@ static void d3d_draw(void)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     rs = raster_state(surf_sx(si));
-    ID3D11DeviceContext_RSSetState(s_ctx, gvs ? cull_state(rs) : rs);
+    rs = gvs ? cull_state(rs) : rs;
+    ID3D11DeviceContext_RSSetState(s_ctx, s_wire ? wire_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     bs = blend_state(bpp);
@@ -6964,6 +6991,10 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     DofParams dp;
     int si, zi;
 
+    if (id == NV_HOST_FX_WIRE) {
+        s_wire = p[0] != 0;
+        return;
+    }
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();
