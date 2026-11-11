@@ -316,6 +316,115 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
     return TRUE;
 }
 
+/* Partition sizes in sectors, the same geometry as the table above; the index
+ * is the partition number. 0 is the whole disk: its image holds the table and
+ * nothing answers for its size but the image itself. */
+static const ULONGLONG s_part_sectors[6] = {
+    0,             /* 0: whole disk           */
+    0x00465400ull, /* 1: E: game and saves    */
+    0x000FA000ull, /* 2: C: system            */
+    0x00177000ull, /* 3: X: cache             */
+    0x00177000ull, /* 4: Y: cache             */
+    0x00177000ull, /* 5: Z: cache             */
+};
+
+ULONGLONG xbox_partition_image_bytes(int n)
+{
+    if (n < 1 || n > 5)
+        return 0;
+    return s_part_sectors[n] * 512ull;
+}
+
+int xbox_partition_image_number(const WCHAR *host_path)
+{
+    WCHAR prefix[MAX_PATH];
+    size_t n;
+    WCHAR d;
+
+    if (!host_path || !s_save_dir[0])
+        return 0;
+    swprintf_s(prefix, MAX_PATH, L"%s\\Partition", s_save_dir);
+    n = wcslen(prefix);
+    if (_wcsnicmp(host_path, prefix, n) != 0)
+        return 0;
+    d = host_path[n];
+    if (d < L'1' || d > L'5' || _wcsicmp(host_path + n + 1, L".img") != 0)
+        return 0;
+    return (int)(d - L'0');
+}
+
+/* Cut an image from before images were sized by what is written.
+ *
+ * Only an image exactly the partition's full size is one of those; anything
+ * else has been sized by writes already and is left alone. Sparse and as
+ * made, its allocated ranges are what a title wrote (the Z: a title formats
+ * is ~0.1 MB), so it is cut after the last one and keeps its data. Fully
+ * allocated -- a copy wrote the zeros out, or the drive has no sparse files --
+ * there is no telling data from zeros without reading gigabytes, so it is
+ * emptied: a blank partition is one a title formats again, and these hold
+ * only what a title keeps on the console's own disk (caches), never saves. */
+static void xbox_shrink_full_size_image(const WCHAR *image, int p)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    LARGE_INTEGER size, cut;
+    FILE_ALLOCATED_RANGE_BUFFER query, ranges[64];
+    ULONGLONG allocated = 0, last_end = 0;
+    BOOL known = TRUE;
+    HANDLE h;
+
+    if (!GetFileAttributesExW(image, GetFileExInfoStandard, &fa))
+        return;
+    size.LowPart = fa.nFileSizeLow;
+    size.HighPart = (LONG)fa.nFileSizeHigh;
+    if ((ULONGLONG)size.QuadPart != xbox_partition_image_bytes(p))
+        return;
+
+    h = CreateFileW(image, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    query.FileOffset.QuadPart = 0;
+    query.Length.QuadPart = size.QuadPart;
+    for (;;) {
+        DWORD got = 0, i, count;
+        BOOL ok = DeviceIoControl(h, FSCTL_QUERY_ALLOCATED_RANGES, &query,
+                                  sizeof(query), ranges, sizeof(ranges), &got,
+                                  NULL);
+        if (!ok && GetLastError() != ERROR_MORE_DATA) {
+            known = FALSE;
+            break;
+        }
+        count = got / sizeof(ranges[0]);
+        for (i = 0; i < count; i++) {
+            ULONGLONG end = (ULONGLONG)ranges[i].FileOffset.QuadPart +
+                            (ULONGLONG)ranges[i].Length.QuadPart;
+            allocated += (ULONGLONG)ranges[i].Length.QuadPart;
+            if (end > last_end)
+                last_end = end;
+        }
+        if (ok || count == 0)
+            break;
+        query.FileOffset.QuadPart = (LONGLONG)last_end;
+        query.Length.QuadPart = size.QuadPart - (LONGLONG)last_end;
+    }
+
+    if (known && allocated < (ULONGLONG)size.QuadPart)
+        cut.QuadPart = (LONGLONG)((last_end + 511) & ~511ull);
+    else
+        cut.QuadPart = 0;
+    if (SetFilePointerEx(h, cut, NULL, FILE_BEGIN) && SetEndOfFile(h))
+        xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH,
+                 "Partition%d.img was full size (%llu MB, %llu MB of it on "
+                 "disk): %s, now %llu KB", p,
+                 (unsigned long long)(size.QuadPart >> 20),
+                 (unsigned long long)((known ? allocated
+                                             : (ULONGLONG)size.QuadPart) >> 20),
+                 cut.QuadPart ? "cut after its data" : "emptied",
+                 (unsigned long long)(cut.QuadPart >> 10));
+    CloseHandle(h);
+}
+
 void xbox_path_init(const char* game_dir, const char* save_dir)
 {
     WCHAR save_base[MAX_PATH];
@@ -385,38 +494,30 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
         swprintf_s(image, MAX_PATH, L"%s\\%s", s_save_dir, XBOX_DISK_IMAGE_NAME);
         xbox_write_partition_table(image);
-        /* The other partition devices, sized to the same geometry the table
-         * above describes, so a title that asks the device how big it is gets
-         * an answer consistent with the table it just read. Marked sparse
-         * first: the cache partitions are 750 MB each and none of that is
-         * touched until something writes to it. */
-        {
-            static const ULONGLONG part_sectors[6] = {
-                0,             /* 0: whole disk, sized below      */
-                0x00465400ull, /* 1: E: game and saves            */
-                0x000FA000ull, /* 2: C: system                    */
-                0x00177000ull, /* 3: X: cache                     */
-                0x00177000ull, /* 4: Y: cache                     */
-                0x00177000ull, /* 5: Z: cache                     */
-            };
-            for (int p = 1; p <= 5; p++) {
-                HANDLE h;
-                DWORD ret;
-                LARGE_INTEGER end;
+        /* The other partition devices. Each image is only as long as what a
+         * title has written to it: the partition's size comes from the table
+         * (xbox_partition_image_bytes, which the size queries answer with),
+         * and a read past the image's end returns zeros (kernel_file.c), the
+         * way an untouched stretch of a real disk reads.
+         *
+         * They used to be set to the full partition size here, as sparse
+         * files: 4.9 GB listed, ~0 on disk. Copying the folder (Explorer, a
+         * backup, another drive) writes every one of those zeros out, and a
+         * drive without sparse files (exFAT, FAT32) holds them in full from
+         * the start. Images from then are cut back below. Still marked
+         * sparse, so a write far into an image leaves the gap unallocated. */
+        for (int p = 1; p <= 5; p++) {
+            HANDLE h;
+            DWORD ret;
 
-                swprintf_s(image, MAX_PATH, L"%s\\Partition%d.img",
-                           s_save_dir, p);
-                h = CreateFileW(image, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                                OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (h == INVALID_HANDLE_VALUE)
-                    continue;
-                DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0,
-                                &ret, NULL);
-                end.QuadPart = (LONGLONG)(part_sectors[p] * 512ull);
-                if (SetFilePointerEx(h, end, NULL, FILE_BEGIN))
-                    SetEndOfFile(h);
-                CloseHandle(h);
-            }
+            swprintf_s(image, MAX_PATH, L"%s\\Partition%d.img", s_save_dir, p);
+            xbox_shrink_full_size_image(image, p);
+            h = CreateFileW(image, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h == INVALID_HANDLE_VALUE)
+                continue;
+            DeviceIoControl(h, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &ret, NULL);
+            CloseHandle(h);
         }
     }
 

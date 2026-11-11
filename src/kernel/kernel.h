@@ -557,6 +557,18 @@ typedef char  xbox_host_char;
 /* Host path produced by the most recent xbox_translate_path call. */
 const wchar_t *xbox_LastHostPath(void);
 
+#if defined(_WIN32)
+/* Partition device images (<save>\Partition1-5.img). An image is only as long
+ * as what has been written to it; the partition's size comes from the
+ * synthesised partition table instead. _number: 1-5 when host_path is one of
+ * those images, else 0. _bytes: partition n's size, 0 for any other n. */
+int       xbox_partition_image_number(const WCHAR *host_path);
+ULONGLONG xbox_partition_image_bytes(int n);
+/* The partition size behind a handle NtCreateFile opened on one of those
+ * images, 0 for any other handle (kernel_file.c). */
+ULONGLONG xbox_PartitionHandleBytes(HANDLE h);
+#endif
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
 
 /* Optional: a project sets this to see the guest paths the kernel translates
