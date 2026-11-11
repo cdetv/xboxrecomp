@@ -48,6 +48,11 @@ int usb_gamepad_configured(int pad);
 /* Back to a device fresh off the wire: no address, not configured. */
 void usb_gamepad_reset(int pad);
 
+/* A RECOMP_PAD_LIVE line ("a:100", "&rt:300", "p2-lup:2000", "mouse:40,0")
+ * pressed as if appended to that file, without one: a game's debug console
+ * can drive the pad. Any thread; 0 when 32 lines already wait. */
+int xbox_PadLiveLine(const char *line);
+
 /* Up to four pads, one per Xbox controller port. Pad n is driven by host
  * XInput pad n and by pad-script steps prefixed "p<n+1>-". */
 #define USB_GAMEPAD_MAX 4
