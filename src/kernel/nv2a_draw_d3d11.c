@@ -2643,6 +2643,12 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
     return hash_bytes(p + i, n - i, h);
 }
 
+/* For nv2a_vsh_gpu.c's input cache. */
+uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
+{
+    return hash_fast((const uint8_t *)p, n, h);
+}
+
 /* ── Render to texture ─────────────────────────────────────────────────────
  *
  * A title draws into a surface and then samples it: Conker's bloom
@@ -6793,6 +6799,15 @@ static void d3d_report(void)
                 " (%u failed, %u waiting), %.0f ms compiling%c",
                 s_stat.vsh_gpu, s_stat.vsh_cpu_waiting, s_stat.vsh_cpu_kept,
                 s_stat.vsh_cpu_inputs, made, failed, queued, ms, 10);
+        {
+            uint64_t nb, bytes, wraps, hits, hit_bytes;
+            nv2a_vsh_gpu_input_stats(&nb, &bytes, &wraps);
+            nv2a_vsh_gpu_cache_stats(&hits, &hit_bytes);
+            fprintf(stderr, "[VSHGPU] inputs: %.1f MB copied, %.1f MB drawn"
+                    " from an earlier copy (%llu spans), %llu ring wraps%c",
+                    bytes / 1048576.0, hit_bytes / 1048576.0,
+                    (unsigned long long)hits, (unsigned long long)wraps, 10);
+        }
     }
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads (%u of them"
             " DXT kept compressed), %u binds unchanged, %u binds of a format"

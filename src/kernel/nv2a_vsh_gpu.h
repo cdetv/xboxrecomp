@@ -79,6 +79,10 @@ int nv2a_vsh_gpu_fetch(const uint32_t *idx, uint32_t count,
 void nv2a_vsh_gpu_input_stats(uint64_t *batches, uint64_t *bytes,
                               uint64_t *wraps);
 
+/* Since start: spans drawn from an earlier copy in the ring (the input
+ * cache, RECOMP_VSH_INPUT_CACHE) and their bytes, not copied again. */
+void nv2a_vsh_gpu_cache_stats(uint64_t *hits, uint64_t *hit_bytes);
+
 /* ---- step 3: drawing with them ----------------------------------------- */
 
 struct ID3D11VertexShader;
