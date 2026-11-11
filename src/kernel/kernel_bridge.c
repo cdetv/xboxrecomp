@@ -2548,9 +2548,20 @@ static void kernel_drain_dpcs(void)
  * VOID KeInitializeDpc(PKDPC Dpc, PKDEFERRED_ROUTINE DeferredRoutine,
  *                       PVOID DeferredContext)
  *
- * Initializes a DPC object. The Xbox KDPC structure is 32 bytes.
- * We zero it and set the routine and context pointers.
+ * Initializes a DPC object. The Xbox KDPC is 28 bytes (0x1C): Type,
+ * Inserted, Padding, DpcListEntry, DeferredRoutine, DeferredContext and the
+ * two SystemArguments -- no Number / Importance / DpcData as on NT. We zero
+ * it and set the routine and context pointers.
+ *
+ * It used to be cleared as 32 bytes, so whatever the title keeps right after
+ * the DPC was zeroed too. Conker's XHV voice engine keeps its engine pointer
+ * there (KDPC 0x0075F100, pointer 0x0075F11C): XHVEngineCreate set the
+ * pointer, initialised the DPC, and returned success with an engine of 0. Its
+ * 20 ms timer DPC then ran on "engine 0" for the whole session, reading guest
+ * 0x40..0x53 as the engine's five slots, and crashed once anything nonzero
+ * landed there (to-do 142: right after leaving a level).
  */
+#define XBOX_KDPC_SIZE 28
 static void bridge_KeInitializeDpc(void)
 {
     uint32_t dpc_va = STACK_ARG(0);
@@ -2561,13 +2572,13 @@ static void bridge_KeInitializeDpc(void)
      * makes this memset write through NULL inside the bridge. The export
      * returns void, so refusing is doing nothing -- which is what the real
      * kernel does with an object it cannot write. */
-    if (!bridge_buf_ok(dpc_va, 32, "KeInitializeDpc")) {
+    if (!bridge_buf_ok(dpc_va, XBOX_KDPC_SIZE, "KeInitializeDpc")) {
         g_eax = 0;
         return;
     }
 
-    /* Zero the structure (32 bytes) */
-    memset(XBOX_TO_NATIVE(dpc_va), 0, 32);
+    /* Zero the structure, and nothing past it */
+    memset(XBOX_TO_NATIVE(dpc_va), 0, XBOX_KDPC_SIZE);
 
     /* Set Type (0x13 = DpcObject) and fields */
     BRIDGE_MEM16(dpc_va + 0) = 0x13;   /* Type */
