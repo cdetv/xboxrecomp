@@ -264,6 +264,14 @@ void xbox_WatchdogRemoveThread(void);
  * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
 void xbox_PeekSample(const char *label);
 void xbox_WatchInit(void);
+/* RECOMP_WATCH while the game runs (a debug console): watch the guest dword
+ * `spec` names ("0x0084B290", "[[0x006DF414]]+0x14"), the one before let go.
+ * 1 = armed, 2 = waiting for its chain or page, 0 = not armed. */
+int xbox_WatchSet(const char *spec);
+void xbox_WatchStop(void);
+uint32_t xbox_WatchAddress(void);   /* the dword watched now, 0 = none */
+/* n bytes from guest va are mapped (the windows RECOMP_PEEK reads). */
+int xbox_GuestReadable(uint32_t va, uint32_t n);
 
 /* ================================================================
  * Xbox stack for recompiled code
