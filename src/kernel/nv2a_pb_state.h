@@ -417,22 +417,27 @@ typedef struct {
  *                     style (0 = blur with the square of the depth
  *                     distance, as Conker's; 1 = cinematic, as a lens), p5
  *                     the most blur in guest pixels (radius). All floats
- *                     but p4. */
+ *                     but p4.
+ *   NV_HOST_FX_WIRE   from here on the title's draws fill as lines (p0 != 0)
+ *                     or solid (p0 = 0): a debug view; the frame's own passes
+ *                     (the back end's copies and filters) stay solid. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   8u
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u
+#define NV_HOST_FX_WIRE  2u
 /* NV_HOST_FX_INTERP_CUT: the title's camera cut in this frame (no
  * parameters): frame interpolation does not blend it with the frame before
- * (nv2a_interp.c). Not a back end's. */
-#define NV_HOST_FX_INTERP_CUT 2u
+ * (nv2a_interp.c). Not a back end's. 5..7, not 2..4: main took 2 for
+ * NV_HOST_FX_WIRE. */
+#define NV_HOST_FX_INTERP_CUT 5u
 /* NV_HOST_FX_INTERP_HOLD_ON / _OFF: frame interpolation draws the batches
  * between the two as their own frame, never blended -- a game's particles,
  * whose per-particle constants shift whenever one is born or dies, so a
  * blend mixed different particles (streaks). */
-#define NV_HOST_FX_INTERP_HOLD_ON  3u
-#define NV_HOST_FX_INTERP_HOLD_OFF 4u
+#define NV_HOST_FX_INTERP_HOLD_ON  6u
+#define NV_HOST_FX_INTERP_HOLD_OFF 7u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 

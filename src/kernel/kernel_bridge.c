@@ -4570,8 +4570,10 @@ static void bridge_NtDeviceIoControlFile(void)
     if (ioctl == IOCTL_DISK_GET_PARTITION_INFO) {
         /* PARTITION_INFORMATION: StartingOffset and PartitionLength as
          * LARGE_INTEGERs, then HiddenSectors, PartitionNumber, and three
-         * bytes of type/flags -- 32 bytes. The length is the image's own
-         * size, which kernel_path.c set from the partition table. */
+         * bytes of type/flags -- 32 bytes. For a partition image the length
+         * is the partition's size from the table kernel_path.c writes: the
+         * image itself holds only what has been written to it. Any other
+         * device answers with its file's size. */
         HANDLE h = bridge_resolve_handle(STACK_ARG(0));
         LARGE_INTEGER size;
 
@@ -4580,8 +4582,8 @@ static void bridge_NtDeviceIoControlFile(void)
             g_eax = 0xC0000023u;
             return;
         }
-        size.QuadPart = 0;
-        if (h && h != INVALID_HANDLE_VALUE)
+        size.QuadPart = (LONGLONG)xbox_PartitionHandleBytes(h);
+        if (!size.QuadPart && h && h != INVALID_HANDLE_VALUE)
             GetFileSizeEx(h, &size);
         BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */
         BRIDGE_MEM32(out_va +  4) = 0;

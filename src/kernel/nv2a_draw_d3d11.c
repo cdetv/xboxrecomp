@@ -430,6 +430,7 @@ static struct {
     uint32_t boosted;                   /* surfaces made boosted */
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
+    uint32_t movie_43;                  /* movie batches drawn in 4:3 */
     uint32_t near_draws;                /* receiver_draw's two-pass draws */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
@@ -4332,6 +4333,46 @@ void xbox_SetTextureSmooth(xbox_TextureSmoothFn fn)
     s_smooth_fn = fn;
 }
 
+/* Movies in 4:3 (xbox_SetMovieStretch). A full-motion video frame is a
+ * YUY2 / UYVY texture (format 0x24 / 0x25) the title's decoder fills and
+ * draws over the screen; nothing else a title draws uses those formats at a
+ * movie's size (320 wide and up). On a surface scaled wider than tall (a
+ * wide window: x scale above the y scale), its batch is drawn squeezed to
+ * the guest frame's own shape round the clip's middle, and the clip's two
+ * side strips are cleared to black first. 1 = stretched to the window as
+ * the surface is (the old look); RECOMP_STRETCH_FMV=1 the same from the
+ * start. Executor thread; a change applies at the next movie batch. */
+static volatile int s_movie_stretch = -1;
+
+void xbox_SetMovieStretch(int on)
+{
+    s_movie_stretch = on != 0;
+}
+
+static int movie_stretch(void)
+{
+    if (s_movie_stretch < 0) {
+        const char *e = getenv("RECOMP_STRETCH_FMV");
+        s_movie_stretch = e && *e == '1';
+    }
+    return s_movie_stretch;
+}
+
+/* Whether this batch samples a movie frame: a bound stage with a YUY2 /
+ * UYVY texture at least 320 wide. */
+static int batch_is_movie(uint32_t bound)
+{
+    int st;
+
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &g_pb.texs[st];
+        if ((bound >> st) & 1u && (t->color == 0x24u || t->color == 0x25u)
+            && t->width >= 320u)
+            return 1;
+    }
+    return 0;
+}
+
 static int texture_smooth(int st)
 {
     const Texture *t = &g_pb.texs[st];
@@ -5291,6 +5332,32 @@ static struct {
 } s_cull[CULL_STATES];
 static int s_ncull;
 
+/* NV_HOST_FX_WIRE: the same state filling as lines; each kept once made. */
+#define WIRE_STATES 64
+static int s_wire;
+static struct {
+    ID3D11RasterizerState *base, *rs;
+} s_wires[WIRE_STATES];
+static int s_nwires;
+
+static ID3D11RasterizerState *wire_state(ID3D11RasterizerState *base)
+{
+    D3D11_RASTERIZER_DESC rd;
+    int i;
+
+    for (i = 0; i < s_nwires; i++)
+        if (s_wires[i].base == base)
+            return s_wires[i].rs;
+    if (s_nwires == WIRE_STATES)
+        return base;
+    ID3D11RasterizerState_GetDesc(base, &rd);
+    rd.FillMode = D3D11_FILL_WIREFRAME;
+    if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_wires[s_nwires].rs)))
+        return base;
+    s_wires[s_nwires].base = base;
+    return s_wires[s_nwires++].rs;
+}
+
 static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
 {
     D3D11_RASTERIZER_DESC rd;
@@ -6174,6 +6241,28 @@ static void d3d_draw(void)
     sc.top = (LONG)to_host(g_pb.clip_y, surf_sy(si));
     sc.right = (LONG)to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
     sc.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
+    if (bound && surf_sy(si) < surf_sx(si) * 0.999f && batch_is_movie(bound)
+        && !movie_stretch()) {
+        /* Squeezed to the guest frame's shape (xbox_SetMovieStretch): every
+         * x to cx + (x - cx) * s through the viewport, the scissor with it,
+         * and black where the stretched picture would have been. */
+        const float s = surf_sy(si) / surf_sx(si);
+        const float cx = 0.5f * (float)(sc.left + sc.right);
+        D3D11_RECT bar[2];
+        static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+        vp.TopLeftX = cx * (1.0f - s);
+        vp.Width = (float)s_surf[si].tw * s;
+        bar[0] = bar[1] = sc;
+        sc.left = (LONG)(cx + ((float)sc.left - cx) * s + 0.5f);
+        sc.right = (LONG)(cx + ((float)sc.right - cx) * s + 0.5f);
+        bar[0].right = sc.left;
+        bar[1].left = sc.right;
+        if (s_ctx1)
+            ID3D11DeviceContext1_ClearView(s_ctx1,
+                    (ID3D11View *)s_surf[si].rtv, black, bar, 2);
+        s_stat.movie_43++;
+    }
     blend_constant(bf);
     vis_note_scale(surf_sx(si) * surf_sy(si));
     vis_note_target(si, zi);
@@ -6211,7 +6300,8 @@ static void d3d_draw(void)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     rs = raster_state(surf_sx(si));
-    ID3D11DeviceContext_RSSetState(s_ctx, gvs ? cull_state(rs) : rs);
+    rs = gvs ? cull_state(rs) : rs;
+    ID3D11DeviceContext_RSSetState(s_ctx, s_wire ? wire_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
     bs = blend_state(bpp);
@@ -7345,6 +7435,9 @@ static void d3d_report(void)
     if (s_stat.tex_smooth)
         fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
                 " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
+    if (s_stat.movie_43)
+        fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
+                " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
@@ -7579,6 +7672,10 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     DofParams dp;
     int si, zi;
 
+    if (id == NV_HOST_FX_WIRE) {
+        s_wire = p[0] != 0;
+        return;
+    }
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();

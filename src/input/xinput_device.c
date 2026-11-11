@@ -124,15 +124,32 @@ static BOOL pad_touched(const XINPUT_GAMEPAD *g)
 /* Bit n: host pad n answered the last scan. */
 static volatile LONG g_slots_connected;
 
+/* Debug (issue #20 check): RECOMP_PAD_SCAN_DELAY_MS=<ms> sleeps that long
+ * after each empty XInput slot, as a PC whose virtual-pad drivers make
+ * XInputGetState on an empty slot slow; RECOMP_PAD_SCAN_LOG=1 prints each
+ * scan's length and the thread that ran it. */
+static int scan_env(const char *name)
+{
+    const char *v = getenv(name);
+    return v && *v ? atoi(v) : 0;
+}
+
 static void scan_slots(void)
 {
     static volatile LONG scanning;
+    static int delay_ms = -1, scan_log = -1;
     DWORD i, n = 0;
     LONG mask = 0;
+    LARGE_INTEGER t0, t1, f;
     /* The USB model's thread and the host's menus both ask; one scan at a
      * time, the other keeps what the last one found. */
     if (InterlockedExchange(&scanning, 1))
         return;
+    if (delay_ms < 0) {
+        delay_ms = scan_env("RECOMP_PAD_SCAN_DELAY_MS");
+        scan_log = scan_env("RECOMP_PAD_SCAN_LOG");
+    }
+    QueryPerformanceCounter(&t0);
     /* PlayStation pads start with the first scan: a title that reads its
      * pads through the USB model never calls xbox_InputInit. */
     xbox_SdlPadsInit();
@@ -142,7 +159,18 @@ static void scan_slots(void)
             if (n < XBOX_MAX_CONTROLLERS)
                 g_slot_of_port[n++] = i;
             mask |= 1L << i;
+        } else if (delay_ms > 0 && i < XBOX_MAX_CONTROLLERS) {
+            Sleep((DWORD)delay_ms);
         }
+    }
+    if (scan_log) {
+        QueryPerformanceCounter(&t1);
+        QueryPerformanceFrequency(&f);
+        fprintf(stderr, "[PADSCAN] %.2f ms, thread %lu, pads 0x%02lX\n",
+                (double)(t1.QuadPart - t0.QuadPart) * 1000.0
+                    / (double)f.QuadPart,
+                (unsigned long)GetCurrentThreadId(), (unsigned long)mask);
+        fflush(stderr);
     }
     InterlockedExchange(&g_slots_connected, mask);
     for (i = n; i < XBOX_MAX_CONTROLLERS; i++)
@@ -157,6 +185,60 @@ static void scan_slots(void)
         }
     g_next_scan = GetTickCount64() + 1000;
     InterlockedExchange(&scanning, 0);
+}
+
+/* The rescans run on a thread of their own, never on a reader's: whoever
+ * read a pad first after the second was up ran the scan and waited for it,
+ * and that can be a host's per-present check (a settings overlay's menu
+ * combo). On a PC where XInputGetState on an empty slot is slow (virtual-pad
+ * drivers), each scan froze the picture for 160-340 ms once a second
+ * (conker-lr-recomp issue #20, 2026-11-10; reproduced with
+ * RECOMP_PAD_SCAN_DELAY_MS=50: six 220 ms present gaps per 10 s, none with
+ * the scan on this thread). Readers keep what the last scan found; the
+ * first one scans in place, once, so a port is never read unscanned. */
+static HANDLE g_scan_wake;
+
+static DWORD WINAPI scan_thread(LPVOID arg)
+{
+    (void)arg;
+    for (;;) {
+        ULONGLONG now = GetTickCount64(), next = g_next_scan;
+        DWORD wait = next > now ? (DWORD)(next - now) : 0;
+        if (wait)
+            WaitForSingleObject(g_scan_wake, wait);
+        scan_slots();
+    }
+}
+
+static void scanner_start(void)
+{
+    static volatile LONG started;
+    HANDLE t;
+    if (started || InterlockedExchange(&started, 1))
+        return;
+    scan_slots();
+    g_scan_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    t = g_scan_wake ? CreateThread(NULL, 0, scan_thread, NULL, 0, NULL)
+                    : NULL;
+    if (t) {
+        SetThreadPriority(t, THREAD_PRIORITY_BELOW_NORMAL);
+        CloseHandle(t);
+    }
+}
+
+/* A reader's look: start the scanner the first time, else nothing to wait
+ * for. */
+static void scan_if_due(void)
+{
+    scanner_start();
+}
+
+/* Look again soon (a pad stopped answering, or port 0 changed hands). */
+static void scan_soon(void)
+{
+    g_next_scan = 0;
+    if (g_scan_wake)
+        SetEvent(g_scan_wake);
 }
 
 /* RECOMP_PAD_FOLLOW: before port 0 is read, look at the other connected
@@ -180,7 +262,7 @@ static void follow_active_pad(void)
             g_active_slot = slot;
             fprintf(stderr, "[INPUT] host pad %lu is now port 0"
                     " (last used)\n", (unsigned long)slot);
-            scan_slots();
+            scan_soon();
             return;
         }
     }
@@ -256,8 +338,7 @@ BOOL xbox_InputHostPadConnected(DWORD slot)
 {
     if (slot >= HOST_SLOTS)
         return FALSE;
-    if (GetTickCount64() >= g_next_scan)
-        scan_slots();
+    scan_if_due();
     return (g_slots_connected >> slot) & 1 ? TRUE : FALSE;
 }
 
@@ -399,8 +480,7 @@ DWORD xbox_InputHostPadRead(DWORD slot, XINPUT_STATE *st)
 int xbox_InputFirstHostPad(void)
 {
     DWORD i;
-    if (GetTickCount64() >= g_next_scan)
-        scan_slots();
+    scan_if_due();
     for (i = 0; i < HOST_SLOTS; i++)
         if ((g_slots_connected >> i) & 1)
             return (int)i;
@@ -454,8 +534,7 @@ static DWORD any_slot(void)
 static DWORD slot_of_port(DWORD port)
 {
     LONG src;
-    if (GetTickCount64() >= g_next_scan)
-        scan_slots();
+    scan_if_due();
     if (!g_assign_on)
         return g_slot_of_port[port];
     src = g_source[port];
@@ -574,7 +653,7 @@ static void keyboard_state(XBOX_INPUT_STATE *pState)
 
 void xbox_InputInit(void)
 {
-    scan_slots();
+    scanner_start();
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++)
         g_controller_connected[i] = g_slot_of_port[i] != NO_SLOT;
 }
@@ -712,7 +791,7 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (result != ERROR_SUCCESS) {
         xbox_InputPadHook overlay = g_pad_overlay;
         if (slot != NO_SLOT)
-            g_next_scan = 0;            /* unplugged: look again next time */
+            scan_soon();                /* unplugged: look again now */
         g_controller_connected[dwPort] = FALSE;
         /* No pad, but scripted presses: they are the controller. */
         memset(pState, 0, sizeof(XBOX_INPUT_STATE));
@@ -909,7 +988,7 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
         InterlockedOr(&g_rumbled_slots, 1L << slot);
     rc = host_set_rumble(slot, (WORD)(speeds >> 16), (WORD)speeds);
     if (rc != ERROR_SUCCESS)
-        g_next_scan = 0;                /* unplugged: look again next time */
+        scan_soon();                    /* unplugged: look again now */
     return rc;
 }
 

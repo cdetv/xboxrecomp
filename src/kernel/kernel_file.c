@@ -136,6 +136,56 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* Open handles on partition device images (kernel_path.c), with the size of
+ * the partition behind each. An image holds only what has been written to
+ * it, so the size a title is told and where a read stops come from here, not
+ * from the file. A handful at most are ever open; a full table only means a
+ * handle answers like a plain file. */
+#define MAX_PART_HANDLES 16
+static struct { HANDLE h; ULONGLONG bytes; } s_part_handles[MAX_PART_HANDLES];
+static SRWLOCK s_part_lock = SRWLOCK_INIT;
+
+static void part_handle_add(HANDLE h, ULONGLONG bytes)
+{
+    int i;
+    AcquireSRWLockExclusive(&s_part_lock);
+    for (i = 0; i < MAX_PART_HANDLES; i++) {
+        if (!s_part_handles[i].h) {
+            s_part_handles[i].h = h;
+            s_part_handles[i].bytes = bytes;
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_part_lock);
+}
+
+static void part_handle_drop(HANDLE h)
+{
+    int i;
+    AcquireSRWLockExclusive(&s_part_lock);
+    for (i = 0; i < MAX_PART_HANDLES; i++)
+        if (s_part_handles[i].h == h)
+            s_part_handles[i].h = NULL;
+    ReleaseSRWLockExclusive(&s_part_lock);
+}
+
+ULONGLONG xbox_PartitionHandleBytes(HANDLE h)
+{
+    ULONGLONG bytes = 0;
+    int i;
+    if (!h || h == INVALID_HANDLE_VALUE)
+        return 0;
+    AcquireSRWLockShared(&s_part_lock);
+    for (i = 0; i < MAX_PART_HANDLES; i++) {
+        if (s_part_handles[i].h == h) {
+            bytes = s_part_handles[i].bytes;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&s_part_lock);
+    return bytes;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -222,6 +272,11 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE)) {
+        int part = xbox_partition_image_number(win_path);
+        if (part)
+            part_handle_add(h, xbox_partition_image_bytes(part));
+    }
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -238,18 +293,44 @@ NTSTATUS __stdcall xbox_NtReadFile(
     DWORD bytes_read = 0;
     BOOL result;
     OVERLAPPED ov;
+    ULONGLONG part_bytes = xbox_PartitionHandleBytes(FileHandle);
+    LARGE_INTEGER start;
     (void)ApcRoutine; (void)ApcContext;
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
 
+    start.QuadPart = 0;
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
+        start = *ByteOffset;
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
     } else {
+        LARGE_INTEGER zero;
+        zero.QuadPart = 0;
+        if (part_bytes)
+            SetFilePointerEx(FileHandle, zero, &start, FILE_CURRENT);
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
+    }
+
+    /* A partition image holds only what has been written to it (kernel_path.c),
+     * so the rest of the partition reads as zeros, as an untouched disk does,
+     * up to the partition's end. */
+    if (part_bytes && bytes_read < Length &&
+        (result || GetLastError() == ERROR_HANDLE_EOF) &&
+        (ULONGLONG)start.QuadPart + bytes_read < part_bytes) {
+        ULONGLONG room = part_bytes - ((ULONGLONG)start.QuadPart + bytes_read);
+        DWORD fill = Length - bytes_read;
+        LARGE_INTEGER pos;
+        if (fill > room)
+            fill = (DWORD)room;
+        memset((uint8_t *)Buffer + bytes_read, 0, fill);
+        bytes_read += fill;
+        pos.QuadPart = start.QuadPart + bytes_read;
+        SetFilePointerEx(FileHandle, pos, NULL, FILE_BEGIN);
+        result = TRUE;
     }
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
@@ -311,6 +392,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         xbox_dir_context_drop(Handle);
+        part_handle_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -362,6 +444,9 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->AllocationSize.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->AllocationSize.QuadPart + 4095) & ~4095LL;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            /* A partition image: the partition's size, not what is written. */
+            if (xbox_PartitionHandleBytes(FileHandle) > (ULONGLONG)info->EndOfFile.QuadPart)
+                info->EndOfFile.QuadPart = (LONGLONG)xbox_PartitionHandleBytes(FileHandle);
             info->NumberOfLinks = fi.nNumberOfLinks;
             info->DeletePending = FALSE;
             info->Directory = (fi.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? TRUE : FALSE;
@@ -393,6 +478,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+            if (xbox_PartitionHandleBytes(FileHandle) > (ULONGLONG)info->EndOfFile.QuadPart)
+                info->EndOfFile.QuadPart = (LONGLONG)xbox_PartitionHandleBytes(FileHandle);
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
