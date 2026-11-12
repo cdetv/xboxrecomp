@@ -1707,7 +1707,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_shadow)
             s_shadow->present();
 
-        if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+        static int present_verbose = -1;    /* once: every flip */
+        if (present_verbose < 0)
+            present_verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+        if (present_verbose) {
             static unsigned n;
             if (n++ < 8) {
                 fprintf(stderr, "  [GPU] flip %u: read=%u write=%u\n",
