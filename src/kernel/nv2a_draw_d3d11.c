@@ -560,6 +560,12 @@ typedef struct {
     uint32_t target, tex0, tex1, blend, cw, ch, tw, th;
 } GtKey;
 static int s_gt_on = -1;
+/* xbox_SetGpuFrameTiming (a title's "what's limiting me" view): only the
+ * frame's first and last timestamps, read back without waiting; their span
+ * summed for xbox_GpuFrameMs. Works beside RECOMP_GPU_TIMES too. */
+static int s_gt_light;
+static double s_gt_light_ms;
+static uint32_t s_gt_light_n;
 static struct {
     ID3D11Query *disjoint, *ts[GT_MARKS];
     uint8_t cat[GT_MARKS];
@@ -573,13 +579,18 @@ static uint32_t s_gt_nkeys;
 static double s_gt_key_ms[GT_KEYS], s_gt_cat_ms[GT_N], s_gt_total_ms;
 static uint32_t s_gt_key_n[GT_KEYS], s_gt_frames, s_gt_lost;
 
-static int gt_on(void)
+static int gt_full(void)
 {
     if (s_gt_on < 0) {
         const char *e = getenv("RECOMP_GPU_TIMES");
         s_gt_on = e && *e && *e != '0';
     }
     return s_gt_on;
+}
+
+static int gt_on(void)
+{
+    return gt_full() || s_gt_light;
 }
 
 /* A timestamp now for a step of kind cat (key: GT_KEYS for none). */
@@ -590,6 +601,9 @@ static void gt_mark(int cat, uint32_t key)
     uint32_t i;
 
     if (!gt_on() || !s_gt[f].open || s_gt[f].n >= GT_MARKS)
+        return;
+    /* Light mode: the start and the end (the menus' mark) only. */
+    if (!gt_full() && s_gt[f].n && cat != GT_OVERLAY)
         return;
     i = s_gt[f].n;
     if (!s_gt[f].ts[i]) {
@@ -630,13 +644,91 @@ static uint32_t gt_draw_key(void)
     return s_gt_nkeys++;
 }
 
-/* The frame's timestamps begin (after a present) or end (before it). */
+/* Reads frame slot old's timestamps into the totals, waiting up to wait ms
+ * for the GPU to finish it. 0 = not done yet and left for later (light mode
+ * only, wait 0); 1 = read, or lost (then counted in s_gt_lost); either way
+ * the slot is free again. */
+static int gt_read(int old, ULONGLONG wait)
+{
+    int full = gt_full();
+    uint32_t i;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t, prev = 0, first = 0;
+
+    if (!s_gt[old].disjoint || !s_gt[old].n)
+        return 1;
+    /* The GPU may run that far behind (pacing lets it fall 100 ms back):
+     * waited for here, up to 200 ms, which slows only RECOMP_GPU_TIMES. The
+     * disjoint query ends after the last timestamp: once it is done, all
+     * are. */
+    {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].disjoint, &dj,
+                    sizeof dj, 0)) == S_FALSE
+               && GetTickCount64() - t0 < wait)
+            SwitchToThread();
+        if (hr == S_FALSE && !wait)
+            return 0;
+        if (hr != S_OK || dj.Disjoint || !dj.Frequency) {
+            s_gt_lost++;
+            s_gt[old].n = 0;
+            return 1;
+        }
+    }
+    for (i = 0; i < s_gt[old].n; i++) {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].ts[i], &t, sizeof t,
+                    0)) == S_FALSE && GetTickCount64() - t0 < wait)
+            SwitchToThread();
+        /* Seen under a heavy GPU load: the disjoint query done before the
+         * frame's last timestamp. Light mode: later, as above. */
+        if (hr == S_FALSE && !wait)
+            return 0;
+        if (hr != S_OK) {
+            s_gt_lost++;
+            break;
+        }
+        if (!i)
+            first = t;
+        if (i == s_gt[old].n - 1 && i && s_gt_light) {
+            s_gt_light_ms += (double)(t - first) * 1000.0
+                           / (double)dj.Frequency;
+            s_gt_light_n++;
+        }
+        if (i && full) {
+            double ms = (double)(t - prev) * 1000.0 / (double)dj.Frequency;
+            uint32_t k = s_gt[old].key[i];
+            s_gt_cat_ms[s_gt[old].cat[i]] += ms;
+            s_gt_total_ms += ms;
+            if (k < GT_KEYS) {
+                s_gt_key_ms[k] += ms;
+                s_gt_key_n[k]++;
+            }
+        }
+        prev = t;
+    }
+    s_gt[old].n = 0;
+    if (full)
+        s_gt_frames++;
+    return 1;
+}
+
+/* The frame's timestamps begin (after a present) or end (before it). In
+ * light mode a slot whose frame the GPU has not finished yet (it can run
+ * several frames behind) is not reused: this frame goes unmeasured, and the
+ * slot is tried again at the next one. */
 static void gt_frame_begin(void)
 {
     D3D11_QUERY_DESC qd;
     int f = s_gt_cur;
 
     if (!gt_on() || !s_dev || s_gt[f].open)
+        return;
+    if (s_gt[f].n && !gt_read(f, gt_full() ? 200 : 0))
         return;
     if (!s_gt[f].disjoint) {
         qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
@@ -652,61 +744,41 @@ static void gt_frame_begin(void)
 
 static void gt_frame_end(void)
 {
-    int f = s_gt_cur, old;
-    uint32_t i;
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-    UINT64 t, prev = 0;
+    int f = s_gt_cur;
 
-    if (!gt_on() || !s_gt[f].open)
+    if (!s_gt[f].open)
         return;
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_gt[f].disjoint);
     s_gt[f].open = 0;
     s_gt_cur = (f + 1) % GT_FRAMES;
-    /* The oldest frame, GT_FRAMES - 1 presents ago: read when it is done. */
-    old = s_gt_cur;
-    if (!s_gt[old].disjoint || !s_gt[old].n)
-        return;
-    /* The GPU may run that far behind (pacing lets it fall 100 ms back):
-     * waited for here, up to 200 ms, which slows only this debug mode. */
-    {
-        ULONGLONG t0 = GetTickCount64();
-        HRESULT hr;
-        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
-                    (ID3D11Asynchronous *)s_gt[old].disjoint, &dj,
-                    sizeof dj, 0)) == S_FALSE
-               && GetTickCount64() - t0 < 200)
-            SwitchToThread();
-        if (hr != S_OK || dj.Disjoint || !dj.Frequency) {
-            s_gt_lost++;
-            s_gt[old].n = 0;
-            return;
-        }
+    /* The oldest frame, GT_FRAMES - 1 presents ago: read when it is done
+     * (light mode: if it is; else at that slot's next begin). */
+    gt_read(s_gt_cur, gt_full() ? 200 : 0);
+}
+
+/* For a title's own view (from its overlay hook, the executor thread):
+ * on = the GPU time of each frame measured, from its first timestamp to its
+ * last (so it includes the GPU idling between commands: a frame the CPU
+ * side feeds slowly looks long too). */
+void xbox_SetGpuFrameTiming(int on)
+{
+    s_gt_light = on != 0;
+    if (!on) {
+        s_gt_light_ms = 0.0;
+        s_gt_light_n = 0;
     }
-    for (i = 0; i < s_gt[old].n; i++) {
-        ULONGLONG t0 = GetTickCount64();
-        HRESULT hr;
-        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
-                    (ID3D11Asynchronous *)s_gt[old].ts[i], &t, sizeof t,
-                    0)) == S_FALSE && GetTickCount64() - t0 < 200)
-            SwitchToThread();
-        if (hr != S_OK) {
-            s_gt_lost++;
-            break;
-        }
-        if (i) {
-            double ms = (double)(t - prev) * 1000.0 / (double)dj.Frequency;
-            uint32_t k = s_gt[old].key[i];
-            s_gt_cat_ms[s_gt[old].cat[i]] += ms;
-            s_gt_total_ms += ms;
-            if (k < GT_KEYS) {
-                s_gt_key_ms[k] += ms;
-                s_gt_key_n[k]++;
-            }
-        }
-        prev = t;
-    }
-    s_gt[old].n = 0;
-    s_gt_frames++;
+}
+
+/* The mean GPU ms a frame since the last call, and how many frames that
+ * was (frames): -1 when none were read. */
+double xbox_GpuFrameMs(unsigned *frames)
+{
+    double ms = s_gt_light_n ? s_gt_light_ms / s_gt_light_n : -1.0;
+    if (frames)
+        *frames = s_gt_light_n;
+    s_gt_light_ms = 0.0;
+    s_gt_light_n = 0;
+    return ms;
 }
 
 static void gt_report(void)
