@@ -2576,6 +2576,10 @@ typedef struct {
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
+    uint32_t sample_ok;                 /* sample matches the bytes of hash */
+    uint64_t sample;                    /* tex_sample_hash at the last full hash */
+    LONGLONG calm_at;                   /* QPC of the last upload (a change) */
+    LONGLONG full_due;                  /* QPC by which a full hash is due again */
     ID3D11Resource *tex;                /* Texture2D, Texture3D when d > 1 (not cube) */
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
@@ -2719,6 +2723,69 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
 uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
 {
     return hash_fast((const uint8_t *)p, n, h);
+}
+
+/* ── Sampled texture checks (Conker to-do 208a) ─────────────────────────────
+ *
+ * Hashing every bound texture's bytes once a flip was ~8 % of the executor at
+ * 120-240 fps (memory-bound). Guest memory is a file mapping (mirror views),
+ * so Windows' write watch cannot tell which pages were written. Instead, a
+ * texture unchanged for TEX_CALM_MS gets a sample hash (one 64-byte line per
+ * KB, the last line and the palette) on most flips, and its full hash only
+ * every 17-33 ms (spread per texture). A title that rewrites a texture
+ * changes the sample at once; a small change outside the sampled lines shows
+ * at the next full check, at most ~1/30 s late. Any change found, or a new
+ * upload, puts the texture back on a full hash every flip.
+ * RECOMP_TEX_SAMPLE: 1 on (default), 0 = a full hash every flip (as before),
+ * 2 = check: the full hash as well, counting changes the sample missed (the
+ * picture stays exact), in the [GPU] report's "texture checks" line. */
+#define TEX_SAMPLE_STRIDE 1024u
+#define TEX_SAMPLE_LINE   64u
+#define TEX_SAMPLE_MIN    4096u         /* smaller: a full hash costs little */
+#define TEX_CALM_MS       500
+
+static int s_tex_sample = -1;
+static LONGLONG s_tex_qpf, s_tex_now;
+static uint32_t s_tex_now_flip = ~0u;
+static uint32_t s_tex_sampled, s_tex_full, s_tex_missed;
+
+static int tex_sample_mode(void)
+{
+    if (s_tex_sample < 0) {
+        const char *e = getenv("RECOMP_TEX_SAMPLE");
+        LARGE_INTEGER f;
+        s_tex_sample = e ? atoi(e) : 1;
+        if (s_tex_sample < 0 || s_tex_sample > 2)
+            s_tex_sample = 1;
+        QueryPerformanceFrequency(&f);
+        s_tex_qpf = f.QuadPart;
+    }
+    return s_tex_sample;
+}
+
+/* The clock, read once a flip. */
+static LONGLONG tex_now(void)
+{
+    if (s_tex_now_flip != g_pb.flips) {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        s_tex_now = q.QuadPart;
+        s_tex_now_flip = g_pb.flips;
+    }
+    return s_tex_now;
+}
+
+static uint64_t tex_sample_hash(const uint8_t *p, size_t n, const uint8_t *pal)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    size_t o;
+
+    for (o = 0; o + TEX_SAMPLE_LINE <= n; o += TEX_SAMPLE_STRIDE)
+        h = hash_fast(p + o, TEX_SAMPLE_LINE, h);
+    h = hash_fast(p + n - TEX_SAMPLE_LINE, TEX_SAMPLE_LINE, h);
+    if (pal)
+        h = hash_fast(pal, 256 * 4, h);
+    return h;
 }
 
 /* ── Render to texture ─────────────────────────────────────────────────────
@@ -3439,7 +3506,7 @@ static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
                        uint32_t h, int mode)
 {
     static int seq;
-    const char *pre = getenv("RECOMP_FTRACE_DUMP");
+    const char *pre;
     D3D11_TEXTURE2D_DESC d;
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11Texture2D *staging = NULL;
@@ -3448,7 +3515,11 @@ static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
     char path[512];
     FILE *f;
 
-    if (g_pb_ftrace != 2 || !pre || !tex || !w || !h)
+    /* Traced frames only: every zeta read calls this, so getenv comes after. */
+    if (g_pb_ftrace != 2)
+        return;
+    pre = getenv("RECOMP_FTRACE_DUMP");
+    if (!pre || !tex || !w || !h)
         return;
     ID3D11Texture2D_GetDesc(tex, &d);
     if (w > d.Width) w = d.Width;
@@ -3808,6 +3879,8 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     e->replaced = levels;
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
+    e->sample_ok = 0;                   /* new bytes: full hashes until calm */
+    e->calm_at = tex_now();
     e->used = s_tex_tick;
     tex_link(e);
     s_stat.tex_made++;
@@ -3825,7 +3898,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint64_t hash;
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
-    int i;
+    int i, sampling;
     uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
@@ -3906,10 +3979,46 @@ guest:
      * (~15,000 batches a frame, 2026-10-20). */
     if (!cube)
         note_stale_read(st, bytes);
+    sampling = e && bytes >= TEX_SAMPLE_MIN && tex_sample_mode();
+    if (sampling) {
+        LONGLONG now = tex_now();
+        if (e->sample_ok && now - e->calm_at >= s_tex_qpf * TEX_CALM_MS / 1000
+            && now < e->full_due
+            && tex_sample_hash(mem + t->offset, bytes,
+                               palette ? mem + palette : NULL) == e->sample) {
+            int trust = 1;
+            if (s_tex_sample == 2) {    /* check mode: is the full hash the same? */
+                uint64_t full = hash_fast(mem + t->offset, bytes,
+                                          0xCBF29CE484222325ull);
+                if (palette)
+                    full = hash_fast(mem + palette, 256 * 4, full);
+                if (full != e->hash) {
+                    s_tex_missed++;
+                    trust = 0;
+                }
+            }
+            if (trust) {
+                s_tex_sampled++;
+                e->hashed_flip = g_pb.flips;
+                e->used = s_tex_tick;
+                s_stat.tex_reused++;
+                return e->srv;
+            }
+        }
+        s_tex_full++;
+    }
     hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
         hash = hash_fast(mem + palette, 256 * 4, hash);
     if (e && e->hash == hash) {
+        if (sampling) {
+            /* The next full hash 17-33 ms on, spread by address. */
+            e->full_due = tex_now() + s_tex_qpf / 60
+                        + s_tex_qpf / 60 * ((e->addr * 2654435761u) >> 24) / 256;
+            e->sample = tex_sample_hash(mem + t->offset, bytes,
+                                        palette ? mem + palette : NULL);
+            e->sample_ok = 1;
+        }
         e->hashed_flip = g_pb.flips;
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -4093,6 +4202,8 @@ make:
     }
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
+    e->sample_ok = 0;                   /* new bytes: full hashes until calm */
+    e->calm_at = tex_now();
     e->used = s_tex_tick;
     s_stat.tex_uploads++;
     s_tex_levels[st] = e->lv;
@@ -6308,12 +6419,14 @@ static void heavy_report(void)
  * frame from boot, anything else names a flag file that switches it on. */
 static int flip_dump_on(void)
 {
-    static const char *spec = (const char *)-1;
+    static const char *spec = (const char *)-1, *dump;
     FILE *f;
 
-    if (spec == (const char *)-1)
+    if (spec == (const char *)-1) {     /* once: every flip asks */
         spec = getenv("RECOMP_FB_DUMP_FLIPS");
-    if (!spec || !getenv("RECOMP_FB_DUMP"))
+        dump = getenv("RECOMP_FB_DUMP");
+    }
+    if (!spec || !dump)
         return 0;
     if (strcmp(spec, "1") == 0)
         return 1;
@@ -6449,10 +6562,12 @@ static int dump_shown(void)
  * the frame (at 640x480 the two are the same size). */
 static void dump_back(int seq)
 {
-    const char *prefix = getenv("RECOMP_BB_DUMP");
+    static const char *prefix = (const char *)-1;   /* once: every present */
     ID3D11Texture2D *back = NULL;
     char path[512];
 
+    if (prefix == (const char *)-1)
+        prefix = getenv("RECOMP_BB_DUMP");
     if (!prefix || seq < 0 || !(back = back_tex()))
         return;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
@@ -6886,6 +7001,13 @@ static void d3d_report(void)
             " the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_bc,
             s_stat.tex_reused, s_stat.tex_unreadable, 10);
+    if (s_tex_sample == 1)
+        fprintf(stderr, "[GPU] d3d11: texture checks: %u by a sample, %u full%c",
+                s_tex_sampled, s_tex_full, 10);
+    else if (s_tex_sample == 2)
+        fprintf(stderr, "[GPU] d3d11: texture checks (check mode): %u by a sample,"
+                " %u full, %u changes the sample missed%c",
+                s_tex_sampled, s_tex_full, s_tex_missed, 10);
     fprintf(stderr, "[GPU] d3d11: mip levels: %u binds sampled through the"
             " chain, %u binds of a texture with levels under a level-0 filter%c",
             s_stat.mip_binds, s_stat.mip_unused, 10);
