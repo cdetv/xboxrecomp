@@ -30,6 +30,20 @@
 #include <fnmatch.h>
 #endif
 
+/* File hooks for a title's own runtime code (Windows back end): told of each
+ * file opened (host path, not directories), each successful read (the file
+ * offset it started at and the bytes now in the buffer, which the hook may
+ * change, e.g. to play an altered sound from a streamed bank) and each close.
+ * NULL = none. They run on the thread doing the I/O. */
+void (*g_xbox_file_opened)(const wchar_t *host_path, HANDLE h);
+void (*g_xbox_file_read)(HANDLE h, unsigned long long offset, void *buf,
+                         unsigned long bytes);
+void (*g_xbox_file_closed)(HANDLE h);
+/* Before each write, with the file offset it goes to; the hook may change
+ * the bytes about to be written (e.g. put back what its read hook altered). */
+void (*g_xbox_file_write)(HANDLE h, unsigned long long offset, void *buf,
+                          unsigned long bytes);
+
 /* Get the ANSI path from OBJECT_ATTRIBUTES (platform-independent). */
 static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 {
@@ -276,6 +290,8 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         int part = xbox_partition_image_number(win_path);
         if (part)
             part_handle_add(h, xbox_partition_image_bytes(part));
+        if (g_xbox_file_opened)
+            g_xbox_file_opened(win_path, h);
     }
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
@@ -310,7 +326,7 @@ NTSTATUS __stdcall xbox_NtReadFile(
     } else {
         LARGE_INTEGER zero;
         zero.QuadPart = 0;
-        if (part_bytes)
+        if (part_bytes || g_xbox_file_read)
             SetFilePointerEx(FileHandle, zero, &start, FILE_CURRENT);
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
@@ -339,6 +355,9 @@ NTSTATUS __stdcall xbox_NtReadFile(
             IoStatusBlock->Status = STATUS_END_OF_FILE;
             return STATUS_END_OF_FILE;
         }
+        if (g_xbox_file_read && bytes_read)
+            g_xbox_file_read(FileHandle, (unsigned long long)start.QuadPart, Buffer,
+                             bytes_read);
         IoStatusBlock->Status = STATUS_SUCCESS;
         if (Event) SetEvent(Event);
         return STATUS_SUCCESS;
@@ -363,6 +382,20 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
     if (!IoStatusBlock)
         return STATUS_INVALID_PARAMETER;
+
+    if (g_xbox_file_write && Buffer && Length) {
+        LARGE_INTEGER at;
+        if (ByteOffset && ByteOffset->QuadPart >= 0) {
+            at = *ByteOffset;
+        } else {
+            LARGE_INTEGER zero;
+            zero.QuadPart = 0;
+            if (!SetFilePointerEx(FileHandle, zero, &at, FILE_CURRENT))
+                at.QuadPart = -1;
+        }
+        if (at.QuadPart >= 0)
+            g_xbox_file_write(FileHandle, (unsigned long long)at.QuadPart, Buffer, Length);
+    }
 
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
@@ -391,6 +424,8 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        if (g_xbox_file_closed)
+            g_xbox_file_closed(Handle);
         xbox_dir_context_drop(Handle);
         part_handle_drop(Handle);
         CloseHandle(Handle);
