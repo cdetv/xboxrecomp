@@ -6608,13 +6608,53 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
  * black under a black present (xbox_Nv2aPresentNow). */
 extern int g_pb_present_black;
 
+/* NV_HOST_FX_ASPECT: the shape the frame being drawn is shown at (0:0 = the
+ * whole back buffer). The executor presents at the flip, before it reads the
+ * next frame's commands, so the last mark before a flip is that frame's. */
+static uint32_t s_aspect_w, s_aspect_h;
+
+/* The back buffer's rectangle for the shape asked for: centred, as big as
+ * fits. 0 when none is asked for or it is the whole back buffer anyway. */
+static int aspect_rect(float *x, float *y, float *w, float *h)
+{
+    uint64_t cw = s_bb_w, ch = s_bb_h;
+
+    if (!s_aspect_w || !s_aspect_h || !cw || !ch
+        || cw * s_aspect_h == ch * s_aspect_w)
+        return 0;
+    if (cw * s_aspect_h > ch * s_aspect_w) {        /* wider: bars left and right */
+        *h = (float)ch;
+        *w = (float)(uint32_t)(ch * s_aspect_w / s_aspect_h);
+    } else {                                        /* taller: bars above and below */
+        *w = (float)cw;
+        *h = (float)(uint32_t)(cw * s_aspect_h / s_aspect_w);
+    }
+    *x = (float)(uint32_t)(((float)cw - *w) * 0.5f);
+    *y = (float)(uint32_t)(((float)ch - *h) * 0.5f);
+    return 1;
+}
+
 static void shown_to_back(void)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
+    float ax, ay, aw, ah;
 
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    if (s_shown >= 0 && !g_pb_present_black && (back = back_tex())) {
+    if (s_shown >= 0 && !g_pb_present_black && (back = back_tex())
+        && aspect_rect(&ax, &ay, &aw, &ah)) {
+        /* At a set shape (NV_HOST_FX_ASPECT): the whole shown rectangle
+         * squeezed into the middle, black at the sides. */
+        float sx = surf_sx(s_shown), sy = surf_sy(s_shown);
+        float bl = (float)to_host(s_shown_x, sx), bt = (float)to_host(s_shown_y, sy);
+        float bw = (float)(to_host(s_shown_x + s_shown_w, sx) - to_host(s_shown_x, sx));
+        float bh = (float)(to_host(s_shown_y + s_shown_h, sy) - to_host(s_shown_y, sy));
+        if (!postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex, bl, bt, bw, bh,
+                         s_back_rtv, ax, ay, aw, ah))
+            blit_stretch(s_surf[s_shown].tex, bl, bt, bw, bh, s_back_rtv,
+                         ax, ay, aw, ah);
+        ID3D11Texture2D_Release(back);
+    } else if (s_shown >= 0 && !g_pb_present_black && (back || (back = back_tex()))) {
         /* The shown rectangle at its surface's scale; the back buffer's
          * scale (bx, by: host pixels per guest pixel, worked out as
          * set_render_scale does, so equal sizes give equal scales). An
@@ -7268,6 +7308,19 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
 
     if (id == NV_HOST_FX_WIRE) {
         s_wire = p[0] != 0;
+        return;
+    }
+    if (id == NV_HOST_FX_ASPECT) {
+        uint32_t w = p[1] ? p[0] : 0, h = p[0] ? p[1] : 0;
+        if (w != s_aspect_w || h != s_aspect_h) {
+            static unsigned said;
+            if (said++ < 20)
+                fprintf(stderr, "[GPU] d3d11: frames shown at %s%u:%u (host aspect)%c",
+                        w ? "" : "the window's shape, not ", w ? w : s_aspect_w,
+                        w ? h : s_aspect_h, 10);
+            s_aspect_w = w;
+            s_aspect_h = h;
+        }
         return;
     }
     if (id != NV_HOST_FX_DOF)
