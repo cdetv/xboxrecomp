@@ -33,7 +33,9 @@ add_compile_definitions(
 # that builds the vendored SDL3 names its target (as on Windows for the
 # PlayStation pads); a standalone build takes an installed SDL3.
 if(NOT WIN32)
-    if(NOT XBOXRECOMP_SDL3_TARGET)
+    # Imported targets aren't cached: on a re-configure the cached name is
+    # there but the target is not, so look again then too.
+    if(NOT XBOXRECOMP_SDL3_TARGET OR NOT TARGET ${XBOXRECOMP_SDL3_TARGET})
         find_package(SDL3 REQUIRED CONFIG)
         set(XBOXRECOMP_SDL3_TARGET SDL3::SDL3 CACHE STRING "" FORCE)
     endif()
