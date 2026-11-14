@@ -5157,15 +5157,21 @@ static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
  * the GPU then clips and culls. Everything after the vertex shader -- the
  * pixel shader, textures, blending, depth -- is the CPU path's.
  *
+ * Points go to a second drawing shader (s_hlsl_vsh_points: pb_point_quad
+ * on the GPU, each point its sprite square) unless RECOMP_GPU_POINTS=0
+ * (=2: even frames only, the held-picture check). Before (0.3.0) they were
+ * kept on the CPU, and the plankton under water (~26,000 points a frame in
+ * UBend) cost the executor about a third of a frame (GitHub #18).
+ *
  * Kept on the CPU: a program that may write constants (CXT_WRITE_EN: one
- * vertex can change what the next computes), points (pb_point_quad builds
- * each sprite from the transformed point) and lines (not drawn either way),
- * FRONT_AND_BACK culling (nothing to draw), frame-trace batches and
+ * vertex can change what the next computes), lines (not drawn either way),
+ * FRONT_AND_BACK culling of triangles (nothing to draw), frame-trace
+ * batches and
  * RECOMP_VIS_LOG (both report the transformed vertices), RECOMP_GPU=both
  * (the two back ends share pb_transform_batch's results), and a program
  * whose shader is still compiling (nv2a_vsh_gpu_draw_shader). The vertex
  * shader, or NULL: draw this batch the CPU way. */
-static int s_vsh_gpu = -1;
+static int s_vsh_gpu = -1, s_gpu_points;
 
 static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
 {
@@ -5173,6 +5179,7 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
     ID3D11VertexShader *vs;
     uint32_t used, lo = UINT32_MAX, hi = 0, i;
     static int vis_log, ftrace_gpu;
+    int points = g_pb.prim == NV_PRIM_POINTS;
 
     if (s_vsh_gpu < 0) {
         const char *e = getenv("RECOMP_VSH_GPU");
@@ -5181,14 +5188,20 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
         /* RECOMP_FTRACE_GPU=1: traced batches stay on the GPU, so the
          * trace shows what GPU runs draw. */
         ftrace_gpu = getenv("RECOMP_FTRACE_GPU") != NULL;
+        e = getenv("RECOMP_GPU_POINTS");
+        s_gpu_points = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
         if (s_vsh_gpu) {
             s_vsh_gpu = nv2a_vsh_gpu_init((struct ID3D11Device *)s_dev,
                                           (struct ID3D11DeviceContext *)s_ctx);
             nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw,
                                      "vs_gpu");
+            nv2a_vsh_gpu_point_source(s_hlsl_vsh_points, "vs_gpu_pts");
         }
-        fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s%c",
-                s_vsh_gpu ? "GPU" : "CPU", 10);
+        fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s, points"
+                " on the %s%c", s_vsh_gpu ? "GPU" : "CPU",
+                s_vsh_gpu && s_gpu_points
+                    ? s_gpu_points == 2 ? "GPU in even frames" : "GPU"
+                    : "CPU", 10);
     }
     if (!s_vsh_gpu)
         return NULL;
@@ -5197,17 +5210,24 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
     case NV_PRIM_TRIANGLE_FAN: case NV_PRIM_QUADS: case NV_PRIM_QUAD_STRIP:
     case NV_PRIM_POLYGON:
         break;
+    case NV_PRIM_POINTS:
+        if (s_gpu_points && !(s_gpu_points == 2 && (g_pb.flips & 1)))
+            break;
+        /* fall through */
     default:
         s_stat.vsh_cpu_kept++;
         return NULL;
     }
+    /* Points have no face to cull: the CPU path draws them whatever the
+     * culling, and so does this one. */
     if (nv2a_vsh_cxt_write() || (g_pb_ftrace == 2 && !ftrace_gpu) || vis_log
-        || (g_pb.cull_enable && g_pb.cull_face == 0x408)
+        || (!points && g_pb.cull_enable && g_pb.cull_face == 0x408)
         || !nv2a_vsh_gpu_prepare(NULL) || !nv2a_vsh_prepare(&used)) {
         s_stat.vsh_cpu_kept++;
         return NULL;
     }
-    if (!(vs = nv2a_vsh_gpu_draw_shader(0))) {
+    if (!(vs = points ? nv2a_vsh_gpu_point_shader(0)
+                      : nv2a_vsh_gpu_draw_shader(0))) {
         s_stat.vsh_cpu_waiting++;
         return NULL;
     }
@@ -5258,6 +5278,15 @@ static uint32_t vsh_gpu_index_list(uint32_t n)
         for (i = 0; i + 3 < n; i += 2) {
             PUT(i, i + 1, i + 3);
             PUT(i, i + 3, i + 2);
+        }
+        break;
+    case NV_PRIM_POINTS:
+        /* vs_gpu_pts: index * 6 + k, k the corner of the point's square
+         * (s_hlsl_vsh_points); six per point, never more than s_ib holds. */
+        for (i = 0; i < n; i++) {
+            uint32_t b = x[i] * 6u, k;
+            for (k = 0; k < 6; k++)
+                s_ib[out++] = b + k;
         }
         break;
     default:
@@ -6179,6 +6208,13 @@ static void d3d_draw(void)
     k.mode[0] = path;
     k.mode[1] = bound;
     k.zsc[0] = zeta_scale();
+    if (gvs && g_pb.prim == NV_PRIM_POINTS) {
+        /* vs_gpu_pts: pb_point_quad's size (SET_POINT_SIZE in 1/8 pixels,
+         * or bit 0: the program's oPts.x) and point sprites (bit 1). */
+        k.zsc[1] = (float)g_pb.point_size / 8.0f;
+        k.zsc[2] = (float)(((g_pb.xf_mode & 3) == 2 && g_pb.point_params_enable
+                            ? 1 : 0) | (g_pb.point_sprite ? 2 : 0));
+    }
     {
         uint64_t ct0 = ct_now();
         int ok = buf_fill(s_cb, &k, sizeof k);
@@ -6256,7 +6292,7 @@ static void d3d_draw(void)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     rs = raster_state(surf_sx(si));
-    rs = gvs ? cull_state(rs) : rs;
+    rs = gvs && g_pb.prim != NV_PRIM_POINTS ? cull_state(rs) : rs;
     ID3D11DeviceContext_RSSetState(s_ctx, s_wire ? wire_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
