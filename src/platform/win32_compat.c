@@ -697,11 +697,55 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* The mask the process started with, captured from the first thread that
+ * asks, before any pin: sched_getaffinity(0) answers for the calling thread.
+ * From sp00nznet/xboxrecomp v0.17 (MIT). */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* A new thread gets the process's mask, as on Win32, not its creator's
+     * (which may have pinned itself). */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -828,6 +872,48 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+/* From sp00nznet/xboxrecomp v0.17 (MIT). Linux: pthread_setaffinity_np;
+ * elsewhere there is no thread affinity and the call returns 0 (failure). */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    return 0;
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
@@ -1430,6 +1516,77 @@ DWORD GetFileAttributesA(LPCSTR name)
     if (S_ISDIR(st.st_mode)) a |= FILE_ATTRIBUTE_DIRECTORY;
     if (!(st.st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
     return a ? a : FILE_ATTRIBUTE_NORMAL;
+}
+
+/* Directory, delete and temp-path calls, from sp00nznet/xboxrecomp v0.17
+ * (MIT). Win32 accepts either separator, so paths go through
+ * xbox_path_normalize first. */
+static DWORD w32_error_from_errno(int e)
+{
+    switch (e) {
+    case ENOENT:    return ERROR_FILE_NOT_FOUND;
+    case EEXIST:    return ERROR_ALREADY_EXISTS;
+    case EACCES:
+    case EPERM:     return ERROR_ACCESS_DENIED;
+    case ENOTDIR:   return ERROR_PATH_NOT_FOUND;
+    case ENOTEMPTY: return ERROR_DIR_NOT_EMPTY;
+    default:        return ERROR_GEN_FAILURE;
+    }
+}
+
+static const char *norm_path(const char *in, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s", in);
+    xbox_path_normalize(buf);
+    return buf;
+}
+
+BOOL CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    char norm[1024];
+    (void)sa;
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (mkdir(norm_path(path, norm, sizeof norm), 0777) == 0)
+        return TRUE;
+    /* Win32 reports an existing directory as a failure with this code, and
+     * callers test for it. */
+    SetLastError(errno == EEXIST ? ERROR_ALREADY_EXISTS
+                                 : w32_error_from_errno(errno));
+    return FALSE;
+}
+
+BOOL RemoveDirectoryA(LPCSTR path)
+{
+    char norm[1024];
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (rmdir(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+
+BOOL DeleteFileA(LPCSTR path)
+{
+    char norm[1024];
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (unlink(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+
+/* Win32 returns the length written and guarantees a trailing separator. */
+DWORD GetTempPathA(DWORD buflen, LPSTR buf)
+{
+    const char *tmp = getenv("TMPDIR");
+    size_t n;
+
+    if (!tmp || !*tmp) tmp = "/tmp";
+    n = strlen(tmp);
+    if (!buf || buflen < n + 2)
+        return (DWORD)(n + 2);          /* needed size, including the '/' */
+    memcpy(buf, tmp, n);
+    if (n && buf[n - 1] != '/') buf[n++] = '/';
+    buf[n] = 0;
+    return (DWORD)n;
 }
 
 BOOL FlushFileBuffers(HANDLE h)

@@ -638,6 +638,8 @@ translate:
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <dirent.h>
+#include <strings.h>
 
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
@@ -706,6 +708,65 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir);
 }
 
+/* The disc and FATX ignore case, a POSIX host does not: the title asks for
+ * D:\dvddata\audio\dsp, the disc dump spells it Audio\dsp.
+ * After Txukie/xboxrecomp-conker patch 0005 (MIT).
+ *
+ * If the translated path does not exist, walk it below `fixed` (the host
+ * base, left alone) one component at a time and take the directory entry
+ * that matches ignoring case. An exact match wins; the first component with
+ * no match ends the walk and the rest stays as written, so creating a new
+ * file still works. The path only ever changes in place, never grows. */
+static void fold_path_case(char *path, size_t fixed)
+{
+    struct stat st;
+    size_t total = strlen(path);
+    char *p;
+
+    if (fixed >= total || stat(path, &st) == 0)
+        return;
+    p = path + fixed;
+    while (*p == '/')
+        p++;
+    while (*p) {
+        char *end = strchr(p, '/');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        char saved = end ? *end : '\0';
+
+        if (end)
+            *end = '\0';
+        if (stat(path, &st) != 0 && p > path) {
+            /* p[-1] is the '/' before this component. */
+            DIR *d;
+            struct dirent *de;
+            int found = 0;
+
+            p[-1] = '\0';
+            d = opendir(p - 1 == path ? "/" : path);
+            p[-1] = '/';
+            if (d) {
+                while ((de = readdir(d)) != NULL) {
+                    if (strlen(de->d_name) == len && strncasecmp(de->d_name, p, len) == 0) {
+                        memcpy(p, de->d_name, len);
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            if (!found) {
+                if (end)
+                    *end = saved;
+                return;
+            }
+        }
+        if (!end)
+            return;
+        *end = saved;
+        p = end + 1;
+    }
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -768,6 +829,8 @@ translate:
             while (n > 1 && host_path_buf[n - 1] == '/')
                 host_path_buf[--n] = '\0';
         }
+
+        fold_path_case(host_path_buf, strlen(base_dir) + (sub_dir ? strlen(sub_dir) : 0));
 
         if (g_xbox_path_redirect)
             g_xbox_path_redirect(xbox_path, host_path_buf, buf_size);

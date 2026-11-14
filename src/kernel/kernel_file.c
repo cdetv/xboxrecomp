@@ -974,6 +974,24 @@ static ULONG mode_to_xbox_attrs(mode_t m)
     return a;
 }
 
+/* 1 when the directory holding host_path exists. After sp00nznet/xboxrecomp
+ * v0.17 (MIT); static here, only NtQueryFullAttributesFile uses it. */
+static int xbox_host_parent_exists(const char *host_path)
+{
+    char dir[MAX_PATH];
+    const char *cut;
+    struct stat st;
+
+    if (!host_path)
+        return 0;
+    cut = strrchr(host_path, '/');
+    if (!cut || cut == host_path || (size_t)(cut - host_path) >= sizeof dir)
+        return 0;
+    memcpy(dir, host_path, (size_t)(cut - host_path));
+    dir[cut - host_path] = '\0';
+    return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static NTSTATUS errno_to_status(int e)
 {
     switch (e) {
@@ -1317,8 +1335,16 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     const char* xbox_path = get_xbox_path(ObjectAttributes);
     if (!xbox_path || !xbox_translate_path(xbox_path, host_path, MAX_PATH))
         return STATUS_OBJECT_PATH_NOT_FOUND;
-    if (stat(host_path, &st) != 0)
+    if (stat(host_path, &st) != 0) {
+        /* A missing parent is PATH_NOT_FOUND, as NtCreateFile reports it and
+         * as the console does: Conker's "create directory with parents"
+         * recurses only on that error. After Txukie/xboxrecomp-conker patch
+         * 0004 (MIT). */
+        int e = errno;
+        if (e == ENOTDIR || (e == ENOENT && !xbox_host_parent_exists(host_path)))
+            return STATUS_OBJECT_PATH_NOT_FOUND;
         return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
 
     unix_to_filetime(st.st_ctime, 0, &FileInformation->CreationTime);
     unix_to_filetime(st.st_atime, 0, &FileInformation->LastAccessTime);

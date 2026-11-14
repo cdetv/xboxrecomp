@@ -177,6 +177,12 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
+ * process's mask. Elsewhere SetThreadAffinityMask does nothing and returns 0.
+ * GetProcessAffinityMask is the mask the process started with. */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
@@ -278,6 +284,10 @@ DWORD  GetFileSize(HANDLE h, LPDWORD high);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
 #define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
 DWORD  GetFileAttributesA(LPCSTR name);
+BOOL   CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa);
+BOOL   RemoveDirectoryA(LPCSTR path);
+BOOL   DeleteFileA(LPCSTR path);
+DWORD  GetTempPathA(DWORD buflen, LPSTR buf);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -405,6 +415,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
+#define ERROR_DIR_NOT_EMPTY           145u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
