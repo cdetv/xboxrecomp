@@ -135,6 +135,10 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 /* fd-backed handle, used by the file-I/O HLE (kernel_file.c). Lets file
  * handles flow through the same CloseHandle path as every other object. */
 HANDLE      w32_open_handle(int fd, const char *host_path);
+/* Tell the shim that [base, base+len) is one PROT_NONE reservation the caller
+ * holds (the whole guest window): fixed-address VirtualAlloc / MapViewOfFileEx
+ * inside it take their slice out of it. len 0 forgets it. */
+void        w32_hold_span(void *base, size_t len);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 
