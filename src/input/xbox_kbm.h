@@ -57,9 +57,16 @@ enum {
 #define XBOX_KBM_WHEEL_DOWN  257
 #define XBOX_KBM_INPUTS      258
 
+/* A binding: input held = output pressed. hold (0 = none) makes it a combo:
+ * hold down first, then input; while a combo is on, the plain bindings of
+ * its input do nothing (the combo beats the plain key), the hold key's own
+ * bindings work as ever. XBOX_KBM_KEEP in flags: once on, the combo stays on
+ * while its input alone is held (both keys to start, one to keep it). */
 typedef struct {
     unsigned short input, output;
+    unsigned short hold, flags;
 } xbox_KbmBinding;
+#define XBOX_KBM_KEEP 1
 
 /* A stick as the title reads it: tilt below dead (0-1 of full) counts as
  * none, tilt from full on as all the way. Keys and the mouse ask for 0-1 of
@@ -127,6 +134,10 @@ int  xbox_KbmTakeMouse(long *dx, long *dy);
  * output held by the game, on top of the profile's, until it lets go; not
  * while the keyboard and mouse are off or not active. */
 int  xbox_KbmHeld(unsigned input);
+/* A combo held as a binding counts it: both held, hold down first (not the
+ * wheel: a game reading notches itself checks the hold key with
+ * xbox_KbmHeld). */
+int  xbox_KbmComboHeld(unsigned hold, unsigned input);
 void xbox_KbmForce(unsigned output, int on);
 
 /* For the pad: player 1's keyboard and mouse as a pad state. 0 when they

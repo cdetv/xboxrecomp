@@ -3,7 +3,8 @@
  * tilt, the mouse as a turn owed and paid off at up to full tilt in the
  * title's own stick range, toggles,
  * the weapon-wheel mode where the mouse steers the left stick, and keys the
- * game reads itself with outputs it holds (xbox_KbmHeld, xbox_KbmForce). */
+ * game reads itself with outputs it holds (xbox_KbmHeld, xbox_KbmForce),
+ * and combos (a hold key first; the combo beats the plain key; keep). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -293,6 +294,100 @@ int main(void)
     xbox_KbmKey('F', 0);
     Sleep(100);
     check(xbox_KbmHeld('F') == 0, "the key let go", 0);
+
+    /* Combos (hold): Shift + E is X while E alone is B and Shift walks;
+     * Shift + R is the right trigger kept while R stays held; Shift + the
+     * wheel is White. */
+    {
+        xbox_KbmBinding c[] = {
+            { 'W', XBOX_KBM_LSTICK_UP }, { VK_SHIFT, XBOX_KBM_WALK },
+            { 'E', XBOX_KBM_B }, { 'E', XBOX_KBM_X, VK_SHIFT, 0 },
+            { 'R', XBOX_KBM_RT, VK_SHIFT, XBOX_KBM_KEEP },
+            { XBOX_KBM_WHEEL_UP, XBOX_KBM_WHITE, VK_SHIFT, 0 },
+            { XBOX_KBM_WHEEL_UP, XBOX_KBM_Y },
+        };
+        xbox_KbmSetProfile(2, c, (int)(sizeof(c) / sizeof(c[0])), &m);
+        xbox_KbmSelectProfile(2);
+        xbox_KbmKey('E', 1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 0,
+              "E alone: B, not the combo", st.Gamepad.bAnalogButtons[2]);
+        Sleep(5);
+        xbox_KbmKey(VK_SHIFT, 1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 255
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 0,
+              "E then Shift: still plain E", st.Gamepad.bAnalogButtons[2]);
+        xbox_KbmKey('E', 0);
+        Sleep(100);
+        Sleep(5);
+        xbox_KbmKey('E', 1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 255
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0,
+              "Shift then E: X, and E's own B held back",
+              st.Gamepad.bAnalogButtons[1]);
+        check(xbox_KbmComboHeld(VK_SHIFT, 'E') == 1
+              && xbox_KbmComboHeld('E', VK_SHIFT) == 0,
+              "combo held as the game asks (hold key first)", 0);
+        xbox_KbmKey('W', 1);
+        st = read_pad();
+        check(st.Gamepad.sThumbLY > 0 && st.Gamepad.sThumbLY < 32767,
+              "the hold key's own binding still works (walking)",
+              st.Gamepad.sThumbLY);
+        xbox_KbmKey('W', 0);
+        xbox_KbmKey(VK_SHIFT, 0);
+        Sleep(100);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 0
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0,
+              "Shift let go: the combo is off and E's B stays held back",
+              st.Gamepad.bAnalogButtons[1]);
+        xbox_KbmKey('E', 0);
+        Sleep(100);
+
+        xbox_KbmKey(VK_SHIFT, 1);
+        Sleep(5);
+        xbox_KbmKey('R', 1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255,
+              "Shift then R: the kept combo on", st.Gamepad.bAnalogButtons[7]);
+        xbox_KbmKey(VK_SHIFT, 0);
+        Sleep(100);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255,
+              "Shift let go, R held: it stays on (keep)",
+              st.Gamepad.bAnalogButtons[7]);
+        xbox_KbmKey('R', 0);
+        Sleep(100);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 0,
+              "R let go: off", st.Gamepad.bAnalogButtons[7]);
+        xbox_KbmKey('R', 1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 0,
+              "R alone never starts it", st.Gamepad.bAnalogButtons[7]);
+        xbox_KbmKey('R', 0);
+        Sleep(100);
+
+        xbox_KbmKey(VK_SHIFT, 1);
+        xbox_KbmWheel(1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] == 255
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 0,
+              "Shift + a wheel notch: White, not the wheel's own Y",
+              st.Gamepad.bAnalogButtons[5]);
+        xbox_KbmKey(VK_SHIFT, 0);
+        Sleep(200);
+        xbox_KbmWheel(1);
+        st = read_pad();
+        check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 255
+              && st.Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] == 0,
+              "a notch alone: Y", st.Gamepad.bAnalogButtons[3]);
+        Sleep(200);
+        xbox_KbmSelectProfile(0);
+    }
 
     xbox_KbmKey('W', 1);
     xbox_KbmForce(XBOX_KBM_B, 1);
