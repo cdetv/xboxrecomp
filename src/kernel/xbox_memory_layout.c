@@ -2668,6 +2668,8 @@ static int host_range_free(uintptr_t lo, size_t size)
     while (p < hi) {
         if (!VirtualQuery((LPCVOID)p, &mbi, sizeof mbi) || mbi.State != MEM_FREE)
             return 0;
+        if (!mbi.RegionSize)        /* POSIX shim: a gap it can't size */
+            return 1;
         p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return 1;

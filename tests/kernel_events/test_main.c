@@ -27,6 +27,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#define _putenv_s(n, v) setenv((n), (v), 1)
+#endif
+
 /* Provided by the generated title; this harness has none. */
 typedef void (*recomp_func_t)(void);
 recomp_func_t recomp_lookup(uint32_t xbox_va);

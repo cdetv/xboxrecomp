@@ -42,10 +42,10 @@ int main(void)
     int i;
 
     GetTempPathA(MAX_PATH, root);
-    sprintf_s(game, MAX_PATH, "%sxbr-query-attrs-%lu-game", root, GetCurrentProcessId());
-    sprintf_s(save, MAX_PATH, "%sxbr-query-attrs-%lu-save", root, GetCurrentProcessId());
+    snprintf(game, MAX_PATH, "%sxbr-query-attrs-%lu-game", root, GetCurrentProcessId());
+    snprintf(save, MAX_PATH, "%sxbr-query-attrs-%lu-save", root, GetCurrentProcessId());
     CreateDirectoryA(game, NULL);
-    sprintf_s(p, MAX_PATH, "%s\\present.bin", game);
+    snprintf(p, MAX_PATH, "%s\\present.bin", game);
     h = CreateFileA(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return 10;
     CloseHandle(h);
@@ -65,11 +65,11 @@ int main(void)
     DeleteFileA(p);
     RemoveDirectoryA(game);
     for (i = 0; i < (int)(sizeof(images) / sizeof(images[0])); i++) {
-        sprintf_s(p, MAX_PATH, "%s\\%s", save, images[i]);
+        snprintf(p, MAX_PATH, "%s\\%s", save, images[i]);
         DeleteFileA(p);
     }
     for (i = 0; i < (int)(sizeof(dirs) / sizeof(dirs[0])); i++) {
-        sprintf_s(p, MAX_PATH, "%s\\%s", save, dirs[i]);
+        snprintf(p, MAX_PATH, "%s\\%s", save, dirs[i]);
         RemoveDirectoryA(p);
     }
     RemoveDirectoryA(save);
