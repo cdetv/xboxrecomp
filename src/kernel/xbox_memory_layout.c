@@ -2659,6 +2659,42 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+/* Host [lo, lo + size) is free address space (nothing mapped or reserved). */
+static int host_range_free(uintptr_t lo, size_t size)
+{
+    MEMORY_BASIC_INFORMATION mbi;
+    uintptr_t p = lo, hi = lo + size;
+
+    while (p < hi) {
+        if (!VirtualQuery((LPCVOID)p, &mbi, sizeof mbi) || mbi.State != MEM_FREE)
+            return 0;
+        p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+    }
+    return 1;
+}
+
+/* A base view at host `base` puts the contiguous window and the tiled
+ * aperture at fixed host addresses (guest + offset); both are needed, a
+ * failed map there is a crash at the first draw. Under Wine something small
+ * of Wine's own sat at host 0x10002A000 at start, inside the tiled aperture
+ * of base 0x10000000 (the first base free there): the game faulted at guest
+ * 0xF0000000 (Linux track, run in WSL2 2026-11-14). So a base is taken only
+ * when those ranges are free too; mirrors, the EXT_VMA heap and the
+ * apertures above adapt or only warn. 0 names the range that is taken. */
+static const char *base_ranges_taken(uintptr_t base)
+{
+    uintptr_t off = base - XBOX_MAP_START;
+    size_t tiled = xbox_TiledApertureSize();
+
+    if (tiled > XBOX_CONTIG_SIZE)
+        tiled = XBOX_CONTIG_SIZE;
+    if (!host_range_free(XBOX_CONTIG_BASE + off, XBOX_CONTIG_SIZE))
+        return "contiguous window";
+    if (!host_range_free(XBOX_TILED_BASE + off, tiled))
+        return "tiled aperture";
+    return 0;
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     g_force_return = getenv("RECOMP_FORCE_RETURN") != NULL;
@@ -2721,6 +2757,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0x01000000,             /* 16 MB */
             0x02000000,             /* 32 MB */
             0x10000000,             /* 256 MB */
+            0x20000000,             /* 512 MB: Wine / Proton fill the low */
+            0x40000000,             /* 1 GB    range bottom-up before us */
             0,                      /* sentinel - let OS choose */
         };
 
@@ -2757,7 +2795,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         if (want_base) {
             g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
                                             0, 0, g_memory_size, (LPVOID)want_base);
-            if (g_memory_base && (uintptr_t)g_memory_base != want_base) {
+            if (g_memory_base && ((uintptr_t)g_memory_base != want_base
+                                  || base_ranges_taken(want_base))) {
                 UnmapViewOfFile(g_memory_base);
                 g_memory_base = NULL;
             }
@@ -2796,8 +2835,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 hint            /* desired base address */
             );
             if (g_memory_base) {
+                const char *taken;
                 if (try_bases[i] != 0 && (uintptr_t)g_memory_base != try_bases[i]) {
                     /* OS gave us a different address, retry */
+                    UnmapViewOfFile(g_memory_base);
+                    g_memory_base = NULL;
+                    continue;
+                }
+                taken = base_ranges_taken((uintptr_t)g_memory_base);
+                if (taken && try_bases[i] != 0) {
+                    fprintf(stderr, "xbox_MemoryLayoutInit: base 0x%llX skipped:"
+                            " its %s range is taken\n",
+                            (unsigned long long)try_bases[i], taken);
                     UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
                     continue;
