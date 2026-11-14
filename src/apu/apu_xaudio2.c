@@ -19,6 +19,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <xaudio2.h>
+#include <mmdeviceapi.h>
 
 #pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "ole32.lib")
@@ -58,6 +59,32 @@ static int                     g_xa2_want;        /* init asked for output */
 
 static void xa2_teardown(void);
 
+/* A default sound output exists. Wine's XAudio2 (FAudio) dereferences null
+ * in CreateMasteringVoice when there is none (E_NOTFOUND from mmdevapi; seen
+ * in WSL2 with Wine 11.21, 2026-11-14), where Windows' just fails: so no
+ * engine is made without one -- at the start (the APU falls back to waveOut)
+ * and in a restart after a lost device (retried until one is back). The
+ * GUIDs are spelt out here so no extra import library is needed. */
+static int xa2_output_present(void)
+{
+    static const GUID clsid_enum = { 0xBCDE0395, 0xE52F, 0x467C,
+        { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+    static const GUID iid_enum = { 0xA95664D2, 0x9614, 0x4F35,
+        { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+    IMMDeviceEnumerator *en = NULL;
+    IMMDevice *dev = NULL;
+    HRESULT hr;
+
+    hr = CoCreateInstance(&clsid_enum, NULL, CLSCTX_ALL, &iid_enum, (void **)&en);
+    if (FAILED(hr) || !en)
+        return 1;           /* can't ask: let XAudio2 try, as before */
+    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev);
+    if (dev)
+        IMMDevice_Release(dev);
+    IMMDeviceEnumerator_Release(en);
+    return SUCCEEDED(hr);
+}
+
 int xa2_init(void)
 {
     HRESULT hr;
@@ -72,6 +99,14 @@ int xa2_init(void)
         return 0;
     }
     com_initialized = SUCCEEDED(hr);
+
+    if (!xa2_output_present()) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[XA2] no sound output device: no XAudio2 engine"
+                    " until there is one\n");
+        goto fail;
+    }
 
     hr = XAudio2Create(&g_xa2, 0, XAUDIO2_DEFAULT_PROCESSOR);
     if (FAILED(hr) || !g_xa2) {
