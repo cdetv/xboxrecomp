@@ -105,6 +105,16 @@ void nv2a_vsh_gpu_draw_source(const char *head, const char *tail,
  * first time they run a program. */
 struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait);
 
+/* The same for a POINTS batch: a second drawing shader per program, from
+ * the same head with this tail and entry, which draws each point as its
+ * sprite square (two triangles; the back end's index list says which point
+ * and corner, nv2a_draw_d3d11.c). Compiled on first use like the first and
+ * kept in the disk cache under its own key; the pre-compiler makes only
+ * the first kind. Before the first nv2a_vsh_gpu_point_shader; without it
+ * that returns NULL (points stay on the CPU). */
+void nv2a_vsh_gpu_point_source(const char *tail, const char *entry);
+struct ID3D11VertexShader *nv2a_vsh_gpu_point_shader(int wait);
+
 /* Drawing shaders made, failed, waiting for a thread; their compile time
  * (summed over the threads). Pre-compiled ones are not in these. */
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,

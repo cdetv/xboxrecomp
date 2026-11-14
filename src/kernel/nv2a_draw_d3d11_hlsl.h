@@ -554,17 +554,21 @@ static const char s_hlsl_fill[] =
  * compute it the same way must give the same depth (layered passes test
  * LEQUAL against the base pass), so no fusing or reordering. */
 static const char s_hlsl_vsh_head[] = NV2A_D3D11_HLSL_COMMON;
-static const char s_hlsl_vsh_draw[] =
-"struct VG {\n"
-"  float4 p : SV_Position;\n"
-"  nointerpolation float4 cf : COLOR0;\n"
-"  float4 d0 : COLOR1;\n"
-"  float4 d1 : COLOR2;\n"
-"  float fog : FOG;\n"
-"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
-"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
-"  float2 cd : SV_ClipDistance0;\n"
+/* The vertex both drawing entries hand on (the bytes of s_hlsl_vsh_draw are
+ * the disk cache's key: change them and every shader compiles again). */
+#define NV2A_D3D11_HLSL_VG \
+"struct VG {\n" \
+"  float4 p : SV_Position;\n" \
+"  nointerpolation float4 cf : COLOR0;\n" \
+"  float4 d0 : COLOR1;\n" \
+"  float4 d1 : COLOR2;\n" \
+"  float fog : FOG;\n" \
+"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n" \
+"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n" \
+"  float2 cd : SV_ClipDistance0;\n" \
 "};\n"
+static const char s_hlsl_vsh_draw[] =
+NV2A_D3D11_HLSL_VG
 "VG vs_gpu(uint id : SV_VertexID) {\n"
 "  float4 v[16]; VshOut r; VG o;\n"
 "  vsh_inputs(id, v);\n"
@@ -583,6 +587,48 @@ static const char s_hlsl_vsh_draw[] =
 "  }\n"
 "  o.cf = r.d0; o.d0 = r.d0; o.d1 = r.d1; o.fog = fog_factor(r.fog.x);\n"
 "  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2; o.t3 = r.t3;\n"
+"  return o;\n"
+"}\n";
+
+/* A POINTS batch on the GPU (RECOMP_GPU_POINTS, nv2a_vsh_gpu_point_shader):
+ * pb_point_quad (nv2a_draw_sw.c) in the vertex shader. The index list holds
+ * guest index * 6 + k for each point, k = the six corners of its square's
+ * two triangles (0 1 2, 0 2 3; corners 0..3 at (0,0) (1,0) (1,1) (0,1)), so
+ * the program runs once per corner. Size in guest pixels: zsc.y
+ * (SET_POINT_SIZE / 8), or the program's oPts.x when zsc.z bit 0 says point
+ * params are on; under 1 (or NaN) is 1, at most 2047. zsc.z bit 1: point
+ * sprites, t3 = the corner (x, y, 1, 1). The corners share the centre's
+ * depth and w, so the clip distances, the centre's, drop a point whole as
+ * pb_point_quad drops it, and a point is never culled (the back end draws
+ * it without cull_state). */
+static const char s_hlsl_vsh_points[] =
+NV2A_D3D11_HLSL_VG
+"VG vs_gpu_pts(uint id : SV_VertexID) {\n"
+"  float4 v[16]; VshOut r; VG o;\n"
+"  uint k = id % 6u, c = k < 3u ? k : (k == 3u ? 0u : k - 2u);\n"
+"  uint fl = (uint)zsc.z;\n"
+"  float2 cc = float2(c == 1u || c == 2u ? 1.0 : 0.0, c >= 2u ? 1.0 : 0.0);\n"
+"  vsh_inputs(id / 6u, v);\n"
+"  r = vsh_prog(v);\n"
+"  {\n"
+"    float s = (fl & 1u) ? r.pts : zsc.y;\n"
+"    precise float w = r.pos.w;\n"
+"    precise float x, y;\n"
+"    if (!(s >= 1.0)) s = 1.0;\n"
+"    s = min(s, 2047.0);\n"
+"    x = r.pos.x + (cc.x - 0.5) * s;\n"
+"    y = r.pos.y + (cc.y - 0.5) * s;\n"
+"    o.p = float4((x * rt.x + rt.z) * w, (y * rt.y + rt.w) * w,\n"
+"                 r.pos.z * zsc.x * w, w);\n"
+"    o.cd.x = w - 1e-3;\n"
+"    o.cd.y = vc[58].z != 0.0 ? (r.pos.z - vc[59].z) / vc[58].z * w : 0.0;\n"
+"    if (!all(isfinite(r.pos))) {\n"
+"      o.p = asfloat(0x7FC00000u).xxxx; o.cd = asfloat(0x7FC00000u).xx;\n"
+"    }\n"
+"  }\n"
+"  o.cf = r.d0; o.d0 = r.d0; o.d1 = r.d1; o.fog = fog_factor(r.fog.x);\n"
+"  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2;\n"
+"  o.t3 = (fl & 2u) ? float4(cc, 1.0, 1.0) : r.t3;\n"
 "  return o;\n"
 "}\n";
 
