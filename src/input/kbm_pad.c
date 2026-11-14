@@ -35,6 +35,12 @@
  *   next lets it go (a head-cam held with the left trigger). Changing the
  *   profile or losing the focus lets every toggle go.
  *
+ * - A binding can be a combo (hold): its hold key down first, then its
+ *   input (E then Shift is plain E). While a combo is on, the plain
+ *   bindings of its input do nothing, so Shift + E can be something else
+ *   than E; the hold key's own bindings work as ever (Shift still walks).
+ *   XBOX_KBM_KEEP: once on, the input alone keeps it on.
+ *
  * Held keys come from the window thread one byte at a time and need no
  * lock, like the window's own key table (fb_present.c). Profiles are
  * swapped under a lock the USB thread takes once per report.
@@ -64,7 +70,7 @@ typedef struct {
     int n;
     xbox_KbmMouse mouse;
     int set;
-    unsigned char was[256];   /* toggles: the input last report */
+    unsigned char was[256];   /* the binding on last report (toggles, keep) */
     unsigned char latch[XBOX_KBM_OUTPUTS];   /* toggled on */
 } Profile;
 
@@ -268,6 +274,12 @@ int xbox_KbmHeld(unsigned input)
                              && now_ms() - s_down_at[input] < MIN_PRESS_MS);
 }
 
+int xbox_KbmComboHeld(unsigned hold, unsigned input)
+{
+    return hold < XBOX_KBM_WHEEL_UP && xbox_KbmHeld(hold) && xbox_KbmHeld(input)
+        && s_down_at[hold] <= s_down_at[input];
+}
+
 void xbox_KbmForce(unsigned output, int on)
 {
     if (output < XBOX_KBM_OUTPUTS)
@@ -318,6 +330,21 @@ static int input_held(unsigned input, ULONGLONG t)
         return 0;
     return s_down[input] || (s_down_at[input] && t - s_down_at[input]
                                                  < MIN_PRESS_MS);
+}
+
+/* An input a combo had: its plain bindings stay out until it is let go
+ * (Shift let go before E: E doesn't turn into plain E). USB thread only. */
+static unsigned char s_combo_took[XBOX_KBM_INPUTS];
+
+/* A combo's two keys as it starts: the hold key held and down before the
+ * input (a wheel notch while the hold key is down counts). */
+static int combo_started(const xbox_KbmBinding *bd, ULONGLONG t)
+{
+    if (bd->hold >= XBOX_KBM_WHEEL_UP || !input_held(bd->hold, t)
+        || !input_held(bd->input, t))
+        return 0;
+    return bd->input >= XBOX_KBM_WHEEL_UP
+        || s_down_at[bd->hold] <= s_down_at[bd->input];
 }
 
 /* 0-1 of the title's range (signed) to a raw axis value. */
@@ -382,6 +409,7 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
 {
     static DWORD packet;
     unsigned char out[XBOX_KBM_OUTPUTS];
+    unsigned char on[256], shadow[XBOX_KBM_INPUTS];   /* per binding, per input */
     xbox_KbmMouse m;
     ULONGLONG t = now_ms();
     long dx, dy;
@@ -421,21 +449,45 @@ int xbox_KbmState(XBOX_INPUT_STATE *pState)
         for (i = 0; i < XBOX_KBM_PROFILES; i++)
             memset(s_prof[i].latch, 0, sizeof(s_prof[i].latch));
     m = s_prof[sel].mouse;
+    /* Combos first: one that is on takes its input from the plain
+     * bindings (shadow), until that input is let go. */
+    memset(on, 0, sizeof(on));
+    memset(shadow, 0, sizeof(shadow));
+    for (i = 0; i < XBOX_KBM_WHEEL_UP; i++) {     /* not the wheel: a pulse */
+        if (s_combo_took[i] && !input_held((unsigned)i, t))
+            s_combo_took[i] = 0;
+        shadow[i] = s_combo_took[i];
+    }
+    for (i = 0; i < s_prof[sel].n; i++) {
+        const xbox_KbmBinding *bd = &s_prof[sel].b[i];
+        if (!bd->hold)
+            continue;
+        on[i] = (unsigned char)(combo_started(bd, t)
+                                || ((bd->flags & XBOX_KBM_KEEP) && s_prof[sel].was[i]
+                                    && input_held(bd->input, t)));
+        if (on[i] && bd->input < XBOX_KBM_INPUTS) {
+            shadow[bd->input] = 1;
+            if (bd->input < XBOX_KBM_WHEEL_UP)
+                s_combo_took[bd->input] = 1;
+        }
+    }
     for (i = 0; i < s_prof[sel].n; i++) {
         const xbox_KbmBinding *bd = &s_prof[sel].b[i];
         unsigned o = bd->output & ~XBOX_KBM_TOGGLE;
-        int held;
+        if (!bd->hold)
+            on[i] = (unsigned char)(input_held(bd->input, t)
+                                    && !(bd->input < XBOX_KBM_INPUTS
+                                         && shadow[bd->input]));
         if (o >= XBOX_KBM_OUTPUTS)
             continue;
-        held = input_held(bd->input, t);
         if (bd->output & XBOX_KBM_TOGGLE) {
-            if (held && !s_prof[sel].was[i])
+            if (on[i] && !s_prof[sel].was[i])
                 s_prof[sel].latch[o] ^= 1;
-            s_prof[sel].was[i] = (unsigned char)held;
-        } else if (held) {
+        } else if (on[i]) {
             out[o] = 1;
         }
     }
+    memcpy(s_prof[sel].was, on, sizeof(on));
     for (i = 0; i < XBOX_KBM_OUTPUTS; i++)
         out[i] |= s_prof[sel].latch[i] | s_force[i];
     ReleaseSRWLockExclusive(&s_lock);
@@ -553,6 +605,7 @@ void xbox_KbmWheel(int notches) { (void)notches; }
 void xbox_KbmMouseMove(long dx, long dy) { (void)dx; (void)dy; }
 void xbox_KbmReleaseAll(void) {}
 int  xbox_KbmHeld(unsigned input) { (void)input; return 0; }
+int  xbox_KbmComboHeld(unsigned hold, unsigned input) { (void)hold; (void)input; return 0; }
 void xbox_KbmForce(unsigned output, int on) { (void)output; (void)on; }
 int  xbox_KbmState(XBOX_INPUT_STATE *pState)
 {
