@@ -701,9 +701,14 @@ static void bridge_NtClose(void)
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
 #ifdef _WIN32
-            xbox_dir_context_drop(h);
-#endif
+            /* The kernel's own close: the title's file-close hook, the
+             * directory context and the partition-image size go with the
+             * handle (a guest close used to skip the hook and the size, so
+             * a runtime tracking open files kept stale entries). */
+            xbox_NtClose(h);
+#else
             CloseHandle(h);
+#endif
         }
     }
     g_eax = 0; /* STATUS_SUCCESS */
