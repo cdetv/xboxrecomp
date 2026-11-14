@@ -2743,9 +2743,33 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * touch of the kernel page faults. Larger map sizes push the span
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
+        /* RECOMP_MEM_BASE=<hex>: map the base there and skip the lower bases,
+         * to play another guest-to-host offset on Windows. Proton places its
+         * own allocations upward from 0x10000 before we run, so there the
+         * first bases are likely taken (r-linux-proton.md R1); this tries
+         * that layout (e.g. 0x10000000) before any Linux run. */
+        uintptr_t want_base = 0;
+        {
+            const char *e = getenv("RECOMP_MEM_BASE");
+            if (e && *e)
+                want_base = (uintptr_t)strtoull(e, NULL, 16) & ~(uintptr_t)0xFFFF;
+        }
+        if (want_base) {
+            g_memory_base = MapViewOfFileEx(g_mapping_handle, FILE_MAP_ALL_ACCESS,
+                                            0, 0, g_memory_size, (LPVOID)want_base);
+            if (g_memory_base && (uintptr_t)g_memory_base != want_base) {
+                UnmapViewOfFile(g_memory_base);
+                g_memory_base = NULL;
+            }
+            fprintf(stderr, "xbox_MemoryLayoutInit: RECOMP_MEM_BASE=0x%llX %s\n",
+                    (unsigned long long)want_base,
+                    g_memory_base ? "used"
+                                  : "not free: trying the higher bases");
+        }
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        g_span_base = want_base || g_memory_base ? NULL
+                    : VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
@@ -2762,6 +2786,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
+            if (want_base && try_bases[i] && try_bases[i] <= want_base)
+                continue;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
