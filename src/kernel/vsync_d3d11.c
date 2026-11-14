@@ -42,6 +42,7 @@
 #include <windows.h>
 #include <dxgi1_5.h>
 #include "vsync_d3d11.h"
+#include "host_info.h"
 
 extern void xbox_VblankDisplayLock(int on);
 extern void xbox_VblankFromDisplay(void);
@@ -289,6 +290,31 @@ UINT vsync_swap_flags(IDXGIFactory2 *factory)
     return s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 }
 
+/* The watcher at all. Under Wine (Proton) DXVK emulates WaitForVBlank: it
+ * sleeps to the next boundary of the refresh rate it reports, not the
+ * panel's, so locking the vblank clock to it adds phase drift and, on a
+ * Steam Deck at 40 Hz with 60 reported, the wrong rate (r-linux-proton.md
+ * R3). There the kernel keeps its own clock and FIFO presents pace the
+ * screen. RECOMP_VSYNC_WATCHER=1 / 0 forces it on / off. */
+static int watcher_allowed(void)
+{
+    static int allowed = -1;
+
+    if (allowed < 0) {
+        const char *e = getenv("RECOMP_VSYNC_WATCHER");
+        if (e && *e)
+            allowed = strcmp(e, "0") != 0;
+        else
+            allowed = !xbox_HostIsWine();
+        if (!allowed)
+            fprintf(stderr, "[VSYNC] no refresh watcher (%s): the kernel's own "
+                    "vblank clock paces the game\n",
+                    e && *e ? "RECOMP_VSYNC_WATCHER=0"
+                            : "Wine emulates WaitForVBlank");
+    }
+    return allowed;
+}
+
 /* VSync on: keep the watcher's output the one the window is on (checked
  * every present: MonitorFromWindow is cheap, GetContainingOutput only when
  * the monitor changed), and start the watcher the first time. */
@@ -298,6 +324,8 @@ static void follow_output(IDXGISwapChain1 *swap)
     HMONITOR mon;
     IDXGIOutput *out = NULL, *old;
 
+    if (!watcher_allowed())
+        return;
     if (FAILED(IDXGISwapChain1_GetHwnd(swap, &hwnd)) || !hwnd)
         return;
     mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
