@@ -3251,8 +3251,17 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                                     CREATE_SUSPENDED, &tid);
             if (h) {
                 /* Before it runs: PGRAPH_INTR's write breakpoint is this
-                 * thread's alone (pgraph_w1c_veh). */
-                if (swm_codes() && !pgraph_w1c_install(h, tid)) {
+                 * thread's alone (pgraph_w1c_veh). RECOMP_PGRAPH_NO_DR0=1:
+                 * none; the title clears the acknowledged bits itself (an
+                 * override of D3D's handler), so no debug exception per
+                 * trap -- each costs two wineserver / ptrace round trips
+                 * under Wine. */
+                const char *no_dr0 = getenv("RECOMP_PGRAPH_NO_DR0");
+                if (swm_codes() && no_dr0 && *no_dr0) {
+                    fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
+                            " on PGRAPH_INTR (RECOMP_PGRAPH_NO_DR0: the title"
+                            " acknowledges)\n");
+                } else if (swm_codes() && !pgraph_w1c_install(h, tid)) {
                     fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
                             " on PGRAPH_INTR (error %lu); a PGRAPH trap may be"
                             " handled twice\n", GetLastError());
