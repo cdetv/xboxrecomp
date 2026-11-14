@@ -138,12 +138,6 @@ int  xbox_KbmHeld(unsigned input);
  * wheel: a game reading notches itself checks the hold key with
  * xbox_KbmHeld). */
 int  xbox_KbmComboHeld(unsigned hold, unsigned input);
-/* When input's latest press began (the toolkit's milliseconds; 0 = never
- * pressed, and for the wheel): one value for as long as a press lasts, a
- * new one with each press. A game reading keys itself can remember
- * something about one press with it: a combo kept on until its input's
- * press ends, as XBOX_KBM_KEEP does for bindings. */
-unsigned long long xbox_KbmPressedAt(unsigned input);
 void xbox_KbmForce(unsigned output, int on);
 
 /* For the pad: player 1's keyboard and mouse as a pad state. 0 when they
