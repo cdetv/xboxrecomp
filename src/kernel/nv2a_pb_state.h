@@ -420,13 +420,19 @@ typedef struct {
  *                     but p4.
  *   NV_HOST_FX_WIRE   from here on the title's draws fill as lines (p0 != 0)
  *                     or solid (p0 = 0): a debug view; the frame's own passes
- *                     (the back end's copies and filters) stay solid. */
+ *                     (the back end's copies and filters) stay solid.
+ *   NV_HOST_FX_ASPECT the frame being drawn is shown at the shape p0:p1
+ *                     (whole numbers, e.g. 4:3), centred with black bars
+ *                     where the window is another shape, instead of
+ *                     filling the window; 0:0 = fill it again (the
+ *                     default). The last one before a flip counts. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   8u
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u
 #define NV_HOST_FX_WIRE  2u
+#define NV_HOST_FX_ASPECT 3u
 /* NV_HOST_FX_INTERP_CUT: the title's camera cut in this frame (no
  * parameters): frame interpolation does not blend it with the frame before
  * (nv2a_interp.c). Not a back end's. 5..7, not 2..4: main took 2 for

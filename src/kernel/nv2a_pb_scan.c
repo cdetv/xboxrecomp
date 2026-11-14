@@ -69,10 +69,18 @@ static int s_exec_enabled = -1;
 /* An incrementing run starting near 0x1FFC reaches 0x3FF4. */
 static uint16_t s_seen_slot[8][0x4000 / 4];
 
+/* RECOMP_PB_SCAN: the inventory is only printed then, so only kept then;
+ * counting every word for nothing was ~6% of Conker's executor at 240 fps
+ * (field, 2026-11-11). Set by pb_scan_segment before any walk. */
+static int s_scan = -1;
+
 static void note(uint32_t subch, uint32_t method, uint32_t n)
 {
-    uint16_t *slot = &s_seen_slot[subch & 7u][(method >> 2) & 0xFFFu];
+    uint16_t *slot;
 
+    if (!s_scan)
+        return;
+    slot = &s_seen_slot[subch & 7u][(method >> 2) & 0xFFFu];
     if (*slot) {
         s_seen[*slot - 1].count += n;
         return;
@@ -492,7 +500,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
                 && nv2a_pb_exec_draw_words(method,
                                            (const uint32_t *)(mem + va),
                                            count)) {
-                note(subch, method, count);
+                if (s_scan)
+                    note(subch, method, count);
                 if (method == 0x0100u) {
                     nop_param = 0;
                     nop_end = va + count * 4;
@@ -504,7 +513,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int mode,
             }
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m, 1);
+                if (s_scan)
+                    note(subch, m, 1);
                 if (m == 0x0100u) {
                     nop_param = *(const uint32_t *)(mem + va);
                     nop_end = va + 4;
@@ -596,10 +606,9 @@ static uint32_t pb_scan_segment(uint32_t start_va, uint32_t end_va)
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    static int scan = -1;
-    if (scan < 0)
-        scan = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(scan || s_exec_enabled) || end_va <= start_va)
+    if (s_scan < 0)
+        s_scan = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan || s_exec_enabled) || end_va <= start_va)
         return 0;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;

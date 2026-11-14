@@ -560,6 +560,12 @@ typedef struct {
     uint32_t target, tex0, tex1, blend, cw, ch, tw, th;
 } GtKey;
 static int s_gt_on = -1;
+/* xbox_SetGpuFrameTiming (a title's "what's limiting me" view): only the
+ * frame's first and last timestamps, read back without waiting; their span
+ * summed for xbox_GpuFrameMs. Works beside RECOMP_GPU_TIMES too. */
+static int s_gt_light;
+static double s_gt_light_ms;
+static uint32_t s_gt_light_n;
 static struct {
     ID3D11Query *disjoint, *ts[GT_MARKS];
     uint8_t cat[GT_MARKS];
@@ -573,13 +579,18 @@ static uint32_t s_gt_nkeys;
 static double s_gt_key_ms[GT_KEYS], s_gt_cat_ms[GT_N], s_gt_total_ms;
 static uint32_t s_gt_key_n[GT_KEYS], s_gt_frames, s_gt_lost;
 
-static int gt_on(void)
+static int gt_full(void)
 {
     if (s_gt_on < 0) {
         const char *e = getenv("RECOMP_GPU_TIMES");
         s_gt_on = e && *e && *e != '0';
     }
     return s_gt_on;
+}
+
+static int gt_on(void)
+{
+    return gt_full() || s_gt_light;
 }
 
 /* A timestamp now for a step of kind cat (key: GT_KEYS for none). */
@@ -590,6 +601,9 @@ static void gt_mark(int cat, uint32_t key)
     uint32_t i;
 
     if (!gt_on() || !s_gt[f].open || s_gt[f].n >= GT_MARKS)
+        return;
+    /* Light mode: the start and the end (the menus' mark) only. */
+    if (!gt_full() && s_gt[f].n && cat != GT_OVERLAY)
         return;
     i = s_gt[f].n;
     if (!s_gt[f].ts[i]) {
@@ -630,13 +644,91 @@ static uint32_t gt_draw_key(void)
     return s_gt_nkeys++;
 }
 
-/* The frame's timestamps begin (after a present) or end (before it). */
+/* Reads frame slot old's timestamps into the totals, waiting up to wait ms
+ * for the GPU to finish it. 0 = not done yet and left for later (light mode
+ * only, wait 0); 1 = read, or lost (then counted in s_gt_lost); either way
+ * the slot is free again. */
+static int gt_read(int old, ULONGLONG wait)
+{
+    int full = gt_full();
+    uint32_t i;
+    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+    UINT64 t, prev = 0, first = 0;
+
+    if (!s_gt[old].disjoint || !s_gt[old].n)
+        return 1;
+    /* The GPU may run that far behind (pacing lets it fall 100 ms back):
+     * waited for here, up to 200 ms, which slows only RECOMP_GPU_TIMES. The
+     * disjoint query ends after the last timestamp: once it is done, all
+     * are. */
+    {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].disjoint, &dj,
+                    sizeof dj, 0)) == S_FALSE
+               && GetTickCount64() - t0 < wait)
+            SwitchToThread();
+        if (hr == S_FALSE && !wait)
+            return 0;
+        if (hr != S_OK || dj.Disjoint || !dj.Frequency) {
+            s_gt_lost++;
+            s_gt[old].n = 0;
+            return 1;
+        }
+    }
+    for (i = 0; i < s_gt[old].n; i++) {
+        ULONGLONG t0 = GetTickCount64();
+        HRESULT hr;
+        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
+                    (ID3D11Asynchronous *)s_gt[old].ts[i], &t, sizeof t,
+                    0)) == S_FALSE && GetTickCount64() - t0 < wait)
+            SwitchToThread();
+        /* Seen under a heavy GPU load: the disjoint query done before the
+         * frame's last timestamp. Light mode: later, as above. */
+        if (hr == S_FALSE && !wait)
+            return 0;
+        if (hr != S_OK) {
+            s_gt_lost++;
+            break;
+        }
+        if (!i)
+            first = t;
+        if (i == s_gt[old].n - 1 && i && s_gt_light) {
+            s_gt_light_ms += (double)(t - first) * 1000.0
+                           / (double)dj.Frequency;
+            s_gt_light_n++;
+        }
+        if (i && full) {
+            double ms = (double)(t - prev) * 1000.0 / (double)dj.Frequency;
+            uint32_t k = s_gt[old].key[i];
+            s_gt_cat_ms[s_gt[old].cat[i]] += ms;
+            s_gt_total_ms += ms;
+            if (k < GT_KEYS) {
+                s_gt_key_ms[k] += ms;
+                s_gt_key_n[k]++;
+            }
+        }
+        prev = t;
+    }
+    s_gt[old].n = 0;
+    if (full)
+        s_gt_frames++;
+    return 1;
+}
+
+/* The frame's timestamps begin (after a present) or end (before it). In
+ * light mode a slot whose frame the GPU has not finished yet (it can run
+ * several frames behind) is not reused: this frame goes unmeasured, and the
+ * slot is tried again at the next one. */
 static void gt_frame_begin(void)
 {
     D3D11_QUERY_DESC qd;
     int f = s_gt_cur;
 
     if (!gt_on() || !s_dev || s_gt[f].open)
+        return;
+    if (s_gt[f].n && !gt_read(f, gt_full() ? 200 : 0))
         return;
     if (!s_gt[f].disjoint) {
         qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
@@ -652,61 +744,41 @@ static void gt_frame_begin(void)
 
 static void gt_frame_end(void)
 {
-    int f = s_gt_cur, old;
-    uint32_t i;
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-    UINT64 t, prev = 0;
+    int f = s_gt_cur;
 
-    if (!gt_on() || !s_gt[f].open)
+    if (!s_gt[f].open)
         return;
     ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_gt[f].disjoint);
     s_gt[f].open = 0;
     s_gt_cur = (f + 1) % GT_FRAMES;
-    /* The oldest frame, GT_FRAMES - 1 presents ago: read when it is done. */
-    old = s_gt_cur;
-    if (!s_gt[old].disjoint || !s_gt[old].n)
-        return;
-    /* The GPU may run that far behind (pacing lets it fall 100 ms back):
-     * waited for here, up to 200 ms, which slows only this debug mode. */
-    {
-        ULONGLONG t0 = GetTickCount64();
-        HRESULT hr;
-        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
-                    (ID3D11Asynchronous *)s_gt[old].disjoint, &dj,
-                    sizeof dj, 0)) == S_FALSE
-               && GetTickCount64() - t0 < 200)
-            SwitchToThread();
-        if (hr != S_OK || dj.Disjoint || !dj.Frequency) {
-            s_gt_lost++;
-            s_gt[old].n = 0;
-            return;
-        }
+    /* The oldest frame, GT_FRAMES - 1 presents ago: read when it is done
+     * (light mode: if it is; else at that slot's next begin). */
+    gt_read(s_gt_cur, gt_full() ? 200 : 0);
+}
+
+/* For a title's own view (from its overlay hook, the executor thread):
+ * on = the GPU time of each frame measured, from its first timestamp to its
+ * last (so it includes the GPU idling between commands: a frame the CPU
+ * side feeds slowly looks long too). */
+void xbox_SetGpuFrameTiming(int on)
+{
+    s_gt_light = on != 0;
+    if (!on) {
+        s_gt_light_ms = 0.0;
+        s_gt_light_n = 0;
     }
-    for (i = 0; i < s_gt[old].n; i++) {
-        ULONGLONG t0 = GetTickCount64();
-        HRESULT hr;
-        while ((hr = ID3D11DeviceContext_GetData(s_ctx,
-                    (ID3D11Asynchronous *)s_gt[old].ts[i], &t, sizeof t,
-                    0)) == S_FALSE && GetTickCount64() - t0 < 200)
-            SwitchToThread();
-        if (hr != S_OK) {
-            s_gt_lost++;
-            break;
-        }
-        if (i) {
-            double ms = (double)(t - prev) * 1000.0 / (double)dj.Frequency;
-            uint32_t k = s_gt[old].key[i];
-            s_gt_cat_ms[s_gt[old].cat[i]] += ms;
-            s_gt_total_ms += ms;
-            if (k < GT_KEYS) {
-                s_gt_key_ms[k] += ms;
-                s_gt_key_n[k]++;
-            }
-        }
-        prev = t;
-    }
-    s_gt[old].n = 0;
-    s_gt_frames++;
+}
+
+/* The mean GPU ms a frame since the last call, and how many frames that
+ * was (frames): -1 when none were read. */
+double xbox_GpuFrameMs(unsigned *frames)
+{
+    double ms = s_gt_light_n ? s_gt_light_ms / s_gt_light_n : -1.0;
+    if (frames)
+        *frames = s_gt_light_n;
+    s_gt_light_ms = 0.0;
+    s_gt_light_n = 0;
+    return ms;
 }
 
 static void gt_report(void)
@@ -2541,6 +2613,10 @@ typedef struct {
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
+    uint32_t sample_ok;                 /* sample matches the bytes of hash */
+    uint64_t sample;                    /* tex_sample_hash at the last full hash */
+    LONGLONG calm_at;                   /* QPC of the last upload (a change) */
+    LONGLONG full_due;                  /* QPC by which a full hash is due again */
     ID3D11Resource *tex;                /* Texture2D, Texture3D when d > 1 (not cube) */
     ID3D11ShaderResourceView *srv;
 } GpuTexture;
@@ -2678,6 +2754,75 @@ static uint64_t hash_fast(const uint8_t *p, size_t n, uint64_t h)
     }
     h ^= (uint64_t)n;
     return hash_bytes(p + i, n - i, h);
+}
+
+/* For nv2a_vsh_gpu.c's input cache. */
+uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
+{
+    return hash_fast((const uint8_t *)p, n, h);
+}
+
+/* ── Sampled texture checks (Conker to-do 208a) ─────────────────────────────
+ *
+ * Hashing every bound texture's bytes once a flip was ~8 % of the executor at
+ * 120-240 fps (memory-bound). Guest memory is a file mapping (mirror views),
+ * so Windows' write watch cannot tell which pages were written. Instead, a
+ * texture unchanged for TEX_CALM_MS gets a sample hash (one 64-byte line per
+ * KB, the last line and the palette) on most flips, and its full hash only
+ * every 17-33 ms (spread per texture). A title that rewrites a texture
+ * changes the sample at once; a small change outside the sampled lines shows
+ * at the next full check, at most ~1/30 s late. Any change found, or a new
+ * upload, puts the texture back on a full hash every flip.
+ * RECOMP_TEX_SAMPLE: 1 on (default), 0 = a full hash every flip (as before),
+ * 2 = check: the full hash as well, counting changes the sample missed (the
+ * picture stays exact), in the [GPU] report's "texture checks" line. */
+#define TEX_SAMPLE_STRIDE 1024u
+#define TEX_SAMPLE_LINE   64u
+#define TEX_SAMPLE_MIN    4096u         /* smaller: a full hash costs little */
+#define TEX_CALM_MS       500
+
+static int s_tex_sample = -1;
+static LONGLONG s_tex_qpf, s_tex_now;
+static uint32_t s_tex_now_flip = ~0u;
+static uint32_t s_tex_sampled, s_tex_full, s_tex_missed;
+
+static int tex_sample_mode(void)
+{
+    if (s_tex_sample < 0) {
+        const char *e = getenv("RECOMP_TEX_SAMPLE");
+        LARGE_INTEGER f;
+        s_tex_sample = e ? atoi(e) : 1;
+        if (s_tex_sample < 0 || s_tex_sample > 2)
+            s_tex_sample = 1;
+        QueryPerformanceFrequency(&f);
+        s_tex_qpf = f.QuadPart;
+    }
+    return s_tex_sample;
+}
+
+/* The clock, read once a flip. */
+static LONGLONG tex_now(void)
+{
+    if (s_tex_now_flip != g_pb.flips) {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        s_tex_now = q.QuadPart;
+        s_tex_now_flip = g_pb.flips;
+    }
+    return s_tex_now;
+}
+
+static uint64_t tex_sample_hash(const uint8_t *p, size_t n, const uint8_t *pal)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    size_t o;
+
+    for (o = 0; o + TEX_SAMPLE_LINE <= n; o += TEX_SAMPLE_STRIDE)
+        h = hash_fast(p + o, TEX_SAMPLE_LINE, h);
+    h = hash_fast(p + n - TEX_SAMPLE_LINE, TEX_SAMPLE_LINE, h);
+    if (pal)
+        h = hash_fast(pal, 256 * 4, h);
+    return h;
 }
 
 /* ── Render to texture ─────────────────────────────────────────────────────
@@ -3570,7 +3715,7 @@ static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
                        uint32_t h, int mode)
 {
     static int seq;
-    const char *pre = getenv("RECOMP_FTRACE_DUMP");
+    const char *pre;
     D3D11_TEXTURE2D_DESC d;
     D3D11_MAPPED_SUBRESOURCE m;
     ID3D11Texture2D *staging = NULL;
@@ -3579,7 +3724,11 @@ static void ftdump_tex(const char *what, ID3D11Texture2D *tex, uint32_t w,
     char path[512];
     FILE *f;
 
-    if (g_pb_ftrace != 2 || !pre || !tex || !w || !h)
+    /* Traced frames only: every zeta read calls this, so getenv comes after. */
+    if (g_pb_ftrace != 2)
+        return;
+    pre = getenv("RECOMP_FTRACE_DUMP");
+    if (!pre || !tex || !w || !h)
         return;
     ID3D11Texture2D_GetDesc(tex, &d);
     if (w > d.Width) w = d.Width;
@@ -3939,6 +4088,8 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     e->replaced = levels;
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
+    e->sample_ok = 0;                   /* new bytes: full hashes until calm */
+    e->calm_at = tex_now();
     e->used = s_tex_tick;
     tex_link(e);
     s_stat.tex_made++;
@@ -3956,7 +4107,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint64_t hash;
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
-    int i;
+    int i, sampling;
     uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
@@ -4037,10 +4188,46 @@ guest:
      * (~15,000 batches a frame, 2026-10-20). */
     if (!cube)
         note_stale_read(st, bytes);
+    sampling = e && bytes >= TEX_SAMPLE_MIN && tex_sample_mode();
+    if (sampling) {
+        LONGLONG now = tex_now();
+        if (e->sample_ok && now - e->calm_at >= s_tex_qpf * TEX_CALM_MS / 1000
+            && now < e->full_due
+            && tex_sample_hash(mem + t->offset, bytes,
+                               palette ? mem + palette : NULL) == e->sample) {
+            int trust = 1;
+            if (s_tex_sample == 2) {    /* check mode: is the full hash the same? */
+                uint64_t full = hash_fast(mem + t->offset, bytes,
+                                          0xCBF29CE484222325ull);
+                if (palette)
+                    full = hash_fast(mem + palette, 256 * 4, full);
+                if (full != e->hash) {
+                    s_tex_missed++;
+                    trust = 0;
+                }
+            }
+            if (trust) {
+                s_tex_sampled++;
+                e->hashed_flip = g_pb.flips;
+                e->used = s_tex_tick;
+                s_stat.tex_reused++;
+                return e->srv;
+            }
+        }
+        s_tex_full++;
+    }
     hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
         hash = hash_fast(mem + palette, 256 * 4, hash);
     if (e && e->hash == hash) {
+        if (sampling) {
+            /* The next full hash 17-33 ms on, spread by address. */
+            e->full_due = tex_now() + s_tex_qpf / 60
+                        + s_tex_qpf / 60 * ((e->addr * 2654435761u) >> 24) / 256;
+            e->sample = tex_sample_hash(mem + t->offset, bytes,
+                                        palette ? mem + palette : NULL);
+            e->sample_ok = 1;
+        }
         e->hashed_flip = g_pb.flips;
         e->used = s_tex_tick;
         s_stat.tex_reused++;
@@ -4224,6 +4411,8 @@ make:
     }
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
+    e->sample_ok = 0;                   /* new bytes: full hashes until calm */
+    e->calm_at = tex_now();
     e->used = s_tex_tick;
     s_stat.tex_uploads++;
     s_tex_levels[st] = e->lv;
@@ -5188,15 +5377,21 @@ static void vsh_gpu_check(const Nv2aVshOutput *verts, uint32_t n)
  * the GPU then clips and culls. Everything after the vertex shader -- the
  * pixel shader, textures, blending, depth -- is the CPU path's.
  *
+ * Points go to a second drawing shader (s_hlsl_vsh_points: pb_point_quad
+ * on the GPU, each point its sprite square) unless RECOMP_GPU_POINTS=0
+ * (=2: even frames only, the held-picture check). Before (0.3.0) they were
+ * kept on the CPU, and the plankton under water (~26,000 points a frame in
+ * UBend) cost the executor about a third of a frame (GitHub #18).
+ *
  * Kept on the CPU: a program that may write constants (CXT_WRITE_EN: one
- * vertex can change what the next computes), points (pb_point_quad builds
- * each sprite from the transformed point) and lines (not drawn either way),
- * FRONT_AND_BACK culling (nothing to draw), frame-trace batches and
+ * vertex can change what the next computes), lines (not drawn either way),
+ * FRONT_AND_BACK culling of triangles (nothing to draw), frame-trace
+ * batches and
  * RECOMP_VIS_LOG (both report the transformed vertices), RECOMP_GPU=both
  * (the two back ends share pb_transform_batch's results), and a program
  * whose shader is still compiling (nv2a_vsh_gpu_draw_shader). The vertex
  * shader, or NULL: draw this batch the CPU way. */
-static int s_vsh_gpu = -1;
+static int s_vsh_gpu = -1, s_gpu_points;
 
 static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
 {
@@ -5204,6 +5399,7 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
     ID3D11VertexShader *vs;
     uint32_t used, lo = UINT32_MAX, hi = 0, i;
     static int vis_log, ftrace_gpu;
+    int points = g_pb.prim == NV_PRIM_POINTS;
 
     if (s_vsh_gpu < 0) {
         const char *e = getenv("RECOMP_VSH_GPU");
@@ -5212,14 +5408,20 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
         /* RECOMP_FTRACE_GPU=1: traced batches stay on the GPU, so the
          * trace shows what GPU runs draw. */
         ftrace_gpu = getenv("RECOMP_FTRACE_GPU") != NULL;
+        e = getenv("RECOMP_GPU_POINTS");
+        s_gpu_points = !(e && e[0] == '0') ? 1 + (e && e[0] == '2') : 0;
         if (s_vsh_gpu) {
             s_vsh_gpu = nv2a_vsh_gpu_init((struct ID3D11Device *)s_dev,
                                           (struct ID3D11DeviceContext *)s_ctx);
             nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw,
                                      "vs_gpu");
+            nv2a_vsh_gpu_point_source(s_hlsl_vsh_points, "vs_gpu_pts");
         }
-        fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s%c",
-                s_vsh_gpu ? "GPU" : "CPU", 10);
+        fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s, points"
+                " on the %s%c", s_vsh_gpu ? "GPU" : "CPU",
+                s_vsh_gpu && s_gpu_points
+                    ? s_gpu_points == 2 ? "GPU in even frames" : "GPU"
+                    : "CPU", 10);
     }
     if (!s_vsh_gpu)
         return NULL;
@@ -5228,17 +5430,24 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
     case NV_PRIM_TRIANGLE_FAN: case NV_PRIM_QUADS: case NV_PRIM_QUAD_STRIP:
     case NV_PRIM_POLYGON:
         break;
+    case NV_PRIM_POINTS:
+        if (s_gpu_points && !(s_gpu_points == 2 && (g_pb.flips & 1)))
+            break;
+        /* fall through */
     default:
         s_stat.vsh_cpu_kept++;
         return NULL;
     }
+    /* Points have no face to cull: the CPU path draws them whatever the
+     * culling, and so does this one. */
     if (nv2a_vsh_cxt_write() || (g_pb_ftrace == 2 && !ftrace_gpu) || vis_log
-        || (g_pb.cull_enable && g_pb.cull_face == 0x408)
+        || (!points && g_pb.cull_enable && g_pb.cull_face == 0x408)
         || !nv2a_vsh_gpu_prepare(NULL) || !nv2a_vsh_prepare(&used)) {
         s_stat.vsh_cpu_kept++;
         return NULL;
     }
-    if (!(vs = nv2a_vsh_gpu_draw_shader(0))) {
+    if (!(vs = points ? nv2a_vsh_gpu_point_shader(0)
+                      : nv2a_vsh_gpu_draw_shader(0))) {
         s_stat.vsh_cpu_waiting++;
         return NULL;
     }
@@ -5289,6 +5498,15 @@ static uint32_t vsh_gpu_index_list(uint32_t n)
         for (i = 0; i + 3 < n; i += 2) {
             PUT(i, i + 1, i + 3);
             PUT(i, i + 3, i + 2);
+        }
+        break;
+    case NV_PRIM_POINTS:
+        /* vs_gpu_pts: index * 6 + k, k the corner of the point's square
+         * (s_hlsl_vsh_points); six per point, never more than s_ib holds. */
+        for (i = 0; i < n; i++) {
+            uint32_t b = x[i] * 6u, k;
+            for (k = 0; k < 6; k++)
+                s_ib[out++] = b + k;
         }
         break;
     default:
@@ -6223,6 +6441,13 @@ static void d3d_draw(void)
     k.mode[0] = path;
     k.mode[1] = bound;
     k.zsc[0] = zeta_scale();
+    if (gvs && g_pb.prim == NV_PRIM_POINTS) {
+        /* vs_gpu_pts: pb_point_quad's size (SET_POINT_SIZE in 1/8 pixels,
+         * or bit 0: the program's oPts.x) and point sprites (bit 1). */
+        k.zsc[1] = (float)g_pb.point_size / 8.0f;
+        k.zsc[2] = (float)(((g_pb.xf_mode & 3) == 2 && g_pb.point_params_enable
+                            ? 1 : 0) | (g_pb.point_sprite ? 2 : 0));
+    }
     {
         uint64_t ct0 = ct_now();
         int ok = buf_fill(s_cb, &k, sizeof k);
@@ -6300,7 +6525,7 @@ static void d3d_draw(void)
         ID3D11DeviceContext_PSSetShaderResources(s_ctx, 11, 4, csrv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 4, samp);
     rs = raster_state(surf_sx(si));
-    rs = gvs ? cull_state(rs) : rs;
+    rs = gvs && g_pb.prim != NV_PRIM_POINTS ? cull_state(rs) : rs;
     ID3D11DeviceContext_RSSetState(s_ctx, s_wire ? wire_state(rs) : rs);
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
@@ -6463,12 +6688,14 @@ static void heavy_report(void)
  * frame from boot, anything else names a flag file that switches it on. */
 static int flip_dump_on(void)
 {
-    static const char *spec = (const char *)-1;
+    static const char *spec = (const char *)-1, *dump;
     FILE *f;
 
-    if (spec == (const char *)-1)
+    if (spec == (const char *)-1) {     /* once: every flip asks */
         spec = getenv("RECOMP_FB_DUMP_FLIPS");
-    if (!spec || !getenv("RECOMP_FB_DUMP"))
+        dump = getenv("RECOMP_FB_DUMP");
+    }
+    if (!spec || !dump)
         return 0;
     if (strcmp(spec, "1") == 0)
         return 1;
@@ -6613,10 +6840,12 @@ static int dump_shown(void)
  * the frame (at 640x480 the two are the same size). */
 static void dump_back(int seq)
 {
-    const char *prefix = getenv("RECOMP_BB_DUMP");
+    static const char *prefix = (const char *)-1;   /* once: every present */
     ID3D11Texture2D *back = NULL;
     char path[512];
 
+    if (prefix == (const char *)-1)
+        prefix = getenv("RECOMP_BB_DUMP");
     if (!prefix || seq < 0 || !(back = back_tex()))
         return;
     snprintf(path, sizeof path, "%s%05d.bmp", prefix, seq);
@@ -6661,6 +6890,32 @@ extern int g_pb_present_black;
 static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
                         uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
+/* NV_HOST_FX_ASPECT: the shape the frame being drawn is shown at (0:0 = the
+ * whole back buffer). The executor presents at the flip, before it reads the
+ * next frame's commands, so the last mark before a flip is that frame's. */
+static uint32_t s_aspect_w, s_aspect_h;
+
+/* The back buffer's rectangle for the shape asked for: centred, as big as
+ * fits. 0 when none is asked for or it is the whole back buffer anyway. */
+static int aspect_rect(float *x, float *y, float *w, float *h)
+{
+    uint64_t cw = s_bb_w, ch = s_bb_h;
+
+    if (!s_aspect_w || !s_aspect_h || !cw || !ch
+        || cw * s_aspect_h == ch * s_aspect_w)
+        return 0;
+    if (cw * s_aspect_h > ch * s_aspect_w) {        /* wider: bars left and right */
+        *h = (float)ch;
+        *w = (float)(uint32_t)(ch * s_aspect_w / s_aspect_h);
+    } else {                                        /* taller: bars above and below */
+        *w = (float)cw;
+        *h = (float)(uint32_t)(cw * s_aspect_h / s_aspect_w);
+    }
+    *x = (float)(uint32_t)(((float)cw - *w) * 0.5f);
+    *y = (float)(uint32_t)(((float)ch - *h) * 0.5f);
+    return 1;
+}
+
 static void shown_to_back(void)
 {
     if (s_shown >= 0 && s_scale_on && !s_surf[s_shown].scaled) {
@@ -6684,9 +6939,21 @@ static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
+    float ax, ay, aw, ah;
 
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    if (tex && (back = back_tex())) {
+    if (tex && (back = back_tex()) && aspect_rect(&ax, &ay, &aw, &ah)) {
+        /* At a set shape (NV_HOST_FX_ASPECT): the whole shown rectangle
+         * squeezed into the middle, black at the sides. */
+        float bl = (float)to_host(x, sx), bt = (float)to_host(y, sy);
+        float bw = (float)(to_host(x + w, sx) - to_host(x, sx));
+        float bh = (float)(to_host(y + h, sy) - to_host(y, sy));
+        if (!postfx_draw(s_dev, s_ctx, tex, bl, bt, bw, bh,
+                         s_back_rtv, ax, ay, aw, ah))
+            blit_stretch(tex, bl, bt, bw, bh, s_back_rtv,
+                         ax, ay, aw, ah);
+        ID3D11Texture2D_Release(back);
+    } else if (tex && (back || (back = back_tex()))) {
         /* The shown rectangle at its surface's scale; the back buffer's
          * scale (bx, by: host pixels per guest pixel, worked out as
          * set_render_scale does, so equal sizes give equal scales). */
@@ -7408,12 +7675,28 @@ static void d3d_report(void)
                 " (%u failed, %u waiting), %.0f ms compiling%c",
                 s_stat.vsh_gpu, s_stat.vsh_cpu_waiting, s_stat.vsh_cpu_kept,
                 s_stat.vsh_cpu_inputs, made, failed, queued, ms, 10);
+        {
+            uint64_t nb, bytes, wraps, hits, hit_bytes;
+            nv2a_vsh_gpu_input_stats(&nb, &bytes, &wraps);
+            nv2a_vsh_gpu_cache_stats(&hits, &hit_bytes);
+            fprintf(stderr, "[VSHGPU] inputs: %.1f MB copied, %.1f MB drawn"
+                    " from an earlier copy (%llu spans), %llu ring wraps%c",
+                    bytes / 1048576.0, hit_bytes / 1048576.0,
+                    (unsigned long long)hits, (unsigned long long)wraps, 10);
+        }
     }
     fprintf(stderr, "[GPU] d3d11: textures: %u made, %u uploads (%u of them"
             " DXT kept compressed), %u binds unchanged, %u binds of a format"
             " the sampler cannot read%c",
             s_stat.tex_made, s_stat.tex_uploads, s_stat.tex_bc,
             s_stat.tex_reused, s_stat.tex_unreadable, 10);
+    if (s_tex_sample == 1)
+        fprintf(stderr, "[GPU] d3d11: texture checks: %u by a sample, %u full%c",
+                s_tex_sampled, s_tex_full, 10);
+    else if (s_tex_sample == 2)
+        fprintf(stderr, "[GPU] d3d11: texture checks (check mode): %u by a sample,"
+                " %u full, %u changes the sample missed%c",
+                s_tex_sampled, s_tex_full, s_tex_missed, 10);
     fprintf(stderr, "[GPU] d3d11: mip levels: %u binds sampled through the"
             " chain, %u binds of a texture with levels under a level-0 filter%c",
             s_stat.mip_binds, s_stat.mip_unused, 10);
@@ -7674,6 +7957,19 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
 
     if (id == NV_HOST_FX_WIRE) {
         s_wire = p[0] != 0;
+        return;
+    }
+    if (id == NV_HOST_FX_ASPECT) {
+        uint32_t w = p[1] ? p[0] : 0, h = p[0] ? p[1] : 0;
+        if (w != s_aspect_w || h != s_aspect_h) {
+            static unsigned said;
+            if (said++ < 20)
+                fprintf(stderr, "[GPU] d3d11: frames shown at %s%u:%u (host aspect)%c",
+                        w ? "" : "the window's shape, not ", w ? w : s_aspect_w,
+                        w ? h : s_aspect_h, 10);
+            s_aspect_w = w;
+            s_aspect_h = h;
+        }
         return;
     }
     if (id != NV_HOST_FX_DOF)

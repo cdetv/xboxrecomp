@@ -27,6 +27,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "nv2a_pb_state.h"
+
+/* What nv2a_vsh_gpu.c takes from the rest of the kernel since the vertex
+ * input cache (Conker to-do 72): the push buffer state (its flip count, for
+ * RECOMP_VSH_INPUT_LOG) and the back end's hash. Stand-ins here: the state
+ * all zero, an FNV-1a hash (the cache only needs equal bytes to hash
+ * equal). */
+Nv2aPbState g_pb;
+
+uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    size_t i;
+    h ^= 0xCBF29CE484222325ull;
+    for (i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
 static uint32_t s_rng = 12345u;
 
 static uint32_t rnd(void)

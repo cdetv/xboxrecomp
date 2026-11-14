@@ -1174,9 +1174,12 @@ static DWORD WINAPI fb_thread(LPVOID unused)
 
 void xbox_FramebufferWindowStart(void)
 {
+    static int on = -1;     /* read once: d3d_clear calls this every clear */
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (on < 0)
+        on = getenv("RECOMP_FB_WINDOW") != NULL;
+    if (!on)
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;

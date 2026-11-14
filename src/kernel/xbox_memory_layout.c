@@ -2083,6 +2083,7 @@ static int peek_readable(uint32_t va)
  */
 static uint32_t g_watch_va;
 static void    *g_watch_page;
+static void    *g_watch_old_page;   /* the page before xbox_WatchStop / Set */
 static uint32_t g_watch_last;
 static void    *g_watch_veh;
 static RECOMP_TLS int s_watch_stepping;
@@ -2173,15 +2174,30 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
-    if (!g_watch_page)
-        return EXCEPTION_CONTINUE_SEARCH;
-
+    /* A step that began before xbox_WatchStop ends here too: its trap flag
+     * is ours to clear whatever the watch does now. */
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
+        void *page = g_watch_page;
         s_watch_stepping = 0;
-        watch_report();
-        VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+        if (page) {
+            watch_report();
+            VirtualProtect(page, 4096, PAGE_READONLY, &old);
+        }
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* A write that faulted just before a stop made its page writable
+     * again: tried once more, it goes through. */
+    if (!g_watch_page) {
+        if (code == EXCEPTION_ACCESS_VIOLATION && g_watch_old_page
+                && ep->ExceptionRecord->ExceptionInformation[0] == 1
+                && ep->ExceptionRecord->ExceptionInformation[1]
+                       >= (uintptr_t)g_watch_old_page
+                && ep->ExceptionRecord->ExceptionInformation[1]
+                       < (uintptr_t)g_watch_old_page + 4096)
+            return EXCEPTION_CONTINUE_EXECUTION;
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     if (code == EXCEPTION_ACCESS_VIOLATION
@@ -2211,6 +2227,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 static unsigned g_watch_derefs;
 static uint32_t g_watch_root;
 static uint32_t g_watch_off;
+static volatile LONG g_watch_gen;   /* xbox_WatchSet / Stop: old resolvers quit */
 
 static int watch_resolve(uint32_t *out)
 {
@@ -2240,10 +2257,13 @@ static int watch_arm(uint32_t va);
 static DWORD WINAPI watch_resolver(LPVOID unused)
 {
     unsigned tries;
+    LONG gen = g_watch_gen;
 
     (void)unused;
     for (tries = 0; tries < 15000u && !g_watch_page; tries++) {
         uint32_t va;
+        if (gen != g_watch_gen)
+            return 0;
         if (watch_resolve(&va) && watch_arm(va))
             return 0;
         Sleep(20);
@@ -2254,15 +2274,15 @@ static DWORD WINAPI watch_resolver(LPVOID unused)
     return 0;
 }
 
-void xbox_WatchInit(void)
+/* "[[root]]+off": 1 = armed, 2 = waiting for the chain or the page, 0 =
+ * not armed. */
+static int watch_start(const char *spec)
 {
-    const char *spec = getenv("RECOMP_WATCH");
     const char *q;
     char *endp;
 
-    if (!spec || !*spec || g_memory_base == NULL || g_watch_page)
-        return;
-
+    g_watch_derefs = 0;
+    g_watch_off = 0;
     for (q = spec; *q == '['; q++)
         g_watch_derefs++;
     g_watch_root = (uint32_t)strtoul(q, &endp, 0);
@@ -2277,9 +2297,54 @@ void xbox_WatchInit(void)
         fprintf(stderr, "  WATCH: resolving %u-deep chain from 0x%08X "
                         "+0x%X\n", g_watch_derefs, g_watch_root, g_watch_off);
         CloseHandle(CreateThread(NULL, 0, watch_resolver, NULL, 0, NULL));
-        return;
+        return 2;
     }
-    watch_arm(g_watch_root + g_watch_off);
+    return watch_arm(g_watch_root + g_watch_off);
+}
+
+void xbox_WatchInit(void)
+{
+    const char *spec = getenv("RECOMP_WATCH");
+
+    if (!spec || !*spec || g_memory_base == NULL || g_watch_page)
+        return;
+    watch_start(spec);
+}
+
+void xbox_WatchStop(void)
+{
+    void *page = g_watch_page;
+    DWORD old;
+
+    InterlockedIncrement(&g_watch_gen);
+    if (!page)
+        return;
+    g_watch_old_page = page;
+    VirtualProtect(page, 4096, PAGE_READWRITE, &old);
+    g_watch_page = NULL;
+    fprintf(stderr, "  WATCH: 0x%08X no longer watched\n", g_watch_va);
+    fflush(stderr);
+}
+
+int xbox_WatchSet(const char *spec)
+{
+    if (!spec || !*spec || g_memory_base == NULL)
+        return 0;
+    xbox_WatchStop();
+    return watch_start(spec);
+}
+
+uint32_t xbox_WatchAddress(void)
+{
+    return g_watch_page ? g_watch_va : 0;
+}
+
+int xbox_GuestReadable(uint32_t va, uint32_t n)
+{
+    if (n <= 4)
+        return peek_readable(va);
+    return (uint64_t)va + n <= 0x100000000ull && peek_readable(va)
+        && peek_readable(va + n - 4);
 }
 
 static int watch_arm(uint32_t va)
@@ -2297,7 +2362,8 @@ static int watch_arm(uint32_t va)
     /* The page holding the guest dword, in host terms. */
     g_watch_page = (void *)(((uintptr_t)((const uint8_t *)g_memory_offset
                                          + g_watch_va)) & ~(uintptr_t)4095);
-    g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
+    if (!g_watch_veh)
+        g_watch_veh = AddVectoredExceptionHandler(1, watch_veh);
     if (!g_watch_veh
             || !VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old)) {
         if (g_watch_veh) {

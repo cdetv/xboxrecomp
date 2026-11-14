@@ -9,6 +9,7 @@
 #include "nv2a_vsh_gpu.h"
 #include "nv2a_vsh_hlsl.h"
 #include "nv2a_attr.h"
+#include "nv2a_pb_state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,8 +25,11 @@
 #define VSH_IN_SIZE  (NV2A_VSH_INPUTS * 16)
 
 /* draw_state: the drawing shader not asked for yet, waiting for a worker,
- * made, or failed. */
+ * made, or failed. Two kinds of drawing shader per program: kind 0 for
+ * triangles (nv2a_vsh_gpu_draw_shader), kind 1 for a POINTS batch, each
+ * point drawn as its sprite square (nv2a_vsh_gpu_point_shader). */
 enum { DRAW_NONE, DRAW_QUEUED, DRAW_READY, DRAW_FAILED };
+enum { DRAW_KINDS = 2 };
 
 typedef struct {
     uint64_t hash;
@@ -34,8 +38,8 @@ typedef struct {
     int      check_tried;
     ID3D11VertexShader   *vs;           /* vs_check */
     ID3D11GeometryShader *gs;           /* vs_check's outputs to stream-out */
-    volatile LONG         draw_state;
-    ID3D11VertexShader   *draw_vs;      /* the drawing entry, once READY */
+    volatile LONG         draw_state[DRAW_KINDS];
+    ID3D11VertexShader   *draw_vs[DRAW_KINDS]; /* each entry, once READY */
 } VshProg;
 
 static ID3D11Device         *s_dev;
@@ -58,6 +62,7 @@ typedef struct {
     char    *src;
     size_t   len;
     uint64_t key;                       /* src_key(src): the disk cache's name */
+    int      kind;                      /* which drawing shader (DRAW_KINDS) */
 } DrawJob;
 
 /* RECOMP_VSH_GPU_CACHE=<folder>: every drawing shader compiled is kept
@@ -81,11 +86,12 @@ static DiskShader s_disk[VSH_DISK_MAX];  /* under s_q_cs */
 static uint32_t s_ndisk;
 static char s_cache_dir[MAX_PATH];
 static int s_cache_on = -1;
-static const char *s_dhead, *s_dtail, *s_dentry;
+static const char *s_dhead, *s_dtail[DRAW_KINDS], *s_dentry[DRAW_KINDS];
 static INIT_ONCE          s_q_once = INIT_ONCE_STATIC_INIT;
 static CRITICAL_SECTION   s_q_cs;
 static CONDITION_VARIABLE s_q_work, s_q_done;
-static DrawJob s_q[VSH_CACHE];          /* a program is queued once at most */
+/* A program is queued once at most per kind. */
+static DrawJob s_q[VSH_CACHE * DRAW_KINDS];
 static uint32_t s_q_head, s_q_tail;
 static volatile LONG s_workers;         /* 0 = not started, -1 = none */
 static uint32_t s_dcompiled, s_dfailed; /* under s_q_cs */
@@ -126,6 +132,150 @@ static ID3D11GeometryShader *s_fetch_gs;
 static int s_fetch_tried, s_no_overwrite;
 static uint32_t s_ring_at;
 static uint64_t s_in_batches, s_in_bytes, s_in_wraps;
+
+/* RECOMP_VSH_INPUT_CACHE (on; =0 off): what was copied into the ring stays
+ * there until the ring wraps (NO_OVERWRITE never writes over it), so a span
+ * whose bytes are the same as when it was copied in this lap is drawn from
+ * that copy, not copied again. Conker's field copied ~3.4 MB a frame of
+ * vertices that never changed (characters bend on the GPU from fixed data;
+ * RECOMP_VSH_INPUT_LOG, 2026-11-11): the copy was ~5% of the executor. Every
+ * span is hashed at every draw, so bytes the game rewrites between two draws
+ * of one frame are copied again. Needs NO_OVERWRITE on the ring. =2: in
+ * even frames only (held-picture check: neighbouring frames must match). */
+#define INCACHE_SLOTS 16384u
+#define INCACHE_PROBE 32u
+typedef struct {
+    uintptr_t s0;
+    uint32_t len, lap, off;
+    uint64_t hash;
+} InCache;
+static InCache *s_incache;
+static int s_incache_on = -1;
+static uint32_t s_lap = 1;              /* ring laps; 0 = never in a lap */
+static uint64_t s_in_hits, s_in_hit_bytes;
+
+uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h); /* d3d11 */
+
+/* The slot for span (s0, len): its own, else an empty or old-lap one in its
+ * probe run; NULL when all of them hold this lap's spans. */
+static InCache *incache_slot(uintptr_t s0, uint32_t len)
+{
+    uint32_t i = (uint32_t)(((uint64_t)s0 * 0x9E3779B97F4A7C15ull ^ len) >> 40)
+                 & (INCACHE_SLOTS - 1), k;
+    InCache *spare = NULL;
+    for (k = 0; k < INCACHE_PROBE; k++, i = (i + 1) & (INCACHE_SLOTS - 1)) {
+        InCache *c = &s_incache[i];
+        if (c->s0 == s0 && c->len == len)
+            return c;
+        if (!spare && c->lap != s_lap)
+            spare = c;
+    }
+    return spare;
+}
+
+void nv2a_vsh_gpu_cache_stats(uint64_t *hits, uint64_t *hit_bytes)
+{
+    *hits = s_in_hits;
+    *hit_bytes = s_in_hit_bytes;
+}
+
+/* RECOMP_VSH_INPUT_LOG=1 ([VSHIN] every 300 flips): the bytes copied into the
+ * input ring per frame, split by whether that exact source range was already
+ * copied this frame (a repeat), was copied in an earlier frame with the same
+ * bytes (unchanged), with other bytes (changed), or never (new). Tells how
+ * much an upload-once cache could save. Diagnosis only: hashes every span. */
+#define INLOG_SLOTS 65536u
+typedef struct {
+    uintptr_t s0;
+    uint32_t len, flip;
+    uint64_t hash;
+} InLogSpan;
+static InLogSpan *s_inlog;
+static int s_inlog_on = -1;
+static uint32_t s_inlog_flip0, s_inlog_last_flip;
+static uint64_t s_inlog_b[4], s_inlog_n[4], s_inlog_full;
+static uintptr_t s_inlog_lo[4], s_inlog_hi[4];
+
+static uint64_t inlog_hash(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0xCBF29CE484222325ull;
+    size_t i;
+    for (i = 0; i + 8 <= n; i += 8) {
+        uint64_t w;
+        memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001B3ull;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001B3ull;
+    return h;
+}
+
+static void inlog_span(uintptr_t s0, uintptr_t s1)
+{
+    static const char *kind[4] = { "repeat", "unchanged", "changed", "new" };
+    uint32_t len = (uint32_t)(s1 - s0), flip = g_pb.flips, i, k;
+    uint64_t h;
+    InLogSpan *e = NULL;
+
+    if (s_inlog_on < 0) {
+        s_inlog_on = getenv("RECOMP_VSH_INPUT_LOG") != NULL;
+        if (s_inlog_on)
+            s_inlog = (InLogSpan *)calloc(INLOG_SLOTS, sizeof *s_inlog);
+        if (!s_inlog)
+            s_inlog_on = 0;
+        s_inlog_flip0 = flip;
+    }
+    if (!s_inlog_on)
+        return;
+    if (flip - s_inlog_flip0 >= 300) {
+        uint32_t f = flip - s_inlog_flip0;
+        fprintf(stderr, "[VSHIN] per frame over %u frames:", f);
+        for (k = 0; k < 4; k++)
+            fprintf(stderr, " %s %.1f KB (%.0f spans, %08llX-%08llX)", kind[k],
+                    (double)s_inlog_b[k] / 1024.0 / f,
+                    (double)s_inlog_n[k] / f,
+                    (unsigned long long)s_inlog_lo[k],
+                    (unsigned long long)s_inlog_hi[k]);
+        fprintf(stderr, "; table full %llu%c",
+                (unsigned long long)s_inlog_full, 10);
+        memset(s_inlog_b, 0, sizeof s_inlog_b);
+        memset(s_inlog_n, 0, sizeof s_inlog_n);
+        memset(s_inlog_lo, 0, sizeof s_inlog_lo);
+        memset(s_inlog_hi, 0, sizeof s_inlog_hi);
+        s_inlog_full = 0;
+        s_inlog_flip0 = flip;
+    }
+    i = (uint32_t)(((uint64_t)s0 * 0x9E3779B97F4A7C15ull ^ len) >> 40)
+        & (INLOG_SLOTS - 1);
+    for (k = 0; k < 64; k++, i = (i + 1) & (INLOG_SLOTS - 1)) {
+        InLogSpan *c = &s_inlog[i];
+        if (!c->len || (c->s0 == s0 && c->len == len)) {
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        s_inlog_full++;
+        return;
+    }
+    if (e->len && e->flip == flip) {
+        k = 0;
+    } else {
+        h = inlog_hash((const uint8_t *)s0, len);
+        k = !e->len ? 3 : e->hash == h ? 1 : 2;
+        e->s0 = s0;
+        e->len = len;
+        e->hash = h;
+        e->flip = flip;
+    }
+    s_inlog_b[k] += len;
+    s_inlog_n[k]++;
+    {
+        uintptr_t g = s0 - (uintptr_t)0x10000u; /* host = guest + 0x10000 */
+        if (!s_inlog_lo[k] || g < s_inlog_lo[k]) s_inlog_lo[k] = g;
+        if (g + len > s_inlog_hi[k]) s_inlog_hi[k] = g + len;
+    }
+}
 
 static HRESULT make_input_buffers(ID3D11Device *dev)
 {
@@ -670,8 +820,8 @@ static void compile_draw(DrawJob *j)
                 now_ms() - t0);
         free(j->src);
         EnterCriticalSection(&s_q_cs);
-        j->p->draw_vs = vs;
-        j->p->draw_state = DRAW_READY;
+        j->p->draw_vs[j->kind] = vs;
+        j->p->draw_state[j->kind] = DRAW_READY;
         s_dcompiled++;
         WakeAllConditionVariable(&s_q_done);
         LeaveCriticalSection(&s_q_cs);
@@ -680,8 +830,9 @@ static void compile_draw(DrawJob *j)
 
     /* Optimisation levels 0, 1 and 3 took the same time (tests/nv2a_vsh_gpu,
      * 400 programs, 2026-10-18): the cost is in the source, not the level. */
-    hr = D3DCompile(j->src, j->len, "nv2a_vsh_draw", NULL, NULL, s_dentry,
-                    VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, &code, &err);
+    hr = D3DCompile(j->src, j->len, "nv2a_vsh_draw", NULL, NULL,
+                    s_dentry[j->kind], VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0,
+                    &code, &err);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateVertexShader(s_dev,
                 ID3D10Blob_GetBufferPointer(code),
@@ -695,15 +846,15 @@ static void compile_draw(DrawJob *j)
     }
     ms = now_ms() - t0;
     if (FAILED(hr)) {
-        fprintf(stderr, "[VSHGPU] program %016llX: draw shader failed"
+        fprintf(stderr, "[VSHGPU] program %016llX: %sdraw shader failed"
                 " (0x%08lX): %s\n", (unsigned long long)j->p->hash,
-                (unsigned long)hr,
+                j->kind ? "point " : "", (unsigned long)hr,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
         vs = NULL;
     } else {
-        fprintf(stderr, "[VSHGPU] program %016llX: %u instructions, draw"
+        fprintf(stderr, "[VSHGPU] program %016llX: %u instructions, %sdraw"
                 " shader compiled in %.1f ms\n", (unsigned long long)j->p->hash,
-                j->p->count, ms);
+                j->p->count, j->kind ? "point " : "", ms);
     }
     if (s_dump > 0)
         fprintf(stderr, "%s\n", j->src);
@@ -712,8 +863,8 @@ static void compile_draw(DrawJob *j)
     free(j->src);
 
     EnterCriticalSection(&s_q_cs);
-    j->p->draw_vs = vs;
-    j->p->draw_state = vs ? DRAW_READY : DRAW_FAILED;
+    j->p->draw_vs[j->kind] = vs;
+    j->p->draw_state[j->kind] = vs ? DRAW_READY : DRAW_FAILED;
     if (vs) s_dcompiled++; else s_dfailed++;
     s_dms += ms;
     WakeAllConditionVariable(&s_q_done);
@@ -724,15 +875,21 @@ void nv2a_vsh_gpu_draw_source(const char *head, const char *tail,
                               const char *entry)
 {
     s_dhead = head;
-    s_dtail = tail;
-    s_dentry = entry;
+    s_dtail[0] = tail;
+    s_dentry[0] = entry;
+}
+
+void nv2a_vsh_gpu_point_source(const char *tail, const char *entry)
+{
+    s_dtail[1] = tail;
+    s_dentry[1] = entry;
 }
 
 /* head, the fetch of the inputs in `used`, the program, tail: into a buffer
  * of its own, for the worker, which frees it. NULL when the program does
  * not translate. */
 static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
-                         size_t *len)
+                         int kind, size_t *len)
 {
     size_t cap = 160 * 1024, n, m;
     char *s = (char *)malloc(cap);
@@ -751,9 +908,9 @@ static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
     m = nv2a_vsh_hlsl(ins, count, s + n, cap - n);
     if (!m) { free(s); return NULL; }
     n += m;
-    m = strlen(s_dtail);
+    m = strlen(s_dtail[kind]);
     if (n + m >= cap) { free(s); return NULL; }
-    memcpy(s + n, s_dtail, m + 1);
+    memcpy(s + n, s_dtail[kind], m + 1);
     *len = n + m;
     return s;
 }
@@ -777,7 +934,7 @@ static void precompile_job(PreJob *pj)
 
     count = nv2a_vsh_decode_words(pj->words, pj->count, ins, &used, &hash);
     if (count)
-        src = draw_source(ins, count, used, &len);
+        src = draw_source(ins, count, used, 0, &len);
     free(pj->words);
     if (src) {
         key = src_key(src, len);
@@ -789,8 +946,9 @@ static void precompile_job(PreJob *pj)
         if (had || loaded)
             cache_touch(key);           /* a scan found it: used */
         if (!had && !loaded) {
-            hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL, s_dentry,
-                            VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, &code, &err);
+            hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL,
+                            s_dentry[0], VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0,
+                            &code, &err);
             if (SUCCEEDED(hr))
                 hr = ID3D11Device_CreateVertexShader(s_dev,
                         ID3D10Blob_GetBufferPointer(code),
@@ -852,7 +1010,7 @@ static DWORD WINAPI draw_worker(LPVOID arg)
         while (s_q_head == s_q_tail && s_pq_head == s_pq_tail)
             SleepConditionVariableCS(&s_q_work, &s_q_cs, INFINITE);
         if (s_q_head != s_q_tail) {
-            j = s_q[s_q_head++ % VSH_CACHE];
+            j = s_q[s_q_head++ % (VSH_CACHE * DRAW_KINDS)];
             LeaveCriticalSection(&s_q_cs);
             compile_draw(&j);
         } else {
@@ -954,7 +1112,7 @@ int nv2a_vsh_gpu_precompile(const uint32_t *words, uint32_t count)
         free(pj.words);
     /* The workers start with the first drawing shader; once the back end
      * has given its HLSL, the first program found may start them too. */
-    else if (s_ready && s_dentry)
+    else if (s_ready && s_dentry[0])
         start_workers();
     return queued;
 }
@@ -971,24 +1129,24 @@ void nv2a_vsh_gpu_precompile_stats(uint32_t *compiled, uint32_t *had,
     LeaveCriticalSection(&s_q_cs);
 }
 
-struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
+static ID3D11VertexShader *draw_shader_kind(int wait, int kind)
 {
     VshProg *p = s_cur;
 
-    if (!s_ready || !p || p->failed || p == &s_spare || !s_dentry)
+    if (!s_ready || !p || p->failed || p == &s_spare || !s_dentry[kind])
         return NULL;
-    if (p->draw_state == DRAW_READY)
-        return p->draw_vs;
-    if (p->draw_state == DRAW_FAILED)
+    if (p->draw_state[kind] == DRAW_READY)
+        return p->draw_vs[kind];
+    if (p->draw_state[kind] == DRAW_FAILED)
         return NULL;
-    if (p->draw_state == DRAW_NONE) {
+    if (p->draw_state[kind] == DRAW_NONE) {
         const Nv2aVshIns *ins;
         uint32_t count, used = 0;
         uint64_t hash;
         DrawJob j;
         DiskShader *d;
         if (!start_workers()) {
-            p->draw_state = DRAW_FAILED;
+            p->draw_state[kind] = DRAW_FAILED;
             return NULL;
         }
         ins = nv2a_vsh_decoded(&count, &hash);
@@ -996,7 +1154,8 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
             || !nv2a_vsh_prepare(&used))
             return NULL;
         j.p = p;
-        j.src = draw_source(ins, count, used, &j.len);
+        j.kind = kind;
+        j.src = draw_source(ins, count, used, kind, &j.len);
         if (!j.src) {
             fprintf(stderr, "[VSHGPU] program %016llX: %u instructions do not"
                     " translate\n", (unsigned long long)p->hash, count);
@@ -1020,36 +1179,47 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
                         (unsigned long long)p->hash, count, va, buf);
             }
         }
-        if (nv2a_vsh_gpu_new_program_hook)
+        if (nv2a_vsh_gpu_new_program_hook
+            && p->draw_state[1 - kind] == DRAW_NONE)
             nv2a_vsh_gpu_new_program_hook(p->hash);
         EnterCriticalSection(&s_q_cs);
         if (cache_on() && (d = disk_find(j.key)) != NULL) {
             /* Loaded at startup or pre-compiled: drawn on the GPU from its
              * first batch. */
             int pre = d->pre;
-            p->draw_vs = d->vs;
-            p->draw_state = DRAW_READY;
+            p->draw_vs[kind] = d->vs;
+            p->draw_state[kind] = DRAW_READY;
             s_dcompiled++;
             LeaveCriticalSection(&s_q_cs);
             free(j.src);
             cache_touch(j.key);         /* drawn: used */
             fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
-                    " cache%s\n", (unsigned long long)p->hash,
-                    pre ? " (pre-compiled)" : "");
-            return p->draw_vs;
+                    " cache%s%s\n", (unsigned long long)p->hash,
+                    pre ? " (pre-compiled)" : "", kind ? " (points)" : "");
+            return p->draw_vs[kind];
         }
-        p->draw_state = DRAW_QUEUED;
-        s_q[s_q_tail++ % VSH_CACHE] = j;
+        p->draw_state[kind] = DRAW_QUEUED;
+        s_q[s_q_tail++ % (VSH_CACHE * DRAW_KINDS)] = j;
         WakeConditionVariable(&s_q_work);
         LeaveCriticalSection(&s_q_cs);
     }
     if (wait) {
         EnterCriticalSection(&s_q_cs);
-        while (p->draw_state == DRAW_QUEUED)
+        while (p->draw_state[kind] == DRAW_QUEUED)
             SleepConditionVariableCS(&s_q_done, &s_q_cs, INFINITE);
         LeaveCriticalSection(&s_q_cs);
     }
-    return p->draw_state == DRAW_READY ? p->draw_vs : NULL;
+    return p->draw_state[kind] == DRAW_READY ? p->draw_vs[kind] : NULL;
+}
+
+struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
+{
+    return draw_shader_kind(wait, 0);
+}
+
+struct ID3D11VertexShader *nv2a_vsh_gpu_point_shader(int wait)
+{
+    return draw_shader_kind(wait, 1);
 }
 
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
@@ -1071,7 +1241,10 @@ void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
 
 typedef struct {
     uintptr_t s0, s1;                   /* source bytes [s0, s1) */
-    uint32_t at;                        /* where in this batch's copy */
+    uint32_t at;                        /* where in the ring */
+    int copy;                           /* 1: copied in this call */
+    InCache *c;                         /* its cache slot, or NULL */
+    uint64_t hash;
 } Span;
 
 int nv2a_vsh_gpu_inputs(const Nv2aVshArray a[NV2A_VSH_INPUTS], uint32_t used,
@@ -1124,24 +1297,87 @@ int nv2a_vsh_gpu_inputs(const Nv2aVshArray a[NV2A_VSH_INPUTS], uint32_t used,
         uint64_t len = sp[k].s1 - sp[k].s0;
         if ((uint64_t)total + len > VSH_RING_SIZE)
             return 0;
-        sp[k].at = total;
         total += ((uint32_t)len + 15u) & ~15u;
     }
 
-    if (ns) {
+    if (s_inlog_on)
+        for (k = 0; k < ns; k++)
+            inlog_span(sp[k].s0, sp[k].s1);
+    if (s_incache_on < 0) {
+        const char *e = getenv("RECOMP_VSH_INPUT_CACHE");
+        s_incache_on = !s_no_overwrite || (e && e[0] == '0') ? 0
+                     : e && e[0] == '2' ? 2 : 1;
+        if (s_incache_on)
+            s_incache = (InCache *)calloc(INCACHE_SLOTS, sizeof *s_incache);
+        if (!s_incache)
+            s_incache_on = 0;
+        fprintf(stderr, "[VSHGPU] input cache %s%c", s_incache_on == 2
+                ? "on in even frames only (=2)" : s_incache_on ? "on" : "off",
+                10);
+    }
+    /* Spans copied in this lap with the same bytes are drawn from there. */
+    total = 0;
+    for (k = 0; k < ns; k++) {
+        uint32_t len = (uint32_t)(sp[k].s1 - sp[k].s0);
+        sp[k].copy = 1;
+        sp[k].c = NULL;
+        if (s_incache_on == 1 || (s_incache_on == 2 && !(g_pb.flips & 1))) {
+            InCache *c = incache_slot(sp[k].s0, len);
+            sp[k].hash = nv2a_hash_fast((const void *)sp[k].s0, len,
+                                        0xCBF29CE484222325ull);
+            sp[k].c = c;
+            if (c && c->s0 == sp[k].s0 && c->len == len && c->lap == s_lap
+                && c->hash == sp[k].hash) {
+                sp[k].copy = 0;
+                sp[k].at = c->off;
+                continue;
+            }
+        }
+        total += (len + 15u) & ~15u;
+    }
+    if (total) {
+        uint32_t at;
         if (!s_no_overwrite || s_ring_at + total > VSH_RING_SIZE) {
             if (s_no_overwrite)
                 s_in_wraps++;
             how = D3D11_MAP_WRITE_DISCARD;
             s_ring_at = 0;
+            /* A new lap: nothing from the old one is there any more. */
+            s_lap = s_lap + 1 ? s_lap + 1 : 1;
+            total = 0;
+            for (k = 0; k < ns; k++) {
+                sp[k].copy = 1;
+                total += ((uint32_t)(sp[k].s1 - sp[k].s0) + 15u) & ~15u;
+            }
         }
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ring, 0,
                 how, 0, &ms)))
             return 0;
-        for (k = 0; k < ns; k++)
-            memcpy((uint8_t *)ms.pData + s_ring_at + sp[k].at,
-                   (const void *)sp[k].s0, (size_t)(sp[k].s1 - sp[k].s0));
+        for (k = 0, at = s_ring_at; k < ns; k++) {
+            uint32_t len = (uint32_t)(sp[k].s1 - sp[k].s0);
+            if (!sp[k].copy)
+                continue;
+            memcpy((uint8_t *)ms.pData + at, (const void *)sp[k].s0, len);
+            sp[k].at = at;
+            if (sp[k].c) {
+                sp[k].c->s0 = sp[k].s0;
+                sp[k].c->len = len;
+                sp[k].c->lap = s_lap;
+                sp[k].c->off = at;
+                sp[k].c->hash = sp[k].hash;
+            }
+            at += (len + 15u) & ~15u;
+        }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ring, 0);
+        s_ring_at += total;
+        s_in_bytes += total;
+    }
+    for (k = 0; k < ns; k++)
+        if (!sp[k].copy) {
+            s_in_hits++;
+            s_in_hit_bytes += sp[k].s1 - sp[k].s0;
+        }
+    if (ns) {
         /* Element 0's address, modulo 2^32: the shader's d.x + i * d.y
          * lands on element i for every i from lo up. */
         for (k = 0; k < NV2A_VSH_INPUTS; k++) {
@@ -1149,12 +1385,10 @@ int nv2a_vsh_gpu_inputs(const Nv2aVshArray a[NV2A_VSH_INPUTS], uint32_t used,
                 continue;
             for (j = ns - 1; sp[j].s0 > start[k]; j--)
                 ;
-            rows[k][0] = s_ring_at + sp[j].at
+            rows[k][0] = sp[j].at
                        + (uint32_t)(start[k] - sp[j].s0)
                        - lo * a[k].stride;
         }
-        s_ring_at += total;
-        s_in_bytes += total;
     }
     s_in_batches++;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_acb, 0,

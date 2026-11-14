@@ -309,7 +309,8 @@ static uint8_t synthetic_buttons(void)
  * look again. A line "mouse:<dx>,<dy>" moves the keyboard-and-mouse pad's
  * mouse instead (no time, no hold). Lines go one after another with a 200 ms
  * release between; a line starting with "&" ("&rt:300") is pressed at once,
- * on top of whatever is held (a tap of RT while LT stays held). A fixed timeline cannot do that on a rasterised run, where
+ * on top of whatever is held (a tap of RT while LT stays held).
+ * xbox_PadLiveLine hands over the same lines from inside the process. A fixed timeline cannot do that on a rasterised run, where
  * how long a screen takes to appear depends on how much the software
  * rasteriser has to draw.
  *
@@ -450,8 +451,76 @@ static void pad_script_compact(unsigned long t)
     s_script_len = n;
 }
 
+/* One live line (from the RECOMP_PAD_LIVE file or xbox_PadLiveLine),
+ * scheduled at t: a press, or "mouse:<dx>,<dy>". */
+static void pad_live_line(const char *pending, unsigned long t)
+{
+    static unsigned long next_free[USB_GAMEPAD_MAX];
+    size_t npending = strlen(pending);
+
+    /* "mouse:<dx>,<dy>": mouse movement for the keyboard-and-mouse
+     * pad (kbm_pad.c), as the window's raw input would give it, so
+     * mouse look can be tested with nobody at the mouse. */
+    if (npending > 6 && same_word(pending, "mouse:", 6)) {
+        extern void xbox_KbmMouseMove(long dx, long dy);
+        long mx = 0, my = 0;
+        if (sscanf(pending + 6, "%ld,%ld", &mx, &my) == 2) {
+            xbox_KbmMouseMove(mx, my);
+            fprintf(stderr, "  PAD: live mouse %ld,%ld at t=%lu ms\n",
+                    mx, my, t);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (npending) {
+        char line[560];
+        int now_too = pending[0] == '&';
+        /* Several lines in one read go one after another, with a
+         * 200 ms release between: a title polling its pad a few times
+         * a second would otherwise see "down" and "a" in the same
+         * report, which is a different input from "down, then a". */
+        /* Serialised per pad: pad 2's throttle must not wait out
+         * pad 1's -- split-screen players press at the same time. */
+        const char *b = pending + now_too;
+        int pd = (b[0] == 'p' || b[0] == 'P')
+                 && b[1] >= '1' && b[1] <= '4'
+                 && b[2] == '-' ? b[1] - '1' : 0;
+        unsigned long at = now_too || t > next_free[pd] ? t
+                                                         : next_free[pd];
+        snprintf(line, sizeof line, "%lu:%s", at, b);
+        if (s_script_len >= PAD_SCRIPT_MAX - 1)
+            pad_script_compact(t);
+        pad_script_parse(line);
+        if (s_script_len > 0 && !now_too)
+            next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
+        fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
+        fflush(stderr);
+    }
+}
+
+/* Lines handed over by xbox_PadLiveLine (any thread), taken by the next
+ * poll. A game's own debug tools use it (a console command that presses
+ * buttons) without a file. */
+#define PAD_QUEUE 32
+static SRWLOCK s_queue_lock = SRWLOCK_INIT;
+static char s_queue[PAD_QUEUE][512];
+static int s_queue_n;
+
+int xbox_PadLiveLine(const char *line)
+{
+    int ok = 0;
+    AcquireSRWLockExclusive(&s_queue_lock);
+    if (s_queue_n < PAD_QUEUE) {
+        snprintf(s_queue[s_queue_n++], sizeof s_queue[0], "%s", line);
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&s_queue_lock);
+    return ok;
+}
+
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
- * schedule each complete line at t. Polled at most every 50 ms. */
+ * schedule each complete line at t; the file is read at most every 50 ms.
+ * Then the lines xbox_PadLiveLine queued. */
 static void pad_live_poll(unsigned long t)
 {
     static const char *path;
@@ -460,10 +529,20 @@ static void pad_live_poll(unsigned long t)
     static unsigned long last_poll;
     static char pending[512];
     static size_t npending;
-    static unsigned long next_free[USB_GAMEPAD_MAX];
     FILE *f;
     int c;
 
+    if (s_queue_n) {
+        char lines[PAD_QUEUE][512];
+        int n, i;
+        AcquireSRWLockExclusive(&s_queue_lock);
+        n = s_queue_n;
+        memcpy(lines, s_queue, (size_t)n * sizeof lines[0]);
+        s_queue_n = 0;
+        ReleaseSRWLockExclusive(&s_queue_lock);
+        for (i = 0; i < n; i++)
+            pad_live_line(lines[i], t);
+    }
     if (!checked) {
         checked = 1;
         path = getenv("RECOMP_PAD_LIVE");
@@ -485,48 +564,9 @@ static void pad_live_poll(unsigned long t)
     while ((c = fgetc(f)) != EOF) {
         consumed++;
         if (c == '\n' || c == '\r') {
-            /* "mouse:<dx>,<dy>": mouse movement for the keyboard-and-mouse
-             * pad (kbm_pad.c), as the window's raw input would give it, so
-             * mouse look can be tested with nobody at the mouse. */
-            if (npending > 6 && same_word(pending, "mouse:", 6)) {
-                extern void xbox_KbmMouseMove(long dx, long dy);
-                long mx = 0, my = 0;
-                pending[npending] = 0;
-                if (sscanf(pending + 6, "%ld,%ld", &mx, &my) == 2) {
-                    xbox_KbmMouseMove(mx, my);
-                    fprintf(stderr, "  PAD: live mouse %ld,%ld at t=%lu ms\n",
-                            mx, my, t);
-                    fflush(stderr);
-                }
-                npending = 0;
-                continue;
-            }
-            if (npending) {
-                char line[560];
-                int now_too = pending[0] == '&';
-                /* Several lines in one read go one after another, with a
-                 * 200 ms release between: a title polling its pad a few times
-                 * a second would otherwise see "down" and "a" in the same
-                 * report, which is a different input from "down, then a". */
-                /* Serialised per pad: pad 2's throttle must not wait out
-                 * pad 1's -- split-screen players press at the same time. */
-                const char *b = pending + now_too;
-                int pd = (b[0] == 'p' || b[0] == 'P')
-                         && b[1] >= '1' && b[1] <= '4'
-                         && b[2] == '-' ? b[1] - '1' : 0;
-                unsigned long at = now_too || t > next_free[pd] ? t
-                                                                 : next_free[pd];
-                pending[npending] = 0;
-                snprintf(line, sizeof line, "%lu:%s", at, b);
-                if (s_script_len >= PAD_SCRIPT_MAX - 1)
-                    pad_script_compact(t);
-                pad_script_parse(line);
-                if (s_script_len > 0 && !now_too)
-                    next_free[pd] = at + s_script[s_script_len - 1].hold_ms + 200;
-                fprintf(stderr, "  PAD: live \"%s\" at t=%lu ms\n", pending, at);
-                fflush(stderr);
-                npending = 0;
-            }
+            pending[npending] = 0;
+            pad_live_line(pending, t);
+            npending = 0;
         } else if (npending < sizeof pending - 1) {
             pending[npending++] = (char)c;
         }
