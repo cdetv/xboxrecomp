@@ -280,6 +280,11 @@ int xbox_KbmComboHeld(unsigned hold, unsigned input)
         && s_down_at[hold] <= s_down_at[input];
 }
 
+unsigned long long xbox_KbmPressedAt(unsigned input)
+{
+    return input < XBOX_KBM_WHEEL_UP ? (unsigned long long)s_down_at[input] : 0;
+}
+
 void xbox_KbmForce(unsigned output, int on)
 {
     if (output < XBOX_KBM_OUTPUTS)
@@ -606,6 +611,7 @@ void xbox_KbmMouseMove(long dx, long dy) { (void)dx; (void)dy; }
 void xbox_KbmReleaseAll(void) {}
 int  xbox_KbmHeld(unsigned input) { (void)input; return 0; }
 int  xbox_KbmComboHeld(unsigned hold, unsigned input) { (void)hold; (void)input; return 0; }
+unsigned long long xbox_KbmPressedAt(unsigned input) { (void)input; return 0; }
 void xbox_KbmForce(unsigned output, int on) { (void)output; (void)on; }
 int  xbox_KbmState(XBOX_INPUT_STATE *pState)
 {

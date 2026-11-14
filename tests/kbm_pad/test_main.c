@@ -353,6 +353,13 @@ int main(void)
         st = read_pad();
         check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 255,
               "Shift then R: the kept combo on", st.Gamepad.bAnalogButtons[7]);
+        {
+            unsigned long long at = xbox_KbmPressedAt('R');
+            xbox_KbmKey('R', 1);                  /* auto-repeat */
+            check(at != 0 && xbox_KbmPressedAt('R') == at
+                  && xbox_KbmPressedAt(XBOX_KBM_WHEEL_UP) == 0,
+                  "a press keeps its press time (auto-repeat too)", 0);
+        }
         xbox_KbmKey(VK_SHIFT, 0);
         Sleep(100);
         st = read_pad();
@@ -364,6 +371,14 @@ int main(void)
         st = read_pad();
         check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 0,
               "R let go: off", st.Gamepad.bAnalogButtons[7]);
+        {
+            unsigned long long at = xbox_KbmPressedAt('R');
+            Sleep(5);
+            xbox_KbmKey('R', 1);
+            check(xbox_KbmPressedAt('R') > at, "a new press, a new press time", 0);
+            xbox_KbmKey('R', 0);
+            Sleep(100);
+        }
         xbox_KbmKey('R', 1);
         st = read_pad();
         check(st.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 0,
