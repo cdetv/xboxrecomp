@@ -29,6 +29,16 @@ add_compile_definitions(
 # Platform: Win32/NT type vocabulary + POSIX implementation of generic
 # Win32 host primitives. Carries no Xbox semantics; provides the foundation
 # the kernel HLE and the graphics/audio/input layers build on.
+# POSIX: SDL3 for audio and input (and later the window). A game project
+# that builds the vendored SDL3 names its target (as on Windows for the
+# PlayStation pads); a standalone build takes an installed SDL3.
+if(NOT WIN32)
+    if(NOT XBOXRECOMP_SDL3_TARGET)
+        find_package(SDL3 REQUIRED CONFIG)
+        set(XBOXRECOMP_SDL3_TARGET SDL3::SDL3 CACHE STRING "" FORCE)
+    endif()
+endif()
+
 add_subdirectory(src/platform)
 
 # Core: Xbox kernel replacement (memory layout, file I/O, threading, sync)

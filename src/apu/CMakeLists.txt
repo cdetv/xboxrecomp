@@ -54,9 +54,8 @@ if(WIN32)
     # xaudio2_8 for XAudio2Create, which apu_xaudio2.c calls directly.
     set(_apu_emu_libs platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
-    find_package(SDL2 REQUIRED)
-    set(_apu_emu_libs platform SDL2::SDL2 m)
+    # POSIX: platform layer (Win32 primitives on POSIX) + SDL3 audio + libm
+    set(_apu_emu_libs platform ${XBOXRECOMP_SDL3_TARGET} m)
 endif()
 target_link_libraries(xbox_apu_emu PRIVATE ${_apu_emu_libs})
 
