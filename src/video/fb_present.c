@@ -16,6 +16,26 @@
  */
 #include <stdint.h>
 
+/* The largest w:h rectangle that fits a cw x ch client area, centred:
+ * letterbox or pillarbox, never stretched. Plain arithmetic, on every platform
+ * (the POSIX build had a stub that returned the whole area). */
+void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
+{
+    if (cw <= 0 || ch <= 0 || w <= 0 || h <= 0) {
+        *x = *y = 0; *fw = cw > 0 ? cw : 0; *fh = ch > 0 ? ch : 0;
+        return;
+    }
+    if ((long long)cw * h > (long long)ch * w) {      /* wider: bars left/right */
+        *fh = ch;
+        *fw = (int)((long long)ch * w / h);
+    } else {                                          /* taller: bars top/bottom */
+        *fw = cw;
+        *fh = (int)((long long)cw * h / w);
+    }
+    *x = (cw - *fw) / 2;
+    *y = (ch - *fh) / 2;
+}
+
 #if defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>
@@ -51,25 +71,6 @@ static volatile LONG s_gpu_owned;
 void *xbox_FramebufferWindowHandle(void)
 {
     return s_fb_running ? (void *)s_hwnd : NULL;
-}
-
-/* The largest w:h rectangle that fits a cw x ch client area, centred:
- * letterbox or pillarbox, never stretched. */
-void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
-{
-    if (cw <= 0 || ch <= 0 || w <= 0 || h <= 0) {
-        *x = *y = 0; *fw = cw > 0 ? cw : 0; *fh = ch > 0 ? ch : 0;
-        return;
-    }
-    if ((long long)cw * h > (long long)ch * w) {      /* wider: bars left/right */
-        *fh = ch;
-        *fw = (int)((long long)ch * w / h);
-    } else {                                          /* taller: bars top/bottom */
-        *fw = cw;
-        *fh = (int)((long long)cw * h / w);
-    }
-    *x = (cw - *fw) / 2;
-    *y = (ch - *fh) / 2;
 }
 
 /* A GPU back end's swap chain goes on a child window that the frame window
@@ -1203,8 +1204,6 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 void *xbox_FramebufferWindowHandle(void) { return NULL; }
 void *xbox_FramebufferWindowGpuView(unsigned w, unsigned h) { (void)w; (void)h; return NULL; }
 void xbox_FramebufferWindowGpuOwned(int on) { (void)on; }
-void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y, int *fw, int *fh)
-{ (void)w; (void)h; *x = *y = 0; *fw = cw; *fh = ch; }
 int xbox_RenderRes(unsigned *w, unsigned *h) { (void)w; (void)h; return 0; }
 int xbox_SetRenderRes(unsigned w, unsigned h) { (void)w; (void)h; return 0; }
 void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h) { (void)w; (void)h; }
