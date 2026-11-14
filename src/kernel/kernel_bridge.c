@@ -2936,6 +2936,7 @@ static volatile int g_w1c_inside;  /* only that thread ever sets it */
 #define W1C_REG ((volatile uint32_t *)((uintptr_t)(XBOX_NV2A_REG_BASE \
                     + NV2A_PGRAPH_INTR) + (uintptr_t)g_xbox_mem_offset))
 
+#ifdef _WIN32
 /* A data breakpoint traps after the write, so the value before it is the one
  * kept in g_w1c_value; nothing else writes the register during a delivery
  * (the ack thread leaves it alone, nv2a_handshake_pass). */
@@ -2979,6 +2980,15 @@ static int pgraph_w1c_install(HANDLE thread, DWORD tid)
     AddVectoredExceptionHandler(1, pgraph_w1c_veh);
     return 1;
 }
+#else
+/* POSIX: no DR0 breakpoint (no Get/SetThreadContext); returns 0 = not set.
+ * The title's handler override acknowledges instead, RECOMP_PGRAPH_NO_DR0. */
+static int pgraph_w1c_install(HANDLE thread, DWORD tid)
+{
+    (void)thread; (void)tid;
+    return 0;
+}
+#endif
 
 /* After the registers are raised, before the ISR runs; off again before
  * they are cleared, so neither of our own writes is taken as D3D's. */
@@ -4607,7 +4617,11 @@ static void bridge_NtDeviceIoControlFile(void)
             g_eax = 0xC0000023u;
             return;
         }
+#ifdef _WIN32
         size.QuadPart = (LONGLONG)xbox_PartitionHandleBytes(h);
+#else
+        size.QuadPart = 0;     /* POSIX: no partition images yet, file size below */
+#endif
         if (!size.QuadPart && h && h != INVALID_HANDLE_VALUE)
             GetFileSizeEx(h, &size);
         BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */

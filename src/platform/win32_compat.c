@@ -74,6 +74,12 @@ PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp
     return cmp;
 }
 
+/* Like the Win32 ones, these return the value before the operation. */
+LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v)
+{ return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+
 /* ===================================================================== */
 /* Critical sections (recursive pthread mutex)                           */
 /* ===================================================================== */
@@ -1413,6 +1419,17 @@ BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
     if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
     size->QuadPart = (LONGLONG)st.st_size;
     return TRUE;
+}
+
+/* Plain stat() on the path as given; only the directory / readonly bits. */
+DWORD GetFileAttributesA(LPCSTR name)
+{
+    struct stat st;
+    DWORD a = 0;
+    if (!name || stat(name, &st) != 0) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    if (S_ISDIR(st.st_mode)) a |= FILE_ATTRIBUTE_DIRECTORY;
+    if (!(st.st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
+    return a ? a : FILE_ATTRIBUTE_NORMAL;
 }
 
 BOOL FlushFileBuffers(HANDLE h)

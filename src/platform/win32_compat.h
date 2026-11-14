@@ -66,6 +66,7 @@ extern "C" {
 #define PAGE_EXECUTE           0x10u
 #define PAGE_EXECUTE_READ      0x20u
 #define PAGE_EXECUTE_READWRITE 0x40u
+#define PAGE_GUARD             0x100u
 
 /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
 #define CP_ACP    0u
@@ -92,6 +93,15 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+LONG InterlockedOr(volatile LONG *Dest, LONG Value);
+LONG InterlockedAnd(volatile LONG *Dest, LONG Value);
+LONGLONG InterlockedExchange64(volatile LONGLONG *Target, LONGLONG Value);
+/* Spin-wait hint (x86 PAUSE); nothing on other CPUs. */
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor() __builtin_ia32_pause()
+#else
+#define YieldProcessor() ((void)0)
+#endif
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -191,6 +201,11 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                         PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
 BOOL   CancelWaitableTimer(HANDLE h);
+#define TIMER_ALL_ACCESS 0x1F0003u
+/* POSIX: no high-resolution timer object; NULL makes callers use CreateWaitableTimerW. */
+static inline HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name,
+                                            DWORD flags, DWORD access)
+{ (void)sa; (void)name; (void)flags; (void)access; return NULL; }
 
 /* ---- Heap ------------------------------------------------------------- */
 HANDLE GetProcessHeap(void);
@@ -261,6 +276,8 @@ BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+DWORD  GetFileAttributesA(LPCSTR name);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -579,6 +596,11 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 { (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+static inline MMRESULT waveOutPause(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+static inline MMRESULT waveOutRestart(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+/* winmm timer resolution: nothing to do, Linux sleeps are not tick-bound. */
+static inline MMRESULT timeBeginPeriod(UINT ms) { (void)ms; return MMSYSERR_NOERROR; }
+static inline MMRESULT timeEndPeriod(UINT ms) { (void)ms; return MMSYSERR_NOERROR; }
 
 #ifdef __cplusplus
 }

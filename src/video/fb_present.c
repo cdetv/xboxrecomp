@@ -1191,6 +1191,7 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
+#include <stddef.h>
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
