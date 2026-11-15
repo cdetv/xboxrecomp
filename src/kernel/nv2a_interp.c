@@ -243,7 +243,9 @@ static const int32_t *s_rep_donor;      /* unpaired draw -> paired one it
 static int32_t *s_donor_f, *s_donor_p;  /* for N's draws, N-1's */
 static uint32_t s_donor_fcap, s_donor_pcap;
 static int s_borrow = 1;                /* RECOMP_INTERP_BORROW=0: off */
-static int s_borrow_any = 1;            /* RECOMP_INTERP_BORROW_ANY=0: off */
+static int s_borrow_any;                /* RECOMP_INTERP_BORROW_ANY=1: on (off:
+                                         * worse in gameplay, Tank Tunnel and
+                                         * Canyon, 2026-11-15 A/B) */
 static int s_donors_ok, s_donors_p_ok;  /* this frame's donor lists made */
 static uint32_t s_borrowed;             /* draws that borrowed (10 s) */
 static VshConsts s_tmp2;
@@ -336,7 +338,7 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_BORROW");
         s_borrow = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_BORROW_ANY");
-        s_borrow_any = !(e && *e == '0');
+        s_borrow_any = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_HOLD");
         s_hold_on = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_ADAPT");
@@ -2449,7 +2451,9 @@ static void find_donors(const Frame *a, const int32_t *map, const Frame *b,
          * shares a changed register with it bit for bit (the camera's rows
          * at the same place). The main menu's candle flames (a program of
          * their own) stayed where the newer frame drew them while the
-         * candles moved with the camera. RECOMP_INTERP_BORROW_ANY=0: off. */
+         * candles moved with the camera. RECOMP_INTERP_BORROW_ANY=1 (off
+         * by default: in gameplay it made more bad pictures than it fixed,
+         * a level piece taking another program's blend). */
         for (k = 1; s_borrow_any && k <= 64 && out[j] < 0; k++) {
             int s2;
             for (s2 = 0; s2 < 2 && out[j] < 0; s2++) {
