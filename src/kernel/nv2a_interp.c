@@ -157,6 +157,11 @@ static int s_pivot = 1;                 /* RECOMP_INTERP_PIVOT=0: translation
                                          * blended straight */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
 static uint64_t s_spos_refused;
+static float s_nearcam = 4.0f;          /* RECOMP_INTERP_NEARCAM (near_cam) */
+static uint64_t s_nearcam_refused;
+static int s_copy_jump = 1;             /* RECOMP_INTERP_COPY_JUMP=0: off */
+static uint64_t s_copy_refused;
+static int s_loose_count = 1;           /* RECOMP_INTERP_LOOSE_COUNT=0: off */
 static float s_coh_min = 0.0f;          /* RECOMP_INTERP_COH=<least move>, e.g. 0.2 (default 0 = off: no gain in the menu A/B, 2026-11-15) */
 static uint64_t s_coh_refused;
 #define SPOS_MAX_DRAWS 6000u            /* per frame: the rest go without */
@@ -238,6 +243,7 @@ static const int32_t *s_rep_donor;      /* unpaired draw -> paired one it
 static int32_t *s_donor_f, *s_donor_p;  /* for N's draws, N-1's */
 static uint32_t s_donor_fcap, s_donor_pcap;
 static int s_borrow = 1;                /* RECOMP_INTERP_BORROW=0: off */
+static int s_borrow_any = 1;            /* RECOMP_INTERP_BORROW_ANY=0: off */
 static int s_donors_ok, s_donors_p_ok;  /* this frame's donor lists made */
 static uint32_t s_borrowed;             /* draws that borrowed (10 s) */
 static VshConsts s_tmp2;
@@ -317,11 +323,20 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_SPOS_MAX");
         if (e)
             s_spos_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_NEARCAM");
+        if (e)
+            s_nearcam = (float)atof(e);
+        e = getenv("RECOMP_INTERP_COPY_JUMP");
+        s_copy_jump = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_LOOSE_COUNT");
+        s_loose_count = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_COH");
         if (e)
             s_coh_min = (float)atof(e);
         e = getenv("RECOMP_INTERP_BORROW");
         s_borrow = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_BORROW_ANY");
+        s_borrow_any = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_HOLD");
         s_hold_on = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_ADAPT");
@@ -953,7 +968,8 @@ static void ctl_read(void)
 
 /* Where the draw's first vertex lands on its target (the program run on
  * it once, as the title's constants are now), as x, y in 0..1 of the
- * clip; out[2] = 1 when known (in front of the camera, finite). Two
+ * clip; out[2] = its w when known (in front of the camera, finite), -1
+ * when behind the camera (x, y not known), 0 when not run. Two
  * draws of one mesh pair by this: Conker's bar room has several of one
  * bottle, and as the camera turns one leaves at one side while another
  * comes in at the other -- paired by their constants, one flew across the
@@ -976,11 +992,15 @@ static void spos_note(float out[3], uint32_t j)
             in[a][0] = in[a][1] = in[a][2] = 0.0f, in[a][3] = 1.0f;
     }
     if (!nv2a_vsh_run((const float (*)[4])in, &o) || !isfinite(o.pos[0])
-        || !isfinite(o.pos[1]) || !(o.pos[3] > 0.0f))
+        || !isfinite(o.pos[1]) || !isfinite(o.pos[3]))
         return;
+    if (!(o.pos[3] > 0.0f)) {
+        out[2] = -1.0f;
+        return;
+    }
     out[0] = (o.pos[0] - (float)g_pb.clip_x) / (float)g_pb.clip_w;
     out[1] = (o.pos[1] - (float)g_pb.clip_y) / (float)g_pb.clip_h;
-    out[2] = isfinite(out[0]) && isfinite(out[1]) ? 1.0f : 0.0f;
+    out[2] = isfinite(out[0]) && isfinite(out[1]) ? o.pos[3] : 0.0f;
 }
 
 /* How far draw ia of f and ib of prev moved on their target (0..1 units of
@@ -989,7 +1009,8 @@ static float spos_dist(const Frame *f, const Frame *prev, uint32_t ia,
                        uint32_t ib)
 {
     float dx, dy;
-    if (!f->spos || !prev->spos || !f->spos[ia][2] || !prev->spos[ib][2])
+    if (!f->spos || !prev->spos || !(f->spos[ia][2] > 0.0f)
+        || !(prev->spos[ib][2] > 0.0f))
         return -1.0f;
     /* Only near the picture: a big mesh's first vertex beside or behind the
      * camera swings far for a small camera move. */
@@ -1304,6 +1325,31 @@ static float pair_limit(const Frame *f, uint32_t ia, float abs_max)
     return m >= 0.0f && 4.0f * m > abs_max ? 4.0f * m : abs_max;
 }
 
+/* RECOMP_INTERP_NEARCAM (on; the depth ratio, 0 = off): a pair whose first
+ * vertex is behind the camera in one frame and in front in the other, or
+ * whose depth (w) changed more than this many times over, is at the camera
+ * in one of them. Blended, its vertices pass through the camera plane in
+ * the in-between and blow up across the picture (the main menu's board
+ * zoom: a fur character beside the lens filled the middle picture). Such a
+ * pair is not made; each frame draws it as it was. */
+static int near_cam(const Frame *f, const Frame *prev, uint32_t ia,
+                    uint32_t ib)
+{
+    float a, b;
+    if (s_nearcam <= 0.0f || !f->spos || !prev->spos || ia >= SPOS_MAX_DRAWS
+        || ib >= SPOS_MAX_DRAWS)
+        return 0;
+    a = f->spos[ia][2];
+    b = prev->spos[ib][2];
+    if (a == 0.0f || b == 0.0f)
+        return 0;                       /* not known */
+    if ((a < 0.0f) != (b < 0.0f))
+        return 1;
+    if (a < 0.0f)
+        return 0;                       /* behind in both */
+    return a > s_nearcam * b || b > s_nearcam * a;
+}
+
 static float spos_limit(void)
 {
     return 4.0f * s_sd_med > s_spos_max ? 4.0f * s_sd_med : s_spos_max;
@@ -1322,8 +1368,18 @@ static int pair_set(Frame *f, const Frame *prev, uint32_t ia, uint32_t ib,
                             f->prog[ia] != PROG_NONE
                             ? s_prog[f->prog[ia]].reads : NULL);
         float sd = spos_dist(f, prev, ia, ib);
+        /* Without one vertex array to share (CPU-written vertices: attr0
+         * 0), a count more than twice the other is another mesh: the main
+         * menu's fur (1404 vertices) paired with a 24-vertex draw took its
+         * matrices and streaked across the middle picture
+         * (RECOMP_INTERP_LOOSE_COUNT=0: off). */
+        uint32_t na = f->part[ia][2], nb = prev->part[ib][2];
+        int counts_off = s_loose_count && !(f->part[ia][1]
+                                            && f->part[ia][1] == prev->part[ib][1])
+                         && na && nb && (na > 2 * nb || nb > 2 * na);
         int refuse = d > pair_limit(f, ia, s_loose_max)
-                     || (s_spos_max > 0.0f && sd > spos_limit());
+                     || (s_spos_max > 0.0f && sd > spos_limit()) || counts_off
+                     || near_cam(f, prev, ia, ib);
         if (s_log)
             s_dhist[1][d < 0.01f ? 0 : d < 0.05f ? 1 : d < 0.1f ? 2
                        : d < 0.25f ? 3 : d < 0.5f ? 4 : d < 1.0f ? 5
@@ -1334,7 +1390,8 @@ static int pair_set(Frame *f, const Frame *prev, uint32_t ia, uint32_t ib,
                     g_pb.flips, k, d, sd, f->part[ia][0], f->part[ia][1],
                     prev->part[ib][1], f->part[ia][2], prev->part[ib][2],
                     f->part[ia][4], f->part[ia][5],
-                    refuse ? " REFUSED" : "", 10);
+                    refuse ? counts_off ? " REFUSED (count)" : " REFUSED"
+                           : "", 10);
         if (refuse) {
             s_loose_refused++;
             return 0;
@@ -1395,6 +1452,19 @@ static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
         const NearCand *k = &s_near_c[x];
         if (useda[k->a] || usedb[k->b])
             continue;
+        /* Copies of one mesh (more than one draw on a side): a pair whose
+         * matrices jumped is two different copies. The main menu's bar
+         * shelves: a row of ten bottles off the picture's left in one frame,
+         * another row off its right in the frame before, paired anyway as
+         * the nearest left; each bottle stretched across the middle
+         * picture. A lone draw that spins (It's War's valve) still pairs.
+         * RECOMP_INTERP_COPY_JUMP=0: off. */
+        if (s_copy_jump && (na > 1 || nb > 1)
+            && mats_jumped((const float (*)[4])f->consts[s_ka[a0 + k->a].i],
+                           (const float (*)[4])prev->consts[s_kb[b0 + k->b].i])) {
+            s_copy_refused++;
+            continue;
+        }
         if (!pair_set(f, prev, s_ka[a0 + k->a].i, s_kb[b0 + k->b].i, kk))
             continue;
         useda[k->a] = usedb[k->b] = 1;
@@ -1758,7 +1828,7 @@ static void coh_moves(const Frame *f, const Frame *prev)
             continue;
         a = prev->spos[pj];
         b = f->spos[j];
-        if (!a[2] || !b[2] || a[0] < -1.0f || a[0] > 2.0f || a[1] < -1.0f
+        if (!(a[2] > 0.0f) || !(b[2] > 0.0f) || a[0] < -1.0f || a[0] > 2.0f || a[1] < -1.0f
             || a[1] > 2.0f || b[0] < -1.0f || b[0] > 2.0f || b[1] < -1.0f
             || b[1] > 2.0f)
             continue;
@@ -1885,15 +1955,16 @@ static uint32_t pair_refuse(Frame *f, const Frame *prev)
         sd = spos_dist(f, prev, j, (uint32_t)pj);
         why = dd[j] > pair_limit(f, j, s_pair_max) ? 1
             : s_spos_max > 0.0f && sd > spos_limit() ? 2
-            : coh_off(f, prev, j) ? 3 : 0;
+            : coh_off(f, prev, j) ? 3
+            : near_cam(f, prev, j, (uint32_t)pj) ? 4 : 0;
         if (!why)
             continue;
         if (s_jumplog)
             fprintf(stderr, "[IREFUSE] flip %u draw %u %s: d %.3f (median %.3f)"
                     " sd %.3f (median %.3f) prog %08X attr0 %08X n %u tex0"
                     " %08X target %08X%c", g_pb.flips, j,
-                    why == 1 ? "unlike" : why == 2 ? "moved" : "apart from its"
-                    " neighbours", dd[j],
+                    why == 1 ? "unlike" : why == 2 ? "moved" : why == 3
+                    ? "apart from its neighbours" : "at the camera", dd[j],
                     f->prog[j] != PROG_NONE ? s_prog_med[f->prog[j]] : -1.0f,
                     sd, s_sd_med, f->part[j][0], f->part[j][1], f->part[j][2],
                     f->part[j][4], f->part[j][5], 10);
@@ -1901,8 +1972,10 @@ static uint32_t pair_refuse(Frame *f, const Frame *prev)
             s_pair_refused++;
         else if (why == 2)
             s_spos_refused++;
-        else
+        else if (why == 3)
             s_coh_refused++;
+        else
+            s_nearcam_refused++;
         s_taken[pj] = 0;
         f->pair[j] = -1;
         refused++;
@@ -2134,7 +2207,8 @@ static void stats_line(LONGLONG now)
     fprintf(stderr, "[INTERP] nearest pairing: %llu groups, %llu draws paired"
             " out of order; %llu strict and %llu loose pairs refused as too"
             " unlike, %llu as moved across the picture, %llu as moved apart"
-            " from their neighbours; %u held draws; %u"
+            " from their neighbours, %llu copies as jumped, %llu at the camera;"
+            " %u held draws; %u"
             " unpaired draws moved with the camera; %u"
             " turned matrices kept their size%c",
             (unsigned long long)s_near_groups,
@@ -2142,10 +2216,13 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_pair_refused,
             (unsigned long long)s_loose_refused,
             (unsigned long long)s_spos_refused,
-            (unsigned long long)s_coh_refused, s_held, s_borrowed,
+            (unsigned long long)s_coh_refused,
+            (unsigned long long)s_copy_refused,
+            (unsigned long long)s_nearcam_refused, s_held, s_borrowed,
             s_rot_fixed, 10);
     s_borrowed = 0;
-    s_pair_refused = s_spos_refused = s_coh_refused = 0;
+    s_pair_refused = s_spos_refused = s_coh_refused = s_copy_refused =
+        s_nearcam_refused = 0;
     s_held = 0;
     fprintf(stderr, "[INTERP] pair distances <.01 <.05 <.1 <.25 <.5 <1 <2"
             " more: strict %u %u %u %u %u %u %u %u, loose %u %u %u %u %u %u"
@@ -2283,12 +2360,12 @@ static void trace_frame(const Frame *f, const Frame *prev)
             if (lite < 0)
                 lite = getenv("RECOMP_INTERP_TRACE_LITE") != NULL;
             if (lite) {
-                if (f->spos && j < SPOS_MAX_DRAWS && f->spos[j][2])
+                if (f->spos && j < SPOS_MAX_DRAWS && f->spos[j][2] > 0.0f)
                     len += snprintf(line + len, sizeof line - len,
                                     " at %.3f,%.3f", f->spos[j][0],
                                     f->spos[j][1]);
                 if (pj >= 0 && prev->spos && (uint32_t)pj < SPOS_MAX_DRAWS
-                    && prev->spos[pj][2])
+                    && prev->spos[pj][2] > 0.0f)
                     len += snprintf(line + len, sizeof line - len,
                                     " before %.3f,%.3f", prev->spos[pj][0],
                                     prev->spos[pj][1]);
@@ -2366,6 +2443,31 @@ static void find_donors(const Frame *a, const int32_t *map, const Frame *b,
                         out[j] = (int32_t)d;
                         break;
                     }
+            }
+        }
+        /* None of its own program: any program's paired draw nearby that
+         * shares a changed register with it bit for bit (the camera's rows
+         * at the same place). The main menu's candle flames (a program of
+         * their own) stayed where the newer frame drew them while the
+         * candles moved with the camera. RECOMP_INTERP_BORROW_ANY=0: off. */
+        for (k = 1; s_borrow_any && k <= 64 && out[j] < 0; k++) {
+            int s2;
+            for (s2 = 0; s2 < 2 && out[j] < 0; s2++) {
+                int64_t d = s2 ? (int64_t)j + k : (int64_t)j - k;
+                const float (*x)[4], (*y)[4];
+                uint32_t same = 0;
+                if (d < 0 || d >= a->ndraws || map[d] < 0)
+                    continue;
+                x = (const float (*)[4])a->consts[d];
+                y = (const float (*)[4])b->consts[map[d]];
+                /* At least three rows (a matrix), so a lone shared value
+                 * (a colour, 1.0) is no camera. */
+                for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+                    if (memcmp(x[r], y[r], 16) && !all_zero(x[r])
+                        && !memcmp(x[r], a->consts[j][r], 16))
+                        same++;
+                if (same >= 3)
+                    out[j] = (int32_t)d;
             }
         }
     }
