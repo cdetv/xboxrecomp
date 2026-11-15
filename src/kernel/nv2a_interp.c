@@ -885,24 +885,38 @@ void nv2a_interp_after_draw(const Nv2aPbBackend *be)
 {
     const Frame *p = s_rep_prev;
     int32_t pj = s_extra;
-    uint32_t n, keep;
+    uint32_t n, keep, keep_prim, keep_np;
+    const uint32_t *keep_part;
 
     if (!s_rep || pj < 0)
         return;
     s_extra = -1;
     n = p->ix[pj][1];
     keep = g_pb.idx_count;
+    keep_prim = g_pb.prim;
+    keep_np = g_pb.merge_nparts;
+    keep_part = g_pb.merge_part;
     memcpy(s_extra_idx, g_pb.idx, (size_t)keep * 4);
     memcpy(s_extra_attr, g_pb.attr, sizeof g_pb.attr);
     memcpy(g_pb.idx, p->idx + p->ix[pj][0], (size_t)n * 4);
     memcpy(g_pb.attr, p->attr[pj], sizeof g_pb.attr);
     g_pb.idx_count = n;
+    /* The partner's own primitive (a merged draw is a triangle list, the
+     * title's own batches strips: drawn with this draw's type, a strip's
+     * indices as a list made slabs across the picture), and a plain draw:
+     * the merged parts belong to this draw's list, not the partner's. */
+    g_pb.prim = p->part[pj][3] & 0xFFu;
+    g_pb.merge_nparts = 0;
+    g_pb.merge_part = NULL;
     pb_transform_forget();
     be->draw();
     pb_transform_forget();
     memcpy(g_pb.idx, s_extra_idx, (size_t)keep * 4);
     memcpy(g_pb.attr, s_extra_attr, sizeof g_pb.attr);
     g_pb.idx_count = keep;
+    g_pb.prim = keep_prim;
+    g_pb.merge_nparts = keep_np;
+    g_pb.merge_part = keep_part;
     s_st.unions++;
 }
 
@@ -1088,7 +1102,12 @@ void nv2a_interp_draw(void)
             /* The same vertices drawn with another index list in the
              * partner frame (a ground's pieces, each frame only what that
              * frame sees): its triangles too, opaque draws only. */
+            /* Not merged draws: the extra triangles get this pass but
+             * not the later ones that cover only this frame's own list (a
+             * Tank Tunnel floor plate came out unlit in the middle
+             * picture). One primitive type on both sides. */
             if (s_union && !g_pb.blend_enable && !g_pb.merge_nparts
+                && (f->part[j][3] & 0xFFu) == (s_rep_prev->part[pj][3] & 0xFFu)
                 && !f->inl[j] && !s_rep_prev->inl[pj]
                 && f->part[j][0] == s_rep_prev->part[pj][0]
                 && f->part[j][1] && f->part[j][1] == s_rep_prev->part[pj][1]
