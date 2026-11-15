@@ -905,9 +905,19 @@ void nv2a_interp_after_draw(const Nv2aPbBackend *be)
      * title's own batches strips: drawn with this draw's type, a strip's
      * indices as a list made slabs across the picture), and a plain draw:
      * the merged parts belong to this draw's list, not the partner's. */
-    g_pb.prim = p->part[pj][3] & 0xFFu;
-    g_pb.merge_nparts = 0;
-    g_pb.merge_part = NULL;
+    {
+        static int own = -1;            /* RECOMP_INTERP_UNION_PRIM=0: this
+                                         * draw's type, as before 2026-11-15 */
+        if (own < 0) {
+            const char *e = getenv("RECOMP_INTERP_UNION_PRIM");
+            own = !(e && *e == '0');
+        }
+        if (own) {
+            g_pb.prim = p->part[pj][3] & 0xFFu;
+            g_pb.merge_nparts = 0;
+            g_pb.merge_part = NULL;
+        }
+    }
     pb_transform_forget();
     be->draw();
     pb_transform_forget();
@@ -1105,9 +1115,10 @@ void nv2a_interp_draw(void)
             /* Not merged draws: the extra triangles get this pass but
              * not the later ones that cover only this frame's own list (a
              * Tank Tunnel floor plate came out unlit in the middle
-             * picture). One primitive type on both sides. */
+             * picture). The primitive types may differ (the partner's own
+             * is used, nv2a_interp_after_draw): requiring one type left the
+             * field's cliff cracked white at 16:9. */
             if (s_union && !g_pb.blend_enable && !g_pb.merge_nparts
-                && (f->part[j][3] & 0xFFu) == (s_rep_prev->part[pj][3] & 0xFFu)
                 && !f->inl[j] && !s_rep_prev->inl[pj]
                 && f->part[j][0] == s_rep_prev->part[pj][0]
                 && f->part[j][1] && f->part[j][1] == s_rep_prev->part[pj][1]
@@ -1389,15 +1400,18 @@ static int pair_set(Frame *f, const Frame *prev, uint32_t ia, uint32_t ib,
                             f->prog[ia] != PROG_NONE
                             ? s_prog[f->prog[ia]].reads : NULL);
         float sd = spos_dist(f, prev, ia, ib);
-        /* Without one vertex array to share (CPU-written vertices: attr0
-         * 0), a count more than twice the other is another mesh: the main
+        /* CPU-written vertices on both sides (attr0 0), a count more
+         * than 8x the other is another mesh: the main
          * menu's fur (1404 vertices) paired with a 24-vertex draw took its
          * matrices and streaked across the middle picture
          * (RECOMP_INTERP_LOOSE_COUNT=0: off). */
+        /* CPU-written on both sides only: a level piece seen in one
+         * frame pairs loosely with another piece of its program, which
+         * still moves it with the camera; refusing those cracked the
+         * field's cliff white at 16:9 (2026-11-15). */
         uint32_t na = f->part[ia][2], nb = prev->part[ib][2];
-        int counts_off = s_loose_count && !(f->part[ia][1]
-                                            && f->part[ia][1] == prev->part[ib][1])
-                         && na && nb && (na > 2 * nb || nb > 2 * na);
+        int counts_off = s_loose_count && !f->part[ia][1] && !prev->part[ib][1]
+                         && na && nb && (na > 8 * nb || nb > 8 * na);
         int refuse = d > pair_limit(f, ia, s_loose_max)
                      || (s_spos_max > 0.0f && sd > spos_limit()) || counts_off
                      || near_cam(f, prev, ia, ib);
