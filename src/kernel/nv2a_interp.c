@@ -157,6 +157,8 @@ static int s_pivot = 1;                 /* RECOMP_INTERP_PIVOT=0: translation
                                          * blended straight */
 static float s_spos_max = 0.3f;         /* RECOMP_INTERP_SPOS_MAX (0 = off) */
 static uint64_t s_spos_refused;
+static float s_coh_min = 0.0f;          /* RECOMP_INTERP_COH=<least move>, e.g. 0.2 (default 0 = off: no gain in the menu A/B, 2026-11-15) */
+static uint64_t s_coh_refused;
 #define SPOS_MAX_DRAWS 6000u            /* per frame: the rest go without */
 static uint32_t s_rot_fixed;            /* matrices rescaled (10 s) */
 static float s_pair_max = 1.0f;         /* RECOMP_INTERP_PAIR_MAX: strict
@@ -315,6 +317,9 @@ int nv2a_interp_n(void)
         e = getenv("RECOMP_INTERP_SPOS_MAX");
         if (e)
             s_spos_max = (float)atof(e);
+        e = getenv("RECOMP_INTERP_COH");
+        if (e)
+            s_coh_min = (float)atof(e);
         e = getenv("RECOMP_INTERP_BORROW");
         s_borrow = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_HOLD");
@@ -1714,6 +1719,105 @@ static int cmp_float(const void *x, const void *y)
  * (RECOMP_INTERP_SPOS_MAX, at least, 0.3), unpaired: one mesh in two unlike
  * places (a model reused, a teleport, identical bottles leaving and coming
  * in) flew through the picture. The draws unpaired. */
+/* Moves that disagree with their neighbours (RECOMP_INTERP_COH=0.2 turns it on, off by default; the
+ * least move refused, 0 = off): each pair's first vertex's move on the
+ * picture against the median move of the paired draws drawn just before
+ * and after it on the same target (a character's other pieces, the room
+ * around a prop). A camera turn moves them all alike, so a pair crossed
+ * between two copies of one mesh (Conker's bar room: one character's
+ * bottle paired with another's, a bottle flying through the middle
+ * picture) stands out where the frame-wide median (spos_limit) cannot see
+ * it. */
+#define COH_W 10
+static float (*s_mv)[2];
+static uint8_t *s_mv_ok;
+static uint32_t s_mv_cap;
+
+static int cmp_float(const void *x, const void *y);
+
+static void coh_moves(const Frame *f, const Frame *prev)
+{
+    uint32_t j;
+
+    if (s_coh_min <= 0.0f || !f->spos || !prev->spos)
+        return;
+    if (s_mv_cap < f->ndraws) {
+        float (*m)[2] = realloc(s_mv, f->ndraws * sizeof *m);
+        uint8_t *o = realloc(s_mv_ok, f->ndraws);
+        if (m) s_mv = m;
+        if (o) s_mv_ok = o;
+        if (!m || !o)
+            return;
+        s_mv_cap = f->ndraws;
+    }
+    for (j = 0; j < f->ndraws; j++) {
+        int32_t pj = f->pair[j];
+        const float *a, *b;
+        s_mv_ok[j] = 0;
+        if (pj < 0 || j >= SPOS_MAX_DRAWS || (uint32_t)pj >= SPOS_MAX_DRAWS)
+            continue;
+        a = prev->spos[pj];
+        b = f->spos[j];
+        if (!a[2] || !b[2] || a[0] < -1.0f || a[0] > 2.0f || a[1] < -1.0f
+            || a[1] > 2.0f || b[0] < -1.0f || b[0] > 2.0f || b[1] < -1.0f
+            || b[1] > 2.0f)
+            continue;
+        s_mv[j][0] = b[0] - a[0];
+        s_mv[j][1] = b[1] - a[1];
+        s_mv_ok[j] = 1;
+    }
+}
+
+/* 1 when draw j's move is far from its neighbours' (coh_moves first). */
+static int coh_off(const Frame *f, const Frame *prev, uint32_t j)
+{
+    float xs[2 * COH_W], ys[2 * COH_W], ds[2 * COH_W], mx, my, dev, spread;
+    uint32_t k, lo, hi, n = 0;
+
+    if (s_coh_min <= 0.0f || !s_mv_ok || j >= s_mv_cap || !s_mv_ok[j])
+        return 0;
+    /* Only a draw near the picture in both frames (as spos_dist): a big
+     * mesh's first vertex beside the camera swings far for a small turn. */
+    if (spos_dist(f, prev, j, (uint32_t)f->pair[j]) < 0.0f)
+        return 0;
+    lo = j > COH_W ? j - COH_W : 0;
+    hi = j + COH_W < f->ndraws ? j + COH_W : f->ndraws - 1;
+    for (k = lo; k <= hi; k++)
+        if (k != j && s_mv_ok[k] && f->part[k][5] == f->part[j][5]) {
+            xs[n] = s_mv[k][0];
+            ys[n] = s_mv[k][1];
+            n++;
+        }
+    if (n < 3)
+        return 0;
+    {
+        float sx[2 * COH_W], sy[2 * COH_W];
+        memcpy(sx, xs, n * sizeof *sx);
+        memcpy(sy, ys, n * sizeof *sy);
+        qsort(sx, n, sizeof *sx, cmp_float);
+        qsort(sy, n, sizeof *sy, cmp_float);
+        mx = sx[n / 2];
+        my = sy[n / 2];
+    }
+    for (k = 0; k < n; k++)
+        ds[k] = sqrtf((xs[k] - mx) * (xs[k] - mx) + (ys[k] - my) * (ys[k] - my));
+    qsort(ds, n, sizeof *ds, cmp_float);
+    spread = ds[n / 2];
+    dev = sqrtf((s_mv[j][0] - mx) * (s_mv[j][0] - mx)
+                + (s_mv[j][1] - my) * (s_mv[j][1] - my));
+    if (s_jumplog && dev > 0.1f)
+        fprintf(stderr, "[ICOH] flip %u draw %u pair %d prog %08X attr0 %08X n %u"
+                " tex0 %08X: %.3f,%.3f -> %.3f,%.3f move %.3f,%.3f, neighbours"
+                " %.3f,%.3f (%u, spread %.3f) off %.3f%s%c", g_pb.flips, j,
+                f->pair[j], f->part[j][0], f->part[j][1], f->part[j][2],
+                f->part[j][4], prev->spos[f->pair[j]][0],
+                prev->spos[f->pair[j]][1], f->spos[j][0], f->spos[j][1],
+                s_mv[j][0], s_mv[j][1], mx, my, n, spread, dev,
+                dev > s_coh_min && dev > 4.0f * spread + 0.05f ? " REFUSED"
+                                                                : "", 10);
+    return dev > s_coh_min && dev > 4.0f * spread + 0.05f;
+}
+
 static uint32_t pair_refuse(Frame *f, const Frame *prev)
 {
     static ProgDist *pd;
@@ -1771,6 +1875,7 @@ static uint32_t pair_refuse(Frame *f, const Frame *prev)
                     " %.3f, 75%% %.3f, 90%% %.3f%c", g_pb.flips, ns, s_sd_med,
                     sds[ns * 3 / 4], sds[ns * 9 / 10], 10);
     }
+    coh_moves(f, prev);
     for (j = 0; j < f->ndraws; j++) {
         int32_t pj = f->pair[j];
         float sd;
@@ -1779,21 +1884,25 @@ static uint32_t pair_refuse(Frame *f, const Frame *prev)
             continue;
         sd = spos_dist(f, prev, j, (uint32_t)pj);
         why = dd[j] > pair_limit(f, j, s_pair_max) ? 1
-            : s_spos_max > 0.0f && sd > spos_limit() ? 2 : 0;
+            : s_spos_max > 0.0f && sd > spos_limit() ? 2
+            : coh_off(f, prev, j) ? 3 : 0;
         if (!why)
             continue;
         if (s_jumplog)
             fprintf(stderr, "[IREFUSE] flip %u draw %u %s: d %.3f (median %.3f)"
                     " sd %.3f (median %.3f) prog %08X attr0 %08X n %u tex0"
                     " %08X target %08X%c", g_pb.flips, j,
-                    why == 1 ? "unlike" : "moved", dd[j],
+                    why == 1 ? "unlike" : why == 2 ? "moved" : "apart from its"
+                    " neighbours", dd[j],
                     f->prog[j] != PROG_NONE ? s_prog_med[f->prog[j]] : -1.0f,
                     sd, s_sd_med, f->part[j][0], f->part[j][1], f->part[j][2],
                     f->part[j][4], f->part[j][5], 10);
         if (why == 1)
             s_pair_refused++;
-        else
+        else if (why == 2)
             s_spos_refused++;
+        else
+            s_coh_refused++;
         s_taken[pj] = 0;
         f->pair[j] = -1;
         refused++;
@@ -2024,17 +2133,19 @@ static void stats_line(LONGLONG now)
                 " they were recorded%c", s_vdiff, 10);
     fprintf(stderr, "[INTERP] nearest pairing: %llu groups, %llu draws paired"
             " out of order; %llu strict and %llu loose pairs refused as too"
-            " unlike, %llu as moved across the picture; %u held draws; %u"
+            " unlike, %llu as moved across the picture, %llu as moved apart"
+            " from their neighbours; %u held draws; %u"
             " unpaired draws moved with the camera; %u"
             " turned matrices kept their size%c",
             (unsigned long long)s_near_groups,
             (unsigned long long)s_near_moved,
             (unsigned long long)s_pair_refused,
             (unsigned long long)s_loose_refused,
-            (unsigned long long)s_spos_refused, s_held, s_borrowed,
+            (unsigned long long)s_spos_refused,
+            (unsigned long long)s_coh_refused, s_held, s_borrowed,
             s_rot_fixed, 10);
     s_borrowed = 0;
-    s_pair_refused = s_spos_refused = 0;
+    s_pair_refused = s_spos_refused = s_coh_refused = 0;
     s_held = 0;
     fprintf(stderr, "[INTERP] pair distances <.01 <.05 <.1 <.25 <.5 <1 <2"
             " more: strict %u %u %u %u %u %u %u %u, loose %u %u %u %u %u %u"
@@ -2165,6 +2276,28 @@ static void trace_frame(const Frame *f, const Frame *prev)
             len += snprintf(line + len, sizeof line - len, " LOOSE (before:"
                             " attr0 %08X n %u tex0 %08X)", prev->part[pj][1],
                             prev->part[pj][2], prev->part[pj][4]);
+        {
+            /* RECOMP_INTERP_TRACE_LITE=1: no constants, the first vertex's
+             * place in both frames instead (cheap enough for every frame). */
+            static int lite = -1;
+            if (lite < 0)
+                lite = getenv("RECOMP_INTERP_TRACE_LITE") != NULL;
+            if (lite) {
+                if (f->spos && j < SPOS_MAX_DRAWS && f->spos[j][2])
+                    len += snprintf(line + len, sizeof line - len,
+                                    " at %.3f,%.3f", f->spos[j][0],
+                                    f->spos[j][1]);
+                if (pj >= 0 && prev->spos && (uint32_t)pj < SPOS_MAX_DRAWS
+                    && prev->spos[pj][2])
+                    len += snprintf(line + len, sizeof line - len,
+                                    " before %.3f,%.3f", prev->spos[pj][0],
+                                    prev->spos[pj][1]);
+                if (f->held && f->held[j])
+                    len += snprintf(line + len, sizeof line - len, " HELD");
+                fprintf(stderr, "%s%c", line, 10);
+                continue;
+            }
+        }
         if (pj >= 0) {
             const float (*a)[4] = (const float (*)[4])prev->consts[pj];
             const float (*b)[4] = (const float (*)[4])f->consts[j];
