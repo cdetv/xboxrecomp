@@ -117,6 +117,9 @@ typedef struct {
 } Frame;
 
 static int s_n = -1;
+static volatile LONG s_n_req = -1;      /* xbox_SetFrameInterp: applied at the
+                                         * next flip (nv2a_interp_flip_apply) */
+static int s_env_n;                     /* RECOMP_FRAME_INTERP given: it wins */
 static int s_log = -1;
 static int s_mode;                      /* RECOMP_INTERP_MODE */
 static int s_unique;                    /* RECOMP_INTERP_UNIQUE (test) */
@@ -287,6 +290,7 @@ int nv2a_interp_n(void)
     if (s_n < 0) {
         const char *e = getenv("RECOMP_FRAME_INTERP");
         int n = e ? atoi(e) : 1;
+        s_env_n = e && *e;
         if (n < 1)
             n = 1;
         if (n > INTERP_MAX_N)
@@ -374,6 +378,53 @@ void nv2a_interp_note_cut(void)
 {
     if (!s_rep)
         s_cut = 1;
+}
+
+/* The title's settings (a menu): n pictures per title frame from the next
+ * flip on, 1 = off. RECOMP_FRAME_INTERP, when given, wins (tests). */
+void xbox_SetFrameInterp(int n)
+{
+    if (n < 1)
+        n = 1;
+    if (n > INTERP_MAX_N)
+        n = INTERP_MAX_N;
+    InterlockedExchange(&s_n_req, n);
+}
+
+/* Pictures per title frame now (1 = off), for a title's own counters. */
+int xbox_FrameInterpPictures(void)
+{
+    return s_n > 0 ? s_n : 1;
+}
+
+/* At a flip, before nv2a_interp_flip_before: a count asked for since is
+ * taken here, between two frames, so flip_before / _after and every draw of
+ * a frame see one count. Pictures still waiting are dropped, the recorded
+ * frames forgotten (the next pair starts two frames on: a frame recorded
+ * before an off spell would pair with one minutes later) and the adaptive
+ * count starts again. */
+void nv2a_interp_flip_apply(void)
+{
+    int was = nv2a_interp_n(), want = (int)s_n_req;
+
+    if (want < 1 || s_env_n || want == was)
+        return;
+    s_q_n = s_q_next = s_q_old = 0;
+    InterlockedExchange(&s_q_pending, 0);
+    s_q_shown_base = -1;
+    s_recording = 0;
+    s_fr[0].valid = s_fr[1].valid = 0;
+    s_n_eff = 99;
+    s_rep_ema = -1.0;
+    s_lat_ms = -1.0;
+    s_both_rest = 0;
+    s_hold = 0;
+    s_cut = 0;
+    s_last_flip = 0;
+    s_period = s_freq.QuadPart / 30;
+    s_n = want;
+    fprintf(stderr, "[INTERP] %d picture%s per title frame (set by the title)%c",
+            want, want == 1 ? " (off)" : "s", 10);
 }
 
 static int grow_words(Frame *f, size_t more)

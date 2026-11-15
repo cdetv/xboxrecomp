@@ -40,6 +40,10 @@ void nv2a_interp_note_cut(void);
 /* NV_HOST_FX_INTERP_HOLD_ON / _OFF met in the stream (1 / 0). */
 void nv2a_interp_hold(int on);
 
+/* At a flip, first: a count the title asked for (xbox_SetFrameInterp)
+ * since the last flip is taken. */
+void nv2a_interp_flip_apply(void);
+
 /* NV097_FLIP_STALL, after the wait and before the back end presents: draws
  * and presents the in-between pictures (before), then the next frame's
  * recording starts (after). */

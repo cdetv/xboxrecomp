@@ -1740,6 +1740,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             xbox_FramebufferWindowFrameStats(g_pb.draws - draws_at_flip);
             draws_at_flip = g_pb.draws;
         }
+        nv2a_interp_flip_apply();       /* a count asked for since */
         if (nv2a_interp_n() > 1)
             nv2a_interp_flip_before(s_be);
         s_be->present();
