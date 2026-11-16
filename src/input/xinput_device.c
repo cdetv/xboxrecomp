@@ -353,6 +353,54 @@ int xbox_InputHostPadOfPort(DWORD port)
     return s < HOST_SLOTS && ((g_slots_connected >> s) & 1) ? (int)s : -1;
 }
 
+/* ---- gyro: the motion sensors of the pad driving a port -------------------
+ *
+ * Only SDL's pads have one (host pads 4-7; XInput has no sensors). */
+static int gyro_pad(DWORD port)
+{
+    int s = xbox_InputHostPadOfPort(port);
+    return s >= XBOX_MAX_CONTROLLERS ? s - XBOX_MAX_CONTROLLERS : -1;
+}
+
+static int input_blocked(void);
+
+/* While a host menu has the pads (xbox_InputSetBlocked), the turn is taken
+ * and thrown away, as the buttons read at rest. */
+int xbox_InputGyroTake(DWORD port, float *yaw, float *pitch)
+{
+    int n = gyro_pad(port), has;
+    if (n < 0) {
+        *yaw = *pitch = 0.0f;
+        return 0;
+    }
+    has = xbox_SdlPadGyroTake(n, yaw, pitch);
+    if (input_blocked())
+        *yaw = *pitch = 0.0f;
+    return has;
+}
+
+int xbox_InputGyroRate(DWORD port, float *yaw, float *pitch)
+{
+    int n = gyro_pad(port);
+    if (n < 0) {
+        *yaw = *pitch = 0.0f;
+        return 0;
+    }
+    return xbox_SdlPadGyroRate(n, yaw, pitch);
+}
+
+void xbox_InputGyroCalibrate(DWORD port)
+{
+    int n = gyro_pad(port);
+    if (n >= 0)
+        xbox_SdlPadGyroCalibrate(n);
+}
+
+void xbox_InputGyroSetAuto(int on)
+{
+    xbox_SdlPadGyroAuto(on);
+}
+
 /* ---- pad names, for a host menu -------------------------------------------
  *
  * XInput has no names, only user indices, and "controller 2" tells a player
@@ -667,6 +715,11 @@ void xbox_InputInit(void)
  * a fresh press (Start on top of a menu closed with Start pauses the game). */
 static volatile LONG g_input_blocked;
 static BOOL          g_port_held[XBOX_MAX_CONTROLLERS];
+
+static int input_blocked(void)
+{
+    return InterlockedCompareExchange(&g_input_blocked, 0, 0) != 0;
+}
 
 void xbox_InputSetBlocked(int on)
 {
@@ -1088,6 +1141,21 @@ int  xbox_InputHostPadOfPort(DWORD dwPort)
 {
     return dwPort < XBOX_MAX_CONTROLLERS && g_pads[dwPort] ? (int)dwPort : -1;
 }
+/* No gyro outside Windows yet. */
+int  xbox_InputGyroTake(DWORD dwPort, float *yaw, float *pitch)
+{
+    (void)dwPort;
+    *yaw = *pitch = 0.0f;
+    return 0;
+}
+int  xbox_InputGyroRate(DWORD dwPort, float *yaw, float *pitch)
+{
+    (void)dwPort;
+    *yaw = *pitch = 0.0f;
+    return 0;
+}
+void xbox_InputGyroCalibrate(DWORD dwPort) { (void)dwPort; }
+void xbox_InputGyroSetAuto(int on) { (void)on; }
 int  xbox_InputHostPadName(DWORD slot, char *out, int size)
 {
     const char *n = slot < XBOX_MAX_CONTROLLERS && g_pads[slot]
