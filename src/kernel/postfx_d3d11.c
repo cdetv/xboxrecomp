@@ -71,6 +71,7 @@
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
 static volatile LONG s_aa;            /* AA_*, a plain number */
 static volatile LONG s_upscale;       /* UP_*, a plain number */
+static volatile LONG s_fsr_prepare;   /* xbox_PrepareUpscaler asked */
 static volatile LONG s_crt;           /* CRT_*, a plain number */
 static volatile LONG s_crt_strength;  /* percent, float bits */
 static int s_force;
@@ -264,6 +265,16 @@ int xbox_SetUpscaler(int mode)
         return 0;
     InterlockedExchange(&s_upscale, mode);
     return 1;
+}
+
+/* For a title that will lower the render scale by itself (an automatic
+ * resolution): the FSR upscaler's shaders are made at the next present
+ * even while the frame is not stretched, so the first stretch doesn't wait
+ * the ~110 ms they take to compile. Nothing when the upscaler is bilinear
+ * (asked again after a change to FSR). */
+void xbox_PrepareUpscaler(void)
+{
+    InterlockedExchange(&s_fsr_prepare, 1);
 }
 
 /* For a settings menu: 0 = off, 1 = scanlines, 2 = CRT (scanlines, curve,
@@ -1230,6 +1241,10 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     if (!src || !dst || dw < 1.0f || dh < 1.0f || sw <= 0.0f || sh <= 0.0f
         || !setup(dev))
         return 0;
+    if (s_fsr_prepare && s_upscale == UP_FSR) {
+        InterlockedExchange(&s_fsr_prepare, 0);
+        fsr_setup(dev);
+    }
     ID3D11Texture2D_GetDesc(src, &td);
     if (FAILED(ID3D11Device_CreateShaderResourceView(dev,
             (ID3D11Resource *)src, NULL, &srv)))
@@ -1460,6 +1475,10 @@ int xbox_SetUpscaler(int mode)
 {
     (void)mode;
     return 0;
+}
+
+void xbox_PrepareUpscaler(void)
+{
 }
 
 int xbox_SetCrt(int mode, float strength)
