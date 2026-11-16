@@ -2573,6 +2573,7 @@ typedef struct {
     uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
     uint32_t lv;                        /* mip levels uploaded (2D only) */
     uint32_t replaced;                  /* a replacement PNG (tex_replace.h): its levels */
+    uint32_t sgn;                       /* channels uploaded signed (tex_signed_mask) */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
     uint32_t hashed_flip;               /* g_pb.flips when hash was taken */
@@ -2824,7 +2825,38 @@ static int  s_tex_slot[4];
 /* Mip levels of each stage's texture as bound (1 for a surface or zeta
  * copy), for sampler_stage. Set by texture_stage. */
 static uint32_t s_tex_levels[4];
+/* Signed channels of each stage's texture as uploaded (FILTER bits 28-31:
+ * 1 alpha, 2 red, 4 green, 8 blue), for the shader's bsc[st].w; 0 = none
+ * or not a decoded guest texture. Set by texture_stage. */
+static uint32_t s_tex_sgn[4];
 static int  s_rtt_slot;
+
+/* Signed filtering (FILTER bits 28-31): the NV2A filters a channel marked
+ * signed as a two's-complement byte, so -1 and +1 blend through 0. Read as
+ * unsigned bytes, a bilinear tap between 0x02 and 0xFE gives 0x80, the most
+ * negative value: every zero crossing of a du/dv map became a jagged dark
+ * line on the water, ripple rings, lens drops and heat haze. A decoded
+ * texture whose stage marks channels signed goes up with those channels
+ * XOR 0x80 (offset binary, which blends like the signed value), and the
+ * shader turns them back (stage_fetch). RECOMP_SIGNED_FILTER=0 = as before. */
+static uint32_t tex_signed_mask(const Texture *t)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_SIGNED_FILTER");
+        off = e && !strcmp(e, "0");
+        if (off)
+            fprintf(stderr, "[GPU] d3d11: signed filtering off"
+                    " (RECOMP_SIGNED_FILTER=0)%c", 10);
+    }
+    return off ? 0u : (t->filter >> 28) & 0xFu;
+}
+
+static uint32_t tex_signed_xor(uint32_t sgn)
+{
+    return (sgn & 1 ? 0x80000000u : 0) | (sgn & 2 ? 0x00800000u : 0)
+         | (sgn & 4 ? 0x00008000u : 0) | (sgn & 8 ? 0x00000080u : 0);
+}
 
 /* A stage's copies of GPU surfaces it reads, one per size, the least
  * recently used one remade. With one a stage, Conker's field remade it
@@ -3903,12 +3935,13 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
 
-    uint32_t lv = 1, total;
+    uint32_t lv = 1, total, sgn;
     DXGI_FORMAT bc;
 
     *flags = 0;
     s_tex_src[st] = '-';
     s_tex_levels[st] = 1;
+    s_tex_sgn[st] = 0;
     if (!t->valid || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
         || t->height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
@@ -3948,6 +3981,13 @@ guest:
                 " guest memory (flip %u)%c", st, t->offset, t->color,
                 t->width, t->height, g_pb.flips, 10);
     palette = t->color == 0x0B ? t->palette : 0;
+    /* Signed channels go up as offset binary (tex_signed_mask); DXT goes up
+     * as it is, so never. Part of the key: the same bytes read unsigned by
+     * another stage keep their own entry. */
+    sgn = tex_signed_mask(t);
+    if (sgn && (d3 == 1 || cube) && tex_bc_format(t))
+        sgn = 0;
+    s_tex_sgn[st] = sgn;
 
     s_tex_tick++;
     for (i = s_tex_head[tex_bucket(t->offset)]; i; i = s_tex_next[i - 1]) {
@@ -3955,7 +3995,7 @@ guest:
         if (c->addr == t->offset && c->fmt == t->color
             && c->w == t->width && c->h == t->height && c->pitch == t->pitch
             && c->palette == palette && c->d == d3 && c->cube == cube
-            && c->lv == lv) {
+            && c->lv == lv && c->sgn == sgn) {
             e = c;
             break;
         }
@@ -4026,7 +4066,7 @@ guest:
     }
 
     /* New or changed: a replacement PNG for these bytes goes up instead. */
-    if (d3 == 1 && !cube && tex_replace_active()) {
+    if (d3 == 1 && !cube && !sgn && tex_replace_active()) {
         uint32_t rw, rh;
         const uint32_t *px;
         uint64_t name = hash_bytes(mem + t->offset, bytes,
@@ -4108,6 +4148,11 @@ guest:
                         *o = 0xFFFFFFFFu;
         }
     }
+    if (sgn) {
+        uint32_t xm = tex_signed_xor(sgn), n;
+        for (n = 0; n < total; n++)
+            s_texels[n] ^= xm;
+    }
 
 make:
     if (!e) {
@@ -4155,6 +4200,7 @@ make:
         e->d = d3;
         e->cube = cube;
         e->lv = lv;
+        e->sgn = sgn;
         if (d3 > 1)
             *flags |= cube ? TEX_CUBE : TEX_VOLUME;
         tex_link(e);
@@ -5826,6 +5872,7 @@ static void d3d_draw(void)
                 continue;
             }
             bound |= 1u << st;
+            k.bsc[st][3] = (float)s_tex_sgn[st];
             if (rtt & TEX_VOLUME) {
                 vsrv[st] = srv[st];
                 srv[st] = NULL;
@@ -5890,6 +5937,7 @@ static void d3d_draw(void)
             samp[0] = srv[0] && !(rtt & TEX_CUBE) ? sampler_stage(0, 0) : NULL;
             if (samp[0]) {
                 bound = 1;
+                k.bsc[0][3] = (float)s_tex_sgn[0];
                 k.tscale[0][0] = 1.0f / (float)g_pb.texs[0].width;
                 k.tscale[0][1] = 1.0f / (float)g_pb.texs[0].height;
                 k.tscale[0][2] = (rtt & RTT_ALPHA_ONE) ? 1.0f : 0.0f;

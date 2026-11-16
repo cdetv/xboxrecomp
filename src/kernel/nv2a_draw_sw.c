@@ -1595,6 +1595,37 @@ static uint32_t tex_face_stride(const Texture *t)
 /* One texel at normalised (swizzled/DXT) or texel (linear) coordinates, as
  * floats. An unusable stage reads white, so a missing texture multiplies
  * through instead of blacking the pixel out. */
+/* Signed filtering (FILTER bits 28-31, as nv2a_draw_d3d11.c's
+ * tex_signed_mask): channels marked signed blend as two's-complement values,
+ * so -1 and +1 average to 0, not to 0x80. The four taps go XOR 0x80 (offset
+ * binary) into the blend and the result back to the two's-complement byte
+ * read unsigned, which sign3 and the combiners expect. RECOMP_SIGNED_FILTER=0
+ * = blended as unsigned bytes, as before. */
+static uint32_t rc_signed_xor(const Texture *t)
+{
+    static int off = -1;
+    uint32_t m;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_SIGNED_FILTER");
+        off = e && !strcmp(e, "0");
+    }
+    m = off ? 0u : (t->filter >> 28) & 0xFu;
+    return (m & 1 ? 0x80000000u : 0) | (m & 2 ? 0x00800000u : 0)
+         | (m & 4 ? 0x00008000u : 0) | (m & 8 ? 0x00000080u : 0);
+}
+
+static void rc_signed_back(uint32_t xm, float out[4])
+{
+    static const uint32_t bit[4] = { 0x00800000u, 0x00008000u, 0x00000080u,
+                                     0x80000000u };   /* r g b a */
+    int j;
+    for (j = 0; j < 4; j++)
+        if (xm & bit[j]) {
+            float v = (out[j] * 255.0f - 128.0f) / 255.0f;
+            out[j] = v >= 0.0f ? v : v + 256.0f / 255.0f;
+        }
+}
+
 static void rc_texel(const Texture *t, uint32_t face, float u, float v,
                      float out[4])
 {
@@ -1612,18 +1643,21 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
     if (mag == 2 || min == 2 || min == 4 || min == 6) {
         float fu = u - 0.5f, fv = v - 0.5f, wu, wv, c[4][4];
         int32_t iu = (int32_t)floorf(fu), iv = (int32_t)floorf(fv), k, j;
+        uint32_t xm = rc_signed_xor(t);
         wu = fu - (float)iu;
         wv = fv - (float)iv;
         for (k = 0; k < 4; k++) {
             if (sample_tex(t, face, (uint32_t)(iu + (k & 1)),
                            (uint32_t)(iv + (k >> 1)), &texel))
-                nv2a_rc_unpack(texel, c[k]);
+                nv2a_rc_unpack(texel ^ xm, c[k]);
             else
                 c[k][0] = c[k][1] = c[k][2] = c[k][3] = 1.0f;
         }
         for (j = 0; j < 4; j++)
             out[j] = (c[0][j] * (1.0f - wu) + c[1][j] * wu) * (1.0f - wv)
                    + (c[2][j] * (1.0f - wu) + c[3][j] * wu) * wv;
+        if (xm)
+            rc_signed_back(xm, out);
         return;
     }
     if (sample_tex(t, face, (uint32_t)(int32_t)floorf(u),
@@ -1704,9 +1738,9 @@ static int rc_stage_fetch(int st, const float c[4], const float prev[][4],
         /* The input stage's blue/green are (du, dv); the stage's matrix turns
          * them into an offset added to this stage's coordinates, with no
          * projective divide (xemu). Conker's water: a V8U8 ripple map on
-         * stage 0 shifts a reduced copy of the screen on stage 1.
-         * ponytail: the input was filtered as unsigned bytes, so texels
-         * either side of 0x80 blend wrong -- xemu does the same. */
+         * stage 0 shifts a reduced copy of the screen on stage 1. Its
+         * channels are filtered as signed (rc_signed_xor); the blend comes
+         * back as a byte, so du/dv step by 1/127. */
         const float *in = prev[pb_rc_input_stage(st)];
         const float *m = t->bump_mat;
         float du, dv;
