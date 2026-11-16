@@ -231,6 +231,30 @@ static bool apu_declick_on(void)
     return on != 0;
 }
 
+/* Idle voices reported in turn (Conker to-do 223; idea from Txukie's
+ * Conker recomp, patch 0040, MIT). The front end hears of one idle voice a
+ * frame (SE2FE_IDLE_VOICE leaves its handle in FEDECPARAM; a second report
+ * the same frame overwrites the first). xemu reports every idle voice on
+ * the lists each frame, so only the last one is ever heard: a 4-channel
+ * stream is two linked voices, DirectSound frees them only once both were
+ * reported idle, and the other half never was, until its own ~20 s give-up
+ * (a level's ambience at a level exit: Windmill -> throne room). Now each
+ * frame reports the first idle voice not yet reported this round; when all
+ * were, a new round starts. A voice seen active again may be reported anew.
+ * RECOMP_APU_IDLE_TURN=0 = xemu's way (A/B). */
+static bool apu_idle_turn_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_IDLE_TURN");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+        fprintf(stderr, "[APU] idle voices reported: %s\n",
+                on ? "in turn" : "all each frame (the last heard)");
+    }
+    return on != 0;
+}
+static uint8_t s_idle_told[MCPX_HW_MAX_VOICES];
+
 #define DECLICK_DECAY 0.98620f            /* exp(-1/72): 1.5 ms at 48 kHz */
 static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
 static uint32_t s_dc_frame[MCPX_HW_MAX_VOICES];     /* frame a voice last mixed */
@@ -1795,6 +1819,9 @@ void mcpx_apu_monitor_place_speakers(const int bin[8], const float gain[8],
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    bool turn = apu_idle_turn_on();
+    int idle_new = -1, idle_any = -1;
+
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
     s_vp_frame++;
 
@@ -1818,8 +1845,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
 
             if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
-                fe_method(d, SE2FE_IDLE_VOICE, v);
+                if (!turn)
+                    fe_method(d, SE2FE_IDLE_VOICE, v);
+                else {
+                    if (idle_any < 0)
+                        idle_any = v;
+                    if (idle_new < 0 && !s_idle_told[v])
+                        idle_new = v;
+                }
             } else {
+                s_idle_told[v] = 0;
                 if (g_apu_prof_on) {
                     g_apu_prof.voices++;
                     if (voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
@@ -1835,6 +1870,16 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             }
             d->regs[current] = d->regs[next];
         }
+    }
+
+    /* One idle voice reported a frame, in turn (apu_idle_turn_on). */
+    if (turn && idle_any >= 0) {
+        if (idle_new < 0) {
+            memset(s_idle_told, 0, sizeof(s_idle_told));
+            idle_new = idle_any;
+        }
+        s_idle_told[idle_new] = 1;
+        fe_method(d, SE2FE_IDLE_VOICE, (uint32_t)idle_new);
     }
 
     /* VP monitor output */
