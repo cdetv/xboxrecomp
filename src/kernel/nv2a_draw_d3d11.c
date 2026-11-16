@@ -561,10 +561,8 @@ typedef struct {
 } GtKey;
 static int s_gt_on = -1;
 /* xbox_SetGpuFrameTiming (a title's "what's limiting me" view): only the
- * frame's first timestamp, one before the back buffer is first touched
- * (gt_mark_back) and the last, read back without waiting; the span from
- * the first to the back buffer one summed for xbox_GpuFrameMs. Works
- * beside RECOMP_GPU_TIMES too (then up to the last). */
+ * frame's first and last timestamps, read back without waiting; their span
+ * summed for xbox_GpuFrameMs. Works beside RECOMP_GPU_TIMES too. */
 static int s_gt_light;
 static double s_gt_light_ms;
 static uint32_t s_gt_light_n;
@@ -573,7 +571,6 @@ static struct {
     uint8_t cat[GT_MARKS];
     uint16_t key[GT_MARKS];
     uint32_t n;
-    uint32_t back;      /* light mode: gt_mark_back's mark, 0 = none */
     int open;
 } s_gt[GT_FRAMES];
 static int s_gt_cur;
@@ -697,8 +694,7 @@ static int gt_read(int old, ULONGLONG wait)
         }
         if (!i)
             first = t;
-        if (i && s_gt_light && (s_gt[old].back ? i == s_gt[old].back
-                                               : i == s_gt[old].n - 1)) {
+        if (i == s_gt[old].n - 1 && i && s_gt_light) {
             s_gt_light_ms += (double)(t - first) * 1000.0
                            / (double)dj.Frequency;
             s_gt_light_n++;
@@ -742,27 +738,8 @@ static void gt_frame_begin(void)
     }
     ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_gt[f].disjoint);
     s_gt[f].n = 0;
-    s_gt[f].back = 0;
     s_gt[f].open = 1;
     gt_mark(GT_OVERLAY, GT_KEYS);       /* the start; its own time unused */
-}
-
-/* Light mode: the frame's own work ends here, before the back buffer is
- * first touched. With VSync, a frame the GPU starts while the one before
- * waits to be shown (a busy GPU running ahead) waits again at the back
- * buffer until that buffer leaves the screen: the span up to the last mark
- * then grows to the whole refresh at any load (seen at 60 Hz: 16.2 ms at
- * both 4x and 3x render scale, 5.7 ms at 1x), which is no work. The
- * filters' own pass onto the back buffer is left out with it. */
-static void gt_mark_back(void)
-{
-    int f = s_gt_cur;
-
-    if (gt_full() || !s_gt_light || !s_gt[f].open || s_gt[f].n != 1)
-        return;
-    gt_mark(GT_OVERLAY, GT_KEYS);
-    if (s_gt[f].n == 2)
-        s_gt[f].back = 1;
 }
 
 static void gt_frame_end(void)
@@ -780,10 +757,9 @@ static void gt_frame_end(void)
 }
 
 /* For a title's own view (from its overlay hook, the executor thread):
- * on = the GPU time of each frame measured, from its first timestamp to
- * the one before the back buffer is touched (gt_mark_back; so it includes
- * the GPU idling between commands: a frame the CPU side feeds slowly looks
- * long too, but not the wait for a back buffer still on screen). */
+ * on = the GPU time of each frame measured, from its first timestamp to its
+ * last (so it includes the GPU idling between commands: a frame the CPU
+ * side feeds slowly looks long too). */
 void xbox_SetGpuFrameTiming(int on)
 {
     s_gt_light = on != 0;
@@ -7077,7 +7053,6 @@ static void d3d_present(void)
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             gt_frame_begin();
-            gt_mark_back();
             shown_to_back();
             gt_mark(GT_POST, GT_KEYS);
             dump_back(seq);
