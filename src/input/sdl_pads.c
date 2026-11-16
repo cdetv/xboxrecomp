@@ -81,13 +81,18 @@ static volatile LONG g_rumble[SDL_PADS_MAX];
 #define RUMBLE_MS   2000
 #define RUMBLE_KEEP 1000
 
-/* Only PlayStation pads: an Xbox pad is XInput's already, and SDL's own
- * XInput, Raw Input, WGI and DirectInput back ends are off (sdl_thread),
- * so the same pad never shows up twice. */
+/* Only PlayStation and Nintendo Switch pads (a Switch Pro Controller, or a
+ * pair of Joy-Cons, which SDL joins into one by default): an Xbox pad is
+ * XInput's already, and SDL's own XInput, Raw Input, WGI and DirectInput
+ * back ends are off (sdl_thread), so the same pad never shows up twice.
+ * Buttons go by position (read_pad), so a Switch pad's bottom button (its
+ * "B") is the Xbox A, as the hands expect. */
 static BOOL wanted(SDL_JoystickID id)
 {
     SDL_GamepadType t = SDL_GetGamepadTypeForID(id);
-    return t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5;
+    return t == SDL_GAMEPAD_TYPE_PS4 || t == SDL_GAMEPAD_TYPE_PS5
+        || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO
+        || t == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR;
 }
 
 static void pad_added(SDL_JoystickID id)
@@ -147,7 +152,7 @@ static void pad_added(SDL_JoystickID id)
     g_pads[n].gyro_flags = 0;
     ReleaseSRWLockExclusive(&g_lock);
     InterlockedOr(&g_mask, 1L << n);
-    fprintf(stderr, "[INPUT] SDL: PlayStation controller %d: \"%s\" (%s)\n",
+    fprintf(stderr, "[INPUT] SDL: controller %d: \"%s\" (%s)\n",
             n + 1, g_pads[n].name,
             SDL_GetGamepadConnectionState(gp) == SDL_JOYSTICK_CONNECTION_WIRELESS
                 ? "wireless" : "wired");
@@ -172,8 +177,7 @@ static void pad_removed(SDL_JoystickID id)
             g_pads[n].pad = NULL;
             gyro_motion_free(g_pads[n].motion);
             g_pads[n].motion = NULL;
-            fprintf(stderr, "[INPUT] SDL: PlayStation controller %d gone\n",
-                    n + 1);
+            fprintf(stderr, "[INPUT] SDL: controller %d gone\n", n + 1);
         }
 }
 
@@ -192,7 +196,10 @@ static BYTE trigger(Sint16 v)
  * Square X, Triangle Y, L1/R1 the shoulders (the title's White/Black),
  * Share/Create is Back and Options Start. The touchpad click is Back too:
  * Share sits where it is hard to reach in a hurry. The PS button is left
- * alone (Windows and Steam use it). */
+ * alone (Windows and Steam use it). On a Switch pad the same positions: its
+ * B (bottom) is A, A (right) B, Y (left) X, X (top) Y, L/R the shoulders,
+ * ZL/ZR the triggers (all or nothing), - Back, + Start; Home and Capture
+ * are left alone. */
 static void read_pad(SDL_Gamepad *gp, XINPUT_GAMEPAD *g)
 {
     static const struct { SDL_GamepadButton b; WORD bit; } map[] = {
@@ -382,11 +389,12 @@ static DWORD WINAPI sdl_thread(LPVOID arg)
     SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "0");
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
-        fprintf(stderr, "[INPUT] SDL: no PlayStation controllers (%s)\n",
-                SDL_GetError());
+        fprintf(stderr, "[INPUT] SDL: no PlayStation / Switch controllers "
+                "(%s)\n", SDL_GetError());
         return 0;
     }
-    fprintf(stderr, "[INPUT] SDL %d.%d.%d: PlayStation controllers on\n",
+    fprintf(stderr, "[INPUT] SDL %d.%d.%d: PlayStation / Switch controllers "
+            "on\n",
             SDL_VERSIONNUM_MAJOR(SDL_GetVersion()),
             SDL_VERSIONNUM_MINOR(SDL_GetVersion()),
             SDL_VERSIONNUM_MICRO(SDL_GetVersion()));
