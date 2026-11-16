@@ -671,6 +671,64 @@ static int merge_take(void)
     return 1;
 }
 
+/* RECOMP_MERGE_LOG=1 (diagnosis): which methods drew held batches early,
+ * how often, and how many of those wrote the value the method already had
+ * (a state written again unchanged, which could let the merge go on). In the
+ * report, the most frequent first. Transform constants (0x0B80-0x0BFC) load
+ * through a moving pointer, so "unchanged" means little for them. */
+static int s_mgl_on = -1;
+static struct { uint32_t key, n, same; } s_mgl[48];
+static uint32_t s_mgl_n, s_mgl_other;
+static uint32_t s_mgl_last[0x800];
+static uint8_t s_mgl_seen[0x800];
+
+static void merge_log_method(uint32_t subch, uint32_t method, uint32_t param,
+                             int flush)
+{
+    uint32_t i, key = subch << 16 | method, same = 0;
+    if (subch == 0 && method < 0x2000u) {
+        same = s_mgl_seen[method >> 2] && s_mgl_last[method >> 2] == param;
+        s_mgl_last[method >> 2] = param;
+        s_mgl_seen[method >> 2] = 1;
+    }
+    if (!flush)
+        return;
+    for (i = 0; i < s_mgl_n && s_mgl[i].key != key; i++)
+        ;
+    if (i == s_mgl_n) {
+        if (s_mgl_n == sizeof s_mgl / sizeof s_mgl[0]) {
+            s_mgl_other++;
+            return;
+        }
+        s_mgl[s_mgl_n++].key = key;
+    }
+    s_mgl[i].n++;
+    s_mgl[i].same += same;
+}
+
+static void merge_log_report(void)
+{
+    uint32_t i, j, k;
+    if (s_mgl_on <= 0 || !s_mgl_n)
+        return;
+    fprintf(stderr, "[GPU] draw merge broken by (RECOMP_MERGE_LOG): method"
+            " count (written unchanged)%c", 10);
+    for (k = 0; k < 12 && k < s_mgl_n; k++) {
+        for (j = k, i = k + 1; i < s_mgl_n; i++)
+            if (s_mgl[i].n > s_mgl[j].n)
+                j = i;
+        if (j != k) {
+            uint32_t a = s_mgl[k].key, b = s_mgl[k].n, c = s_mgl[k].same;
+            s_mgl[k] = s_mgl[j];
+            s_mgl[j].key = a; s_mgl[j].n = b; s_mgl[j].same = c;
+        }
+        fprintf(stderr, "[GPU]   %u:0x%04X %u (%u)%c", s_mgl[k].key >> 16,
+                s_mgl[k].key & 0xFFFFu, s_mgl[k].n, s_mgl[k].same, 10);
+    }
+    if (s_mgl_other)
+        fprintf(stderr, "[GPU]   other methods %u%c", s_mgl_other, 10);
+}
+
 /* Methods that may come between two batches merged into one draw. */
 static int merge_passes(uint32_t subch, uint32_t method, uint32_t param)
 {
@@ -1431,8 +1489,16 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         g_pb.max_x = g_pb.max_y = -1e30f;
     }
     /* Merged batches draw before anything that is not more of the same. */
-    if (s_mg_held && !merge_passes(subch, method, param))
+    if (s_mgl_on < 0) {
+        const char *e = getenv("RECOMP_MERGE_LOG");
+        s_mgl_on = e && *e && *e != '0';
+    }
+    if (s_mg_held && !merge_passes(subch, method, param)) {
+        if (s_mgl_on)
+            merge_log_method(subch, method, param, 1);
         nv2a_pb_merge_flush();
+    } else if (s_mgl_on)
+        merge_log_method(subch, method, param, 0);
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Cached: this runs for every method, and an
@@ -2051,6 +2117,7 @@ void nv2a_pb_exec_report(void)
         fprintf(stderr, "[GPU] draw merge: %llu batches drawn as %llu draws"
                 " (RECOMP_DRAW_MERGE=0: off); %llu held apart by their"
                 " inputs' range%c", s_mg_in, s_mg_out, s_mg_span, 10);
+    merge_log_report();
     s_be->report();
     if (s_shadow)
         s_shadow->report();
