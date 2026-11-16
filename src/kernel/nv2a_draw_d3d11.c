@@ -561,11 +561,10 @@ typedef struct {
 } GtKey;
 static int s_gt_on = -1;
 /* xbox_SetGpuFrameTiming (a title's "what's limiting me" view): only the
- * frame's first and last timestamps and the two around the back buffer's
- * first touch (gt_mark_back), read back without waiting; the span from the
- * first to the last less the one around that touch (the wait for a back
- * buffer still on screen) summed for xbox_GpuFrameMs. Works beside
- * RECOMP_GPU_TIMES too (then the whole span). */
+ * frame's first timestamp, one before the back buffer is first touched
+ * (gt_mark_back) and the last, read back without waiting; the span from
+ * the first to the back buffer one summed for xbox_GpuFrameMs. Works
+ * beside RECOMP_GPU_TIMES too (then up to the last). */
 static int s_gt_light;
 static double s_gt_light_ms;
 static uint32_t s_gt_light_n;
@@ -574,8 +573,7 @@ static struct {
     uint8_t cat[GT_MARKS];
     uint16_t key[GT_MARKS];
     uint32_t n;
-    uint32_t back;      /* light mode: the mark before the back buffer's
-                         * first touch (the one after it follows), 0 = none */
+    uint32_t back;      /* light mode: gt_mark_back's mark, 0 = none */
     int open;
 } s_gt[GT_FRAMES];
 static int s_gt_cur;
@@ -656,9 +654,9 @@ static uint32_t gt_draw_key(void)
 static int gt_read(int old, ULONGLONG wait)
 {
     int full = gt_full();
-    uint32_t i, back = s_gt[old].back;
+    uint32_t i;
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
-    UINT64 t, prev = 0, first = 0, wait0 = 0, wait1 = 0;
+    UINT64 t, prev = 0, first = 0;
 
     if (!s_gt[old].disjoint || !s_gt[old].n)
         return 1;
@@ -699,16 +697,10 @@ static int gt_read(int old, ULONGLONG wait)
         }
         if (!i)
             first = t;
-        if (back && i == back)
-            wait0 = t;
-        if (back && i == back + 1)
-            wait1 = t;
-        if (i == s_gt[old].n - 1 && i && s_gt_light) {
-            UINT64 span = t - first;
-            if (back && i > back + 1 && wait1 >= wait0
-                && wait1 - wait0 <= span)
-                span -= wait1 - wait0;
-            s_gt_light_ms += (double)span * 1000.0 / (double)dj.Frequency;
+        if (i && s_gt_light && (s_gt[old].back ? i == s_gt[old].back
+                                               : i == s_gt[old].n - 1)) {
+            s_gt_light_ms += (double)(t - first) * 1000.0
+                           / (double)dj.Frequency;
             s_gt_light_n++;
         }
         if (i && full) {
@@ -755,33 +747,22 @@ static void gt_frame_begin(void)
     gt_mark(GT_OVERLAY, GT_KEYS);       /* the start; its own time unused */
 }
 
-/* Light mode: marks just before (after = 0) and just after (after = 1) the
- * back buffer's first touch, the clear in shown_to_back. With VSync, a
- * frame the GPU starts while the one before waits to be shown (a busy GPU
- * running ahead) waits there until that buffer leaves the screen: the
- * first-to-last span then grew to the whole refresh at any load (seen at
- * 60 Hz: 16.2 ms at both 4x and 3x render scale, 5.7 ms at 1x), which is
- * no work. The span between these two is taken off (a clear's own time is
- * next to nothing); the filters' passes after it stay counted. */
-static void gt_mark_back(int after)
+/* Light mode: the frame's own work ends here, before the back buffer is
+ * first touched. With VSync, a frame the GPU starts while the one before
+ * waits to be shown (a busy GPU running ahead) waits again at the back
+ * buffer until that buffer leaves the screen: the span up to the last mark
+ * then grows to the whole refresh at any load (seen at 60 Hz: 16.2 ms at
+ * both 4x and 3x render scale, 5.7 ms at 1x), which is no work. The
+ * filters' own pass onto the back buffer is left out with it. */
+static void gt_mark_back(void)
 {
     int f = s_gt_cur;
 
-    if (gt_full() || !s_gt_light || !s_gt[f].open)
+    if (gt_full() || !s_gt_light || !s_gt[f].open || s_gt[f].n != 1)
         return;
-    if (!after) {
-        if (s_gt[f].n != 1)
-            return;
-        gt_mark(GT_OVERLAY, GT_KEYS);
-        if (s_gt[f].n == 2)
-            s_gt[f].back = 1;
-    } else {
-        if (!s_gt[f].back || s_gt[f].n != 2)
-            return;
-        gt_mark(GT_OVERLAY, GT_KEYS);
-        if (s_gt[f].n != 3)
-            s_gt[f].back = 0;
-    }
+    gt_mark(GT_OVERLAY, GT_KEYS);
+    if (s_gt[f].n == 2)
+        s_gt[f].back = 1;
 }
 
 static void gt_frame_end(void)
@@ -800,9 +781,9 @@ static void gt_frame_end(void)
 
 /* For a title's own view (from its overlay hook, the executor thread):
  * on = the GPU time of each frame measured, from its first timestamp to
- * its last less the wait for a back buffer still on screen (gt_mark_back;
- * it includes the GPU idling between commands: a frame the CPU side feeds
- * slowly looks long too). */
+ * the one before the back buffer is touched (gt_mark_back; so it includes
+ * the GPU idling between commands: a frame the CPU side feeds slowly looks
+ * long too, but not the wait for a back buffer still on screen). */
 void xbox_SetGpuFrameTiming(int on)
 {
     s_gt_light = on != 0;
@@ -6767,9 +6748,7 @@ static void shown_to_back(void)
     ID3D11Texture2D *back = NULL;
     float ax, ay, aw, ah;
 
-    gt_mark_back(0);        /* the wait for the buffer, if any, is here */
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
-    gt_mark_back(1);
     if (s_shown >= 0 && !g_pb_present_black && (back = back_tex())
         && aspect_rect(&ax, &ay, &aw, &ah)) {
         /* At a set shape (NV_HOST_FX_ASPECT): the whole shown rectangle
@@ -7098,6 +7077,7 @@ static void d3d_present(void)
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             gt_frame_begin();
+            gt_mark_back();
             shown_to_back();
             gt_mark(GT_POST, GT_KEYS);
             dump_back(seq);
