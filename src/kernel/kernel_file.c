@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include "guest_text.h"     /* a title's 8-bit names <-> UTF-16, never the PC code page */
 #include <string.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -143,7 +144,7 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
             win_path, buf_size, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
         if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
         if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
-        int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
+        int count = xbox_guest_text_to_wide(xbox_path, -1,
             win_path + used, (int)(buf_size - used));
         return count != 0;
     }
@@ -849,8 +850,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             swprintf_s(search_path, MAX_PATH, L"%s\\*", clean_path);
         } else if (FileName && FileName->Buffer) {
             WCHAR pattern_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
-                                pattern_wide, MAX_PATH);
+            xbox_guest_text_to_wide(FileName->Buffer, FileName->Length,
+                                    pattern_wide, MAX_PATH);
             pattern_wide[FileName->Length] = L'\0';
             swprintf_s(search_path, MAX_PATH, L"%s\\%s", clean_path, pattern_wide);
         } else {
@@ -884,8 +885,8 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
             if (!g_xbox_dir_entry_redirect
                 || !g_xbox_dir_entry_redirect(ctx->dir, ctx->find_data.cFileName,
                                               filename_ansi, MAX_PATH))
-                WideCharToMultiByte(CP_ACP, 0, ctx->find_data.cFileName, -1,
-                                    filename_ansi, MAX_PATH, NULL, NULL);
+                xbox_guest_text_from_wide(ctx->find_data.cFileName, -1,
+                                          filename_ansi, MAX_PATH);
             if (!ctx->pattern[0] || dir_pattern_match(ctx->pattern, filename_ansi))
                 break;
         }
