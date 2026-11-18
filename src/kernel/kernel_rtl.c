@@ -10,6 +10,7 @@
 #include "kernel.h"
 /* RECOMP_TLS, and the guest stack pointer the contention report walks. */
 #include "xbox_memory_layout.h"
+#include "guest_text.h"     /* a title's 8-bit text <-> UTF-16, never the PC code page */
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -74,7 +75,7 @@ NTSTATUS __stdcall xbox_RtlAnsiStringToUnicodeString(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    int result = MultiByteToWideChar(CP_ACP, 0,
+    int result = xbox_guest_text_to_wide(
         SourceString->Buffer, SourceString->Length,
         DestinationString->Buffer, DestinationString->MaximumLength / sizeof(WCHAR));
 
@@ -108,10 +109,9 @@ NTSTATUS __stdcall xbox_RtlUnicodeStringToAnsiString(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    int result = WideCharToMultiByte(CP_ACP, 0,
+    int result = xbox_guest_text_from_wide(
         SourceString->Buffer, SourceString->Length / sizeof(WCHAR),
-        DestinationString->Buffer, DestinationString->MaximumLength,
-        NULL, NULL);
+        DestinationString->Buffer, DestinationString->MaximumLength);
 
     if (result >= 0) {
         DestinationString->Length = (USHORT)result;

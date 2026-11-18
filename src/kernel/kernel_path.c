@@ -17,6 +17,7 @@
  */
 
 #include "kernel.h"
+#include "guest_text.h"     /* a title's 8-bit paths -> UTF-16, never the PC code page */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -577,7 +578,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     }
 
     xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "Unrecognized Xbox path: %s", xbox_path);
-    MultiByteToWideChar(CP_ACP, 0, xbox_path, -1, host_path_buf, buf_size);
+    xbox_guest_text_to_wide(xbox_path, -1, host_path_buf, buf_size);
     return TRUE;
 
 translate:
@@ -587,7 +588,7 @@ translate:
     fflush(stderr);
     {
         WCHAR remainder_wide[MAX_PATH];
-        MultiByteToWideChar(CP_ACP, 0, remainder, -1, remainder_wide, MAX_PATH);
+        xbox_guest_text_to_wide(remainder, -1, remainder_wide, MAX_PATH);
 
         for (WCHAR* p = remainder_wide; *p; p++) {
             if (*p == L'/') *p = L'\\';
@@ -595,7 +596,7 @@ translate:
 
         if (sub_dir) {
             WCHAR sub_wide[MAX_PATH];
-            MultiByteToWideChar(CP_ACP, 0, sub_dir, -1, sub_wide, MAX_PATH);
+            xbox_guest_text_to_wide(sub_dir, -1, sub_wide, MAX_PATH);
             swprintf_s(host_path_buf, buf_size, L"%s%s\\%s", base_dir, sub_wide, remainder_wide);
 
             WCHAR dir_path[MAX_PATH];
