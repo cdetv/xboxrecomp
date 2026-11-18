@@ -231,6 +231,26 @@ static bool apu_declick_on(void)
     return on != 0;
 }
 
+/* A 2D voice of two channels plays without its DLS2 low-pass. xemu's
+ * table runs it for filter mode 1, but the console plays such voices
+ * clear: Conker's BrontoThroat music (AD_SEQ_bronto_lowpass, a stereo
+ * stream) gets a 100 Hz cutoff from XACT and came out as a bass rumble,
+ * 12-20 dB down at 150-400 Hz, where the console (videos, giacomozama's
+ * report) has the tune as in the cavern. Mono 2D voices and 3D voices
+ * keep their filters. RECOMP_APU_STEREO_LPF=1 = xemu's rule (A/B). */
+static bool apu_stereo_lpf_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_STEREO_LPF");
+        on = (e && *e) ? (atoi(e) != 0) : 0;
+        if (on)
+            fprintf(stderr, "[APU] stereo 2D voices low-pass filtered as"
+                    " xemu (RECOMP_APU_STEREO_LPF=1)\n");
+    }
+    return on != 0;
+}
+
 #define DECLICK_DECAY 0.98620f            /* exp(-1/72): 1.5 ms at 48 kHz */
 static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
 static uint32_t s_dc_frame[MCPX_HW_MAX_VOICES];     /* frame a voice last mixed */
@@ -1470,7 +1490,8 @@ static void voice_process(MCPXAPUState *d,
     if (v < MCPX_HW_MAX_3D_VOICES) {
         lpf = (fmode == 1);
     } else {
-        lpf = stereo ? (fmode == 1) : (fmode & 1) != 0;
+        lpf = stereo ? (fmode == 1 && apu_stereo_lpf_on())
+                     : (fmode & 1) != 0;
     }
     if (lpf) {
         for (int ch = 0; ch < 2; ch++) {

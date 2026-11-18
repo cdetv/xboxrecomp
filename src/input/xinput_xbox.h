@@ -174,6 +174,30 @@ int  xbox_InputHostPadOfPort(DWORD dwPort);
  *  (UTF-8), for a host menu: 1 if found, else 0 and out = "". Looked up
  *  again whenever the set of connected pads changes. */
 int  xbox_InputHostPadName(DWORD slot, char *out, int size);
+/* ---- gyro (motion sensors) ------------------------------------------------
+ *
+ * The pad driving a port, if it has a gyro (PlayStation pads read through
+ * SDL3): calibrated (by hand, and automatically while held still) and in
+ * "player space" (turning about the vertical however the pad is held,
+ * GamepadMotionHelpers), in degrees of the hand's turn. Yaw = turning
+ * right positive, pitch = tilting the front up positive. */
+#ifndef XBOX_GYRO_HAS
+#define XBOX_GYRO_HAS         1
+#define XBOX_GYRO_CALIBRATING 2   /* a hand calibration is running */
+#define XBOX_GYRO_STILL       4   /* the automatic calibration sees it still */
+#endif
+/** Degrees the pad turned since the last call: 1 if it has a gyro, else 0
+ *  and zeros. Call once a frame whether used or not: a turn left for more
+ *  than 1/4 s is thrown away, never applied late. */
+int  xbox_InputGyroTake(DWORD dwPort, float *yaw, float *pitch);
+/** Its turn speed now (degrees a second) and XBOX_GYRO_* flags (0: none),
+ *  for a host menu's meter. */
+int  xbox_InputGyroRate(DWORD dwPort, float *yaw, float *pitch);
+/** A hand calibration (~2 s; the pad lies still meanwhile). */
+void xbox_InputGyroCalibrate(DWORD dwPort);
+/** The automatic calibration on (1, the default) or off, every pad. */
+void xbox_InputGyroSetAuto(int on);
+
 /** 1: host pads drive the title while another window is in front; 0 (the
  *  default, RECOMP_PAD_BACKGROUND unset): they read at rest until the game
  *  window is in front again. Takes effect on the next read. */
