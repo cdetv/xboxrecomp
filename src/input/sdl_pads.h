@@ -9,6 +9,12 @@
 
 #define SDL_PADS_MAX 4
 
+#ifndef XBOX_GYRO_HAS           /* as in xinput_xbox.h */
+#define XBOX_GYRO_HAS         1
+#define XBOX_GYRO_CALIBRATING 2
+#define XBOX_GYRO_STILL       4
+#endif
+
 /** Starts SDL's thread (once). Without SDL3 in the build: nothing. */
 void     xbox_SdlPadsInit(void);
 /** Bit n: PlayStation pad n is connected. */
@@ -23,5 +29,12 @@ int      xbox_SdlPadName(int n, char *out, int size);
 void     xbox_SdlPadRumble(int n, WORD low, WORD high);
 /** Every pad's motors off now, from any thread (the process is ending). */
 void     xbox_SdlPadsStopRumble(void);
+/** Gyro (xinput_xbox.h's xbox_InputGyro* by port): degrees turned since
+ *  the last take (1 if pad n has a gyro); its speed now and XBOX_GYRO_*
+ *  flags; a hand calibration; the automatic calibration on or off. */
+int      xbox_SdlPadGyroTake(int n, float *yaw, float *pitch);
+int      xbox_SdlPadGyroRate(int n, float *yaw, float *pitch);
+void     xbox_SdlPadGyroCalibrate(int n);
+void     xbox_SdlPadGyroAuto(int on);
 
 #endif

@@ -130,6 +130,23 @@ MIT — AMD FidelityFX FSR 1, included unchanged
   LICENSES/FidelityFX-FSR.txt.
 
 
+MIT — GamepadMotionHelpers, included unchanged
+-----------------------------------------------
+
+  https://github.com/JibbSmart/GamepadMotionHelpers (commit f1a7600, version 10)
+
+  third_party/gamepadmotionhelpers/GamepadMotion.hpp   gyro calibration
+                                (by hand, and while the pad is held still)
+                                and gravity ("player space" aiming)
+  third_party/gamepadmotionhelpers/LICENSE   its licence, as published
+  src/input/gyro_motion.cpp     a C front for it (sdl_pads.c's gyro)
+                                (c) 2020-2023 Julian "Jibb" Smart
+
+  Licensed under the MIT licence; the full text, with the author's
+  copyright notice, is in third_party/gamepadmotionhelpers/LICENSE and
+  LICENSES/GamepadMotionHelpers.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

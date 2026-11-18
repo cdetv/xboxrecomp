@@ -10,6 +10,12 @@ target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 if(WIN32)
     target_link_libraries(xbox_input PUBLIC platform xinput)
     target_sources(xbox_input PRIVATE sdl_pads.c)
+    # The gyro's calibration and gravity: GamepadMotionHelpers (MIT, one
+    # C++ header, third_party/gamepadmotionhelpers), behind a C front.
+    enable_language(CXX)
+    target_sources(xbox_input PRIVATE gyro_motion.cpp)
+    target_include_directories(xbox_input PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/gamepadmotionhelpers)
     # PlayStation pads (sdl_pads.c): the game project builds SDL3 and names
     # its target here, e.g. SDL3::SDL3-static. Without one, XInput only.
     set(XBOXRECOMP_SDL3_TARGET "" CACHE STRING
