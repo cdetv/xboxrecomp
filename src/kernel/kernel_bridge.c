@@ -29,6 +29,7 @@
 #include "guest_vmem.h"
 #include "xbox_memory_layout.h"
 #include "recomp_icall_feedback.h"
+#include "guest_text.h"     /* a title's 8-bit text <-> UTF-16, never the PC code page */
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -5783,7 +5784,7 @@ static void bridge_RtlAnsiStringToUnicodeString(void)
         }
     }
 
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = xbox_guest_text_to_wide(
         (const char*)XBOX_TO_NATIVE(s_buf_va), (int)s_len,
         (WCHAR*)XBOX_TO_NATIVE(d_buf_va), (int)(unicode_bytes / sizeof(WCHAR)));
     if (result > 0) {
@@ -5839,9 +5840,9 @@ static void bridge_RtlUnicodeStringToAnsiString(void)
         }
     }
 
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = xbox_guest_text_from_wide(
         (const WCHAR*)XBOX_TO_NATIVE(s_buf_va), (int)(s_len / sizeof(WCHAR)),
-        (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes, NULL, NULL);
+        (char*)XBOX_TO_NATIVE(d_buf_va), (int)ansi_bytes);
     if (result > 0) {
         BRIDGE_MEM16(dst_va + 0) = (uint16_t)result;
         if ((uint16_t)result < d_max)
@@ -6442,8 +6443,9 @@ static void bridge_RtlZeroMemory(void)
 }
 
 /* ── Rtl MultiByte <-> Unicode (ordinals 299, 300, 310, 311, 315) ──
- * All buffers are guest VAs.  MultiByteToWideChar / WideCharToMultiByte are
- * available on both host platforms.  UNICODE_STRING lengths are byte counts. */
+ * All buffers are guest VAs.  The Xbox's 8-bit text is Latin-1, one byte per
+ * character (guest_text.h), whatever the PC's code page.  UNICODE_STRING
+ * lengths are byte counts. */
 
 /* 299: NTSTATUS RtlMultiByteToUnicodeN(PWCH UnicodeString, ULONG MaxBytesInUnicodeString,
  *       PULONG BytesInUnicodeString, PCCH MultiByteString, ULONG BytesInMultiByteString) */
@@ -6458,7 +6460,7 @@ static void bridge_RtlMultiByteToUnicodeN(void)
 
     if (!uni_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
     chars = (int)(max_bytes / sizeof(WCHAR));
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = xbox_guest_text_to_wide(
         (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes,
         uni_va ? (WCHAR *)XBOX_TO_NATIVE(uni_va) : NULL, chars);
     if (bytes_va)
@@ -6475,7 +6477,7 @@ static void bridge_RtlMultiByteToUnicodeSize(void)
     uint32_t mb_bytes = STACK_ARG(2);
     int result;
 
-    result = MultiByteToWideChar(CP_ACP, 0,
+    result = xbox_guest_text_to_wide(
         (const char *)XBOX_TO_NATIVE(mb_va), (int)mb_bytes, NULL, 0);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)(result * sizeof(WCHAR)) : 0;
@@ -6494,10 +6496,9 @@ static void bridge_RtlUnicodeToMultiByteN(void)
     int result;
 
     if (!mb_va && max_bytes) { g_eax = (uint32_t)STATUS_INVALID_PARAMETER; return; }
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = xbox_guest_text_from_wide(
         (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
-        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
-        NULL, NULL);
+        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;
     g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
@@ -6512,9 +6513,9 @@ static void bridge_RtlUnicodeToMultiByteSize(void)
     uint32_t uni_bytes = STACK_ARG(2);
     int result;
 
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = xbox_guest_text_from_wide(
         (const WCHAR *)XBOX_TO_NATIVE(uni_va), (int)(uni_bytes / sizeof(WCHAR)),
-        NULL, 0, NULL, NULL);
+        NULL, 0);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;
     g_eax = result > 0 ? 0 : (uint32_t)STATUS_UNSUCCESSFUL;
@@ -6548,10 +6549,9 @@ static void bridge_RtlUpcaseUnicodeToMultiByteN(void)
             tmp[wc] = 0;
         }
     }
-    result = WideCharToMultiByte(CP_ACP, 0,
+    result = xbox_guest_text_from_wide(
         tmp, (int)wc,
-        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes,
-        NULL, NULL);
+        mb_va ? (char *)XBOX_TO_NATIVE(mb_va) : NULL, (int)max_bytes);
     free(tmp);
     if (bytes_va)
         BRIDGE_MEM32(bytes_va) = result > 0 ? (uint32_t)result : 0;

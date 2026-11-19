@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(guest_text_test C CXX)
+# A title's 8-bit text through the kernel's Rtl calls, under a UTF-8 process
+# code page (Windows: utf8.manifest, merged into the test's own manifest).
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)      # the runtime's gyro code (std::clamp)
+add_subdirectory(../.. runtime)
+add_executable(guest_text_test test_main.c)
+if(WIN32)
+    target_sources(guest_text_test PRIVATE utf8.manifest)
+endif()
+target_include_directories(guest_text_test PRIVATE ../../src/kernel)
+target_link_libraries(guest_text_test PRIVATE xboxrecomp)
+enable_testing()
+add_test(NAME guest_text_test COMMAND guest_text_test)
