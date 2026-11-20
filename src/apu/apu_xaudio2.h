@@ -22,6 +22,9 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 int xa2_get_buffer_size(void);
 /* Buffers XAudio2 still has queued (0 = it ran dry), or -1 if inactive. */
 int xa2_queued_buffers(void);
+/* The same, with the samples the voice has played since it started
+ * (RECOMP_APU_PROFILE; a restart begins them again from 0). */
+int xa2_queue_probe(unsigned long long *played);
 
 /* Stop the output where it is (1), keeping what is queued, or start it
  * again from there (0). */

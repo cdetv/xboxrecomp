@@ -305,6 +305,22 @@ int xa2_queued_buffers(void)
     return n;
 }
 
+int xa2_queue_probe(unsigned long long *played)
+{
+    XAUDIO2_VOICE_STATE state;
+    int n = -1;
+
+    *played = 0;
+    AcquireSRWLockExclusive(&g_xa2_lock);
+    if (g_xa2_initialized && g_xa2_source) {
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+        n = (int)state.BuffersQueued;
+        *played = (unsigned long long)state.SamplesPlayed;
+    }
+    ReleaseSRWLockExclusive(&g_xa2_lock);
+    return n;
+}
+
 void xa2_set_paused(int on)
 {
     AcquireSRWLockExclusive(&g_xa2_lock);
