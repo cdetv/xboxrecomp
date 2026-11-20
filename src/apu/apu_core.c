@@ -155,6 +155,12 @@ static void prof_report(void)
                 p->throttle_lost_ms, p->t_gate, p->max_gate, p->gate_busy,
                 p->t_relock, p->max_relock, p->max_loop, p->trap_waits,
                 p->t_trap, p->max_trap, p->trap_timeouts);
+        fprintf(stderr, "  [APUPROF] xa2 queue at submit 0:%lu 1:%lu 2:%lu 3:%lu"
+                " | played between submits min %llu max %llu samples (%lu)"
+                " | longest gap between submits %.1f ms\n",
+                p->xa2_depth[0], p->xa2_depth[1], p->xa2_depth[2],
+                p->xa2_depth[3], p->xa2_bite_min, p->xa2_bite_max,
+                p->xa2_bites, p->xa2_gap_max);
         double n = p->mix_samples ? (double)p->mix_samples : 1.0;
         double rl = sqrt(p->mix_l2 / n), rr = sqrt(p->mix_r2 / n);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
@@ -720,8 +726,32 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                n * 2 * sizeof(int16_t));
         g_xa2_stage_fill += n;
         if (g_xa2_stage_fill >= buf_size) {
-            if (g_apu_prof_on && xa2_queued_buffers() == 0)
-                g_apu_prof.xa2_starved++;
+            if (g_apu_prof_on) {
+                /* How far ahead of XAudio2 we are, how much it played since
+                 * the last submit and how long that took (Proton's starving:
+                 * we keep time, so who runs dry?). */
+                static unsigned long long last_played;
+                static double last_t;
+                unsigned long long played;
+                double t = prof_now_ms();
+                int q = xa2_queue_probe(&played);
+                if (q == 0)
+                    g_apu_prof.xa2_starved++;
+                if (q >= 0)
+                    g_apu_prof.xa2_depth[q > 3 ? 3 : q]++;
+                if (q >= 0 && last_t > 0.0 && played >= last_played) {
+                    unsigned long long bite = played - last_played;
+                    if (!g_apu_prof.xa2_bites || bite < g_apu_prof.xa2_bite_min)
+                        g_apu_prof.xa2_bite_min = bite;
+                    if (bite > g_apu_prof.xa2_bite_max)
+                        g_apu_prof.xa2_bite_max = bite;
+                    g_apu_prof.xa2_bites++;
+                    if (t - last_t > g_apu_prof.xa2_gap_max)
+                        g_apu_prof.xa2_gap_max = t - last_t;
+                }
+                last_played = played;
+                last_t = q >= 0 ? t : 0.0;
+            }
             if (!xa2_submit_samples((const int16_t *)g_xa2_stage, buf_size)
                 && g_apu_prof_on)
                 g_apu_prof.xa2_dropped++;
