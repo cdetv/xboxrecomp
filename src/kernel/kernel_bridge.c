@@ -1216,8 +1216,31 @@ static void bridge_NtFreeVirtualMemory(void)
         }
     }
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    /* Nothing else owns it: leave it allocated and say so, as the console
+     * would for an address it does not know. This used to hand the guest
+     * slots to xbox_NtFreeVirtualMemory, which reads the guest's 32-bit
+     * address as a host pointer and VirtualFrees it. On Windows nothing is
+     * mapped at those low host addresses, so the call always failed (err 487)
+     * and nothing happened. Under Wine the low host addresses hold Wine's own
+     * heaps: a guest free of 0x018B0000 released Wine's heap at 0x018B0000,
+     * and the next thread to exit crashed walking the heap list (Conker under
+     * Proton: every photo froze the game). The guest sees the same status as
+     * before: invalid parameter for a null address, else unsuccessful. */
+    if (!base_ptr || !BRIDGE_MEM32(base_ptr)) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    if (size_ptr) {
+        static int logged;
+        if (logged < 8) {
+            logged++;
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                     "NtFreeVirtualMemory: guest 0x%08X (type 0x%X) not freed: "
+                     "not from the guest heap or a guest mapping",
+                     BRIDGE_MEM32(base_ptr), free_type);
+        }
+    }
+    g_eax = 0xC0000001u; /* STATUS_UNSUCCESSFUL */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
