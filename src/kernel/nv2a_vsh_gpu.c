@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #define COBJMACROS
 #include <windows.h>
@@ -637,6 +638,115 @@ static uint64_t src_key(const char *s, size_t n)
     return h;
 }
 
+/* Proton 11's d3dcompiler (Wine's, on vkd3d-shader; seen on a Steam Deck
+ * 2026-11-20) has no isfinite: the draw shaders' "position not finite: drop
+ * the vertex" test (s_hlsl_vsh_draw / s_hlsl_vsh_points) failed to compile and
+ * every program batch stayed on the CPU. When the compiler says so, the
+ * source is compiled again with each isfinite(x) written as
+ * (abs(x) <= FLT_MAX), and the rest of the run starts with that form. NaN and
+ * infinity fail that ordered compare (VSH_DRAW_FLAGS asks for IEEE
+ * strictness), so it means the same. Windows' compiler never fails here, so
+ * Windows keeps isfinite; RECOMP_VSH_NO_ISFINITE=1 forces the written-out
+ * form (a test). The key stays the original source's: the cache finds the
+ * shader either way. */
+static volatile LONG s_no_isfinite = -1;    /* -1 not yet known, 0 kept, 1 written out */
+
+static char *src_without_isfinite(const char *src, size_t len, size_t *out_len)
+{
+    static const char word[] = "isfinite(", head[] = "(abs(",
+                      tail[] = ") <= 3.402823466e+38)";
+    const size_t wl = sizeof word - 1, hl = sizeof head - 1, tl = sizeof tail - 1;
+    size_t i, n = 0, uses = 0, cap;
+    char *out;
+
+    for (i = 0; i + wl <= len; i++)
+        if (memcmp(src + i, word, wl) == 0)
+            uses++;
+    cap = len + uses * (hl + tl) + 1;
+    out = (char *)malloc(cap);
+    if (!out)
+        return NULL;
+    for (i = 0; i < len; ) {
+        int starts = i + wl <= len && memcmp(src + i, word, wl) == 0
+                     && (i == 0 || !(isalnum((unsigned char)src[i - 1])
+                                     || src[i - 1] == '_'));
+        if (starts) {
+            size_t a = i + wl, b = a;
+            int depth = 1;
+            while (b < len && depth) {
+                if (src[b] == '(') depth++;
+                else if (src[b] == ')') depth--;
+                if (depth) b++;
+            }
+            if (b < len) {                  /* src[a..b) is x, src[b] is ')' */
+                memcpy(out + n, head, hl); n += hl;
+                memcpy(out + n, src + a, b - a); n += b - a;
+                memcpy(out + n, tail, tl); n += tl;
+                i = b + 1;
+                continue;
+            }
+        }
+        out[n++] = src[i++];
+    }
+    out[n] = '\0';
+    *out_len = n;
+    return out;
+}
+
+static int blob_says(ID3DBlob *b, const char *what)
+{
+    const char *s;
+    size_t n, w = strlen(what), i;
+
+    if (!b)
+        return 0;
+    s = (const char *)ID3D10Blob_GetBufferPointer(b);
+    n = ID3D10Blob_GetBufferSize(b);
+    for (i = 0; s && i + w <= n; i++)
+        if (memcmp(s + i, what, w) == 0)
+            return 1;
+    return 0;
+}
+
+/* D3DCompile of a draw source with the options of every key; falls back to
+ * the written-out isfinite as said above. */
+static HRESULT draw_compile(const char *src, size_t len, const char *entry,
+                            ID3DBlob **code, ID3DBlob **err)
+{
+    LONG mode = s_no_isfinite;
+    char *alt;
+    size_t alt_len;
+    HRESULT hr;
+
+    if (mode < 0) {
+        const char *e = getenv("RECOMP_VSH_NO_ISFINITE");
+        if (e && e[0] == '1'
+            && InterlockedCompareExchange(&s_no_isfinite, 1, -1) == -1)
+            fprintf(stderr, "[VSHGPU] RECOMP_VSH_NO_ISFINITE: draw shaders"
+                    " written without isfinite (abs(x) <= FLT_MAX)\n");
+        mode = s_no_isfinite;
+    }
+    if (mode != 1) {
+        hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL, entry,
+                        VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, code, err);
+        if (SUCCEEDED(hr) || !blob_says(*err, "isfinite"))
+            return hr;
+        if (InterlockedExchange(&s_no_isfinite, 1) != 1)
+            fprintf(stderr, "[VSHGPU] this shader compiler has no isfinite:"
+                    " draw shaders written without it (abs(x) <= FLT_MAX)"
+                    " from now on\n");
+        ID3D10Blob_Release(*err);
+        *err = NULL;
+    }
+    alt = src_without_isfinite(src, len, &alt_len);
+    if (!alt)
+        return E_OUTOFMEMORY;
+    hr = D3DCompile(alt, alt_len, "nv2a_vsh_draw", NULL, NULL, entry,
+                    VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0, code, err);
+    free(alt);
+    return hr;
+}
+
 static int cache_on(void)
 {
     if (s_cache_on < 0) {
@@ -830,9 +940,7 @@ static void compile_draw(DrawJob *j)
 
     /* Optimisation levels 0, 1 and 3 took the same time (tests/nv2a_vsh_gpu,
      * 400 programs, 2026-10-18): the cost is in the source, not the level. */
-    hr = D3DCompile(j->src, j->len, "nv2a_vsh_draw", NULL, NULL,
-                    s_dentry[j->kind], VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0,
-                    &code, &err);
+    hr = draw_compile(j->src, j->len, s_dentry[j->kind], &code, &err);
     if (SUCCEEDED(hr))
         hr = ID3D11Device_CreateVertexShader(s_dev,
                 ID3D10Blob_GetBufferPointer(code),
@@ -946,9 +1054,7 @@ static void precompile_job(PreJob *pj)
         if (had || loaded)
             cache_touch(key);           /* a scan found it: used */
         if (!had && !loaded) {
-            hr = D3DCompile(src, len, "nv2a_vsh_draw", NULL, NULL,
-                            s_dentry[0], VSH_DRAW_PROFILE, VSH_DRAW_FLAGS, 0,
-                            &code, &err);
+            hr = draw_compile(src, len, s_dentry[0], &code, &err);
             if (SUCCEEDED(hr))
                 hr = ID3D11Device_CreateVertexShader(s_dev,
                         ID3D10Blob_GetBufferPointer(code),

@@ -41,6 +41,16 @@ Each check fails without the change and passes with it.
 | A page `MEM_DECOMMIT` then `MEM_COMMIT` again reads as zero; its neighbours keep their data | The old contents: both calls were no-ops on heap memory, while the console hands recommitted pages back zeroed. |
 | `MmFreeContiguousMemory` gives a contiguous block back and the next request of that size reuses it | Nothing came back: the address went to the general heap, which does not own it, so a title that frees and reloads a scene runs the 64 MB window out. The default mode pins the old bump allocator. |
 
+## Every mode but the high-VMA ones: a guest free nothing owns
+
+Host memory is put at an address below 4 GB, and the guest then releases that
+same number with `NtFreeVirtualMemory(MEM_RELEASE)`. The answer must be
+`STATUS_UNSUCCESSFUL` and the host memory must still be there (Windows only).
+
+| Check | Without it |
+|---|---|
+| A guest free nothing owns leaves host memory at that number | `STATUS_SUCCESS`, and the host memory is gone (`MEM_FREE`): the bridge handed the guest slot to the host `VirtualFree` as a pointer. On Windows nothing lives at the low host addresses a title's heap numbers fall on, so the call always failed; under Wine they hold Wine's own heaps, and a title's free of `0x018B0000` released the heap at host `0x018B0000` (Conker: Live & Reloaded under Proton froze at the next thread exit). |
+
 ## `RECOMP_EXT_VMA`
 
 A title that reserves a specific address above the RAM mirrors (`0x74000000` up

@@ -1729,9 +1729,12 @@ static FILE *shader_file(const char *src, const char *entry,
 }
 
 /* src compiled (or loaded from the cache); *loaded (may be NULL) says it
- * came from the cache. quiet: no line for a compile that worked. */
-static ID3DBlob *compile_src(const char *src, const char *entry,
-                             const char *target, int quiet, int *loaded)
+ * came from the cache. quiet: no line for a compile that worked. load_only:
+ * NULL when it is not in the cache, and a load is not a use (no touch: the
+ * combiner setups loaded ahead, RECOMP_PS_PRELOAD). */
+static ID3DBlob *compile_src_ex(const char *src, const char *entry,
+                                const char *target, int quiet, int *loaded,
+                                int load_only)
 {
     ID3DBlob *code = NULL, *err = NULL;
     char path[MAX_PATH + 32] = "", tmp[MAX_PATH + 48];
@@ -1757,10 +1760,13 @@ static ID3DBlob *compile_src(const char *src, const char *entry,
         if (code) {
             if (loaded)
                 *loaded = 1;
-            nv2a_vsh_gpu_cache_touch(path);   /* a pre-compile pass: used */
+            if (!load_only)
+                nv2a_vsh_gpu_cache_touch(path);   /* a pre-compile pass: used */
             return code;
         }
     }
+    if (load_only)
+        return NULL;
     QueryPerformanceCounter(&t0);
     hr = D3DCompile(src, strlen(src), "nv2a_draw_d3d11",
                     NULL, NULL, entry, target,
@@ -1795,6 +1801,12 @@ static ID3DBlob *compile_src(const char *src, const char *entry,
     return code;
 }
 
+static ID3DBlob *compile_src(const char *src, const char *entry,
+                             const char *target, int quiet, int *loaded)
+{
+    return compile_src_ex(src, entry, target, quiet, loaded, 0);
+}
+
 static ID3DBlob *compile(const char *entry, const char *target)
 {
     return compile_src(s_hlsl, entry, target, 0, NULL);
@@ -1816,24 +1828,55 @@ typedef struct {
     uint32_t bound, prog, clip, ctrl, fin[2], icw[8][4];
 } PsKey;
 
+/* RECOMP_PS_PRELOAD (on; =0 off): the setups this machine has drawn are
+ * listed in the shader cache folder (ps_setups.bin: a header, then one
+ * PsKey each, appended when a draw's setup gets its shader), and at the
+ * first draw every listed setup's shader is loaded from the cache on the
+ * workers, behind any setup a draw is waiting for. A level's setups are
+ * then ready before its first frame. Under Proton each CreatePixelShader
+ * took ~35 ms (DXVK translating it; the Steam Deck, 2026-11-20; Windows
+ * ~0) and the intro's walk-in met 49 setups new to the run: 0.13-1.1 s
+ * frames, drawn meanwhile with the one shader, which the Deck's GPU runs
+ * at ~16 fps. Loaded ahead: one 247 ms frame. Load only: a listed setup
+ * not in the cache (a new toolkit's source, a pre-compile pass deleted
+ * it) is made when drawn, as before.
+ * Off during a pre-compile pass (RECOMP_SHADER_CACHE_TOUCH): the pass
+ * needs to see which files its levels use. */
 #define PS_SPEC_MAX 2048                /* setups kept; past it, the one shader */
+#define PS_LIST_MAGIC 0x314B5350u       /* "PSK1" */
 typedef struct {
     PsKey key;
     uint64_t h;
     volatile LONG state;                /* PS_* */
+    volatile LONG taken;                /* a worker has it (it can be queued
+                                         * twice: loaded ahead, then drawn) */
+    volatile LONG listed;               /* in ps_setups.bin */
+    uint8_t seen, bumped;               /* executor only: drawn this run;
+                                         * queued for a draw while listed */
     ID3D11PixelShader *ps;
 } PsSpec;
-enum { PS_EMPTY, PS_QUEUED, PS_READY, PS_FAILED };
+/* PS_IDLE: listed but not made this run (RECOMP_PS_PRELOAD off, or not in
+ * the cache): queued when a draw needs it. */
+enum { PS_EMPTY, PS_QUEUED, PS_READY, PS_FAILED, PS_IDLE };
 
 static PsSpec s_pss[PS_SPEC_MAX];
-static uint32_t s_pss_n;
+static uint32_t s_pss_n, s_pss_seen;    /* table entries; drawn this run */
 static int s_pss_on = -1;
-static CRITICAL_SECTION s_pss_cs;
+static CRITICAL_SECTION s_pss_cs, s_pss_fcs;   /* queues; the list file */
 static CONDITION_VARIABLE s_pss_cv;
-static uint32_t s_pss_q[PS_SPEC_MAX], s_pss_qh, s_pss_qt;  /* under s_pss_cs */
+/* Under s_pss_cs: the draws' queue (first), the setups loaded ahead. */
+static uint32_t s_pss_q[PS_SPEC_MAX], s_pss_qh, s_pss_qt;
+static uint32_t s_pss_pq[PS_SPEC_MAX], s_pss_pqh, s_pss_pqt;
 static volatile LONG s_pss_compiled, s_pss_loaded, s_pss_failed;
+static volatile LONG s_pss_busy;        /* draws' jobs not finished */
 static volatile LONG64 s_pss_us;        /* compile time, microseconds */
 static uint64_t s_pss_draws, s_pss_waits;  /* drawn with their own, not yet */
+static uint32_t s_pss_listed;           /* read from the list at the start */
+static volatile LONG s_pss_pre_left, s_pss_pre_loaded, s_pss_pre_missing,
+                     s_pss_pre_drawn;   /* loaded ahead; not in the cache;
+                                         * a draw's job got there first */
+static volatile LONG64 s_pss_pre_us;
+static LARGE_INTEGER s_pss_pre_t0;
 
 /* The setup the shader branches on, as the K_ macros read it from k; words
  * no stage of this setup reads are left 0, so they do not split setups. */
@@ -1880,6 +1923,63 @@ static char *ps_spec_source(const PsKey *k)
     return src;
 }
 
+/* <cache folder>\ps_setups.bin, or 0 without a cache. */
+static int ps_list_path(char *path, size_t cap)
+{
+    const char *dir = getenv("RECOMP_VSH_GPU_CACHE");
+    if (!dir || !dir[0] || !strcmp(dir, "0") || strlen(dir) > MAX_PATH)
+        return 0;
+    snprintf(path, cap, "%s\\ps_setups.bin", dir);
+    return 1;
+}
+
+/* A draw's setup got its shader: listed for the next run. Workers; one
+ * record at a time, so a run stopped halfway loses nothing. */
+static void ps_list_add(const PsKey *k)
+{
+    char path[MAX_PATH + 32];
+    FILE *f;
+
+    if (!ps_list_path(path, sizeof path))
+        return;
+    EnterCriticalSection(&s_pss_fcs);
+    if (!fopen_s(&f, path, "ab") && f) {
+        fseek(f, 0, SEEK_END);
+        if (ftell(f) == 0) {
+            uint32_t hdr[2] = { PS_LIST_MAGIC, (uint32_t)sizeof *k };
+            fwrite(hdr, sizeof hdr, 1, f);
+        }
+        fwrite(k, sizeof *k, 1, f);
+        fclose(f);
+    }
+    LeaveCriticalSection(&s_pss_fcs);
+}
+
+/* One job of the setups loaded ahead done: kind 1 loaded, 2 not in the
+ * cache (or not made), 0 a draw's job had it first. The last one says how
+ * it went. */
+static void ps_pre_done(int kind)
+{
+    if (kind == 1)
+        InterlockedIncrement(&s_pss_pre_loaded);
+    else if (kind == 2)
+        InterlockedIncrement(&s_pss_pre_missing);
+    else
+        InterlockedIncrement(&s_pss_pre_drawn);
+    if (InterlockedDecrement(&s_pss_pre_left) == 0) {
+        LARGE_INTEGER t, fq;
+        QueryPerformanceCounter(&t);
+        QueryPerformanceFrequency(&fq);
+        fprintf(stderr, "[GPU] d3d11: combiner setups loaded ahead"
+                " (RECOMP_PS_PRELOAD): %ld of %u in %.0f ms (%.1f s of the"
+                " compile threads), %ld first wanted by a draw, %ld not in"
+                " the cache (made when drawn)%c", s_pss_pre_loaded,
+                s_pss_listed, (double)(t.QuadPart - s_pss_pre_t0.QuadPart)
+                * 1000.0 / fq.QuadPart, (double)s_pss_pre_us / 1e6,
+                s_pss_pre_drawn, s_pss_pre_missing, 10);
+    }
+}
+
 static DWORD WINAPI ps_spec_worker(LPVOID arg)
 {
     (void)arg;
@@ -1888,16 +1988,28 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
         char *src;
         ID3DBlob *code;
         LARGE_INTEGER t0, t1, fq;
-        int loaded = 0;
+        LONG64 us;
+        int loaded = 0, pre;
 
         EnterCriticalSection(&s_pss_cs);
-        while (s_pss_qh == s_pss_qt)
+        while (s_pss_qh == s_pss_qt && s_pss_pqh == s_pss_pqt)
             SleepConditionVariableCS(&s_pss_cv, &s_pss_cs, INFINITE);
-        e = &s_pss[s_pss_q[s_pss_qh++ % PS_SPEC_MAX]];
+        pre = s_pss_qh == s_pss_qt;     /* a draw's setup first */
+        e = &s_pss[pre ? s_pss_pq[s_pss_pqh++ % PS_SPEC_MAX]
+                       : s_pss_q[s_pss_qh++ % PS_SPEC_MAX]];
         LeaveCriticalSection(&s_pss_cs);
+        if (InterlockedExchange(&e->taken, 1)) {
+            /* Its other job has it (or had it). */
+            if (pre)
+                ps_pre_done(0);
+            else
+                InterlockedDecrement(&s_pss_busy);
+            continue;
+        }
         QueryPerformanceCounter(&t0);
         src = ps_spec_source(&e->key);
-        code = src ? compile_src(src, "ps", "ps_4_0", 1, &loaded) : NULL;
+        code = src ? compile_src_ex(src, "ps", "ps_4_0", 1, &loaded, pre)
+                   : NULL;
         free(src);
         if (code && FAILED(ID3D11Device_CreatePixelShader(s_dev,
                     ID3D10Blob_GetBufferPointer(code),
@@ -1907,11 +2019,135 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
             ID3D10Blob_Release(code);
         QueryPerformanceCounter(&t1);
         QueryPerformanceFrequency(&fq);
-        InterlockedAdd64(&s_pss_us, (LONG64)((t1.QuadPart - t0.QuadPart)
-                                             * 1000000 / fq.QuadPart));
+        us = (LONG64)((t1.QuadPart - t0.QuadPart) * 1000000 / fq.QuadPart);
+        if (pre) {
+            /* Not in the cache: made when a draw needs it. */
+            InterlockedAdd64(&s_pss_pre_us, us);
+            InterlockedExchange(&e->state, e->ps ? PS_READY : PS_IDLE);
+            ps_pre_done(e->ps ? 1 : 2);
+            continue;
+        }
+        InterlockedAdd64(&s_pss_us, us);
         InterlockedIncrement(e->ps ? (loaded ? &s_pss_loaded : &s_pss_compiled)
                                    : &s_pss_failed);
+        if (e->ps && !InterlockedExchange(&e->listed, 1))
+            ps_list_add(&e->key);
         InterlockedExchange(&e->state, e->ps ? PS_READY : PS_FAILED);
+        InterlockedDecrement(&s_pss_busy);
+    }
+}
+
+static uint64_t ps_hash(const PsKey *key)
+{
+    const uint8_t *b = (const uint8_t *)key;
+    uint64_t h = 0xCBF29CE484222325ull;
+    uint32_t i;
+    for (i = 0; i < sizeof *key; i++)
+        h = (h ^ b[i]) * 0x100000001B3ull;
+    return h;
+}
+
+/* key's entry; with add, a new one when absent (*fresh = 1: the caller
+ * sets its state at once, as a probe stops at the first PS_EMPTY). NULL:
+ * absent and not added (the table stays half empty at most, so a probe
+ * always ends). Executor thread only. */
+static PsSpec *ps_find(const PsKey *key, uint64_t h, int add, int *fresh)
+{
+    uint32_t i, at;
+
+    *fresh = 0;
+    for (i = 0, at = (uint32_t)h % PS_SPEC_MAX; i < PS_SPEC_MAX;
+         i++, at = (at + 1) % PS_SPEC_MAX) {
+        if (s_pss[at].state == PS_EMPTY)
+            break;
+        if (s_pss[at].h == h && !memcmp(&s_pss[at].key, key, sizeof *key))
+            return &s_pss[at];
+    }
+    if (!add || i == PS_SPEC_MAX || s_pss_n >= PS_SPEC_MAX / 2)
+        return NULL;
+    s_pss[at].key = *key;
+    s_pss[at].h = h;
+    s_pss_n++;
+    *fresh = 1;
+    return &s_pss[at];
+}
+
+/* e onto the draws' queue. Executor thread only. */
+static void ps_queue(PsSpec *e)
+{
+    InterlockedIncrement(&s_pss_busy);
+    EnterCriticalSection(&s_pss_cs);
+    s_pss_q[s_pss_qt++ % PS_SPEC_MAX] = (uint32_t)(e - s_pss);
+    LeaveCriticalSection(&s_pss_cs);
+    WakeConditionVariable(&s_pss_cv);
+}
+
+/* The list into the table, at the first draw (executor thread): queued to
+ * be loaded ahead, or PS_IDLE (made when drawn) without the preload. */
+static void ps_list_load(void)
+{
+    const char *pv = getenv("RECOMP_PS_PRELOAD");
+    const char *tv = getenv("RECOMP_SHADER_CACHE_TOUCH");
+    int touch = tv && atoi(tv) != 0;
+    int pre = !(pv && pv[0] == '0') && !touch;
+    char path[MAX_PATH + 32];
+    uint32_t hdr[2], t = s_pss_pqt, dup = 0;
+    PsKey k;
+    FILE *f;
+
+    if (!ps_list_path(path, sizeof path))
+        return;
+    if (fopen_s(&f, path, "rb") || !f) {
+        fprintf(stderr, "[GPU] d3d11: combiner setups listed in the shader"
+                " cache: none yet%c", 10);
+        return;
+    }
+    if (fread(hdr, sizeof hdr, 1, f) != 1 || hdr[0] != PS_LIST_MAGIC
+        || hdr[1] != sizeof k) {
+        fclose(f);
+        /* Another layout (or cut short): started again. */
+        if (!fopen_s(&f, path, "wb") && f) {
+            hdr[0] = PS_LIST_MAGIC;
+            hdr[1] = (uint32_t)sizeof k;
+            fwrite(hdr, sizeof hdr, 1, f);
+            fclose(f);
+        }
+        fprintf(stderr, "[GPU] d3d11: combiner setups list of another"
+                " layout: started again%c", 10);
+        return;
+    }
+    QueryPerformanceCounter(&s_pss_pre_t0);
+    while (fread(&k, sizeof k, 1, f) == 1) {
+        int fresh;
+        PsSpec *e = ps_find(&k, ps_hash(&k), 1, &fresh);
+        if (!e)
+            break;                      /* the table's half is full */
+        if (!fresh) {
+            dup++;                      /* two games appended it */
+            continue;
+        }
+        e->listed = 1;
+        s_pss_listed++;
+        if (pre) {
+            e->state = PS_QUEUED;
+            s_pss_pq[t++ % PS_SPEC_MAX] = (uint32_t)(e - s_pss);
+        } else {
+            e->state = PS_IDLE;
+        }
+    }
+    fclose(f);
+    fprintf(stderr, "[GPU] d3d11: combiner setups listed in the shader"
+            " cache: %u%s, %s%c", s_pss_listed, dup ? " (and repeats)" : "",
+            pre ? "loading them ahead (RECOMP_PS_PRELOAD)"
+                : touch ? "made when drawn (a pre-compile pass)"
+                        : "made when drawn (RECOMP_PS_PRELOAD=0)", 10);
+    if (pre && s_pss_listed) {
+        /* Workers read the entries below the tail, published last. */
+        s_pss_pre_left = (LONG)s_pss_listed;
+        EnterCriticalSection(&s_pss_cs);
+        s_pss_pqt = t;
+        LeaveCriticalSection(&s_pss_cs);
+        WakeAllConditionVariable(&s_pss_cv);
     }
 }
 
@@ -1921,10 +2157,8 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
 {
     static PsSpec *last;
     PsKey key;
-    uint64_t h = 0xCBF29CE484222325ull;
-    const uint8_t *b = (const uint8_t *)&key;
-    uint32_t i, at;
     PsSpec *e;
+    int fresh;
 
     if (s_pss_on < 0) {
         const char *v = getenv("RECOMP_PS_SPEC");
@@ -1932,6 +2166,7 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
         s_pss_on = !(v && v[0] == '0') ? 1 + (v && v[0] == '2') : 0;
         if (s_pss_on) {
             InitializeCriticalSection(&s_pss_cs);
+            InitializeCriticalSection(&s_pss_fcs);
             InitializeConditionVariable(&s_pss_cv);
             if (want < 1) want = 1;
             if (want > 4) want = 4;
@@ -1947,6 +2182,8 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
             fprintf(stderr, "[GPU] d3d11: a pixel shader per combiner setup"
                     " (RECOMP_PS_SPEC=%d), %d compile thread%s%c", s_pss_on,
                     t, t == 1 ? "" : "s", 10);
+            if (s_pss_on)
+                ps_list_load();
         }
     }
     if (!s_pss_on || k->mode[0] != PATH_COMBINERS
@@ -1956,36 +2193,31 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
     if (last && !memcmp(&last->key, &key, sizeof key)) {
         e = last;
     } else {
-        for (i = 0; i < sizeof key; i++)
-            h = (h ^ b[i]) * 0x100000001B3ull;
-        e = NULL;
-        for (i = 0, at = (uint32_t)h % PS_SPEC_MAX; i < PS_SPEC_MAX;
-             i++, at = (at + 1) % PS_SPEC_MAX) {
-            if (s_pss[at].state == PS_EMPTY)
-                break;
-            if (s_pss[at].h == h && !memcmp(&s_pss[at].key, &key, sizeof key)) {
-                e = &s_pss[at];
-                break;
-            }
+        e = ps_find(&key, ps_hash(&key), 1, &fresh);
+        if (!e)
+            return NULL;
+        if (fresh) {
+            e->state = PS_QUEUED;       /* new: queued for a worker */
+            ps_queue(e);
         }
-        if (!e) {
-            /* New: queued for a worker; the table stays half empty at most
-             * so a probe always ends. */
-            if (i == PS_SPEC_MAX || s_pss_n >= PS_SPEC_MAX / 2)
-                return NULL;
-            e = &s_pss[at];
-            e->key = key;
-            e->h = h;
-            e->state = PS_QUEUED;
-            s_pss_n++;
-            EnterCriticalSection(&s_pss_cs);
-            s_pss_q[s_pss_qt++ % PS_SPEC_MAX] = at;
-            LeaveCriticalSection(&s_pss_cs);
-            WakeConditionVariable(&s_pss_cv);
+        if (!e->seen) {
+            e->seen = 1;
+            s_pss_seen++;
         }
         last = e;
     }
     if (e->state != PS_READY) {
+        if (e->state == PS_IDLE) {
+            /* Listed, not made yet: now. */
+            InterlockedExchange(&e->taken, 0);
+            InterlockedExchange(&e->state, PS_QUEUED);
+            e->bumped = 1;
+            ps_queue(e);
+        } else if (e->state == PS_QUEUED && e->listed && !e->bumped) {
+            /* Waiting among the setups loaded ahead: a draw's job too. */
+            e->bumped = 1;
+            ps_queue(e);
+        }
         s_pss_waits++;
         return NULL;
     }
@@ -1993,18 +2225,18 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
     return e->ps;
 }
 
-/* Combiner setups seen whose shader is not ready yet (queued or being
- * made or loaded); 0 with RECOMP_PS_SPEC off. compiled (may be NULL): how
- * many were compiled this run (not loaded from the cache). Any thread, a
- * moment's count: a title's shader pre-compile pass waits for 0 before it
- * moves on (Conker's --precompile-shaders). */
+/* Combiner setups drawn whose shader is not ready yet (queued or being
+ * made or loaded for a draw; the setups loaded ahead do not count); 0 with
+ * RECOMP_PS_SPEC off. compiled (may be NULL): how many were compiled this
+ * run (not loaded from the cache). Any thread, a moment's count: a title's
+ * shader pre-compile pass waits for 0 before it moves on (Conker's
+ * --precompile-shaders). */
 uint32_t nv2a_d3d11_ps_spec_pending(uint32_t *compiled)
 {
-    uint32_t done = (uint32_t)(s_pss_compiled + s_pss_loaded + s_pss_failed);
-    uint32_t seen = s_pss_n;
+    LONG busy = s_pss_busy;
     if (compiled)
         *compiled = (uint32_t)s_pss_compiled;
-    return seen > done ? seen - done : 0;
+    return busy > 0 ? (uint32_t)busy : 0;
 }
 
 /* The fixed pipeline objects. 0 when they cannot be made; batches are then
@@ -7176,10 +7408,12 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: combiner setups (RECOMP_PS_SPEC): %u"
                 " seen, %ld compiled, %ld from the cache, %ld failed, %.1f s"
                 " of compile threads; batches %llu with their own shader,"
-                " %llu with the one (theirs not ready)%c", s_pss_n,
+                " %llu with the one (theirs not ready); %u listed at the"
+                " start, %ld of them loaded ahead%c", s_pss_seen,
                 s_pss_compiled, s_pss_loaded, s_pss_failed,
                 (double)s_pss_us / 1e6, (unsigned long long)s_pss_draws,
-                (unsigned long long)s_pss_waits, 10);
+                (unsigned long long)s_pss_waits, s_pss_listed,
+                s_pss_pre_loaded, 10);
     if (s_stat.dof_drawn || s_stat.dof_skipped)
         fprintf(stderr, "[GPU] d3d11: host depth of field: %u drawn, %u not"
                 " (no surface, depth buffer or shaders)%c", s_stat.dof_drawn,

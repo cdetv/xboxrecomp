@@ -385,6 +385,47 @@ int main(int argc, char **argv)
               "default: an unconstrained request still does not reuse it", d);
     }
 
+#ifdef _WIN32
+    /* 8. A guest free that nothing owns leaves host memory alone. The bridge
+     * handed the guest slots to the host NtFreeVirtualMemory, which read the
+     * 32-bit guest address as a host pointer and VirtualFreed it. On Windows
+     * nothing lives at those low host addresses, so it always failed; under
+     * Wine they hold Wine's own heaps, and a guest free of 0x018B0000 released
+     * the heap at host 0x018B0000 (Conker under Proton: the next thread exit
+     * crashed in the heap's thread-detach). Here host memory sits at the
+     * guest address's number and must survive the guest's release. */
+    if (!ext) {
+        uint8_t *host = NULL;
+        uint32_t num = 0, st;
+        MEMORY_BASIC_INFORMATION mi;
+
+        /* Any host address below 4 GB the layout left free (the guest's own
+         * views take most of the low range here). */
+        for (num = 0x00100000u; num < 0xFFF00000u; num += 0x00100000u) {
+            if (xbox_HeapBlockSize(num))
+                continue;
+            host = (uint8_t *)VirtualAlloc((void *)(uintptr_t)num, 0x10000,
+                                           MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (host)
+                break;
+        }
+        if (!host) {
+            check(0, "host memory at a low guest-looking address", "none free");
+        } else {
+            *(uint32_t *)host = 0x5AFE5AFEu;
+            st = nt_release(num);
+            memset(&mi, 0, sizeof mi);
+            VirtualQuery(host, &mi, sizeof mi);
+            snprintf(d, sizeof d, "status 0x%08X, host 0x%08X state 0x%lX", st, num,
+                     (unsigned long)mi.State);
+            check(st == 0xC0000001u && mi.State == MEM_COMMIT &&
+                  *(volatile uint32_t *)host == 0x5AFE5AFEu,
+                  "a guest free nothing owns leaves host memory at that number", d);
+            VirtualFree(host, 0, MEM_RELEASE);
+        }
+    }
+#endif
+
     /* 4. Above the RAM mirrors: [0x74000000, 0x7FFE0000) at 64 MB. */
     {
         const uint32_t hi = 0x76000000u;
