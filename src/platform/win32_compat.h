@@ -66,6 +66,7 @@ extern "C" {
 #define PAGE_EXECUTE           0x10u
 #define PAGE_EXECUTE_READ      0x20u
 #define PAGE_EXECUTE_READWRITE 0x40u
+#define PAGE_GUARD             0x100u
 
 /* Code-page ids accepted by MultiByteToWideChar (only UTF8/ACP are honoured) */
 #define CP_ACP    0u
@@ -92,6 +93,15 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+LONG InterlockedOr(volatile LONG *Dest, LONG Value);
+LONG InterlockedAnd(volatile LONG *Dest, LONG Value);
+LONGLONG InterlockedExchange64(volatile LONGLONG *Target, LONGLONG Value);
+/* Spin-wait hint (x86 PAUSE); nothing on other CPUs. */
+#if defined(__x86_64__) || defined(__i386__)
+#define YieldProcessor() __builtin_ia32_pause()
+#else
+#define YieldProcessor() ((void)0)
+#endif
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -125,6 +135,10 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 /* fd-backed handle, used by the file-I/O HLE (kernel_file.c). Lets file
  * handles flow through the same CloseHandle path as every other object. */
 HANDLE      w32_open_handle(int fd, const char *host_path);
+/* Tell the shim that [base, base+len) is one PROT_NONE reservation the caller
+ * holds (the whole guest window): fixed-address VirtualAlloc / MapViewOfFileEx
+ * inside it take their slice out of it. len 0 forgets it. */
+void        w32_hold_span(void *base, size_t len);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
 
@@ -167,6 +181,12 @@ HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
+/* Linux: pthread_setaffinity_np on the thread; a new thread gets the
+ * process's mask. Elsewhere SetThreadAffinityMask does nothing and returns 0.
+ * GetProcessAffinityMask is the mask the process started with. */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
+BOOL   GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                              DWORD_PTR *system_mask);
 VOID   SwitchToThread(void);
 DWORD  QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data);
 
@@ -191,6 +211,11 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL   SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                         PTIMERAPCROUTINE completion, PVOID arg, BOOL resume);
 BOOL   CancelWaitableTimer(HANDLE h);
+#define TIMER_ALL_ACCESS 0x1F0003u
+/* POSIX: no high-resolution timer object; NULL makes callers use CreateWaitableTimerW. */
+static inline HANDLE CreateWaitableTimerExW(LPSECURITY_ATTRIBUTES sa, LPCWSTR name,
+                                            DWORD flags, DWORD access)
+{ (void)sa; (void)name; (void)flags; (void)access; return NULL; }
 
 /* ---- Heap ------------------------------------------------------------- */
 HANDLE GetProcessHeap(void);
@@ -261,6 +286,12 @@ BOOL   ReadFile(HANDLE h, LPVOID buf, DWORD len, LPDWORD nread, void *overlapped
 BOOL   WriteFile(HANDLE h, LPCVOID buf, DWORD len, LPDWORD nwritten, void *overlapped);
 DWORD  GetFileSize(HANDLE h, LPDWORD high);
 BOOL   GetFileSizeEx(HANDLE h, PLARGE_INTEGER size);
+#define INVALID_FILE_ATTRIBUTES ((DWORD)-1)
+DWORD  GetFileAttributesA(LPCSTR name);
+BOOL   CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa);
+BOOL   RemoveDirectoryA(LPCSTR path);
+BOOL   DeleteFileA(LPCSTR path);
+DWORD  GetTempPathA(DWORD buflen, LPSTR buf);
 BOOL   FlushFileBuffers(HANDLE h);
 
 /* ---- Keyboard + window helpers (stubs on POSIX) --------------------- */
@@ -388,6 +419,7 @@ int   WideCharToMultiByte(UINT cp, DWORD flags, LPCWSTR wide, int wideCount,
 #define ERROR_CALL_NOT_IMPLEMENTED    120u
 #define ERROR_INSUFFICIENT_BUFFER     122u
 #define ERROR_ALREADY_EXISTS          183u
+#define ERROR_DIR_NOT_EMPTY           145u
 #define ERROR_MORE_DATA               234u
 #define ERROR_NOT_OWNER               288u
 #define ERROR_MR_MID_NOT_FOUND        317u
@@ -579,6 +611,11 @@ static inline MMRESULT waveOutWrite(HWAVEOUT h, WAVEHDR *hdr, UINT sz)
 { (void)h;(void)hdr;(void)sz; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutReset(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
 static inline MMRESULT waveOutClose(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+static inline MMRESULT waveOutPause(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+static inline MMRESULT waveOutRestart(HWAVEOUT h) { (void)h; return MMSYSERR_NOERROR; }
+/* winmm timer resolution: nothing to do, Linux sleeps are not tick-bound. */
+static inline MMRESULT timeBeginPeriod(UINT ms) { (void)ms; return MMSYSERR_NOERROR; }
+static inline MMRESULT timeEndPeriod(UINT ms) { (void)ms; return MMSYSERR_NOERROR; }
 
 #ifdef __cplusplus
 }

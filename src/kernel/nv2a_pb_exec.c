@@ -1032,8 +1032,10 @@ static void tex_stage_method(uint32_t method, uint32_t param)
 #endif
 /* winmm: once the flip waits, the title's own short waits for the GPU
  * (Sleep-based) land on the 15.6 ms default tick and halve a 44 fps menu. */
+#ifdef _WIN32
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+#endif
 static void flip_pace(void)
 {
     static int on = -1;

@@ -2668,6 +2668,8 @@ static int host_range_free(uintptr_t lo, size_t size)
     while (p < hi) {
         if (!VirtualQuery((LPCVOID)p, &mbi, sizeof mbi) || mbi.State != MEM_FREE)
             return 0;
+        if (!mbi.RegionSize)        /* POSIX shim: a gap it can't size */
+            return 1;
         p = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return 1;
@@ -2807,6 +2809,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         }
 #ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
+        /* RECOMP_EXT_VMA: hold the whole 4 GB guest window, not just RAM and
+         * the mirrors (idea from upstream sp00nznet/xboxrecomp, Txukie's patch
+         * 0001). Linux maps top-down, so the host range right above the span
+         * is usually taken (libc, SDL): guest_vmem's fixed reservation there
+         * failed. The shim hands each fixed window's slice back as it is
+         * mapped (w32_hold_span). */
+        if (getenv("RECOMP_EXT_VMA") && g_span_size < GUEST_VMEM_TOP)
+            g_span_size = (size_t)1 << 32;
         g_span_base = want_base || g_memory_base ? NULL
                     : VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
@@ -2818,6 +2828,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 VirtualFree(g_span_base, g_span_size, MEM_RELEASE);
                 g_span_base = NULL;
                 g_span_size = 0;
+            } else if (g_span_size == ((size_t)1 << 32)) {
+                w32_hold_span(g_span_base, g_span_size);
             }
         }
 #endif

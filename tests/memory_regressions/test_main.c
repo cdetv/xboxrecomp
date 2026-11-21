@@ -61,6 +61,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) { (void)xbox_va; return NUL
 
 extern recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 extern RECOMP_TLS uint32_t g_eax, g_esp;
+extern int xbox_ContiguousFree(uint32_t addr);
 
 enum { S_ALLOC, S_FREE, S_QUERY, S_DPC, N_SLOTS };
 static const uint32_t ORD[N_SLOTS] = {
@@ -351,7 +352,6 @@ int main(int argc, char **argv)
 
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
-        extern int xbox_ContiguousFree(uint32_t addr);
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
 

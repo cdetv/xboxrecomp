@@ -18,6 +18,16 @@ if(WIN32)
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke
                      ${CMAKE_CURRENT_BINARY_DIR}/d3d8_smoke)
 else()
+    # POSIX: the OpenGL layer (SDL2 + libepoxy) only on request; a title
+    # that runs the pushbuffer executor (Conker) never calls it. Off: only
+    # the headers.
+    option(XBOXRECOMP_D3D8_GL "POSIX: build the OpenGL D3D8 layer (SDL2 + libepoxy)" OFF)
+    if(NOT XBOXRECOMP_D3D8_GL)
+        add_library(xbox_d3d8 INTERFACE)
+        target_include_directories(xbox_d3d8 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(xbox_d3d8 INTERFACE platform)
+        return()
+    endif()
     add_library(xbox_d3d8 STATIC
         d3d8_gl.c
     )
