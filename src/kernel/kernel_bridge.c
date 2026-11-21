@@ -1216,8 +1216,31 @@ static void bridge_NtFreeVirtualMemory(void)
         }
     }
 
-    g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
-        XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    /* Nothing else owns it: leave it allocated and say so, as the console
+     * would for an address it does not know. This used to hand the guest
+     * slots to xbox_NtFreeVirtualMemory, which reads the guest's 32-bit
+     * address as a host pointer and VirtualFrees it. On Windows nothing is
+     * mapped at those low host addresses, so the call always failed (err 487)
+     * and nothing happened. Under Wine the low host addresses hold Wine's own
+     * heaps: a guest free of 0x018B0000 released Wine's heap at 0x018B0000,
+     * and the next thread to exit crashed walking the heap list (Conker under
+     * Proton: every photo froze the game). The guest sees the same status as
+     * before: invalid parameter for a null address, else unsuccessful. */
+    if (!base_ptr || !BRIDGE_MEM32(base_ptr)) {
+        g_eax = 0xC000000Du; /* STATUS_INVALID_PARAMETER */
+        return;
+    }
+    if (size_ptr) {
+        static int logged;
+        if (logged < 8) {
+            logged++;
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
+                     "NtFreeVirtualMemory: guest 0x%08X (type 0x%X) not freed: "
+                     "not from the guest heap or a guest mapping",
+                     BRIDGE_MEM32(base_ptr), free_type);
+        }
+    }
+    g_eax = 0xC0000001u; /* STATUS_UNSUCCESSFUL */
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -2937,6 +2960,7 @@ static volatile int g_w1c_inside;  /* only that thread ever sets it */
 #define W1C_REG ((volatile uint32_t *)((uintptr_t)(XBOX_NV2A_REG_BASE \
                     + NV2A_PGRAPH_INTR) + (uintptr_t)g_xbox_mem_offset))
 
+#ifdef _WIN32
 /* A data breakpoint traps after the write, so the value before it is the one
  * kept in g_w1c_value; nothing else writes the register during a delivery
  * (the ack thread leaves it alone, nv2a_handshake_pass). */
@@ -2980,6 +3004,15 @@ static int pgraph_w1c_install(HANDLE thread, DWORD tid)
     AddVectoredExceptionHandler(1, pgraph_w1c_veh);
     return 1;
 }
+#else
+/* POSIX: no DR0 breakpoint (no Get/SetThreadContext); returns 0 = not set.
+ * The title's handler override acknowledges instead, RECOMP_PGRAPH_NO_DR0. */
+static int pgraph_w1c_install(HANDLE thread, DWORD tid)
+{
+    (void)thread; (void)tid;
+    return 0;
+}
+#endif
 
 /* After the registers are raised, before the ISR runs; off again before
  * they are cleared, so neither of our own writes is taken as D3D's. */
@@ -3252,8 +3285,17 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
                                     CREATE_SUSPENDED, &tid);
             if (h) {
                 /* Before it runs: PGRAPH_INTR's write breakpoint is this
-                 * thread's alone (pgraph_w1c_veh). */
-                if (swm_codes() && !pgraph_w1c_install(h, tid)) {
+                 * thread's alone (pgraph_w1c_veh). RECOMP_PGRAPH_NO_DR0=1:
+                 * none; the title clears the acknowledged bits itself (an
+                 * override of D3D's handler), so no debug exception per
+                 * trap -- each costs two wineserver / ptrace round trips
+                 * under Wine. */
+                const char *no_dr0 = getenv("RECOMP_PGRAPH_NO_DR0");
+                if (swm_codes() && no_dr0 && *no_dr0) {
+                    fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
+                            " on PGRAPH_INTR (RECOMP_PGRAPH_NO_DR0: the title"
+                            " acknowledges)\n");
+                } else if (swm_codes() && !pgraph_w1c_install(h, tid)) {
                     fprintf(stderr, "  [KERNEL] timer thread: no write breakpoint"
                             " on PGRAPH_INTR (error %lu); a PGRAPH trap may be"
                             " handled twice\n", GetLastError());
@@ -4599,7 +4641,11 @@ static void bridge_NtDeviceIoControlFile(void)
             g_eax = 0xC0000023u;
             return;
         }
+#ifdef _WIN32
         size.QuadPart = (LONGLONG)xbox_PartitionHandleBytes(h);
+#else
+        size.QuadPart = 0;     /* POSIX: no partition images yet, file size below */
+#endif
         if (!size.QuadPart && h && h != INVALID_HANDLE_VALUE)
             GetFileSizeEx(h, &size);
         BRIDGE_MEM32(out_va +  0) = 0;                       /* StartingOffset */

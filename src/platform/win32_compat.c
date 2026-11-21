@@ -74,6 +74,12 @@ PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp
     return cmp;
 }
 
+/* Like the Win32 ones, these return the value before the operation. */
+LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v)
+{ return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+
 /* ===================================================================== */
 /* Critical sections (recursive pthread mutex)                           */
 /* ===================================================================== */
@@ -305,6 +311,8 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+
+    struct w32_object *reg_next;   /* live-object registry chain */
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -327,6 +335,42 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Registry of live objects. A HANDLE here is the object's address, so a value
+ * that is not one (a guest address, a stale pointer) would be dereferenced;
+ * Windows rejects it with ERROR_INVALID_HANDLE instead, and so does obj_check. */
+#define W32_REG_BUCKETS 256
+static w32_object     *s_reg[W32_REG_BUCKETS];
+static pthread_mutex_t s_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+#define REG_SLOT(p) (((uintptr_t)(p) >> 4) % W32_REG_BUCKETS)
+
+static void reg_add(w32_object *o)
+{
+    pthread_mutex_lock(&s_reg_lock);
+    o->reg_next = s_reg[REG_SLOT(o)];
+    s_reg[REG_SLOT(o)] = o;
+    pthread_mutex_unlock(&s_reg_lock);
+}
+
+static void reg_remove(w32_object *o)
+{
+    pthread_mutex_lock(&s_reg_lock);
+    for (w32_object **pp = &s_reg[REG_SLOT(o)]; *pp; pp = &(*pp)->reg_next)
+        if (*pp == o) { *pp = o->reg_next; break; }
+    pthread_mutex_unlock(&s_reg_lock);
+}
+
+static w32_object *obj_check(HANDLE h)
+{
+    w32_object *found = NULL;
+    if (!h) return NULL;
+    pthread_mutex_lock(&s_reg_lock);
+    for (w32_object *o = s_reg[REG_SLOT(h)]; o; o = o->reg_next)
+        if ((HANDLE)o == h) { found = o; break; }
+    pthread_mutex_unlock(&s_reg_lock);
+    if (!found) SetLastError(ERROR_INVALID_HANDLE);
+    return found;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -335,6 +379,7 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    reg_add(o);
     return o;
 }
 
@@ -342,6 +387,7 @@ static void obj_release(w32_object *o)
 {
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
+    reg_remove(o);
     if (o->kind == K_FILE) {
         if (o->fd >= 0) close(o->fd);
         free(o->file_path);
@@ -367,13 +413,13 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
@@ -382,7 +428,9 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    w32_object *o = obj_check(h);
+    if (!o) return FALSE;
+    obj_release(o);
     return TRUE;
 }
 
@@ -394,7 +442,8 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = obj_check(src);
+    if (!o) return FALSE;
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -514,7 +563,9 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    w32_object *o = obj_check(h);
+    if (!o) return WAIT_FAILED;
+    return wait_single(o, ms);
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -586,7 +637,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -597,7 +648,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -607,7 +658,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -637,7 +688,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -667,7 +718,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -691,11 +742,55 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* The mask the process started with, captured from the first thread that
+ * asks, before any pin: sched_getaffinity(0) answers for the calling thread.
+ * From sp00nznet/xboxrecomp v0.17 (MIT). */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* A new thread gets the process's mask, as on Win32, not its creator's
+     * (which may have pinned itself). */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -764,7 +859,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -774,7 +869,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -788,7 +883,7 @@ DWORD SuspendThread(HANDLE h)
 {
     /* True mid-run suspension is not supported on POSIX; only the
      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -799,7 +894,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -813,22 +908,64 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+/* From sp00nznet/xboxrecomp v0.17 (MIT). Linux: pthread_setaffinity_np;
+ * elsewhere there is no thread affinity and the call returns 0 (failure). */
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(h);
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    return 0;
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_check(thread);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -923,7 +1060,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_check(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_due    = dueTime;
     o->timer_period = period;
@@ -933,7 +1070,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_check(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_cancel = 1;
     if (completionEvent) SetEvent(completionEvent);
@@ -980,7 +1117,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     (void)completion; (void)arg; (void)resume;
     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
     pthread_mutex_lock(&o->lock);
@@ -1012,7 +1149,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_check(h);
     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
@@ -1124,6 +1261,14 @@ static void *mach_map_fixed(void *address, size_t size, int prot)
 void view_register(void *addr, size_t len);
 size_t view_take(const void *addr);
 
+/* The layout can hold the whole 4 GB guest window as one PROT_NONE span (see
+ * w32_hold_span). A fixed-address request inside it then finds its own span
+ * in the way: this hands that slice back first, unless something else was
+ * mapped there since (then the request fails, as on Windows). */
+static void  *s_span_base;
+static size_t s_span_len;
+static void span_take(void *addr, size_t size);
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -1137,6 +1282,7 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
         /* fall through to a fresh mapping */
     }
 
+    if (address) span_take(address, size);
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
 #endif
@@ -1178,6 +1324,8 @@ BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
          * silent no-op: the caller believed the address was free, the next
          * allocation there failed, and nothing connected the two. */
         size_t len = view_take(address);
+        if (s_span_len && address == s_span_base && size >= s_span_len)
+            s_span_len = 0;   /* the whole span goes: nothing left to hand out */
         if (size == 0) size = len;
         if (size == 0) return FALSE;
         return munmap(address, size) == 0;
@@ -1415,6 +1563,88 @@ BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
     return TRUE;
 }
 
+/* Plain stat() on the path as given; only the directory / readonly bits. */
+DWORD GetFileAttributesA(LPCSTR name)
+{
+    struct stat st;
+    DWORD a = 0;
+    if (!name || stat(name, &st) != 0) { SetLastError(ERROR_FILE_NOT_FOUND); return INVALID_FILE_ATTRIBUTES; }
+    if (S_ISDIR(st.st_mode)) a |= FILE_ATTRIBUTE_DIRECTORY;
+    if (!(st.st_mode & S_IWUSR)) a |= FILE_ATTRIBUTE_READONLY;
+    return a ? a : FILE_ATTRIBUTE_NORMAL;
+}
+
+/* Directory, delete and temp-path calls, from sp00nznet/xboxrecomp v0.17
+ * (MIT). Win32 accepts either separator, so paths go through
+ * xbox_path_normalize first. */
+static DWORD w32_error_from_errno(int e)
+{
+    switch (e) {
+    case ENOENT:    return ERROR_FILE_NOT_FOUND;
+    case EEXIST:    return ERROR_ALREADY_EXISTS;
+    case EACCES:
+    case EPERM:     return ERROR_ACCESS_DENIED;
+    case ENOTDIR:   return ERROR_PATH_NOT_FOUND;
+    case ENOTEMPTY: return ERROR_DIR_NOT_EMPTY;
+    default:        return ERROR_GEN_FAILURE;
+    }
+}
+
+static const char *norm_path(const char *in, char *buf, size_t n)
+{
+    snprintf(buf, n, "%s", in);
+    xbox_path_normalize(buf);
+    return buf;
+}
+
+BOOL CreateDirectoryA(LPCSTR path, LPSECURITY_ATTRIBUTES sa)
+{
+    char norm[1024];
+    (void)sa;
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (mkdir(norm_path(path, norm, sizeof norm), 0777) == 0)
+        return TRUE;
+    /* Win32 reports an existing directory as a failure with this code, and
+     * callers test for it. */
+    SetLastError(errno == EEXIST ? ERROR_ALREADY_EXISTS
+                                 : w32_error_from_errno(errno));
+    return FALSE;
+}
+
+BOOL RemoveDirectoryA(LPCSTR path)
+{
+    char norm[1024];
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (rmdir(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+
+BOOL DeleteFileA(LPCSTR path)
+{
+    char norm[1024];
+    if (!path) { SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (unlink(norm_path(path, norm, sizeof norm)) == 0) return TRUE;
+    SetLastError(w32_error_from_errno(errno));
+    return FALSE;
+}
+
+/* Win32 returns the length written and guarantees a trailing separator. */
+DWORD GetTempPathA(DWORD buflen, LPSTR buf)
+{
+    const char *tmp = getenv("TMPDIR");
+    size_t n;
+
+    if (!tmp || !*tmp) tmp = "/tmp";
+    n = strlen(tmp);
+    if (!buf || buflen < n + 2)
+        return (DWORD)(n + 2);          /* needed size, including the '/' */
+    memcpy(buf, tmp, n);
+    if (n && buf[n - 1] != '/') buf[n++] = '/';
+    buf[n] = 0;
+    return (DWORD)n;
+}
+
 BOOL FlushFileBuffers(HANDLE h)
 {
     int fd = w32_handle_fd(h);
@@ -1591,6 +1821,30 @@ size_t view_take(const void *addr)
     return len;
 }
 
+void w32_hold_span(void *base, size_t len)
+{
+    s_span_base = base;
+    s_span_len  = len;
+}
+
+static void span_take(void *addr, size_t size)
+{
+    uintptr_t a = (uintptr_t)addr, lo = (uintptr_t)s_span_base;
+    int busy = 0;
+
+    if (!s_span_len || a < lo || a + size > lo + s_span_len)
+        return;
+    size = (size + 4095) & ~(size_t)4095;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t v = (uintptr_t)s_views[i].addr;
+        if (v && v < a + size && a < v + s_views[i].len) { busy = 1; break; }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    if (!busy)
+        munmap(addr, size);
+}
+
 /* An unnamed file descriptor that ftruncate and mmap both accept. Linux has
  * memfd_create for this; elsewhere an immediately-unlinked temp file does. */
 static int anon_map_fd(const char *name)
@@ -1640,7 +1894,7 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = obj_check(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
     off_t  off = ((off_t)offHigh << 32) | offLow;
@@ -1655,6 +1909,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
      * difference is the process quietly destroying its own libraries and heap
      * and dying somewhere unrelated a moment later. */
     if (baseAddr) {
+        span_take(baseAddr, len);
 #if defined(MAP_FIXED_NOREPLACE)
         flags |= MAP_FIXED_NOREPLACE;
 #elif defined(__APPLE__)

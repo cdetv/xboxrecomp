@@ -54,6 +54,12 @@ static size_t host_free_run(uintptr_t host, size_t limit)
         MEMORY_BASIC_INFORMATION mbi;
         if (!VirtualQuery((void *)cur, &mbi, sizeof mbi) || mbi.State != MEM_FREE)
             break;
+        /* The POSIX VirtualQuery knows only what it mapped itself: elsewhere it
+         * says MEM_FREE with RegionSize 0, and this loop never moved on (the
+         * memory_regressions ext_vma test spun for good on Linux). Take the
+         * rest as free; the reservation that follows decides. */
+        if (!mbi.RegionSize)
+            return limit;
         cur = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
     }
     return cur - host < limit ? cur - host : limit;
