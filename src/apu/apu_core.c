@@ -91,6 +91,67 @@ static volatile LONG g_host_paused = 0;
 struct ApuProfile g_apu_prof;
 int g_apu_prof_on;
 
+/* ============================================================
+ * Output pacing (RECOMP_APU_PACE=1; Conker 0.4.0 Linux Findings 28)
+ *
+ * throttle() keeps the wall clock and the sound device keeps its own; the
+ * two differ by a few hundred ppm and wander, so XAudio2's queue drifts
+ * until it runs dry (a gap) or overflows (a dropped buffer), and nothing
+ * steered it back. With the switch on, the queue may hold 6 buffers and
+ * the frame time is nudged by up to PACE_MAX_PPM so that the depth found at
+ * a submit averages PACE_AIM: about one buffer more cushion than before
+ * (~21 ms more latency). The nudge moves the queue by at most ~96 samples a
+ * second, so it settles in ~10 s and no sample is played faster or slower.
+ * ============================================================ */
+#define PACE_AIM       2.0      /* buffers queued at a submit, on average */
+#define PACE_GAIN_PPM  2000.0   /* nudge per buffer away from the aim */
+#define PACE_MAX_PPM   2000.0   /* 0.2 %: the most the frame time moves */
+#define PACE_AVG_K     (1.0 / 128.0)            /* ~2.7 s of submits */
+#define PACE_FRAME_US  (256.0 * 1e6 / 48000.0)  /* EP_FRAME_US unrounded */
+
+static int    g_apu_pace = -1;     /* -1: not read yet */
+static double g_pace_avg = -1.0;   /* depth average; < 0: no submit yet */
+static double g_pace_ppm;          /* + = longer frames (slower) */
+static double g_pace_frac_us;      /* throttle's part of a microsecond */
+
+static int apu_pace_on(void)
+{
+    if (g_apu_pace < 0) {
+        const char *e = getenv("RECOMP_APU_PACE");
+        g_apu_pace = e && atoi(e) != 0;
+        if (g_apu_pace)
+            fprintf(stderr, "[APU] output pacing on (RECOMP_APU_PACE): queue"
+                    " up to 6 buffers, depth at a submit held at %.1f by up"
+                    " to %.1f %% on the frame time\n", PACE_AIM,
+                    PACE_MAX_PPM / 1e4);
+    }
+    return g_apu_pace;
+}
+
+/* A submit found q buffers queued. */
+static void pace_update(int q)
+{
+    double ppm;
+
+    if (g_pace_avg < 0.0)
+        g_pace_avg = (double)q;
+    else
+        g_pace_avg += ((double)q - g_pace_avg) * PACE_AVG_K;
+    ppm = (g_pace_avg - PACE_AIM) * PACE_GAIN_PPM;
+    if (ppm > PACE_MAX_PPM)
+        ppm = PACE_MAX_PPM;
+    if (ppm < -PACE_MAX_PPM)
+        ppm = -PACE_MAX_PPM;
+    g_pace_ppm = ppm;
+    if (g_apu_prof_on) {
+        if (!g_apu_prof.pace_seen || ppm < g_apu_prof.pace_ppm_min)
+            g_apu_prof.pace_ppm_min = ppm;
+        if (!g_apu_prof.pace_seen || ppm > g_apu_prof.pace_ppm_max)
+            g_apu_prof.pace_ppm_max = ppm;
+        g_apu_prof.pace_seen++;
+    }
+}
+
 static double prof_now_ms(void)
 {
     static LARGE_INTEGER freq;
@@ -155,12 +216,30 @@ static void prof_report(void)
                 p->throttle_lost_ms, p->t_gate, p->max_gate, p->gate_busy,
                 p->t_relock, p->max_relock, p->max_loop, p->trap_waits,
                 p->t_trap, p->max_trap, p->trap_timeouts);
-        fprintf(stderr, "  [APUPROF] xa2 queue at submit 0:%lu 1:%lu 2:%lu 3:%lu"
-                " | played between submits min %llu max %llu samples (%lu)"
-                " | longest gap between submits %.1f ms\n",
-                p->xa2_depth[0], p->xa2_depth[1], p->xa2_depth[2],
-                p->xa2_depth[3], p->xa2_bite_min, p->xa2_bite_max,
-                p->xa2_bites, p->xa2_gap_max);
+        {
+            /* 0..the most the queue may hold (3, or 6 with pacing). */
+            char depth[7 * 24] = "";
+            size_t dl = 0;
+            int top = xa2_max_buffers();
+            if (top < 3)
+                top = 3;
+            if (top > 6)
+                top = 6;
+            for (int i = 0; i <= top && dl < sizeof(depth); i++)
+                dl += (size_t)snprintf(depth + dl, sizeof(depth) - dl,
+                                       "%s%d:%lu", i ? " " : "", i,
+                                       p->xa2_depth[i]);
+            fprintf(stderr, "  [APUPROF] xa2 queue at submit %s"
+                    " | played between submits min %llu max %llu samples"
+                    " (%lu) | longest gap between submits %.1f ms\n",
+                    depth, p->xa2_bite_min, p->xa2_bite_max,
+                    p->xa2_bites, p->xa2_gap_max);
+        }
+        if (apu_pace_on() && p->pace_seen)
+            fprintf(stderr, "  [APUPROF] pace: depth average %.2f (aim %.1f)"
+                    " | frame time %+.0f ppm now, %+.0f to %+.0f in this"
+                    " report\n", g_pace_avg, PACE_AIM, g_pace_ppm,
+                    p->pace_ppm_min, p->pace_ppm_max);
         double n = p->mix_samples ? (double)p->mix_samples : 1.0;
         double rl = sqrt(p->mix_l2 / n), rr = sqrt(p->mix_r2 / n);
         fprintf(stderr, "  [APUPROF] mix: %lu of %lu samples clipped, peak %.2f"
@@ -501,6 +580,8 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_high = 3072;
 
     /* Try XAudio2 first (lower latency) */
+    if (apu_pace_on())
+        xa2_set_max_buffers(6);
     if (xa2_init()) {
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
         return;
@@ -726,19 +807,23 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                n * 2 * sizeof(int16_t));
         g_xa2_stage_fill += n;
         if (g_xa2_stage_fill >= buf_size) {
+            unsigned long long played = 0;
+            int q = -1;
+            if (g_apu_prof_on || apu_pace_on())
+                q = xa2_queue_probe(&played);
+            if (q >= 0 && apu_pace_on())
+                pace_update(q);
             if (g_apu_prof_on) {
                 /* How far ahead of XAudio2 we are, how much it played since
                  * the last submit and how long that took (Proton's starving:
                  * we keep time, so who runs dry?). */
                 static unsigned long long last_played;
                 static double last_t;
-                unsigned long long played;
                 double t = prof_now_ms();
-                int q = xa2_queue_probe(&played);
                 if (q == 0)
                     g_apu_prof.xa2_starved++;
                 if (q >= 0)
-                    g_apu_prof.xa2_depth[q > 3 ? 3 : q]++;
+                    g_apu_prof.xa2_depth[q > 6 ? 6 : q]++;
                 if (q >= 0 && last_t > 0.0 && played >= last_played) {
                     unsigned long long bite = played - last_played;
                     if (!g_apu_prof.xa2_bites || bite < g_apu_prof.xa2_bite_min)
@@ -831,7 +916,17 @@ static void throttle(MCPXAPUState *d)
             break;
         }
     }
-    d->next_frame_time_us += EP_FRAME_US;
+    if (apu_pace_on()) {
+        /* The unrounded frame time (EP_FRAME_US is 62.5 ppm short), nudged
+         * to hold XAudio2's queue (pace_update). */
+        int64_t whole;
+        g_pace_frac_us += PACE_FRAME_US * (1.0 + g_pace_ppm * 1e-6);
+        whole = (int64_t)g_pace_frac_us;
+        g_pace_frac_us -= (double)whole;
+        d->next_frame_time_us += whole;
+    } else {
+        d->next_frame_time_us += EP_FRAME_US;
+    }
     if (g_apu_prof_on) g_apu_prof.t_wait += prof_now_ms() - t0;
 
     d->sleep_acc_us += (int)(qemu_clock_get_us(QEMU_CLOCK_REALTIME) - now_us);
