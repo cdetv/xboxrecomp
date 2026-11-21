@@ -27,12 +27,14 @@
 #define XA2_SAMPLE_RATE   48000
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
-#define XA2_NUM_BUFS      3
+#define XA2_NUM_BUFS      3      /* queued at most, by default */
+#define XA2_MAX_BUFS      6      /* output pacing (apu_core.c): xa2_set_max_buffers */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
 static IXAudio2SourceVoice    *g_xa2_source = NULL;
-static int16_t                 g_xa2_bufs[XA2_NUM_BUFS][XA2_BUF_SAMPLES][2];
+static int16_t                 g_xa2_bufs[XA2_MAX_BUFS][XA2_BUF_SAMPLES][2];
+static int                     g_xa2_num_bufs = XA2_NUM_BUFS;
 static int                     g_xa2_next_buf = 0;
 static int                     g_xa2_initialized = 0;
 static int                     g_xa2_frames_written = 0;
@@ -43,7 +45,8 @@ static int                     g_xa2_frames_written = 0;
  * (r-linux-proton.md R5a). Windows' XAudio2 stops the same way on a device
  * change. Our queue then stays full; after XA2_STALL_MS of that (not
  * paused) the engine and voices are made again on the default device. The
- * whole queue is ~64 ms, so a draining output is never full that long.
+ * whole queue is ~128 ms (~64 ms with RECOMP_APU_PACE=0: 3 buffers), so a
+ * draining output is never full that long.
  * RECOMP_XA2_STALL_TEST=<s>: stop the voice <s> seconds after the start,
  * as a lost device would, to try it. */
 #define XA2_STALL_MS      500
@@ -149,7 +152,7 @@ int xa2_init(void)
     g_xa2_started = GetTickCount64();
 
     fprintf(stderr, "[XA2] XAudio2 initialized (%d Hz stereo 16-bit, %d x %d-sample buffers)\n",
-            XA2_SAMPLE_RATE, XA2_NUM_BUFS, XA2_BUF_SAMPLES);
+            XA2_SAMPLE_RATE, g_xa2_num_bufs, XA2_BUF_SAMPLES);
     return 1;
 
 fail:
@@ -254,7 +257,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
     }
 
     IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-    if ((int)state.BuffersQueued >= XA2_NUM_BUFS) {
+    if ((int)state.BuffersQueued >= g_xa2_num_bufs) {
         if (g_xa2_paused)
             g_xa2_full_since = 0;
         else if (!g_xa2_full_since)
@@ -280,7 +283,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
         return 0;
     }
 
-    g_xa2_next_buf = (idx + 1) % XA2_NUM_BUFS;
+    g_xa2_next_buf = (idx + 1) % g_xa2_num_bufs;
     g_xa2_frames_written++;
     ReleaseSRWLockExclusive(&g_xa2_lock);
     return 1;
@@ -289,6 +292,20 @@ int xa2_submit_samples(const int16_t *samples, int num_samples)
 int xa2_get_buffer_size(void)
 {
     return XA2_BUF_SAMPLES;
+}
+
+/* Before xa2_init only: the rotation through g_xa2_bufs assumes the count
+ * stays put while buffers are queued. */
+void xa2_set_max_buffers(int n)
+{
+    if (g_xa2_initialized)
+        return;
+    g_xa2_num_bufs = n < 2 ? 2 : n > XA2_MAX_BUFS ? XA2_MAX_BUFS : n;
+}
+
+int xa2_max_buffers(void)
+{
+    return g_xa2_num_bufs;
 }
 
 int xa2_queued_buffers(void)
@@ -300,6 +317,22 @@ int xa2_queued_buffers(void)
     if (g_xa2_initialized && g_xa2_source) {
         IXAudio2SourceVoice_GetState(g_xa2_source, &state, XAUDIO2_VOICE_NOSAMPLESPLAYED);
         n = (int)state.BuffersQueued;
+    }
+    ReleaseSRWLockExclusive(&g_xa2_lock);
+    return n;
+}
+
+int xa2_queue_probe(unsigned long long *played)
+{
+    XAUDIO2_VOICE_STATE state;
+    int n = -1;
+
+    *played = 0;
+    AcquireSRWLockExclusive(&g_xa2_lock);
+    if (g_xa2_initialized && g_xa2_source) {
+        IXAudio2SourceVoice_GetState(g_xa2_source, &state, 0);
+        n = (int)state.BuffersQueued;
+        *played = (unsigned long long)state.SamplesPlayed;
     }
     ReleaseSRWLockExclusive(&g_xa2_lock);
     return n;
@@ -326,6 +359,8 @@ void xa2_shutdown(void)                               {}
 int  xa2_is_active(void)                              { return 0; }
 int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
 int  xa2_get_buffer_size(void)                        { return 0; }
+void xa2_set_max_buffers(int n)                       { (void)n; }
+int  xa2_max_buffers(void)                            { return 0; }
 int  xa2_queued_buffers(void)                         { return -1; }
 void xa2_set_paused(int on)                           { (void)on; }
 

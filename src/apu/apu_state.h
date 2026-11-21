@@ -574,6 +574,18 @@ struct ApuProfile {
      * the frame thread woke too late to catch up and gave the time up. */
     unsigned long xa2_starved, xa2_dropped, throttle_resets;
     double throttle_lost_ms;
+    /* The queue's depth at each submit (0-6 buffers; more = 6), the samples
+     * XAudio2 played between two submits (1024 = in step with us; Proton's
+     * starving, Conker 0.4.0 Linux Findings 11), and the longest wall time
+     * between two submits (xa2_bites = submits measured). */
+    unsigned long xa2_depth[7];
+    unsigned long long xa2_bite_min, xa2_bite_max;
+    unsigned long xa2_bites;
+    double xa2_gap_max;
+    /* Output pacing: the frame time's nudge (ppm, + = longer frames)
+     * seen in this report (pace_seen = submits it was set at). */
+    double pace_ppm_min, pace_ppm_max;
+    unsigned long pace_seen;
     /* Where the frame thread blocks: the ISR gate, retaking d->lock from
      * guest threads, and the longest gap between two loops. */
     double t_gate, max_gate, t_relock, max_relock, max_loop;
