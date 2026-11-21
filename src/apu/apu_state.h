@@ -582,7 +582,7 @@ struct ApuProfile {
     unsigned long long xa2_bite_min, xa2_bite_max;
     unsigned long xa2_bites;
     double xa2_gap_max;
-    /* RECOMP_APU_PACE: the frame time's nudge (ppm, + = longer frames)
+    /* Output pacing: the frame time's nudge (ppm, + = longer frames)
      * seen in this report (pace_seen = submits it was set at). */
     double pace_ppm_min, pace_ppm_max;
     unsigned long pace_seen;

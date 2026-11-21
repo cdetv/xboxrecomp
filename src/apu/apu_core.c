@@ -92,12 +92,14 @@ struct ApuProfile g_apu_prof;
 int g_apu_prof_on;
 
 /* ============================================================
- * Output pacing (RECOMP_APU_PACE=1; Conker 0.4.0 Linux Findings 28)
+ * Output pacing (on; RECOMP_APU_PACE=0 = off, the old wall-clock pacing;
+ * Conker 0.4.0 Linux Findings 28-30)
  *
  * throttle() keeps the wall clock and the sound device keeps its own; the
  * two differ by a few hundred ppm and wander, so XAudio2's queue drifts
  * until it runs dry (a gap) or overflows (a dropped buffer), and nothing
- * steered it back. With the switch on, the queue may hold 6 buffers and
+ * steered it back (Windows and Proton alike: one buffer of cushion at
+ * almost every submit). With pacing on, the queue may hold 6 buffers and
  * the frame time is nudged by up to PACE_MAX_PPM so that the depth found at
  * a submit averages PACE_AIM: about one buffer more cushion than before
  * (~21 ms more latency). The nudge moves the queue by at most ~96 samples a
@@ -118,12 +120,15 @@ static int apu_pace_on(void)
 {
     if (g_apu_pace < 0) {
         const char *e = getenv("RECOMP_APU_PACE");
-        g_apu_pace = e && atoi(e) != 0;
+        g_apu_pace = !(e && *e && atoi(e) == 0);
         if (g_apu_pace)
-            fprintf(stderr, "[APU] output pacing on (RECOMP_APU_PACE): queue"
-                    " up to 6 buffers, depth at a submit held at %.1f by up"
-                    " to %.1f %% on the frame time\n", PACE_AIM,
+            fprintf(stderr, "[APU] output pacing on: queue up to 6 buffers,"
+                    " depth at a submit held at %.1f by up to %.1f %% on the"
+                    " frame time (RECOMP_APU_PACE=0 = off)\n", PACE_AIM,
                     PACE_MAX_PPM / 1e4);
+        else
+            fprintf(stderr, "[APU] output pacing off (RECOMP_APU_PACE=0):"
+                    " 3 buffers, wall-clock frame time\n");
     }
     return g_apu_pace;
 }

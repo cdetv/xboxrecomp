@@ -20,7 +20,7 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
-/* How many buffers may be queued at most (3 by default; RECOMP_APU_PACE
+/* How many buffers may be queued at most (3 unless set; output pacing
  * asks for 6). Set before xa2_init; ignored once it is up. */
 void xa2_set_max_buffers(int n);
 int xa2_max_buffers(void);

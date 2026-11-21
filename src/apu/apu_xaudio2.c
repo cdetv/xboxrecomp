@@ -28,7 +28,7 @@
 #define XA2_CHANNELS      2
 #define XA2_BUF_SAMPLES   1024   /* ~21ms per submission */
 #define XA2_NUM_BUFS      3      /* queued at most, by default */
-#define XA2_MAX_BUFS      6      /* RECOMP_APU_PACE: xa2_set_max_buffers */
+#define XA2_MAX_BUFS      6      /* output pacing (apu_core.c): xa2_set_max_buffers */
 
 static IXAudio2               *g_xa2 = NULL;
 static IXAudio2MasteringVoice *g_xa2_master = NULL;
@@ -45,7 +45,7 @@ static int                     g_xa2_frames_written = 0;
  * (r-linux-proton.md R5a). Windows' XAudio2 stops the same way on a device
  * change. Our queue then stays full; after XA2_STALL_MS of that (not
  * paused) the engine and voices are made again on the default device. The
- * whole queue is ~64 ms (~128 ms with RECOMP_APU_PACE's 6 buffers), so a
+ * whole queue is ~128 ms (~64 ms with RECOMP_APU_PACE=0: 3 buffers), so a
  * draining output is never full that long.
  * RECOMP_XA2_STALL_TEST=<s>: stop the voice <s> seconds after the start,
  * as a lost device would, to try it. */
