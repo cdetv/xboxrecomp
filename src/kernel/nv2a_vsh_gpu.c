@@ -798,30 +798,34 @@ static ID3D11VertexShader *disk_add(uint64_t key, ID3D11VertexShader *vs,
 
 /* RECOMP_SHADER_CACHE_TOUCH=1 (a title's shader pre-compile pass): a cache
  * file a level actually uses -- found by a scan, loaded for a draw, drawn
- * from the startup load -- gets its write time set to now, so the pass can
- * tell what nothing used (older than its start) and delete it. The startup
- * loader, which reads every file, touches nothing. Off: files are never
- * written to after their compile. */
-void nv2a_vsh_gpu_cache_touch(const char *path)
+ * from the startup load -- or a combiner setup's file listed in
+ * ps_setups.bin (drawn in an earlier run, nv2a_draw_d3d11.c ps_list_load)
+ * gets its write time set to now, so the pass can tell what nothing used
+ * (older than its start) and delete it. The startup loader, which reads
+ * every file, touches nothing. Off: files are never written to after their
+ * compile. Returns 1 when the file was there and got the time. */
+int nv2a_vsh_gpu_cache_touch(const char *path)
 {
     static int on = -1;
     HANDLE h;
     FILETIME now;
+    BOOL ok;
 
     if (on < 0) {
         const char *e = getenv("RECOMP_SHADER_CACHE_TOUCH");
         on = e && atoi(e) != 0;
     }
     if (!on || !path || !path[0])
-        return;
+        return 0;
     h = CreateFileA(path, FILE_WRITE_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
-        return;
+        return 0;
     GetSystemTimeAsFileTime(&now);
-    SetFileTime(h, NULL, NULL, &now);
+    ok = SetFileTime(h, NULL, NULL, &now);
     CloseHandle(h);
+    return ok ? 1 : 0;
 }
 
 static void cache_touch(uint64_t key)
