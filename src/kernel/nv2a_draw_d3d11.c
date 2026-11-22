@@ -1700,20 +1700,19 @@ static ID3D11SamplerState *s_bsamp;
  * that long, so nothing is shown (Conker's boot loading screen never
  * appeared, 2026-10-30). The bytecode is kept beside the vertex-program
  * shaders (RECOMP_VSH_GPU_CACHE) as <key>.cso, key = hash of the source,
- * entry, target and flags, so it compiles once per machine. Unset: no cache. */
-static FILE *shader_file(const char *src, const char *entry,
-                         const char *target, const char *mode, char *path,
-                         size_t cap)
+ * entry, target and flags, so it compiles once per machine. Unset: no cache.
+ * shader_path: that file's name (0 without a cache); shader_file opens it. */
+static int shader_path(const char *src, const char *entry,
+                       const char *target, char *path, size_t cap)
 {
     const char *dir = getenv("RECOMP_VSH_GPU_CACHE");
     uint64_t h = 0xCBF29CE484222325ull;
     const char *parts[3];
     size_t i, n;
     int p;
-    FILE *f = NULL;
 
     if (!dir || !dir[0] || !strcmp(dir, "0") || strlen(dir) > MAX_PATH)
-        return NULL;
+        return 0;
     parts[0] = src;
     parts[1] = entry;
     parts[2] = target;
@@ -1721,8 +1720,19 @@ static FILE *shader_file(const char *src, const char *entry,
         for (i = 0, n = strlen(parts[p]) + 1; i < n; i++)
             h = (h ^ (uint8_t)parts[p][i]) * 0x100000001B3ull;
     h = (h ^ D3DCOMPILE_OPTIMIZATION_LEVEL3) * 0x100000001B3ull;
-    CreateDirectoryA(dir, NULL);
     snprintf(path, cap, "%s\\%016llX.cso", dir, (unsigned long long)h);
+    return 1;
+}
+
+static FILE *shader_file(const char *src, const char *entry,
+                         const char *target, const char *mode, char *path,
+                         size_t cap)
+{
+    FILE *f = NULL;
+
+    if (!shader_path(src, entry, target, path, cap))
+        return NULL;
+    CreateDirectoryA(getenv("RECOMP_VSH_GPU_CACHE"), NULL);
     if (fopen_s(&f, path, mode))
         f = NULL;
     return f;
@@ -1841,7 +1851,12 @@ typedef struct {
  * not in the cache (a new toolkit's source, a pre-compile pass deleted
  * it) is made when drawn, as before.
  * Off during a pre-compile pass (RECOMP_SHADER_CACHE_TOUCH): the pass
- * needs to see which files its levels use. */
+ * needs to see which files its levels use. There the listed setups' files
+ * are only marked used (write time now, nv2a_vsh_gpu_cache_touch), so the
+ * pass's clean-up keeps them: setups only real play draws (an intro the
+ * pass skips, say) were deleted before, and the next run, finding them
+ * listed but gone, made them mid-level again. A file of an older source
+ * (another name) is not marked and still goes. */
 #define PS_SPEC_MAX 2048                /* setups kept; past it, the one shader */
 #define PS_LIST_MAGIC 0x314B5350u       /* "PSK1" */
 typedef struct {
@@ -2090,8 +2105,8 @@ static void ps_list_load(void)
     const char *tv = getenv("RECOMP_SHADER_CACHE_TOUCH");
     int touch = tv && atoi(tv) != 0;
     int pre = !(pv && pv[0] == '0') && !touch;
-    char path[MAX_PATH + 32];
-    uint32_t hdr[2], t = s_pss_pqt, dup = 0;
+    char path[MAX_PATH + 32], cso[MAX_PATH + 32];
+    uint32_t hdr[2], t = s_pss_pqt, dup = 0, kept = 0;
     PsKey k;
     FILE *f;
 
@@ -2128,6 +2143,14 @@ static void ps_list_load(void)
         }
         e->listed = 1;
         s_pss_listed++;
+        if (touch) {
+            /* A pre-compile pass: its file counts as used (kept). */
+            char *src = ps_spec_source(&k);
+            if (src && shader_path(src, "ps", "ps_4_0", cso, sizeof cso)
+                && nv2a_vsh_gpu_cache_touch(cso))
+                kept++;
+            free(src);
+        }
         if (pre) {
             e->state = PS_QUEUED;
             s_pss_pq[t++ % PS_SPEC_MAX] = (uint32_t)(e - s_pss);
@@ -2141,6 +2164,10 @@ static void ps_list_load(void)
             pre ? "loading them ahead (RECOMP_PS_PRELOAD)"
                 : touch ? "made when drawn (a pre-compile pass)"
                         : "made when drawn (RECOMP_PS_PRELOAD=0)", 10);
+    if (touch)
+        fprintf(stderr, "[GPU] d3d11: pre-compile pass: %u of the %u listed"
+                " setups' shaders in the cache, marked used (kept)%c", kept,
+                s_pss_listed, 10);
     if (pre && s_pss_listed) {
         /* Workers read the entries below the tail, published last. */
         s_pss_pre_left = (LONG)s_pss_listed;
