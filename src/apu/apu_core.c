@@ -865,6 +865,197 @@ static void mono_apply(int16_t (*buf)[2], int n)
     }
 }
 
+/* Speaker test (apu.h xbox_ApuSpeakerTest; Conker to-do 231). The sound is
+ * kept at 48 kHz, scaled to the game's own level in play (SPK_GAIN: its
+ * peaks ~0.3, as the game's); the subwoofer gets it an octave down and
+ * low-passed below 120 Hz (a cash register has no bass of its own), as
+ * loud. The frame thread mixes it into the finished frame before Mono and
+ * the master volume, the game's output faded out under it. Untouched until
+ * the first request: the frame's samples stay exactly as before. */
+#define SPK_GAIN  0.3f
+#ifdef _WIN32
+#define SPK_BARRIER() MemoryBarrier()
+#else
+#define SPK_BARRIER() __sync_synchronize()
+#endif
+#define SPK_GAP   24000                 /* 0.5 s between speakers in turn */
+#define SPK_DUCK  1024                  /* 21 ms fade of the game's output */
+typedef struct { int16_t *pcm, *lfe; int n, lfe_n; } SpkSound;
+static SpkSound *volatile g_spk_sound;
+static volatile LONG g_spk_req = -100;  /* asked: -100 nothing new, -1 stop, 0-7 */
+static volatile LONG g_spk_now = -1;    /* playing (read by any thread) */
+static int   g_spk_pos;                 /* sample in the sound; < 0 = in a gap */
+static int   g_spk_turn = -1;           /* in turn: index in the order, else -1 */
+static float g_spk_duck = 1.0f;         /* the game's share of the output */
+
+static int16_t *spk_resample(const int16_t *in, int n, double step, int *out_n, float gain)
+{
+    int m = (int)((n - 1) / step) + 1;
+    int16_t *o = m > 0 ? malloc(sizeof *o * (size_t)m) : NULL;
+    if (!o)
+        return NULL;
+    for (int i = 0; i < m; i++) {
+        double p = i * step;
+        int a = (int)p;
+        float f = (float)(p - a), x0 = in[a], x1 = in[a + 1 < n ? a + 1 : a];
+        float v = (x0 + (x1 - x0) * f) * gain;
+        o[i] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+    }
+    *out_n = m;
+    return o;
+}
+
+void xbox_ApuSpeakerTestSound(const int16_t *pcm, int frames, int rate)
+{
+    SpkSound *s;
+    if (g_spk_sound || !pcm || frames < 2 || rate < 8000)
+        return;                         /* once (the sound never changes) */
+    s = calloc(1, sizeof *s);
+    if (!s)
+        return;
+    s->pcm = spk_resample(pcm, frames, rate / 48000.0, &s->n, SPK_GAIN);
+    /* Subwoofer: half speed (an octave down), two one-pole low passes at
+     * 120 Hz, then as loud (RMS) as the sound itself. */
+    s->lfe = s->pcm ? spk_resample(s->pcm, s->n, 0.5, &s->lfe_n, 1.0f) : NULL;
+    if (!s->lfe) {
+        free(s->pcm);
+        free(s);
+        return;
+    }
+    {
+        const float a = 1.0f - expf(-2.0f * 3.14159265f * 120.0f / 48000.0f);
+        float y1 = 0.0f, y2 = 0.0f, *t = malloc(sizeof *t * (size_t)s->lfe_n);
+        double e0 = 0.0, e1 = 0.0;
+        if (t) {
+            for (int i = 0; i < s->lfe_n; i++) {
+                y1 += a * ((float)s->lfe[i] - y1);
+                y2 += a * (y1 - y2);
+                t[i] = y2;
+                e1 += (double)y2 * y2;
+            }
+            for (int i = 0; i < s->n; i++)
+                e0 += (double)s->pcm[i] * s->pcm[i];
+            {
+                float k = e1 > 0.0 ? (float)sqrt(e0 / s->n / (e1 / s->lfe_n)) : 0.0f;
+                for (int i = 0; i < s->lfe_n; i++) {
+                    float v = t[i] * k;
+                    s->lfe[i] = (int16_t)(v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v);
+                }
+            }
+            free(t);
+        }
+    }
+    fprintf(stderr, "[SPKTEST] sound: %d samples at %d Hz -> %.2f s at 48 kHz (subwoofer %.2f s)\n",
+            frames, rate, s->n / 48000.0, s->lfe_n / 48000.0);
+    SPK_BARRIER();
+    g_spk_sound = s;
+}
+
+int xbox_ApuSpeakerTest(int speaker)
+{
+    if (speaker != APU_SPEAKER_ASK)
+        InterlockedExchange(&g_spk_req, speaker >= 0 && speaker <= APU_SPEAKER_ALL ? speaker : -1);
+    return (int)InterlockedCompareExchange(&g_spk_now, 0, 0x7FFFFFFF);
+}
+
+int xbox_ApuOutputChannels(void)
+{
+    return g_out_ch;
+}
+
+/* The order "in turn" plays the output's speakers in: Windows' own. */
+static int spk_order(int k)
+{
+    static const int six[6] = { 0, 2, 1, 5, 4, 3 };   /* FL C FR BR BL LFE */
+    return g_out_ch == 6 ? (k < 6 ? six[k] : -1) : (k < 2 ? k : -1);
+}
+
+static const char *const k_spk_name[8] = {
+    "front left", "front right", "centre", "subwoofer", "back left", "back right",
+    "both front", "all in turn"
+};
+
+/* buf: n frames of ch channels (2 or 6), the frame thread. */
+static void spk_test_apply(int16_t *buf, int ch, int n)
+{
+    const SpkSound *s = g_spk_sound;
+    LONG r = InterlockedExchange(&g_spk_req, -100);
+    if (r != -100) {
+        if (r < 0 || !s) {
+            if (g_spk_now >= 0)
+                fprintf(stderr, "[SPKTEST] stopped\n");
+            else if (r >= 0)
+                fprintf(stderr, "[SPKTEST] no sound handed over: nothing to play\n");
+            InterlockedExchange(&g_spk_now, -1);
+            g_spk_turn = -1;
+        } else {
+            g_spk_turn = r == APU_SPEAKER_ALL ? 0 : -1;
+            InterlockedExchange(&g_spk_now, r == APU_SPEAKER_ALL ? spk_order(0) : r);
+            g_spk_pos = -(SPK_DUCK / 2);    /* the game half faded out first */
+            fprintf(stderr, "[SPKTEST] %s (%d channels out)\n", k_spk_name[r], ch);
+        }
+    }
+    if (g_spk_now < 0 && g_spk_duck >= 1.0f)
+        return;
+    for (int i = 0; i < n; i++) {
+        int16_t *f = buf + (size_t)i * ch;
+        const int now = (int)g_spk_now;
+        float v = 0.0f;
+        if (now >= 0 && g_spk_duck > 0.0f)
+            g_spk_duck = g_spk_duck > 1.0f / SPK_DUCK ? g_spk_duck - 1.0f / SPK_DUCK : 0.0f;
+        else if (now < 0 && g_spk_duck < 1.0f)
+            g_spk_duck = g_spk_duck < 1.0f - 1.0f / SPK_DUCK ? g_spk_duck + 1.0f / SPK_DUCK : 1.0f;
+        if (g_spk_duck < 1.0f)
+            for (int c = 0; c < ch; c++)
+                f[c] = (int16_t)lrintf(f[c] * g_spk_duck);
+        if (now < 0 || !s)
+            continue;
+        if (g_spk_pos >= 0) {
+            const int lfe = now == 3, len = lfe ? s->lfe_n : s->n;
+            if (g_spk_pos < len) {
+                v = (float)(lfe ? s->lfe : s->pcm)[g_spk_pos];
+            } else if (g_spk_turn >= 0 && spk_order(g_spk_turn + 1) >= 0) {
+                g_spk_turn++;
+                InterlockedExchange(&g_spk_now, spk_order(g_spk_turn));
+                g_spk_pos = -SPK_GAP;
+                fprintf(stderr, "[SPKTEST] %s\n", k_spk_name[spk_order(g_spk_turn)]);
+                continue;
+            } else {
+                InterlockedExchange(&g_spk_now, -1);
+                g_spk_turn = -1;
+                fprintf(stderr, "[SPKTEST] done\n");
+                continue;
+            }
+        }
+        g_spk_pos++;
+        if (v == 0.0f)
+            continue;
+        if (ch == 6) {
+            if (now == APU_SPEAKER_BOTH) {
+                monitor_add(&f[0], (int32_t)v);
+                monitor_add(&f[1], (int32_t)v);
+            } else {
+                monitor_add(&f[now], (int32_t)v);
+            }
+        } else {
+            /* Stereo: the six speakers as the stereo fold places them. */
+            const float h = 0.70710678f;
+            float l = 0.0f, rr = 0.0f;
+            switch (now) {
+            case 0: l = v; break;
+            case 1: rr = v; break;
+            case 2: l = rr = v * h; break;
+            case 4: l = v * h; break;
+            case 5: rr = v * h; break;
+            case APU_SPEAKER_BOTH: l = rr = v; break;
+            default: break;         /* the subwoofer: not in the fold */
+            }
+            monitor_add(&f[0], (int32_t)l);
+            monitor_add(&f[1], (int32_t)rr);
+        }
+    }
+}
+
 /* The same for 6 channels (5.1): one limiter gain for all of them, from the
  * loudest. The stereo one above stays as it was (Standard + Stereo must
  * give the same samples as before 5.1 came). */
@@ -966,10 +1157,12 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             monitor_add(&d->monitor.frame_buf6[i][1], d->monitor.frame_buf[i][1]);
         }
         frame = &d->monitor.frame_buf6[0][0];
+        spk_test_apply(frame, 6, n);
         out_gain_apply6(d->monitor.frame_buf6, n);
         if (g_out_muted)
             memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
     } else {
+        spk_test_apply(&d->monitor.frame_buf[0][0], 2, n);
         mono_apply(d->monitor.frame_buf, n);
         out_gain_apply(d->monitor.frame_buf, n);
         if (g_out_muted) {

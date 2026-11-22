@@ -74,6 +74,26 @@ void xbox_ApuSetI3dl2Listener(const void *listener48);
 #define APU_OUTPUT_MONO         3
 void xbox_ApuSetAudioMode(int processing, int output);
 
+/* Speaker test: a sound played on one speaker at a time, the game's own
+ * output faded out (21 ms) while it plays and back after; the master volume
+ * applies. xbox_ApuSpeakerTestSound hands over the sound once (mono 16-bit
+ * PCM at any rate; copied, made 48 kHz, plus an octave-down low-passed copy
+ * for the subwoofer). xbox_ApuSpeakerTest(speaker): 0-5 = FL FR C LFE BL
+ * BR (on a stereo output 0 / 1 = left / right; C and the backs fold as the
+ * game's speakers do, LFE stays silent there), APU_SPEAKER_BOTH = both
+ * front speakers at once (Mono), APU_SPEAKER_ALL = each of the output's
+ * speakers in turn (stereo: L R; six channels: FL C FR BR BL LFE) with
+ * 0.5 s between, -1 = stop, APU_SPEAKER_ASK = only ask. Returns the speaker
+ * playing now (-1 none). Not while xbox_ApuSetPaused holds the APU. Any
+ * thread. xbox_ApuOutputChannels: the channels the output stage makes (2,
+ * or 6 for 5.1 on a device with six speakers). */
+#define APU_SPEAKER_BOTH  6
+#define APU_SPEAKER_ALL   7
+#define APU_SPEAKER_ASK  (-2)
+void xbox_ApuSpeakerTestSound(const int16_t *pcm, int frames, int rate);
+int  xbox_ApuSpeakerTest(int speaker);
+int  xbox_ApuOutputChannels(void);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *
