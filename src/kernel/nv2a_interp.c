@@ -107,6 +107,13 @@ typedef struct {
                                          * (0..1 of the clip), valid (0/1) */
     uint32_t *idx;                      /* in here */
     size_t    nidx, capidx;
+    float   (*ivx)[2][4];               /* CPU-written draws' vertices (from
+                                         * INLINE_ARRAY / immediate): each
+                                         * one's position and texture
+                                         * coordinate (inline_blend) */
+    size_t    nivx, capivx;
+    uint32_t (*iv)[2];                  /* each draw's: start in ivx, count
+                                         * (0: none recorded) */
     VshConsts *consts;
     int32_t  *pair;                     /* N's draw j -> N-1's, or -1 */
     uint32_t  ndraws, capdraws;
@@ -171,6 +178,14 @@ static float s_pair_max = 1.0f;         /* RECOMP_INTERP_PAIR_MAX: strict
 static uint64_t s_pair_refused;
 static float s_loose_max = 1.0f;        /* RECOMP_INTERP_LOOSE_MAX: loose pairs
                                          * less alike are refused (draw_dist) */
+static int s_inline = 1;                /* RECOMP_INTERP_INLINE=0: CPU-written
+                                         * vertices as their frame drew them */
+static float s_inline_dev = 0.25f;      /* RECOMP_INTERP_INLINE_DEV: how far a
+                                         * vertex may move apart from the
+                                         * draw's mean move, x its size */
+static uint64_t s_ib_done, s_ib_shift, s_ib_shape, s_ib_far, s_ib_other;
+#define IVX_MAX_DRAW 4096u              /* vertices a draw, more: not blended */
+#define IVX_MAX_FRAME (1u << 20)        /* a frame */
 static int s_vcheck;                    /* RECOMP_INTERP_VCHECK=1 (test) */
 static uint32_t s_vdiff, s_vsaid;       /* replayed draws whose vertices
                                          * changed since recorded (10 s) */
@@ -227,6 +242,8 @@ typedef struct {
     uint64_t texmat[3];                 /* bit r: c[r] (192 bits) */
     uint64_t reads[3];                  /* registers it reads (relative:
                                          * from the base to the end) */
+    int8_t uvin;                        /* the input written to oT0 (or the
+                                         * first oT), or -1 (uv_input) */
     int used;
 } ProgInfo;
 static ProgInfo s_prog[PROG_MAX];
@@ -341,6 +358,11 @@ int nv2a_interp_n(void)
         s_borrow_any = e && *e && *e != '0';
         e = getenv("RECOMP_INTERP_HOLD");
         s_hold_on = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_INLINE");
+        s_inline = !(e && *e == '0');
+        e = getenv("RECOMP_INTERP_INLINE_DEV");
+        if (e)
+            s_inline_dev = (float)atof(e);
         e = getenv("RECOMP_INTERP_ADAPT");
         s_adapt = !(e && *e == '0');
         e = getenv("RECOMP_INTERP_PIVOT");
@@ -642,6 +664,32 @@ static void texmat_regs(const Nv2aVshIns *ins, uint32_t count,
         texmat[w] &= ~pos[w];
 }
 
+/* The input register a program writes to a texture coordinate output
+ * directly (oT0 first, else the first of oT1-oT3), or -1: for CPU-written
+ * vertices, what tells one glyph or sprite from another (inline_blend).
+ * Only straight from an input (a mov, or a dp4 against a texture matrix):
+ * the programs that draw such vertices do no more. */
+static int uv_input(const Nv2aVshIns *ins, uint32_t count)
+{
+    uint32_t i, s;
+    int any = -1;
+
+    for (i = 0; i < count; i++) {
+        const Nv2aVshIns *I = &ins[i];
+        if (!I->out_o || !I->omask || I->oaddr < 9 || I->oaddr > 12)
+            continue;
+        for (s = 0; s < 3; s++)
+            if ((I->need & (1u << s)) && I->src[s].mux == 2
+                && I->iidx < 16) {
+                if (I->oaddr == 9)
+                    return (int)I->iidx;
+                if (any < 0)
+                    any = (int)I->iidx;
+            }
+    }
+    return any;
+}
+
 /* The s_prog entry of the current program (made on first sight), or
  * PROG_NONE. */
 static uint16_t prog_info(void)
@@ -665,6 +713,7 @@ static uint16_t prog_info(void)
     s_prog[h].hash = hash;
     s_prog[h].used = 1;
     texmat_regs(ins, count, s_prog[h].texmat, s_prog[h].reads);
+    s_prog[h].uvin = (int8_t)uv_input(ins, count);
     s_nprog++;
     if (s_log && (s_prog[h].texmat[0] | s_prog[h].texmat[1]
                   | s_prog[h].texmat[2])) {
@@ -1050,6 +1099,244 @@ static float spos_dist(const Frame *f, const Frame *prev, uint32_t ia,
     return sqrtf(dx * dx + dy * dy);
 }
 
+/* CPU-written vertices (FI-4). A title that places its own vertices --
+ * Conker's menu text in screen pixels, the menu candles' flames and smoke
+ * already in camera space, with only a projection in the program -- leaves
+ * nothing in the constants for the blend to move: those draws stayed where
+ * their own frame put them while the room turned under them. So a paired
+ * draw from INLINE_ARRAY or immediate mode gets its positions blended with
+ * its partner's, vertex by vertex, when both have as many vertices and the
+ * move is one move: every vertex's within s_inline_dev x the draw's size of
+ * the mean (a flame's quads, a glyph; not a particle list in another order),
+ * and the mean move within 2 sizes if each vertex's texture coordinate is the
+ * same in both frames (the same glyph), 1 otherwise (an animated flame).
+ * RECOMP_INTERP_INLINE=0: off. */
+static void inline_note(Frame *f, uint32_t j)
+{
+    uint32_t n = g_pb.idx_count, i;
+    uint16_t pg;
+    int uv;
+
+    f->iv[j][0] = f->iv[j][1] = 0;
+    if (!s_inline || !g_pb.inline_active || g_pb.merge_nparts
+        || (g_pb.xf_mode & 3) != 2 || n < 3 || n > IVX_MAX_DRAW
+        || g_pb.attr[0].type != 2 || g_pb.attr[0].size < 2
+        || f->nivx + n > IVX_MAX_FRAME)
+        return;
+    if (f->nivx + n > f->capivx) {
+        size_t cap = f->capivx ? f->capivx * 2 : 4096;
+        float (*v)[2][4];
+        while (cap < f->nivx + n)
+            cap *= 2;
+        v = realloc(f->ivx, cap * sizeof *v);
+        if (!v)
+            return;
+        f->ivx = v;
+        f->capivx = cap;
+    }
+    pg = f->prog[j] != PROG_NONE ? f->prog[j] : prog_info();
+    uv = pg != PROG_NONE ? s_prog[pg].uvin : -1;
+    for (i = 0; i < n; i++) {
+        float (*v)[4] = f->ivx[f->nivx + i];
+        if (!pb_fetch_attr(&g_pb.attr[0], g_pb.idx[i], v[0]))
+            return;
+        if (uv >= 0 && uv < NV_VERTEX_ATTRS && g_pb.attr[uv].size)
+            pb_fetch_attr(&g_pb.attr[uv], g_pb.idx[i], v[1]);
+        else
+            v[1][0] = v[1][1] = v[1][2] = v[1][3] = 0.0f;
+    }
+    f->iv[j][0] = (uint32_t)f->nivx;
+    f->iv[j][1] = n;
+    f->nivx += n;
+}
+
+/* RECOMP_INTERP_INLINE_LOG=<program hex>[,<hex>..] (up to 4): inline_blend's
+ * decisions for those programs' draws, with the first vertex in both frames
+ * (test). */
+static int ib_logged(uint32_t prog)
+{
+    static int logp = -1;
+    static uint32_t lp[4];
+    int i;
+    if (logp < 0) {
+        const char *e = getenv("RECOMP_INTERP_INLINE_LOG");
+        char *x;
+        logp = 0;
+        while (e && *e && logp < 4) {
+            lp[logp++] = (uint32_t)strtoul(e, &x, 16);
+            e = *x == ',' ? x + 1 : NULL;
+        }
+    }
+    for (i = 0; i < logp; i++)
+        if (lp[i] == prog)
+            return 1;
+    return 0;
+}
+
+/* A CPU-written draw whose vertices have no partners one by one (another
+ * count, or not the same points): every vertex moved by w x the move of the
+ * draw's centre (the mean of its vertices) between the frames, when that
+ * move is within the draw's size and over 2 % of it (below: the centre's own
+ * wobble, from a particle born or gone, not a move worth following). */
+static void inline_shift(const Frame *f, uint32_t j, const Frame *p,
+                         int32_t pj, float w, const char *why)
+{
+    const VertexAttr *pa = &g_pb.attr[0];
+    const float (*a)[2][4], (*b)[2][4];
+    uint32_t n = f->iv[j][1], pn = p->iv[pj][1], i, c, ncomp;
+    float ca[3] = {0.0f, 0.0f, 0.0f}, cb[3] = {0.0f, 0.0f, 0.0f}, lo[3], hi[3];
+    float d[3], size, mv;
+
+    if (!g_pb.inline_active || g_pb.idx_count != n || pa->type != 2
+        || pa->size < 3) {
+        s_ib_other++;
+        return;
+    }
+    a = (const float (*)[2][4])f->ivx + f->iv[j][0];
+    b = (const float (*)[2][4])p->ivx + p->iv[pj][0];
+    for (c = 0; c < 3; c++)
+        lo[c] = hi[c] = a[0][0][c];
+    for (i = 0; i < n; i++)
+        for (c = 0; c < 3; c++) {
+            ca[c] += a[i][0][c];
+            if (a[i][0][c] < lo[c]) lo[c] = a[i][0][c];
+            if (a[i][0][c] > hi[c]) hi[c] = a[i][0][c];
+        }
+    for (i = 0; i < pn; i++)
+        for (c = 0; c < 3; c++)
+            cb[c] += b[i][0][c];
+    for (c = 0; c < 3; c++)
+        d[c] = cb[c] / (float)pn - ca[c] / (float)n;
+    size = sqrtf((hi[0] - lo[0]) * (hi[0] - lo[0])
+                 + (hi[1] - lo[1]) * (hi[1] - lo[1])
+                 + (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    mv = sqrtf(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    if (ib_logged(f->part[j][0]))
+        fprintf(stderr, "[IINLINE] flip %u draw %u<-%d n %u <- %u tex0 %08X"
+                " w %.2f %s centre move %.3f size %.3f -> %s%c", g_pb.flips,
+                j, pj, n, pn, f->part[j][4], w, why, mv, size,
+                !(size > 0.0f) || !isfinite(mv) || mv > size ? "kept"
+                : mv < 0.02f * size ? "still" : "shifted", 10);
+    if (!(size > 0.0f) || !isfinite(size) || !isfinite(mv) || mv > size) {
+        s_ib_far++;
+        return;
+    }
+    if (mv < 0.02f * size)
+        return;
+    ncomp = 3;
+    for (i = 0; i < n; i++) {
+        size_t at = (size_t)pa->offset + (size_t)g_pb.idx[i] * pa->stride;
+        float v[3];
+        if (at + ncomp * 4 > (size_t)g_pb.inline_count * 4)
+            return;
+        for (c = 0; c < ncomp; c++)
+            v[c] = a[i][0][c] + d[c] * w;
+        memcpy((uint8_t *)g_pb.inline_buf + at, v, ncomp * 4);
+    }
+    s_ib_shift++;
+}
+
+static void inline_blend(const Frame *f, uint32_t j, const Frame *p,
+                         int32_t pj, float w)
+{
+    const VertexAttr *pa = &g_pb.attr[0];
+    const float (*a)[2][4], (*b)[2][4];
+    uint32_t n, i, c, ncomp;
+    float m[3] = {0.0f, 0.0f, 0.0f}, lo[3], hi[3], dev = 0.0f, size, mv;
+    int same_uv = 1;
+
+    if (!s_inline || !f->iv || !p->iv)
+        return;
+    n = f->iv[j][1];
+    if (!n || !p->iv[pj][1])
+        return;
+    if (p->iv[pj][1] != n) {
+        /* Another number of vertices (a flame drawn with 3 quads, then 4,
+         * then 2: Conker's candles flicker that way): no vertex has a
+         * partner, but the draw as a whole moved by the move of its
+         * centre (inline_shift). */
+        inline_shift(f, j, p, pj, w, "COUNT");
+        return;
+    }
+    if (!g_pb.inline_active || g_pb.idx_count != n || pa->type != 2
+        || pa->size < 2) {
+        s_ib_other++;
+        return;
+    }
+    a = (const float (*)[2][4])f->ivx + f->iv[j][0];
+    b = (const float (*)[2][4])p->ivx + p->iv[pj][0];
+    for (c = 0; c < 3; c++)
+        lo[c] = hi[c] = a[0][0][c];
+    for (i = 0; i < n; i++) {
+        for (c = 0; c < 3; c++) {
+            m[c] += b[i][0][c] - a[i][0][c];
+            if (a[i][0][c] < lo[c]) lo[c] = a[i][0][c];
+            if (a[i][0][c] > hi[c]) hi[c] = a[i][0][c];
+        }
+        if (same_uv && memcmp(a[i][1], b[i][1], sizeof a[i][1]))
+            same_uv = 0;
+    }
+    for (c = 0; c < 3; c++)
+        m[c] /= (float)n;
+    size = sqrtf((hi[0] - lo[0]) * (hi[0] - lo[0])
+                 + (hi[1] - lo[1]) * (hi[1] - lo[1])
+                 + (hi[2] - lo[2]) * (hi[2] - lo[2]));
+    mv = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+    if (!(size > 0.0f) || !isfinite(size) || !isfinite(mv)) {
+        s_ib_other++;
+        return;
+    }
+    if (mv == 0.0f)
+        return;                         /* nothing moved: as drawn */
+    for (i = 0; i < n; i++) {
+        float d2 = 0.0f;
+        for (c = 0; c < 3; c++) {
+            float d = b[i][0][c] - a[i][0][c] - m[c];
+            d2 += d * d;
+        }
+        if (d2 > dev)
+            dev = d2;
+    }
+    {
+        if (ib_logged(f->part[j][0]))
+            fprintf(stderr, "[IINLINE] flip %u draw %u<-%d n %u tex0 %08X w %.2f"
+                    " mv %.3f size %.3f dev %.3f uv %d %s a0 %.2f,%.2f,%.2f,%.2f"
+                    " b0 %.2f,%.2f,%.2f,%.2f uv0 %.3f,%.3f / %.3f,%.3f%c",
+                    g_pb.flips, j, pj, n, f->part[j][4], w, mv, size,
+                    sqrtf(dev), same_uv,
+                    sqrtf(dev) > s_inline_dev * size ? "SHAPE"
+                    : mv > (same_uv ? 2.0f : 1.0f) * size ? "FAR" : "blend",
+                    a[0][0][0], a[0][0][1], a[0][0][2], a[0][0][3],
+                    b[0][0][0], b[0][0][1], b[0][0][2], b[0][0][3],
+                    a[0][1][0], a[0][1][1], b[0][1][0], b[0][1][1], 10);
+    }
+    if (sqrtf(dev) > s_inline_dev * size) {
+        /* Vertex i is not the same point in both (a particle list in
+         * another order, a flame reshaped): the centre's move only. */
+        s_ib_shape++;
+        inline_shift(f, j, p, pj, w, "SHAPE");
+        return;
+    }
+    if (mv > (same_uv ? 2.0f : 1.0f) * size) {
+        s_ib_far++;
+        return;
+    }
+    ncomp = pa->size < 4 ? pa->size : 4;
+    for (i = 0; i < n; i++) {
+        size_t at = (size_t)pa->offset + (size_t)g_pb.idx[i] * pa->stride;
+        float v[4];
+        if (at + ncomp * 4 > (size_t)g_pb.inline_count * 4)
+            return;
+        for (c = 0; c < ncomp; c++) {
+            v[c] = a[i][0][c] + (b[i][0][c] - a[i][0][c]) * w;
+            if (!isfinite(v[c]))
+                v[c] = a[i][0][c];
+        }
+        memcpy((uint8_t *)g_pb.inline_buf + at, v, ncomp * 4);
+    }
+    s_ib_done++;
+}
+
 void nv2a_interp_draw(void)
 {
     if (s_rep) {
@@ -1109,6 +1396,7 @@ void nv2a_interp_draw(void)
                   jumped ? keep : NULL,
                   f->prog[j] != PROG_NONE ? s_prog[f->prog[j]].reads : NULL);
             nv2a_vsh_constants_set_all((const float (*)[4])s_tmp);
+            inline_blend(f, j, s_rep_prev, pj, s_rep_t);
             /* The same vertices drawn with another index list in the
              * partner frame (a ground's pieces, each frame only what that
              * frame sees): its triangles too, opaque draws only. */
@@ -1185,6 +1473,9 @@ void nv2a_interp_draw(void)
                 uint64_t *vh = realloc(f->vh, cap * sizeof *vh);
                 float (*sp)[3] = realloc(f->spos, cap * sizeof *sp);
                 uint8_t *hd = realloc(f->held, cap);
+                uint32_t (*iv)[2] = realloc(f->iv, cap * sizeof *iv);
+                if (iv)
+                    f->iv = iv;
                 if (sp)
                     f->spos = sp;
                 if (hd)
@@ -1203,7 +1494,8 @@ void nv2a_interp_draw(void)
                     f->attr = at;
                 if (il)
                     f->inl = il;
-                if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp || !hd)
+                if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp || !hd
+                    || !iv)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -1245,6 +1537,7 @@ void nv2a_interp_draw(void)
                 f->ix[f->ndraws][1] = 0;
             }
         }
+        inline_note(f, f->ndraws);
         {
             uint64_t prog = 0;
             uint32_t count;
@@ -2255,6 +2548,15 @@ static void stats_line(LONGLONG now)
             (unsigned long long)s_copy_refused,
             (unsigned long long)s_nearcam_refused, s_held, s_borrowed,
             s_rot_fixed, 10);
+    if (s_inline)
+        fprintf(stderr, "[INTERP] CPU-written vertices: %llu draws moved"
+                " part-way vertex by vertex, %llu by their centre (%llu of"
+                " them not one move); left as drawn: %llu moved too far, %llu"
+                " other%c",
+                (unsigned long long)s_ib_done, (unsigned long long)s_ib_shift,
+                (unsigned long long)s_ib_shape, (unsigned long long)s_ib_far,
+                (unsigned long long)s_ib_other, 10);
+    s_ib_done = s_ib_shift = s_ib_shape = s_ib_far = s_ib_other = 0;
     s_borrowed = 0;
     s_pair_refused = s_spos_refused = s_coh_refused = s_copy_refused =
         s_nearcam_refused = 0;
@@ -2864,6 +3166,7 @@ void nv2a_interp_flip_after(void)
     f = &s_fr[s_cur];
     f->nwords = 0;
     f->nidx = 0;
+    f->nivx = 0;
     f->ndraws = 0;
     f->overflow = 0;
     if (!s_vsh_size)
