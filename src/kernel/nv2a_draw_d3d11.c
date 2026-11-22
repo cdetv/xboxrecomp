@@ -2273,6 +2273,8 @@ uint32_t nv2a_d3d11_ps_spec_pending(uint32_t *compiled)
 
 /* The fixed pipeline objects. 0 when they cannot be made; batches are then
  * counted and skipped as before. */
+static void cr_init(void);              /* the constant buffer ring, below */
+
 static int draw_setup(void)
 {
 #define EL(name, idx, off) { name, idx, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, \
@@ -2314,6 +2316,8 @@ static int draw_setup(void)
             bd.ByteWidth = sizeof s_cbd;
             hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb1);
         }
+        if (SUCCEEDED(hr))
+            cr_init();                  /* optional: failing leaves the old path */
     }
     if (SUCCEEDED(hr)) {
         /* The zeta copy pass. Without it a zeta surface read as a texture
@@ -2421,6 +2425,165 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
     return 1;
 }
 
+/* ── The constant buffer ring (executor cheaper wins, step 3) ──────────────
+ *
+ * Every batch put its GpuConsts (cbuffer C) and, on the GPU path, its fetch
+ * rows into buffers of their own with MAP_WRITE_DISCARD (the driver renames
+ * the buffer each time) and cbuffer D when it changed. Now one constant
+ * buffer is appended to with MAP_WRITE_NO_OVERWRITE, in 256-byte pieces, and
+ * each draw binds its piece with VSSetConstantBuffers1 / PSSetConstantBuffers1
+ * (offsets in 16-byte constants, multiples of 16); only a wrap discards. A
+ * piece whose bytes equal the same stream's last one in this lap is not
+ * written at all: the draw binds the old one (consecutive draws of a merged
+ * run, repeated combiner setups, an unchanged cbuffer D).
+ * D3D11.1 only: ConstantBufferOffsetting and MapNoOverwriteOnDynamicConstant
+ * Buffer must both be reported, else the old path stays (RECOMP_CB_RING=0
+ * forces it; =2 uses the ring in even flips only, for the held-picture
+ * check: neighbouring frames must be identical). */
+#define CR_BYTES     (4u << 20)
+#define CR_UNIT      256u
+#define CR_LAST_MAX  1024u
+typedef struct {
+    int      valid;
+    uint32_t lap, first, num, bytes;
+    uint8_t  data[CR_LAST_MAX];
+} CrLast;
+static ID3D11Buffer *s_cr;
+static int      s_cr_on = -1;           /* 0 off, 1 on, 2 even flips only */
+static uint32_t s_cr_at, s_cr_lap = 1;
+static CrLast   s_cr_last[NV2A_CRING_STREAMS];
+static uint64_t s_cr_puts, s_cr_hits, s_cr_wraps, s_cr_bytes;
+
+static void cr_init(void)
+{
+    const char *e = getenv("RECOMP_CB_RING");
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opt;
+    D3D11_BUFFER_DESC bd;
+    const char *why = NULL;
+
+    s_cr_on = e && e[0] == '0' ? 0 : e && e[0] == '2' ? 2 : 1;
+    if (!s_cr_on) {
+        why = "RECOMP_CB_RING=0";
+    } else {
+        memset(&opt, 0, sizeof opt);
+        if (!s_ctx1 || FAILED(ID3D11Device_CheckFeatureSupport(s_dev,
+                D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof opt)))
+            why = "no D3D11.1 options";
+        else if (!opt.ConstantBufferOffsetting)
+            why = "ConstantBufferOffsetting not supported";
+        else if (!opt.MapNoOverwriteOnDynamicConstantBuffer)
+            why = "NO_OVERWRITE on a constant buffer not supported";
+    }
+    if (!why) {
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = CR_BYTES;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cr)))
+            why = "the buffer could not be made";
+    }
+    if (why)
+        s_cr_on = 0;
+    fprintf(stderr, "[GPU] d3d11: constant buffer ring %s%s%s%c",
+            s_cr_on == 2 ? "on in even flips only (=2)" : s_cr_on ? "on"
+            : "off", why ? ": " : "", why ? why : "", 10);
+}
+
+int nv2a_cring_use(void)
+{
+    return s_cr && (s_cr_on == 1 || (s_cr_on == 2 && !(g_pb.flips & 1)));
+}
+
+int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
+                   uint32_t *first, uint32_t *num)
+{
+    CrLast *l;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    uint32_t n;
+
+    if (!s_cr || stream < 0 || stream >= NV2A_CRING_STREAMS || !bytes
+        || bytes > CR_LAST_MAX)
+        return 0;
+    l = &s_cr_last[stream];
+    s_cr_puts++;
+    if (l->valid && l->lap == s_cr_lap && l->bytes == bytes
+        && !memcmp(l->data, src, bytes)) {
+        *first = l->first;
+        *num = l->num;
+        s_cr_hits++;
+        return 1;
+    }
+    n = (bytes + CR_UNIT - 1) / CR_UNIT * CR_UNIT;
+    if (s_cr_at + n > CR_BYTES) {       /* full: start again, one discard */
+        how = D3D11_MAP_WRITE_DISCARD;
+        s_cr_at = 0;
+        s_cr_lap = s_cr_lap + 1 ? s_cr_lap + 1 : 1;
+        s_cr_wraps++;
+    }
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cr, 0,
+                                       how, 0, &m)))
+        return 0;
+    memcpy((uint8_t *)m.pData + s_cr_at, src, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cr, 0);
+    l->valid = 1;
+    l->lap = s_cr_lap;
+    l->bytes = bytes;
+    l->first = s_cr_at / 16u;
+    l->num = n / 16u;
+    memcpy(l->data, src, bytes);
+    *first = l->first;
+    *num = l->num;
+    s_cr_at += n;
+    s_cr_bytes += n;
+    return 1;
+}
+
+void nv2a_cring_bind_vs(uint32_t slot, uint32_t first, uint32_t num)
+{
+    ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, slot, 1, &s_cr, &first,
+                                               &num);
+}
+
+/* Where the last batch's cbuffer C went, so a draw that rebinds it (the
+ * cut-out passes) binds the same piece: the ring's range, or s_cb. */
+static struct { int ring; uint32_t first, num; } s_kb;
+
+/* GpuConsts for the next draw: into the ring, else into s_cb. 0 on failure. */
+static int consts_put(const GpuConsts *k)
+{
+    uint32_t first, num;
+
+    if (nv2a_cring_use()
+        && nv2a_cring_put(NV2A_CRING_CONSTS, k, sizeof *k, &first, &num)) {
+        s_kb.ring = 1;
+        s_kb.first = first;
+        s_kb.num = num;
+        return 1;
+    }
+    s_kb.ring = 0;
+    return buf_fill(s_cb, k, sizeof *k);
+}
+
+static void consts_bind_vs(void)
+{
+    if (s_kb.ring)
+        ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 0, 1, &s_cr,
+                                                   &s_kb.first, &s_kb.num);
+    else
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+}
+
+static void consts_bind_ps(void)
+{
+    if (s_kb.ring)
+        ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 0, 1, &s_cr,
+                                                   &s_kb.first, &s_kb.num);
+    else
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+}
+
 /* Stage st reads its surface as it is (RTT_DIRECT): coordinates scaled into
  * the texture's part of it, and the clamp for the shader. */
 static void tclamp_stage(GpuConsts *k, int st)
@@ -2431,13 +2594,28 @@ static void tclamp_stage(GpuConsts *k, int st)
     s_cbd.tclamp[st][1] = s_rtt_direct[st][3];
 }
 
+/* Whether cbuffer D (pixel shader slot 1) is bound from the ring: set by
+ * tclamp_upload, which then binds it itself; else s_cb1 is bound by the
+ * draw (d3d_draw), as before the ring. */
+static int s_cbd_ring;
+
 /* cbuffer D up to date for this draw; 0 when it could not be written. */
 static int tclamp_upload(void)
 {
     static float last[sizeof s_cbd / sizeof(float)];
     static int valid;
+    uint32_t first, num;
     if (!s_cb1)
         return 0;
+    if (nv2a_cring_use()
+        && nv2a_cring_put(NV2A_CRING_CBD, &s_cbd, sizeof s_cbd, &first,
+                          &num)) {
+        s_cbd_ring = 1;
+        ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 1, 1, &s_cr,
+                                                   &first, &num);
+        return 1;
+    }
+    s_cbd_ring = 0;
     if (valid && !memcmp(last, &s_cbd, sizeof last))
         return 1;
     if (!buf_fill(s_cb1, &s_cbd, sizeof s_cbd))
@@ -5840,8 +6018,10 @@ static void cutout_depth(GpuConsts *k, int c, uint32_t nidx)
     }
     k->mode[2] = s_cut[c].func;
     k->mode[3] = s_cut[c].ref;
-    if (!buf_fill(s_cb, k, sizeof *k))
+    if (!consts_put(k))
         return;
+    consts_bind_vs();                   /* the ring's piece, or s_cb as before */
+    consts_bind_ps();
     g_pb.depth_mask = 1;
     g_pb.stencil_wmask = 0;
     ds = ds_state();
@@ -5912,8 +6092,8 @@ static int cutout_parts(GpuConsts *k, int c, const uint32_t *end,
         if (cut_bound) {
             ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
             ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, ref);
-            ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-            ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+            consts_bind_vs();           /* the batch's cbuffer C again */
+            consts_bind_ps();
         }
         ID3D11DeviceContext_DrawIndexed(s_ctx, cnt, start, 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_no_colour, NULL,
@@ -6583,7 +6763,7 @@ static void d3d_draw(void)
     }
     {
         uint64_t ct0 = ct_now();
-        int ok = buf_fill(s_cb, &k, sizeof k);
+        int ok = consts_put(&k);
         ct_add(CT_CB, ct0);
         if (!ok)
             return;
@@ -6637,12 +6817,12 @@ static void d3d_draw(void)
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    consts_bind_vs();
     {
         ID3D11PixelShader *sp = ps_spec(&k);
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
     }
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    consts_bind_ps();
     {
         uint64_t ct0 = ct_now();
         int ok = tclamp_upload();
@@ -6650,7 +6830,8 @@ static void d3d_draw(void)
         if (!ok)
             return;
     }
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb1);
+    if (!s_cbd_ring)                    /* the ring's piece is bound by tclamp_upload */
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb1);
     /* The target before the textures: a surface read as it is
      * (RECOMP_RTT_DIRECT) is often the one the batch before drew into, still
      * bound as the target, and D3D unbinds a view that overlaps a bound
@@ -7328,6 +7509,7 @@ static void gpu_mem_log(void)
 typedef struct {
     uint64_t flips, batches, drawn, uploads, tex_made, sampled, missed;
     uint64_t in_batches, in_bytes, in_wraps, in_hits, in_hit_bytes;
+    uint64_t cr_puts, cr_hits, cr_bytes, cr_wraps;  /* the constant ring */
     TexStats tx;
 } ExecStats;
 
@@ -7344,6 +7526,10 @@ static void exec_stats_snap(ExecStats *cur)
     nv2a_vsh_gpu_input_stats(&cur->in_batches, &cur->in_bytes,
                              &cur->in_wraps);
     nv2a_vsh_gpu_cache_stats(&cur->in_hits, &cur->in_hit_bytes);
+    cur->cr_puts = s_cr_puts;
+    cur->cr_hits = s_cr_hits;
+    cur->cr_bytes = s_cr_bytes;
+    cur->cr_wraps = s_cr_wraps;
     cur->tx = s_tx;
 }
 
@@ -7415,6 +7601,14 @@ static void exec_stats_tick(void)
             (double)d.in_bytes / 1048576.0,
             (double)d.in_bytes / 1048576.0 / f, EXECN(d.in_hits),
             (double)d.in_hit_bytes / 1048576.0, EXECN(d.in_wraps), 10);
+    if (s_cr_on)
+        fprintf(stderr, "[EXECSTAT]   constant ring: %llu pieces asked for"
+                " (%.0f a flip), %llu already there (%.0f %%), %.2f MB"
+                " written, %llu wraps%c", EXECN(d.cr_puts),
+                (double)d.cr_puts / f, EXECN(d.cr_hits),
+                d.cr_puts ? 100.0 * (double)d.cr_hits / (double)d.cr_puts
+                          : 0.0,
+                (double)d.cr_bytes / 1048576.0, EXECN(d.cr_wraps), 10);
 #undef EXECN
     prev = cur;
     t0 = now;
