@@ -97,6 +97,9 @@ typedef struct {
                                          * program and target only */
     uint32_t (*part)[6];                /* for traces: prog, attr0, n, prim,
                                          * tex0, target */
+    uint32_t (*shape)[3];               /* for traces: the key's target shape:
+                                         * pitch << 16 | format, clip w << 16
+                                         * | h, clip x << 16 | y */
     uint32_t (*ix)[2];                  /* each draw's index list: start, count */
     VertexAttr (*attr)[NV_VERTEX_ATTRS]; /* and its vertex arrays */
     uint8_t  *inl;                      /* drawn from INLINE_ARRAY / immediate */
@@ -1474,8 +1477,11 @@ void nv2a_interp_draw(void)
                 float (*sp)[3] = realloc(f->spos, cap * sizeof *sp);
                 uint8_t *hd = realloc(f->held, cap);
                 uint32_t (*iv)[2] = realloc(f->iv, cap * sizeof *iv);
+                uint32_t (*sh)[3] = realloc(f->shape, cap * sizeof *sh);
                 if (iv)
                     f->iv = iv;
+                if (sh)
+                    f->shape = sh;
                 if (sp)
                     f->spos = sp;
                 if (hd)
@@ -1495,7 +1501,7 @@ void nv2a_interp_draw(void)
                 if (il)
                     f->inl = il;
                 if (!pt || !lk || !ix || !at || !il || !pg || !vh || !sp || !hd
-                    || !iv)
+                    || !iv || !sh)
                     p = NULL;
             }
             if (!k || !c || !p) {
@@ -1563,6 +1569,9 @@ void nv2a_interp_draw(void)
                                   | (g_pb.xf_mode & 3) << 12;
             f->part[f->ndraws][4] = g_pb.texs[0].offset;
             f->part[f->ndraws][5] = g_pb.color_offset;
+            f->shape[f->ndraws][0] = g_pb.pitch << 16 | (g_pb.format & 0xFFFF);
+            f->shape[f->ndraws][1] = g_pb.clip_w << 16 | (g_pb.clip_h & 0xFFFF);
+            f->shape[f->ndraws][2] = g_pb.clip_x << 16 | (g_pb.clip_y & 0xFFFF);
         }
         memcpy(f->consts[f->ndraws], nv2a_vsh_constants_all(),
                sizeof f->consts[0]);
@@ -1737,6 +1746,38 @@ static int cmp_near(const void *x, const void *y)
 }
 
 /* Pairs the group s_ka[a0..a1) with s_kb[b0..b1); the draws paired. */
+/* The registers the copy test (pair_nearest) looks at: those that tell the
+ * copies apart -- that vary among the group's draws in either frame (each
+ * bottle's own matrix) -- and that the program reads; or every register with
+ * RECOMP_INTERP_COPY_READS=0 (before 2026-11-22). Every register included
+ * the camera, the same in every copy: in a fast turn (over 30 degrees a
+ * frame) whole groups of a ground piece's passes and Conker's were refused
+ * as "crossed copies", found no partner and nothing to borrow the camera
+ * from, and stayed where their own frame drew them: holes along every edge
+ * they share, Conker left behind. */
+static uint64_t s_copy_mask[3];
+
+static const uint64_t *copy_reads(const Frame *f, uint32_t j,
+                                  const uint8_t *vary)
+{
+    static int on = -1;
+    uint32_t r;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_INTERP_COPY_READS");
+        on = !(e && *e == '0');
+    }
+    if (!on)
+        return NULL;
+    s_copy_mask[0] = s_copy_mask[1] = s_copy_mask[2] = 0;
+    for (r = 0; r < NV2A_VSH_CONSTANTS; r++)
+        if (vary[r])
+            s_copy_mask[r >> 6] |= 1ull << (r & 63);
+    if (f->prog[j] != PROG_NONE)
+        for (r = 0; r < 3; r++)
+            s_copy_mask[r] &= s_prog[f->prog[j]].reads[r];
+    return s_copy_mask;
+}
+
 static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
                              uint32_t a1, uint32_t b0, uint32_t b1, int kk)
 {
@@ -1745,6 +1786,7 @@ static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
     static uint8_t useda[NEAR_MAX], usedb[NEAR_MAX];
     const float (*ref)[4] = (const float (*)[4])f->consts[s_ka[a0].i];
     uint32_t na = a1 - a0, nb = b1 - b0, nr = 0, n = 0, r, x, y, c, paired = 0;
+    const uint64_t *cmask;
 
     for (r = 0; r < NV2A_VSH_CONSTANTS; r++) {
         vary[r] = 0;
@@ -1776,6 +1818,7 @@ static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
     qsort(s_near_c, n, sizeof *s_near_c, cmp_near);
     memset(useda, 0, na);
     memset(usedb, 0, nb);
+    cmask = copy_reads(f, s_ka[a0].i, vary);
     for (x = 0; x < n && paired < na && paired < nb; x++) {
         const NearCand *k = &s_near_c[x];
         if (useda[k->a] || usedb[k->b])
@@ -1788,8 +1831,9 @@ static uint32_t pair_nearest(Frame *f, const Frame *prev, uint32_t a0,
          * picture. A lone draw that spins (It's War's valve) still pairs.
          * RECOMP_INTERP_COPY_JUMP=0: off. */
         if (s_copy_jump && (na > 1 || nb > 1)
-            && mats_jumped((const float (*)[4])f->consts[s_ka[a0 + k->a].i],
-                           (const float (*)[4])prev->consts[s_kb[b0 + k->b].i])) {
+            && mats_jumped_in((const float (*)[4])f->consts[s_ka[a0 + k->a].i],
+                              (const float (*)[4])prev->consts[s_kb[b0 + k->b].i],
+                              cmask)) {
             s_copy_refused++;
             continue;
         }
@@ -1911,13 +1955,28 @@ static int mats_jumped_rows(const float (*a)[4], const float (*b)[4],
  * translation (the three w) move by more than half its length and more than
  * 100 units. A character put somewhere else between two shots, a camera cut
  * this draw sees, a fast spin. */
+static int mats_jumped_in(const float (*a)[4], const float (*b)[4],
+                          const uint64_t *reads);
+
 static int mats_jumped(const float (*a)[4], const float (*b)[4])
+{
+    return mats_jumped_in(a, b, NULL);
+}
+
+/* As mats_jumped, only matrices whose three rows the program reads (reads:
+ * its s_prog bits; NULL = every register). */
+static int mats_jumped_in(const float (*a)[4], const float (*b)[4],
+                          const uint64_t *reads)
 {
     uint32_t r, k;
 
     for (r = 0; r + 2 < NV2A_VSH_CONSTANTS; r++) {
         float ta[3], tb[3], la = 0, lb = 0, d = 0;
         int unit = 1, turned = 0;
+        if (reads)
+            for (k = 0; k < 3; k++)
+                if (!(reads[(r + k) >> 6] >> ((r + k) & 63) & 1))
+                    unit = 0;
         for (k = 0; k < 3 && unit; k++) {
             const float *x = a[r + k], *y = b[r + k];
             float lx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
@@ -2708,6 +2767,10 @@ static void trace_frame(const Frame *f, const Frame *prev)
                                     prev->spos[pj][1]);
                 if (f->held && f->held[j])
                     len += snprintf(line + len, sizeof line - len, " HELD");
+                if (f->shape)
+                    len += snprintf(line + len, sizeof line - len,
+                                    " shape %08X %08X %08X", f->shape[j][0],
+                                    f->shape[j][1], f->shape[j][2]);
                 fprintf(stderr, "%s%c", line, 10);
                 continue;
             }
@@ -2743,8 +2806,11 @@ static void trace_frame(const Frame *f, const Frame *prev)
             if (taken[j])
                 continue;
             fprintf(stderr, "[ITRACE] gone %4u prog %08X attr0 %08X n %5u prim"
-                    " %X tex0 %08X target %08X%c", j, pt[0], pt[1], pt[2],
-                    pt[3], pt[4], pt[5], 10);
+                    " %X tex0 %08X target %08X shape %08X %08X %08X%c", j,
+                    pt[0], pt[1], pt[2], pt[3], pt[4], pt[5],
+                    prev->shape ? prev->shape[j][0] : 0,
+                    prev->shape ? prev->shape[j][1] : 0,
+                    prev->shape ? prev->shape[j][2] : 0, 10);
         }
         free(taken);
     }
