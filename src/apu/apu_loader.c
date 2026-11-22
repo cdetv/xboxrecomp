@@ -139,6 +139,11 @@ void xbox_ApuSetOutputGain(float gain)
     if (apu()) s_apu->set_output_gain(gain);
 }
 
+void xbox_ApuSetI3dl2Listener(const void *listener48)
+{
+    if (apu()) s_apu->set_i3dl2_listener(listener48);
+}
+
 #else
 
 MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr);

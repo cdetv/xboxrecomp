@@ -41,6 +41,12 @@ void xbox_ApuSetPaused(int on);
  * most 8, +18 dB). Changes glide over ~15 ms. Any thread. */
 void xbox_ApuSetOutputGain(float gain);
 
+/* The title's I3DL2 listener (a DSI3DL2LISTENER, 48 bytes) for the effects
+ * image's reverb (apu_fx.c, Full DSP): the runtime can't find it on its own
+ * (it sits in a DirectSound object), so the game's glue hands it over when
+ * it changes. Any thread. */
+void xbox_ApuSetI3dl2Listener(const void *listener48);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

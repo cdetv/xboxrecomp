@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "apu_fx.h"
 #include "fpconv.h"
 
 /* #define DEBUG_MCPX */
@@ -1904,7 +1905,10 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->monitor.frame_buf[off + i][1] += isamp[2 * i + 1];
         }
         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
-        memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
+        /* The effects image's chain (apu_fx.c) runs on the bins after this:
+         * keep them while it is wanted. */
+        if (!apu_fx_wanted())
+            memset(mixbins, 0, sizeof(float) * NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
     }
 }
 

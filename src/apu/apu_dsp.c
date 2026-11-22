@@ -22,6 +22,7 @@
  */
 
 #include "apu_state.h"
+#include "apu_fx.h"
 #include "fpconv.h"
 
 #include <stdlib.h>
@@ -296,8 +297,14 @@ static void dsp_command(MCPXAPUState *d, uint32_t doorbell, uint32_t cmd)
                 fprintf(stderr, "%s\n", line);
             }
     }
-    if (cmd == 3 && s_dsp_log)
-        dsp_log_fx_table(shared, code_words, n);
+    if (cmd == 3) {
+        if (s_dsp_log)
+            dsp_log_fx_table(shared, code_words, n);
+        /* The effect list follows the state area (dsp_log_fx_table). */
+        apu_fx_load(shared, 0x818u + (code_words + n) * 4u,
+                    (volatile uint32_t *)((uintptr_t)*g_apu_host->mem_offset +
+                                          APU_VA + 0x30000u + NV_PAPU_GPXMEM));
+    }
 }
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -467,7 +474,38 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         }
     }
 
-    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+    /* The effects image's chain (apu_fx.c): with RECOMP_APU_PROCESSING=full
+     * its speaker bins replace the monitor mix's slice, folded to stereo
+     * (L = FL + C/sqrt2 + BL/sqrt2, R likewise; LFE left out unless
+     * RECOMP_APU_FOLD_LFE gives a gain) at RECOMP_APU_DSP_GAIN_DB (default
+     * -6, the monitor mix's headroom). With only RECOMP_APU_FX_LOG it runs
+     * for its log and plays nothing. */
+    if (apu_fx_wanted()) {
+        static float gain = -1.0f, lfe;
+        float spk[APU_FX_SPEAKERS][APU_FX_FRAME];
+        apu_fx_run(mixbins, spk);
+        if (apu_fx_full()) {
+            const float h = 0.70710678f;
+            if (gain < 0.0f) {
+                const char *e = getenv("RECOMP_APU_DSP_GAIN_DB");
+                gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -6.0f) / 20.0f);
+                lfe = env_gain("RECOMP_APU_FOLD_LFE", 0.0f);
+                fprintf(stderr, "[APU] Full DSP: stereo fold, output gain %.2f, LFE %.2f\n",
+                        gain, lfe);
+            }
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float c = h * spk[2][i] + lfe * spk[3][i];
+                float l = (spk[0][i] + c + h * spk[4][i]) * gain;
+                float r = (spk[1][i] + c + h * spk[5][i]) * gain;
+                l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+                r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+                d->monitor.frame_buf[off + i][0] = (int16_t)(l * 32767.0f);
+                d->monitor.frame_buf[off + i][1] = (int16_t)(r * 32767.0f);
+            }
+        }
+    }
+
+    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP && !apu_fx_full()) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
