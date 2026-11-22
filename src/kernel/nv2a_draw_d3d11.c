@@ -3186,8 +3186,14 @@ uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
 #define TEX_SAMPLE_LINE   64u
 #define TEX_SAMPLE_MIN    4096u         /* smaller: a full hash costs little */
 #define TEX_CALM_MS       500
+/* A texture unchanged for TEX_LONG_CALM_MS gets its periodic full hash every
+ * 83-100 ms (TEX_LONG_FULL_MS less a per-address spread) instead of every
+ * 17-33 ms. RECOMP_TEX_LONG_CALM (on; =0 the 17-33 ms for all). */
+#define TEX_LONG_CALM_MS  2000
+#define TEX_LONG_FULL_MS  100
 
 static int s_tex_sample = -1;
+static int s_tex_long = -1;
 static LONGLONG s_tex_qpf, s_tex_now;
 static uint32_t s_tex_now_flip = ~0u;
 static uint32_t s_tex_sampled, s_tex_full, s_tex_missed;
@@ -3205,6 +3211,7 @@ typedef struct {
     /* 0 no entry yet, 1 under 4 KB or sampling off, 2 not calm 0.5 s yet
      * (or no sample), 3 calm and the periodic full check was due, 4 the
      * sample changed, 5 check mode: the sample missed a change */
+    uint64_t due_long, missed_long;     /* of why[3] / why[5]: textures calm 2 s+ */
     uint64_t full_n, full_bytes;        /* full hashes and the bytes in them */
     uint64_t full_same, full_changed;   /* their result, for a known texture */
     uint64_t samp_n, samp_bytes;        /* sample hashes and their bytes */
@@ -3225,6 +3232,15 @@ static int tex_sample_mode(void)
         s_tex_qpf = f.QuadPart;
     }
     return s_tex_sample;
+}
+
+static int tex_long_calm(void)
+{
+    if (s_tex_long < 0) {
+        const char *e = getenv("RECOMP_TEX_LONG_CALM");
+        s_tex_long = !(e && e[0] == '0');
+    }
+    return s_tex_long;
 }
 
 /* The clock, read once a flip. */
@@ -4397,6 +4413,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
     int i, sampling, why;               /* why: index into s_tx.why */
+    int lcalm = 0;                      /* calm for TEX_LONG_CALM_MS (counters) */
     uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
@@ -4496,6 +4513,7 @@ guest:
          * the sample unchanged (4: it changed). */
         if (e->sample_ok && now - e->calm_at >= s_tex_qpf * TEX_CALM_MS / 1000) {
             why = 3;
+            lcalm = now - e->calm_at >= s_tex_qpf * TEX_LONG_CALM_MS / 1000;
             if (now < e->full_due) {
                 why = 4;
                 if (tex_sample_hash(mem + t->offset, bytes,
@@ -4513,6 +4531,7 @@ guest:
                             s_tex_missed++;
                             trust = 0;
                             why = 5;
+                            s_tx.missed_long += lcalm;
                         }
                     }
                     if (trust) {
@@ -4533,6 +4552,8 @@ guest:
     s_tx.full_n++;
     s_tx.full_bytes += bytes + (palette ? 256 * 4 : 0);
     s_tx.why[why]++;
+    if (why == 3)
+        s_tx.due_long += lcalm;
     if (e) {
         if (e->hash == hash)
             s_tx.full_same++;
@@ -4541,9 +4562,20 @@ guest:
     }
     if (e && e->hash == hash) {
         if (sampling) {
-            /* The next full hash 17-33 ms on, spread by address. */
-            e->full_due = tex_now() + s_tex_qpf / 60
-                        + s_tex_qpf / 60 * ((e->addr * 2654435761u) >> 24) / 256;
+            /* The next full hash 17-33 ms on, spread by address; for a
+             * texture unchanged for TEX_LONG_CALM_MS, 83-100 ms on
+             * (RECOMP_TEX_LONG_CALM, executor cheaper wins step 4: user
+             * 2026-11-22, a CPU-written texture that changes only between
+             * the sampled lines shows stale for up to 100 ms, not 33). */
+            LONGLONG now = tex_now();
+            LONGLONG spread = s_tex_qpf / 60
+                            * ((e->addr * 2654435761u) >> 24) / 256;
+            if (tex_long_calm() && now - e->calm_at
+                    >= s_tex_qpf * TEX_LONG_CALM_MS / 1000)
+                e->full_due = now + s_tex_qpf * TEX_LONG_FULL_MS / 1000
+                            - spread;
+            else
+                e->full_due = now + s_tex_qpf / 60 + spread;
             e->sample = tex_sample_hash(mem + t->offset, bytes,
                                         palette ? mem + palette : NULL);
             e->sample_ok = 1;
@@ -7581,13 +7613,15 @@ static void exec_stats_tick(void)
             EXECN(d.tx.full_n), 10);
     fprintf(stderr, "[EXECSTAT]   full hashes %llu (%.1f a flip, %.2f MB, %.2f"
             " MB a flip): first sight %llu, under 4 KB or sampling off %llu,"
-            " not calm yet %llu, calm and due %llu, sample changed %llu,"
-            " check mode: sample missed %llu; result: same bytes %llu,"
-            " changed %llu%c", EXECN(d.tx.full_n), (double)d.tx.full_n / f,
+            " not calm yet %llu, calm and due %llu (%llu of them calm 2 s+),"
+            " sample changed %llu, check mode: sample missed %llu (%llu"
+            " calm 2 s+); result: same bytes %llu, changed %llu%c",
+            EXECN(d.tx.full_n), (double)d.tx.full_n / f,
             (double)d.tx.full_bytes / 1048576.0,
             (double)d.tx.full_bytes / 1048576.0 / f, EXECN(d.tx.why[0]),
             EXECN(d.tx.why[1]), EXECN(d.tx.why[2]), EXECN(d.tx.why[3]),
-            EXECN(d.tx.why[4]), EXECN(d.tx.why[5]), EXECN(d.tx.full_same),
+            EXECN(d.tx.due_long), EXECN(d.tx.why[4]), EXECN(d.tx.why[5]),
+            EXECN(d.tx.missed_long), EXECN(d.tx.full_same),
             EXECN(d.tx.full_changed), 10);
     fprintf(stderr, "[EXECSTAT]   sample hashes %llu (%.2f MB); check mode's"
             " extra full hashes %llu (%.2f MB); uploads %llu (%.2f MB read,"
