@@ -2917,6 +2917,33 @@ static unsigned long g_swm_delivered[32], g_swm_skipped[32];
 static unsigned long g_swm_unacked, g_swm_retries;
 static HANDLE g_timer_wake;                  /* cuts the timer thread's sleep */
 
+/* RECOMP_TURN_PROFILE's trap view (xbox_memory_layout.c, executor cheap wins
+ * step 1): per software method code, how long a trap waits for the timer
+ * thread to start on it ("wake": posted -> its tick began) and how long the
+ * ISR + DPC then run ("handler"). The executor's own round trip per code is
+ * wake + handler + the hand-back. Counted only while the profile is on, so
+ * a normal run pays no extra clock read. */
+static volatile LONG g_swm_prof;
+static volatile LONGLONG g_swm_post_qpc;
+static unsigned long long g_swm_prof_n[32], g_swm_wake_ticks[32],
+                          g_swm_run_ticks[32];
+
+void kernel_pgraph_swm_profile(int on)
+{
+    InterlockedExchange(&g_swm_prof, on ? 1 : 0);
+}
+
+/* Totals so far for one code (QPC ticks); the caller diffs them. */
+void kernel_pgraph_swm_stats(uint32_t code, unsigned long long *n,
+                             unsigned long long *wake_ticks,
+                             unsigned long long *run_ticks)
+{
+    code &= 31u;
+    *n = g_swm_prof_n[code];
+    *wake_ticks = g_swm_wake_ticks[code];
+    *run_ticks = g_swm_run_ticks[code];
+}
+
 /* VSync on (vsync_d3d11.c): the monitor's refreshes drive the vblank clock
  * (kernel_vblank_tick) while on is nonzero; zero = its own 60 Hz again. */
 void xbox_VblankDisplayLock(int on)
@@ -3060,6 +3087,11 @@ int kernel_pgraph_swm_post(uint32_t subch, uint32_t param)
     }
     g_swm_subch = subch;
     g_swm_param = param;
+    if (g_swm_prof) {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        g_swm_post_qpc = q.QuadPart;
+    }
     InterlockedExchange(&g_swm_state, SWM_POSTED);
     SetEvent(g_timer_wake);
     return 1;
@@ -3132,6 +3164,13 @@ static void kernel_pgraph_swm_tick(void)
     }
     QueryPerformanceCounter(&t1);
     QueryPerformanceFrequency(&f);
+    if (g_swm_prof && claimed > 0 && g_swm_post_qpc) {
+        g_swm_prof_n[code]++;
+        g_swm_wake_ticks[code] += (unsigned long long)(t0.QuadPart
+                                                       - g_swm_post_qpc);
+        g_swm_run_ticks[code] += (unsigned long long)(t1.QuadPart
+                                                      - t0.QuadPart);
+    }
     /* The first few of each code, then every 1024th. */
     if (claimed < 0 || left || g_swm_delivered[code] <= 8
             || !(g_swm_delivered[code] & 1023)) {
