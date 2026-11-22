@@ -3,7 +3,7 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass. The command doorbell's copy commands (3 = load, 2 = copy) are done, so GP X memory holds the effect states DirectSound keeps in its shared copy of the image (`apu_dsp.c`; `RECOMP_APU_DSP_COPY=0` = acknowledge only, `RECOMP_APU_DSP_LOG=1|2` = `[APUDSP]` lines).
 - **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
 
 Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
