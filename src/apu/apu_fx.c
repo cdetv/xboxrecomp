@@ -17,9 +17,16 @@
  *
  * Processing (Standard = the monitor mix, Full DSP = this chain's speakers)
  * is switched live by xbox_ApuSetAudioMode, crossfaded (apu_fx_frame_begin).
+ * So is the output's Stereo / Headphones (the crosstalk's cross term faded
+ * out: the HRTF ears straight to their sides); 5.1 surround is fixed at the
+ * start and always plays Full DSP.
  *
  * Switches (read once):
  *   RECOMP_APU_PROCESSING=full   Full DSP until the first xbox_ApuSetAudioMode
+ *   RECOMP_APU_OUTPUT=stereo|headphones|surround
+ *                                the output until the first xbox_ApuSetAudioMode;
+ *                                surround only from the start (apu_core.c makes
+ *                                six channels, the kernel tells the game)
  *   RECOMP_APU_DSP_HRTF_NORM=1   Full DSP with the power-normalised HRTF ears
  *                                (A/B; default the raw ears, as the console)
  *   RECOMP_APU_FX_LOG=1          [APUFX] at the load (each effect and its kind)
@@ -103,7 +110,17 @@ static float limit(float x) { return x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x; }
 
 /* ── Switches ───────────────────────────────────────────────────────────── */
 
-static int s_cfg, s_full, s_log, s_off, s_hrtf_norm;
+static int s_cfg, s_full, s_log, s_off, s_hrtf_norm, s_out_start, s_surround;
+static const char *const k_out[3] = {
+    "stereo", "headphones (no speaker crosstalk)", "5.1 surround"
+};
+
+static int out_of(const char *q)
+{
+    return !q ? APU_OUTPUT_STEREO
+         : !strcmp(q, "surround") ? APU_OUTPUT_SURROUND
+         : !strcmp(q, "headphones") ? APU_OUTPUT_HEADPHONES : APU_OUTPUT_STEREO;
+}
 
 static void cfg(void)
 {
@@ -116,17 +133,32 @@ static void cfg(void)
     o = getenv("RECOMP_APU_FX_OFF");
     n = getenv("RECOMP_APU_DSP_HRTF_NORM");
     s_full = p && !strcmp(p, "full");
+    s_out_start = out_of(getenv("RECOMP_APU_OUTPUT"));
+    s_surround = s_out_start == APU_OUTPUT_SURROUND;
     s_hrtf_norm = n && atoi(n) != 0;
     s_log = (l && *l) ? atoi(l) : 0;
     if (o && *o)
         for (int k = 1; k < FX_KINDS; k++)
             if (strstr(o, k_kind[k]))
                 s_off |= 1 << k;
-    fprintf(stderr, "[APUFX] processing %s%s%s\n",
-            s_full ? "full (the effects image's chain plays)"
-                   : "standard (the monitor mix plays)",
+    fprintf(stderr, "[APUFX] processing %s, output %s%s%s\n",
+            s_surround ? "full (5.1 surround always plays the effects image's chain)"
+            : s_full ? "full (the effects image's chain plays)"
+                     : "standard (the monitor mix plays)",
+            k_out[s_out_start],
             s_log ? ", log on" : "", s_off ? ", some effects off (RECOMP_APU_FX_OFF)" : "");
 }
+
+int apu_fx_surround(void)
+{
+    cfg();
+    return s_surround;
+}
+
+/* The crosstalk's cross term at this frame's start and end: 1 for Stereo
+ * (and 5.1: as the game sets it), 0 for Headphones, faded between over
+ * XF_FRAMES frames (apu_fx_frame_begin). */
+static float s_xt0 = 1.0f, s_xt1 = 1.0f;
 
 /* ── X memory buffers ───────────────────────────────────────────────────
  * A float mirror of the 32-sample buffers the effects name by X address,
@@ -481,7 +513,9 @@ static void run_reverb(const Fx *e)
 /* Two pairs (inputs 0, 1 and 2, 3; outputs 4, 5 and 6, 7): each side adds
  * the other side's output 11 samples back through a one-pole low pass
  * (constants the effect sets on its first run). Flag bit 1 keeps the cross
- * term; without it the inputs pass straight through. */
+ * term; without it the inputs pass straight through. Output Headphones fades
+ * the cross term out (s_xt0..s_xt1); its history runs on either way, so it
+ * comes back without a jump. */
 static void run_crosstalk(Fx *e, int cross)
 {
     const float kPole = 0.924f;     /* 0x7645A1 */
@@ -504,6 +538,10 @@ static void run_crosstalk(Fx *e, int cross)
             if (!cross) {
                 left = inl[i];
                 right = inr[i];
+            } else if (s_xt0 < 1.0f || s_xt1 < 1.0f) {
+                float w = s_xt0 + (s_xt1 - s_xt0) * (float)(i + 1) / APU_FX_FRAME;
+                left = inl[i] + (left - inl[i]) * w;
+                right = inr[i] + (right - inr[i]) * w;
             }
             outl[i] = limit(outl[i] + left);
             outr[i] = limit(outr[i] + right);
@@ -649,7 +687,9 @@ void apu_fx_load(const uint8_t *shared, uint32_t table, volatile uint32_t *xmem)
  * switch back while it still fades out keeps it (no jump). */
 #define XF_FRAMES 32                  /* 32 frames of 32 samples: 21 ms */
 static volatile int s_req = -1;       /* asked: 1 full, 0 standard, -1 not yet */
-static volatile int s_req_out;
+static volatile int s_req_out = -1;   /* asked: APU_OUTPUT_*, -1 not yet */
+static int s_out = -1;                /* the frame thread's output, -1 before the first frame */
+static int s_out_asked = -1;          /* the last request it saw (log) */
 static int s_on;                      /* the frame thread's target: Full */
 static int s_xf;                      /* crossfade frames left */
 static float s_w0, s_w1;              /* Full's share at this frame's start, end */
@@ -669,8 +709,40 @@ static void fx_reset(void)
 
 void apu_fx_set_mode(int processing, int output)
 {
-    s_req_out = output;
+    s_req_out = output >= APU_OUTPUT_STEREO && output <= APU_OUTPUT_SURROUND
+              ? output : APU_OUTPUT_STEREO;
     s_req = processing == APU_PROCESSING_FULL;
+}
+
+/* The output asked for, as it applies now: 5.1 is fixed at the start (the
+ * game was told at boot, apu_core.c chose the channels), so a run started
+ * in 5.1 stays there and 5.1 asked later waits for the next start (the
+ * output stays as it is meanwhile). */
+static void take_output(uint32_t frame)
+{
+    int asked = s_req_out >= 0 ? s_req_out : s_out_start;
+    int out = asked;
+    if (s_surround)
+        out = APU_OUTPUT_SURROUND;
+    else if (out == APU_OUTPUT_SURROUND)
+        out = s_out >= 0 ? s_out : APU_OUTPUT_STEREO;
+    if (asked != s_out_asked && s_out >= 0 && out == s_out && asked != out)
+        fprintf(stderr, "[APUFX] output %s asked: from the next start (%s plays)\n",
+                k_out[asked], k_out[out]);
+    s_out_asked = asked;
+    if (out != s_out) {
+        if (s_out < 0)
+            s_xt1 = out == APU_OUTPUT_HEADPHONES ? 0.0f : 1.0f;   /* no fade at the start */
+        else
+            fprintf(stderr, "[APUFX] output -> %s (crossfade %d ms) at APU frame %u\n",
+                    k_out[out], XF_FRAMES * APU_FX_FRAME / 48, frame);
+        s_out = out;
+    }
+    s_xt0 = s_xt1;
+    if (s_out == APU_OUTPUT_HEADPHONES)
+        s_xt1 = s_xt1 - 1.0f / XF_FRAMES > 0.0f ? s_xt1 - 1.0f / XF_FRAMES : 0.0f;
+    else
+        s_xt1 = s_xt1 + 1.0f / XF_FRAMES < 1.0f ? s_xt1 + 1.0f / XF_FRAMES : 1.0f;
 }
 
 /* xbox_ApuSetAudioMode (apu.h): the DLL's side. */
@@ -684,7 +756,8 @@ void apu_fx_frame_begin(void)
     static uint32_t frame;            /* APU frames so far: x 32 = output samples */
     int want;
     cfg();
-    want = (s_req >= 0 ? s_req : s_full) && s_fx_count > 0;
+    take_output(frame);
+    want = (s_surround || (s_req >= 0 ? s_req : s_full)) && s_fx_count > 0;
     s_w0 = s_w1;
     if (want != s_on) {
         s_on = want;

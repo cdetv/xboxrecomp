@@ -505,6 +505,9 @@ struct MCPXAPUState {
     struct {
         McpxApuDebugMonitorPoint point;
         int16_t frame_buf[256][2];
+        /* 5.1 (apu_out_channels() == 6): Full DSP's six speakers, FL FR C
+         * LFE BL BR; frame_buf's stereo is added to its front pair. */
+        int16_t frame_buf6[256][6];
         void *stream; /* SDL_AudioStream* - stubbed */
         int queued_bytes_low, queued_bytes_high;
     } monitor;
@@ -537,6 +540,10 @@ void mcpx_apu_monitor_place_speakers(const int bin[8], const float gain[8],
                                      unsigned int channels, bool hrtf,
                                      int skip_bin, float out[2][2],
                                      float dry_out[2]);
+
+/* The output stage's channels, fixed at the start (apu_core.c): 2, or 6 for
+ * 5.1 surround on a device with six speakers (or RECOMP_APU_CHANNELS=6). */
+int apu_out_channels(void);
 
 /* XGSCNT, the global sample counter: advanced by the frame thread, one
  * frame's samples at a time (apu_core.c). */

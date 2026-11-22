@@ -53,11 +53,21 @@ void xbox_ApuSetI3dl2Listener(const void *listener48);
  *     use_dsp off; or RECOMP_APU_MIXDOWN's table), APU_PROCESSING_FULL = the
  *     effects image's chain (apu_fx.c) and its speaker bins, folded to the
  *     output;
- *   output: APU_OUTPUT_STEREO (the only one so far).
- * Until the first call RECOMP_APU_PROCESSING (standard | full) decides. */
+ *   output: APU_OUTPUT_STEREO (speakers: Full DSP's crosstalk as the game
+ *     sets it), APU_OUTPUT_HEADPHONES (Full DSP without the crosstalk's cross
+ *     term: the HRTF ears straight to their sides; Standard has no crosstalk,
+ *     so it plays as Stereo), APU_OUTPUT_SURROUND (5.1: only from the start,
+ *     RECOMP_APU_OUTPUT=surround before the APU and the kernel's XC_AUDIO
+ *     read it; always Full DSP, six channels where the device has six
+ *     speakers, else Full DSP's stereo fold; asked later it waits for the
+ *     next start, and a 5.1 run ignores Stereo / Headphones until then).
+ * Until the first call RECOMP_APU_PROCESSING (standard | full) and
+ * RECOMP_APU_OUTPUT (stereo | headphones | surround) decide. */
 #define APU_PROCESSING_STANDARD 0
 #define APU_PROCESSING_FULL     1
 #define APU_OUTPUT_STEREO       0
+#define APU_OUTPUT_HEADPHONES   1
+#define APU_OUTPUT_SURROUND     2
 void xbox_ApuSetAudioMode(int processing, int output);
 
 /* ============================================================
