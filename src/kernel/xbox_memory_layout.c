@@ -1735,10 +1735,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * first eight. A wrap whose start was not found
                          * or lies past PUT is always shown: the segment
                          * after it was walked from a guess. */
-                        if (getenv("RECOMP_PB_WRAP_TRACE")
-                                || !start || (start & 0x0FFFFFFFu) > put) {
+                        /* Read once: a wrap comes every few frames and a
+                         * getenv walks the whole environment block
+                         * (executor cheaper wins step 2). */
+                        static int wt_read;
+                        static const char *wt;
+                        if (!wt_read) {
+                            wt = getenv("RECOMP_PB_WRAP_TRACE");
+                            wt_read = 1;
+                        }
+                        if (wt || !start || (start & 0x0FFFFFFFu) > put) {
                             static unsigned wraps;
-                            const char *wt = getenv("RECOMP_PB_WRAP_TRACE");
                             if (wraps++ < 8 || (wt && !strcmp(wt, "all"))
                                     || !start || (start & 0x0FFFFFFFu) > put)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
