@@ -259,6 +259,12 @@ static float    s_dc_bin_g[MCPX_HW_MAX_VOICES][8];  /* its bin gains then */
 static float    s_dc_mon_g[MCPX_HW_MAX_VOICES][6];  /* its monitor gains then */
 static float    s_dc_last[MCPX_HW_MAX_VOICES][2];   /* its last monitor sample */
 static float    s_dc_tail[2];                       /* stopped voices, decaying */
+static uint32_t s_mon_frame;              /* last frame the monitor mix ran */
+/* Full DSP (apu_fx.c) hears the bins, so its stop tail is per bin: each
+ * voice's last sample in each of its 8 bins, and the decaying sum per bin. */
+static float    s_dc_bin_last[MCPX_HW_MAX_VOICES][8];
+static uint8_t  s_dc_bin_to[MCPX_HW_MAX_VOICES][8];
+static float    s_bin_tail[NUM_MIXBINS];
 
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
@@ -1549,8 +1555,11 @@ static void voice_process(MCPXAPUState *d,
                 for (int k = 0; k < HRTF_NUM_TAPS; k++)
                     e += hf->ch[ch].hrir_coeff_cur[k] * hf->ch[ch].hrir_coeff_cur[k];
             float norm = e > 1e-6f ? fminf(sqrtf(2.0f / e), 8.0f) : 1.0f;
-            if (d->monitor.point == MCPX_APU_DEBUG_MON_VP)
-                norm = 1.0f;          /* xemu's monitor mix: raw HRTF */
+            /* Raw HRTF ears: xemu's monitor mix, and Full DSP as the
+             * console (unless RECOMP_APU_DSP_HRTF_NORM=1). */
+            if (apu_fx_full() ? apu_fx_raw_ears()
+                              : d->monitor.point == MCPX_APU_DEBUG_MON_VP)
+                norm = 1.0f;
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 samples[i][0] *= norm;
                 samples[i][1] *= norm;
@@ -1576,18 +1585,23 @@ static void voice_process(MCPXAPUState *d,
         float gi = dc_ramp ? s_dc_bin_g[v][b] : g;
         float dg = (g - gi) / NUM_SAMPLES_PER_FRAME;
         s_dc_bin_g[v][b] = g;
+        /* What it put in the bin last, for Full DSP's stop tail. */
+        s_dc_bin_to[v][b] = (uint8_t)bin[b];
         if (hrtf_on) {
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 gi += dg;
                 mixbins[bin[b]][i] += gi * (b < 4 ? samples[i][b >> 1]
                                                   : dry[i][b % channels]);
             }
+            s_dc_bin_last[v][b] = g * (b < 4 ? samples[NUM_SAMPLES_PER_FRAME - 1][b >> 1]
+                                             : dry[NUM_SAMPLES_PER_FRAME - 1][b % channels]);
             continue;
         }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             gi += dg;
             mixbins[bin[b]][i] += gi * samples[i][b % channels];
         }
+        s_dc_bin_last[v][b] = g * samples[NUM_SAMPLES_PER_FRAME - 1][b % channels];
     }
 
     if (g_apu_prof_on)
@@ -1621,8 +1635,11 @@ static void voice_process(MCPXAPUState *d,
                         ea_value * place[1][0], ea_value * place[1][1],
                         ea_value * dry_place[0], ea_value * dry_place[1] };
         float gc[6], gd[6];
+        /* (Last frame's gains only if the monitor mix ran then: it rests
+         * while only Full DSP is heard.) */
+        const bool mon_ramp = dc_ramp && s_mon_frame == s_vp_frame - 1;
         for (int k = 0; k < 6; k++) {
-            gc[k] = dc_ramp ? s_dc_mon_g[v][k] : gm[k];
+            gc[k] = mon_ramp ? s_dc_mon_g[v][k] : gm[k];
             gd[k] = (gm[k] - gc[k]) / NUM_SAMPLES_PER_FRAME;
             s_dc_mon_g[v][k] = gm[k];
         }
@@ -1859,6 +1876,30 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         }
     }
 
+    /* Full DSP's stop tail (apu_declick_on), as the monitor mix's below but
+     * per bin, before the effects so the tail goes through them: a voice
+     * that played last frame and not in this one leaves its last sample in
+     * each of its bins to decay (~1.5 ms) instead of dropping to zero. */
+    if (apu_fx_full() && apu_declick_on()) {
+        for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+            if (s_dc_frame[v] == s_vp_frame - 1)
+                for (int b = 0; b < 8; b++)
+                    s_bin_tail[s_dc_bin_to[v][b]] += s_dc_bin_last[v][b];
+        }
+        for (int k = 0; k < NUM_MIXBINS; k++) {
+            float t = s_bin_tail[k];
+            if (t == 0.0f)
+                continue;
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                t *= DECLICK_DECAY;
+                mixbins[k][i] += t;
+            }
+            s_bin_tail[k] = fabsf(t) < 1e-6f ? 0.0f : t;
+        }
+    } else {
+        memset(s_bin_tail, 0, sizeof s_bin_tail);
+    }
+
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
         int16_t isamp[NUM_SAMPLES_PER_FRAME * 2];
@@ -1876,7 +1917,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
         /* Voices that played last frame and not in this one: their last
          * sample decays instead of dropping to zero (apu_declick_on). */
         if (apu_declick_on()) {
-            for (int v = 0; v < MCPX_HW_MAX_VOICES; v++) {
+            /* (Only if the monitor mix ran last frame: else its last
+             * samples are old, from before Full DSP.) */
+            const bool ran = s_mon_frame == s_vp_frame - 1;
+            if (!ran)
+                s_dc_tail[0] = s_dc_tail[1] = 0.0f;
+            for (int v = 0; ran && v < MCPX_HW_MAX_VOICES; v++) {
                 if (s_dc_frame[v] == s_vp_frame - 1) {
                     s_dc_tail[0] += s_dc_last[v][0];
                     s_dc_tail[1] += s_dc_last[v][1];
@@ -1905,6 +1951,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             d->monitor.frame_buf[off + i][1] += isamp[2 * i + 1];
         }
         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+        s_mon_frame = s_vp_frame;
         /* The effects image's chain (apu_fx.c) runs on the bins after this:
          * keep them while it is wanted. */
         if (!apu_fx_wanted())

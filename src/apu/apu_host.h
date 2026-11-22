@@ -36,7 +36,7 @@ extern "C" {
 
 /* Raised whenever either table changes shape; a DLL built for another
  * version refuses to connect rather than call through a wrong table. */
-#define APU_HOST_VERSION 2   /* 2: set_i3dl2_listener (Full DSP) */
+#define APU_HOST_VERSION 3   /* 2: set_i3dl2_listener (Full DSP); 3: set_audio_mode */
 
 /* One delivery of the APU interrupt to the guest's service routine:
  * isr_prepare fills it, isr_call runs it, isr_release gives back what
@@ -97,6 +97,7 @@ typedef struct ApuApi {
 
     void     (*set_output_gain)(float gain);
     void     (*set_i3dl2_listener)(const void *listener48);
+    void     (*set_audio_mode)(int processing, int output);
 } ApuApi;
 
 /* The DLL's one export. Keeps host (it must outlive the APU) and fills api.

@@ -90,5 +90,6 @@ int xemu_apu_connect(const ApuHost *host, ApuApi *api)
     api->mixer_stop         = apu_mixer_stop;
     api->set_output_gain    = xbox_ApuSetOutputGain;
     api->set_i3dl2_listener = xbox_ApuSetI3dl2Listener;
+    api->set_audio_mode     = xbox_ApuSetAudioMode;
     return 1;
 }

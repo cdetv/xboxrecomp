@@ -144,6 +144,11 @@ void xbox_ApuSetI3dl2Listener(const void *listener48)
     if (apu()) s_apu->set_i3dl2_listener(listener48);
 }
 
+void xbox_ApuSetAudioMode(int processing, int output)
+{
+    if (apu()) s_apu->set_audio_mode(processing, output);
+}
+
 #else
 
 MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr);

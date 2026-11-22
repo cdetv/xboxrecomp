@@ -21,12 +21,30 @@ extern "C" {
  * resets every effect's history. */
 void apu_fx_load(const uint8_t *shared, uint32_t table, volatile uint32_t *xmem);
 
+/* Processing as xbox_ApuSetAudioMode asks it (apu.h; any thread). */
+void apu_fx_set_mode(int processing, int output);
+
+/* Frame thread, at the start of every frame (before the VP): takes a new
+ * processing mode and moves the crossfade on. The calls below describe the
+ * frame it began. */
+void apu_fx_frame_begin(void);
+
 /* 1 when the frame thread should run the chain: an image is loaded and
- * Full DSP is on (RECOMP_APU_PROCESSING=full) or RECOMP_APU_FX_LOG is set. */
+ * Full DSP is heard (or fading) or RECOMP_APU_FX_LOG is set. */
 int apu_fx_wanted(void);
 
-/* 1 when the chain's speakers replace the monitor mix (RECOMP_APU_PROCESSING=full). */
+/* 1 when Full DSP's output is heard in this frame (on, or crossfading). */
 int apu_fx_full(void);
+
+/* 1 when only Full DSP is heard (no crossfade): the monitor mix can rest. */
+int apu_fx_full_only(void);
+
+/* Full DSP's share of the output at sample i of this frame (0..1). */
+float apu_fx_share(int i);
+
+/* 1 = Full DSP's 3D voices use the raw HRTF ears, as the console (default);
+ * 0 = the power-normalised ones (RECOMP_APU_DSP_HRTF_NORM=1, A/B). */
+int apu_fx_raw_ears(void);
 
 /* One GP frame on the frame thread: bins = the voice processor's 32 bins,
  * out = speaker bins 0-5 after every effect. */
