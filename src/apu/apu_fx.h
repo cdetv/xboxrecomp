@@ -46,6 +46,9 @@ float apu_fx_share(int i);
  * start): Full DSP always, the chain's six speakers to the output stage. */
 int apu_fx_surround(void);
 
+/* 1 when the output is Mono (frame thread): apu_core.c makes L = R. */
+int apu_fx_mono(void);
+
 /* 1 = Full DSP's 3D voices use the raw HRTF ears, as the console (default);
  * 0 = the power-normalised ones (RECOMP_APU_DSP_HRTF_NORM=1, A/B). */
 int apu_fx_raw_ears(void);

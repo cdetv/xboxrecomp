@@ -60,14 +60,18 @@ void xbox_ApuSetI3dl2Listener(const void *listener48);
  *     RECOMP_APU_OUTPUT=surround before the APU and the kernel's XC_AUDIO
  *     read it; always Full DSP, six channels where the device has six
  *     speakers, else Full DSP's stereo fold; asked later it waits for the
- *     next start, and a 5.1 run ignores Stereo / Headphones until then).
+ *     next start, and a 5.1 run ignores the others until then),
+ *     APU_OUTPUT_MONO (both sides the same, 0.5 x (L + R) after the stereo
+ *     fold; Full DSP without the crosstalk's cross term, as Headphones: on
+ *     one channel it would only take the bass out of 3D sounds).
  * Until the first call RECOMP_APU_PROCESSING (standard | full) and
- * RECOMP_APU_OUTPUT (stereo | headphones | surround) decide. */
+ * RECOMP_APU_OUTPUT (stereo | headphones | surround | mono) decide. */
 #define APU_PROCESSING_STANDARD 0
 #define APU_PROCESSING_FULL     1
 #define APU_OUTPUT_STEREO       0
 #define APU_OUTPUT_HEADPHONES   1
 #define APU_OUTPUT_SURROUND     2
+#define APU_OUTPUT_MONO         3
 void xbox_ApuSetAudioMode(int processing, int output);
 
 /* ============================================================

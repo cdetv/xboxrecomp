@@ -822,6 +822,49 @@ static void out_gain_apply(int16_t (*buf)[2], int n)
     }
 }
 
+/* Output Mono (apu_fx_mono, any processing): both sides 0.5 x (L + R), on
+ * the stereo frame before the output gain. 0.5 never clips; against Stereo
+ * the field opening plays 0.9 dB quieter (median of 5 s windows), within
+ * the 2 dB planned. A switch either way glides over MONO_GLIDE samples (no
+ * click); Stereo / Headphones leave the samples untouched. The game is not
+ * told (on the console its mono setting changes nothing it makes for us). */
+#define MONO_GLIDE 1024                 /* 21 ms at 48 kHz */
+static float g_mono;                    /* Mono's share now, 0..1 */
+
+static void mono_apply(int16_t (*buf)[2], int n)
+{
+    const float target = apu_fx_mono() ? 1.0f : 0.0f;
+    static int last = -1;
+    if (target != (float)last) {
+        if (last >= 0)
+            fprintf(stderr, "[APU] output: %s (over %d ms)\n",
+                    target > 0.0f ? "mono, both sides 0.5 x (L + R)" : "stereo again",
+                    MONO_GLIDE / 48);
+        else if (target > 0.0f)
+            fprintf(stderr, "[APU] output: mono, both sides 0.5 x (L + R)\n");
+        if (last < 0)
+            g_mono = target;            /* no glide at the start */
+        last = (int)target;
+    }
+    if (g_mono == 0.0f && target == 0.0f)
+        return;
+    for (int i = 0; i < n; i++) {
+        int32_t l = buf[i][0], r = buf[i][1];
+        int32_t m = (l + r) / 2;
+        if (g_mono != target) {
+            g_mono += target > g_mono ? 1.0f / MONO_GLIDE : -1.0f / MONO_GLIDE;
+            if (g_mono < 0.0f || g_mono > 1.0f || fabsf(g_mono - target) < 0.5f / MONO_GLIDE)
+                g_mono = target;
+        }
+        if (g_mono >= 1.0f) {
+            buf[i][0] = buf[i][1] = (int16_t)m;
+        } else {
+            buf[i][0] = (int16_t)lrintf((float)l + ((float)m - (float)l) * g_mono);
+            buf[i][1] = (int16_t)lrintf((float)r + ((float)m - (float)r) * g_mono);
+        }
+    }
+}
+
 /* The same for 6 channels (5.1): one limiter gain for all of them, from the
  * loudest. The stereo one above stays as it was (Standard + Stereo must
  * give the same samples as before 5.1 came). */
@@ -927,6 +970,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         if (g_out_muted)
             memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
     } else {
+        mono_apply(d->monitor.frame_buf, n);
         out_gain_apply(d->monitor.frame_buf, n);
         if (g_out_muted) {
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));

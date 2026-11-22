@@ -18,12 +18,13 @@
  * Processing (Standard = the monitor mix, Full DSP = this chain's speakers)
  * is switched live by xbox_ApuSetAudioMode, crossfaded (apu_fx_frame_begin).
  * So is the output's Stereo / Headphones (the crosstalk's cross term faded
- * out: the HRTF ears straight to their sides); 5.1 surround is fixed at the
- * start and always plays Full DSP.
+ * out: the HRTF ears straight to their sides) / Mono (as Headphones here;
+ * apu_core.c makes both sides the same); 5.1 surround is fixed at the start
+ * and always plays Full DSP.
  *
  * Switches (read once):
  *   RECOMP_APU_PROCESSING=full   Full DSP until the first xbox_ApuSetAudioMode
- *   RECOMP_APU_OUTPUT=stereo|headphones|surround
+ *   RECOMP_APU_OUTPUT=stereo|headphones|surround|mono
  *                                the output until the first xbox_ApuSetAudioMode;
  *                                surround only from the start (apu_core.c makes
  *                                six channels, the kernel tells the game)
@@ -111,15 +112,17 @@ static float limit(float x) { return x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x; }
 /* ── Switches ───────────────────────────────────────────────────────────── */
 
 static int s_cfg, s_full, s_log, s_off, s_hrtf_norm, s_out_start, s_surround;
-static const char *const k_out[3] = {
-    "stereo", "headphones (no speaker crosstalk)", "5.1 surround"
+static const char *const k_out[4] = {
+    "stereo", "headphones (no speaker crosstalk)", "5.1 surround",
+    "mono (both sides the same, no speaker crosstalk)"
 };
 
 static int out_of(const char *q)
 {
     return !q ? APU_OUTPUT_STEREO
          : !strcmp(q, "surround") ? APU_OUTPUT_SURROUND
-         : !strcmp(q, "headphones") ? APU_OUTPUT_HEADPHONES : APU_OUTPUT_STEREO;
+         : !strcmp(q, "headphones") ? APU_OUTPUT_HEADPHONES
+         : !strcmp(q, "mono") ? APU_OUTPUT_MONO : APU_OUTPUT_STEREO;
 }
 
 static void cfg(void)
@@ -156,8 +159,10 @@ int apu_fx_surround(void)
 }
 
 /* The crosstalk's cross term at this frame's start and end: 1 for Stereo
- * (and 5.1: as the game sets it), 0 for Headphones, faded between over
- * XF_FRAMES frames (apu_fx_frame_begin). */
+ * (and 5.1: as the game sets it), 0 for Headphones and Mono, faded between
+ * over XF_FRAMES frames (apu_fx_frame_begin). Mono goes without it: summed
+ * to one channel the cross term only colours 3D sounds (L + R: -5 dB below
+ * 200 Hz, +3 dB at 1-1.5 kHz; on two speakers it widens L - R instead). */
 static float s_xt0 = 1.0f, s_xt1 = 1.0f;
 
 /* ── X memory buffers ───────────────────────────────────────────────────
@@ -709,7 +714,7 @@ static void fx_reset(void)
 
 void apu_fx_set_mode(int processing, int output)
 {
-    s_req_out = output >= APU_OUTPUT_STEREO && output <= APU_OUTPUT_SURROUND
+    s_req_out = output >= APU_OUTPUT_STEREO && output <= APU_OUTPUT_MONO
               ? output : APU_OUTPUT_STEREO;
     s_req = processing == APU_PROCESSING_FULL;
 }
@@ -732,17 +737,27 @@ static void take_output(uint32_t frame)
     s_out_asked = asked;
     if (out != s_out) {
         if (s_out < 0)
-            s_xt1 = out == APU_OUTPUT_HEADPHONES ? 0.0f : 1.0f;   /* no fade at the start */
+            s_xt1 = out == APU_OUTPUT_HEADPHONES || out == APU_OUTPUT_MONO
+                  ? 0.0f : 1.0f;                                  /* no fade at the start */
         else
             fprintf(stderr, "[APUFX] output -> %s (crossfade %d ms) at APU frame %u\n",
                     k_out[out], XF_FRAMES * APU_FX_FRAME / 48, frame);
         s_out = out;
     }
     s_xt0 = s_xt1;
-    if (s_out == APU_OUTPUT_HEADPHONES)
+    if (s_out == APU_OUTPUT_HEADPHONES || s_out == APU_OUTPUT_MONO)
         s_xt1 = s_xt1 - 1.0f / XF_FRAMES > 0.0f ? s_xt1 - 1.0f / XF_FRAMES : 0.0f;
     else
         s_xt1 = s_xt1 + 1.0f / XF_FRAMES < 1.0f ? s_xt1 + 1.0f / XF_FRAMES : 1.0f;
+}
+
+/* Mono for the output stage (apu_core.c, the frame thread): the output this
+ * frame thread took, or before its first frame the one asked / started. */
+int apu_fx_mono(void)
+{
+    cfg();
+    return (s_out >= 0 ? s_out : s_req_out >= 0 ? s_req_out : s_out_start)
+           == APU_OUTPUT_MONO;
 }
 
 /* xbox_ApuSetAudioMode (apu.h): the DLL's side. */
