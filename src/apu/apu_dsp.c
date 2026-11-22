@@ -505,6 +505,44 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         static float gain = -1.0f, lfe;
         float spk[APU_FX_SPEAKERS][APU_FX_FRAME];
         apu_fx_run(mixbins, spk);
+        if (apu_fx_full() && apu_out_channels() == 6) {
+            /* 5.1 (to-do 50 step 4): the six speakers as they are, at Full
+             * DSP's gain. While Full DSP fades in (or before the effects
+             * image is loaded) Standard's stereo plays on the front pair:
+             * frame_buf's slice, which apu_core.c adds there. */
+            const int mon = d->monitor.point == MCPX_APU_DEBUG_MON_VP;
+            if (gain < 0.0f) {
+                const char *e = getenv("RECOMP_APU_DSP_GAIN_DB");
+                gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -8.5f) / 20.0f);
+                lfe = env_gain("RECOMP_APU_FOLD_LFE", 0.0f);
+                fprintf(stderr, "[APU] Full DSP: 5.1, six channels, output gain %.2f\n", gain);
+            }
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float w = apu_fx_share(i), o[APU_FX_SPEAKERS], sl = 0.0f, sr = 0.0f;
+                for (int c = 0; c < APU_FX_SPEAKERS; c++)
+                    o[c] = spk[c][i] * gain * w;
+                if (w < 1.0f && !mon) {
+                    table_mix(mixbins, i, &sl, &sr);
+                    sl = sl > 1.0f ? 1.0f : sl < -1.0f ? -1.0f : sl;
+                    sr = sr > 1.0f ? 1.0f : sr < -1.0f ? -1.0f : sr;
+                } else if (w < 1.0f) {
+                    sl = d->monitor.frame_buf[off + i][0] / 32767.0f;
+                    sr = d->monitor.frame_buf[off + i][1] / 32767.0f;
+                }
+                o[0] += sl * (1.0f - w);
+                o[1] += sr * (1.0f - w);
+                for (int c = 0; c < APU_FX_SPEAKERS; c++) {
+                    float x = o[c] > 1.0f ? 1.0f : o[c] < -1.0f ? -1.0f : o[c];
+                    d->monitor.frame_buf6[off + i][c] = (int16_t)(x * 32767.0f);
+                }
+                /* Taken into the front pair above: not twice. */
+                d->monitor.frame_buf[off + i][0] = 0;
+                d->monitor.frame_buf[off + i][1] = 0;
+            }
+            g_dbg.gp.cycles = 0;
+            g_dbg.ep.cycles = 0;
+            return;
+        }
         if (apu_fx_full()) {
             const float h = 0.70710678f;
             /* -8.5 dB (to-do 50 step 3): Full DSP as loud as Standard in

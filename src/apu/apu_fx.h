@@ -42,6 +42,10 @@ int apu_fx_full_only(void);
 /* Full DSP's share of the output at sample i of this frame (0..1). */
 float apu_fx_share(int i);
 
+/* 1 when this run plays 5.1 surround (RECOMP_APU_OUTPUT=surround at the
+ * start): Full DSP always, the chain's six speakers to the output stage. */
+int apu_fx_surround(void);
+
 /* 1 = Full DSP's 3D voices use the raw HRTF ears, as the console (default);
  * 0 = the power-normalised ones (RECOMP_APU_DSP_HRTF_NORM=1, A/B). */
 int apu_fx_raw_ears(void);

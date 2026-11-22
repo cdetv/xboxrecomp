@@ -21,6 +21,7 @@
 
 #include "apu_state.h"
 #include "apu.h"
+#include "apu_fx.h"
 #include "apu_xaudio2.h"
 #include "fpconv.h"
 #include "apu_host.h"
@@ -76,6 +77,16 @@ static unsigned g_out_limited;     /* samples it turned down (log) */
 
 /* xbox_ApuSetPaused: the frame thread idles while this is set. */
 static volatile LONG g_host_paused = 0;
+
+/* Channels the output stage makes (to-do 50 step 4), fixed at the start:
+ * 2, or 6 (FL FR C LFE BL BR) when RECOMP_APU_OUTPUT=surround and the
+ * device has six speakers (or RECOMP_APU_CHANNELS=6 forces it). */
+static int g_out_ch = 2;
+
+int apu_out_channels(void)
+{
+    return g_out_ch;
+}
 
 /* ============================================================
  * RECOMP_APU_PROFILE
@@ -577,20 +588,45 @@ typedef struct {
 
 static WaveOutState g_waveout = { 0 };
 
+/* 5.1 surround (RECOMP_APU_OUTPUT=surround at the start; the game was told
+ * so too, XC_AUDIO): six channels where the device has six speakers, else
+ * Full DSP's stereo fold. RECOMP_APU_CHANNELS=6 makes six anyway (a 5.1 WAV
+ * on a stereo PC: the capture is taken before our fold for the device),
+ * =2 folds on any device. */
+static void out_layout(int device51)
+{
+    const char *e = getenv("RECOMP_APU_CHANNELS");
+    int force = (e && *e) ? atoi(e) : 0;
+    g_out_ch = force == 6 ? 6 : force == 2 ? 2 : device51 ? 6 : 2;
+    fprintf(stderr, "[APU] output: 5.1 surround (Full DSP), %d channels made%s\n", g_out_ch,
+            force == 6 || force == 2 ? " (RECOMP_APU_CHANNELS)"
+            : g_out_ch == 6 ? "" : ": the device has fewer speakers, our stereo fold");
+}
+
 void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
 {
+    const int surround = apu_fx_surround();
     (void)errp;
     d->monitor.stream = NULL;
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
+    if (surround) {
+        const char *e = getenv("RECOMP_APU_FOLD_LFE");
+        xa2_set_channels(6);
+        xa2_set_fold_lfe((e && *e) ? (float)atof(e) : 0.0f);
+    }
     /* Try XAudio2 first (lower latency) */
     if (apu_pace_on())
         xa2_set_max_buffers(6);
     if (xa2_init()) {
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
+        if (surround)
+            out_layout(xa2_source_channels() == 6);
         return;
     }
+    if (surround)
+        out_layout(0);
     fprintf(stderr, "[APU] XAudio2 unavailable, falling back to waveOut\n");
 
     WAVEFORMATEX wfx = { 0 };
@@ -660,9 +696,44 @@ static inline void monitor_add(int16_t *slot, int32_t s)
  * window still leaves a readable file. */
 static FILE    *g_wav;
 static uint32_t g_wav_frames;
+static int      g_wav_ch = 2;      /* 6: a 5.1 WAV (WAVE_FORMAT_EXTENSIBLE) */
+
+/* A 5.1 WAV: FL FR C LFE + the side pair (Windows' 5.1), 16-bit PCM. */
+static void wav_write_header6(void)
+{
+    static const uint8_t pcm[16] = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+                                     0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 };
+    uint32_t data = g_wav_frames * 12;
+    uint8_t h[68];
+    uint32_t v;
+    uint16_t w;
+    memcpy(h, "RIFF", 4);
+    v = 60 + data;                     memcpy(h + 4, &v, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    v = 40;                            memcpy(h + 16, &v, 4);
+    w = 0xFFFE;                        memcpy(h + 20, &w, 2);  /* extensible */
+    w = 6;                             memcpy(h + 22, &w, 2);
+    v = 48000;                         memcpy(h + 24, &v, 4);
+    v = 48000 * 12;                    memcpy(h + 28, &v, 4);
+    w = 12;                            memcpy(h + 32, &w, 2);
+    w = 16;                            memcpy(h + 34, &w, 2);
+    w = 22;                            memcpy(h + 36, &w, 2);  /* cbSize */
+    w = 16;                            memcpy(h + 38, &w, 2);  /* valid bits */
+    v = 0x60F;                         memcpy(h + 40, &v, 4);  /* channel mask */
+    memcpy(h + 44, pcm, 16);
+    memcpy(h + 60, "data", 4);
+    memcpy(h + 64, &data, 4);
+    fseek(g_wav, 0, SEEK_SET);
+    fwrite(h, 1, sizeof h, g_wav);
+    fseek(g_wav, 0, SEEK_END);
+}
 
 static void wav_write_header(void)
 {
+    if (g_wav_ch == 6) {
+        wav_write_header6();
+        return;
+    }
     uint32_t data = g_wav_frames * 4;
     uint8_t h[44];
     memcpy(h, "RIFF", 4);
@@ -682,7 +753,8 @@ static void wav_write_header(void)
     fseek(g_wav, 0, SEEK_END);
 }
 
-static void wav_append(const int16_t (*buf)[2], int frames)
+/* ch: 2, or 6 for the whole run (g_out_ch is fixed at the start). */
+static void wav_append(const int16_t *buf, int frames, int ch)
 {
     static int checked;
     if (!checked) {
@@ -691,14 +763,16 @@ static void wav_append(const int16_t (*buf)[2], int frames)
         if (path && *path) {
             g_wav = fopen(path, "wb");
             if (g_wav) {
+                g_wav_ch = ch;
                 wav_write_header();
-                fprintf(stderr, "[APU] writing output to %s\n", path);
+                fprintf(stderr, "[APU] writing output to %s%s\n", path,
+                        ch == 6 ? " (5.1: FL FR C LFE SL SR)" : "");
             }
         }
     }
-    if (!g_wav)
+    if (!g_wav || ch != g_wav_ch)
         return;
-    fwrite(buf, 4, (size_t)frames, g_wav);
+    fwrite(buf, 2 * (size_t)ch, (size_t)frames, g_wav);
     uint32_t before = g_wav_frames / 48000;
     g_wav_frames += (uint32_t)frames;
     if (g_wav_frames / 48000 != before) {
@@ -709,7 +783,7 @@ static void wav_append(const int16_t (*buf)[2], int frames)
 
 /* Samples produced but not yet handed to the output: XAudio2 and waveOut
  * take bigger buffers than the 256 samples one monitor frame makes. */
-static int16_t g_xa2_stage[1024][2];  /* matches XA2_BUF_SAMPLES max */
+static int16_t g_xa2_stage[1024 * 6]; /* XA2_BUF_SAMPLES max, 2 or 6 channels */
 static int     g_xa2_stage_fill = 0;
 static int     g_waveout_fill = 0;
 
@@ -748,6 +822,42 @@ static void out_gain_apply(int16_t (*buf)[2], int n)
     }
 }
 
+/* The same for 6 channels (5.1): one limiter gain for all of them, from the
+ * loudest. The stereo one above stays as it was (Standard + Stereo must
+ * give the same samples as before 5.1 came). */
+static void out_gain_apply6(int16_t (*buf)[6], int n)
+{
+    const float glide = 1.0f - expf(-1000.0f / (OUT_GAIN_MS * 48000.0f));
+    const float release = 1.0f - expf(-1000.0f / (OUT_LIMIT_MS * 48000.0f));
+    float target = g_out_gain_target;
+
+    if (target == 1.0f && g_out_gain == 1.0f) {
+        g_out_limit = 1.0f;
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        float x[6], peak = 0.0f;
+        g_out_gain += (target - g_out_gain) * glide;
+        if (fabsf(target - g_out_gain) < 1e-5f)
+            g_out_gain = target;
+        for (int c = 0; c < 6; c++) {
+            x[c] = (float)buf[i][c] * (g_out_gain / 32768.0f);
+            peak = fmaxf(peak, fabsf(x[c]));
+        }
+        if (g_out_gain > 1.0f || g_out_limit < 1.0f) {
+            g_out_limit += (1.0f - g_out_limit) * release;
+            if (peak * g_out_limit > OUT_LIMIT_CEIL) {
+                g_out_limit = OUT_LIMIT_CEIL / peak;
+                g_out_limited++;
+            }
+            for (int c = 0; c < 6; c++)
+                x[c] *= g_out_limit;
+        }
+        for (int c = 0; c < 6; c++)
+            buf[i][c] = (int16_t)fmaxf(-32768.0f, fminf(32767.0f, x[c] * 32768.0f));
+    }
+}
+
 void xbox_ApuSetOutputGain(float gain)
 {
     if (!(gain >= 0.0f))
@@ -783,9 +893,13 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     }
 
     const int n = MIXER_FRAME_SAMPLES;
+    /* What goes out: the stereo frame, or (5.1) the six channels. */
+    const int ch = g_out_ch;
+    int16_t *frame = &d->monitor.frame_buf[0][0];
 
     if (g_audio_muted) {
         memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
     } else {
         if (g_test_tone.active) {
             for (int i = 0; i < n; i++) {
@@ -799,17 +913,32 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         }
         mixer_render(d->monitor.frame_buf, n);
     }
-    out_gain_apply(d->monitor.frame_buf, n);
-    if (g_out_muted) {
-        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    if (ch == 6) {
+        /* Full DSP wrote its six speakers into frame_buf6 (apu_dsp.c); what
+         * still came in stereo -- the monitor mix before the effects image
+         * is loaded or while Full DSP fades in, the software mixer, the test
+         * tone -- plays on the front pair. */
+        for (int i = 0; i < n; i++) {
+            monitor_add(&d->monitor.frame_buf6[i][0], d->monitor.frame_buf[i][0]);
+            monitor_add(&d->monitor.frame_buf6[i][1], d->monitor.frame_buf[i][1]);
+        }
+        frame = &d->monitor.frame_buf6[0][0];
+        out_gain_apply6(d->monitor.frame_buf6, n);
+        if (g_out_muted)
+            memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
+    } else {
+        out_gain_apply(d->monitor.frame_buf, n);
+        if (g_out_muted) {
+            memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+        }
     }
-    wav_append((const int16_t (*)[2])d->monitor.frame_buf, n);
+    wav_append(frame, n, ch);
 
     if (xa2_is_active()) {
         int buf_size = xa2_get_buffer_size();
         if (buf_size > 1024) buf_size = 1024;
-        memcpy(g_xa2_stage + g_xa2_stage_fill, d->monitor.frame_buf,
-               n * 2 * sizeof(int16_t));
+        memcpy(g_xa2_stage + g_xa2_stage_fill * ch, frame,
+               n * ch * sizeof(int16_t));
         g_xa2_stage_fill += n;
         if (g_xa2_stage_fill >= buf_size) {
             unsigned long long played = 0;
@@ -842,7 +971,7 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
                 last_played = played;
                 last_t = q >= 0 ? t : 0.0;
             }
-            if (!xa2_submit_samples((const int16_t *)g_xa2_stage, buf_size)
+            if (!xa2_submit_samples_ch(g_xa2_stage, buf_size, ch)
                 && g_apu_prof_on)
                 g_apu_prof.xa2_dropped++;
             g_xa2_stage_fill = 0;
@@ -862,8 +991,17 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
             }
         }
 
-        memcpy(g_waveout.bufs[idx][g_waveout_fill], d->monitor.frame_buf,
-               n * 2 * sizeof(int16_t));
+        if (ch == 6) {
+            static float lfe = -1.0f;   /* RECOMP_APU_FOLD_LFE, as XAudio2's fold */
+            if (lfe < 0.0f) {
+                const char *e = getenv("RECOMP_APU_FOLD_LFE");
+                lfe = (e && *e) ? (float)atof(e) : 0.0f;
+            }
+            xa2_fold6(frame, g_waveout.bufs[idx][g_waveout_fill], n, lfe);
+        } else {
+            memcpy(g_waveout.bufs[idx][g_waveout_fill], d->monitor.frame_buf,
+                   n * 2 * sizeof(int16_t));
+        }
         g_waveout_fill += n;
         if (g_waveout_fill >= WAVEOUT_BUF_SAMPLES) {
             hdr->dwFlags &= ~WHDR_DONE;
@@ -875,6 +1013,8 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     }
 
     memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    if (ch == 6)
+        memset(d->monitor.frame_buf6, 0, sizeof(d->monitor.frame_buf6));
 }
 
 /* ============================================================
