@@ -47,6 +47,19 @@ void xbox_ApuSetOutputGain(float gain);
  * it changes. Any thread. */
 void xbox_ApuSetI3dl2Listener(const void *listener48);
 
+/* How the APU's output is made (any thread; applies at the frame thread's
+ * next frame, crossfaded over ~21 ms, so a switch never clicks):
+ *   processing: APU_PROCESSING_STANDARD = the VP monitor mix (xemu with
+ *     use_dsp off; or RECOMP_APU_MIXDOWN's table), APU_PROCESSING_FULL = the
+ *     effects image's chain (apu_fx.c) and its speaker bins, folded to the
+ *     output;
+ *   output: APU_OUTPUT_STEREO (the only one so far).
+ * Until the first call RECOMP_APU_PROCESSING (standard | full) decides. */
+#define APU_PROCESSING_STANDARD 0
+#define APU_PROCESSING_FULL     1
+#define APU_OUTPUT_STEREO       0
+void xbox_ApuSetAudioMode(int processing, int output);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

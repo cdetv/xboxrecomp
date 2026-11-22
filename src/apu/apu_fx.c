@@ -15,9 +15,13 @@
  * reverb's parameters come from the I3DL2 listener (apu_fx_set_listener),
  * converted the library's own way.
  *
+ * Processing (Standard = the monitor mix, Full DSP = this chain's speakers)
+ * is switched live by xbox_ApuSetAudioMode, crossfaded (apu_fx_frame_begin).
+ *
  * Switches (read once):
- *   RECOMP_APU_PROCESSING=full   the chain's speakers replace the monitor mix
- *                                (apu_dsp.c; first version: no declick yet)
+ *   RECOMP_APU_PROCESSING=full   Full DSP until the first xbox_ApuSetAudioMode
+ *   RECOMP_APU_DSP_HRTF_NORM=1   Full DSP with the power-normalised HRTF ears
+ *                                (A/B; default the raw ears, as the console)
  *   RECOMP_APU_FX_LOG=1          [APUFX] at the load (each effect and its kind)
  *                                and every 5 s of audio (time, reverb, peaks);
  *                                runs the chain even without Full DSP (its
@@ -55,6 +59,7 @@
  * SOFTWARE.
  */
 #include "apu_fx.h"
+#include "apu.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -98,18 +103,20 @@ static float limit(float x) { return x > 1.0f ? 1.0f : x < -1.0f ? -1.0f : x; }
 
 /* ── Switches ───────────────────────────────────────────────────────────── */
 
-static int s_cfg, s_full, s_log, s_off;
+static int s_cfg, s_full, s_log, s_off, s_hrtf_norm;
 
 static void cfg(void)
 {
-    const char *p, *l, *o;
+    const char *p, *l, *o, *n;
     if (s_cfg)
         return;
     s_cfg = 1;
     p = getenv("RECOMP_APU_PROCESSING");
     l = getenv("RECOMP_APU_FX_LOG");
     o = getenv("RECOMP_APU_FX_OFF");
+    n = getenv("RECOMP_APU_DSP_HRTF_NORM");
     s_full = p && !strcmp(p, "full");
+    s_hrtf_norm = n && atoi(n) != 0;
     s_log = (l && *l) ? atoi(l) : 0;
     if (o && *o)
         for (int k = 1; k < FX_KINDS; k++)
@@ -632,16 +639,94 @@ void apu_fx_load(const uint8_t *shared, uint32_t table, volatile uint32_t *xmem)
             by_size ? "code size for some" : "code hash", kinds);
 }
 
+/* ── Processing: Standard or Full DSP, switched live ──────────────────────
+ * xbox_ApuSetAudioMode (any thread) asks; the frame thread takes it at its
+ * next frame (apu_fx_frame_begin) and crossfades the two outputs over
+ * XF_FRAMES frames (apu_dsp.c blends by apu_fx_share). Full DSP needs a
+ * loaded image: until the doorbell's load it waits, then fades in. A switch
+ * to Full from silence clears every effect's history (buffers, filters,
+ * crosstalk, the reverb's lines), so nothing from the last time plays; a
+ * switch back while it still fades out keeps it (no jump). */
+#define XF_FRAMES 32                  /* 32 frames of 32 samples: 21 ms */
+static volatile int s_req = -1;       /* asked: 1 full, 0 standard, -1 not yet */
+static volatile int s_req_out;
+static int s_on;                      /* the frame thread's target: Full */
+static int s_xf;                      /* crossfade frames left */
+static float s_w0, s_w1;              /* Full's share at this frame's start, end */
+
+static void fx_reset(void)
+{
+    for (int s = 0; s < s_slots; s++)
+        memset(s_buf[s], 0, sizeof s_buf[0]);
+    for (int k = 0; k < s_fx_count; k++) {
+        memset(s_fx[k].bq, 0, sizeof s_fx[k].bq);
+        memset(s_fx[k].xt_line, 0, sizeof s_fx[k].xt_line);
+        memset(s_fx[k].xt_lp, 0, sizeof s_fx[k].xt_lp);
+    }
+    if (s_rev.on)
+        reverb_clear(&s_rev);
+}
+
+void apu_fx_set_mode(int processing, int output)
+{
+    s_req_out = output;
+    s_req = processing == APU_PROCESSING_FULL;
+}
+
+/* xbox_ApuSetAudioMode (apu.h): the DLL's side. */
+void xbox_ApuSetAudioMode(int processing, int output)
+{
+    apu_fx_set_mode(processing, output);
+}
+
+void apu_fx_frame_begin(void)
+{
+    static uint32_t frame;            /* APU frames so far: x 32 = output samples */
+    int want;
+    cfg();
+    want = (s_req >= 0 ? s_req : s_full) && s_fx_count > 0;
+    s_w0 = s_w1;
+    if (want != s_on) {
+        s_on = want;
+        s_xf = XF_FRAMES - s_xf;      /* turned round mid-fade: from there */
+        if (want && s_w0 <= 0.0f)
+            fx_reset();
+        fprintf(stderr, "[APUFX] processing -> %s (crossfade %d ms) at APU frame %u\n",
+                want ? "full (the effects image's chain plays)"
+                     : "standard (the monitor mix plays)",
+                s_xf * APU_FX_FRAME / 48, frame);
+    }
+    frame++;
+    if (s_xf > 0)
+        s_xf--;
+    s_w1 = s_on ? 1.0f - (float)s_xf / XF_FRAMES : (float)s_xf / XF_FRAMES;
+}
+
 int apu_fx_wanted(void)
 {
     cfg();
-    return s_fx_count > 0 && (s_full || s_log);
+    return s_fx_count > 0 && (s_on || s_w0 > 0.0f || s_w1 > 0.0f || s_log);
 }
 
 int apu_fx_full(void)
 {
+    return s_w0 > 0.0f || s_w1 > 0.0f;
+}
+
+int apu_fx_full_only(void)
+{
+    return s_w0 >= 1.0f && s_w1 >= 1.0f;
+}
+
+float apu_fx_share(int i)
+{
+    return s_w0 + (s_w1 - s_w0) * (float)(i + 1) / APU_FX_FRAME;
+}
+
+int apu_fx_raw_ears(void)
+{
     cfg();
-    return s_fx_count > 0 && s_full;
+    return !s_hrtf_norm;
 }
 
 void apu_fx_set_listener(const void *listener48)

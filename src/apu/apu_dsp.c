@@ -448,8 +448,25 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
      * the same here, to hear and measure what xemu players hear. */
     if (!s_mix_ready)
         mixdown_init();
+    /* Standard or Full DSP (apu_fx.c, switched live): the monitor mix rests
+     * while only Full DSP is heard, and runs again for a crossfade back. */
+    apu_fx_frame_begin();
     if (s_mix_xemu)
-        d->monitor.point = MCPX_APU_DEBUG_MON_VP;
+        d->monitor.point = apu_fx_full_only() ? MCPX_APU_DEBUG_MON_AC97
+                                              : MCPX_APU_DEBUG_MON_VP;
+}
+
+/* RECOMP_APU_MIXDOWN's table (mixdown_init) at sample i, unclamped. */
+static void table_mix(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME], int i,
+                      float *l, float *r)
+{
+    float left = 0.0f, right = 0.0f;
+    for (int b = 0; b < NUM_MIXBINS; ++b) {
+        left  += s_mix_l[b] * mixbins[b][i];
+        right += s_mix_r[b] * mixbins[b][i];
+    }
+    *l = left;
+    *r = right;
 }
 
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
@@ -474,38 +491,66 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         }
     }
 
-    /* The effects image's chain (apu_fx.c): with RECOMP_APU_PROCESSING=full
-     * its speaker bins replace the monitor mix's slice, folded to stereo
-     * (L = FL + C/sqrt2 + BL/sqrt2, R likewise; LFE left out unless
-     * RECOMP_APU_FOLD_LFE gives a gain) at RECOMP_APU_DSP_GAIN_DB (default
-     * -6, the monitor mix's headroom). With only RECOMP_APU_FX_LOG it runs
-     * for its log and plays nothing. */
+    /* The effects image's chain (apu_fx.c): in Full DSP its speaker bins
+     * replace the monitor mix's slice, folded to stereo (L = FL + C/sqrt2 +
+     * BL/sqrt2, R likewise; LFE left out unless RECOMP_APU_FOLD_LFE gives a
+     * gain) at RECOMP_APU_DSP_GAIN_DB (default -8.5, Standard's level in
+     * play). While the processing switches, the two are crossfaded:
+     * Standard's slice is the monitor mix the VP left there (or the table's
+     * mix). With only RECOMP_APU_FX_LOG it runs for its log and plays
+     * nothing. */
+    int full = 0;
+    float full_l[NUM_SAMPLES_PER_FRAME], full_r[NUM_SAMPLES_PER_FRAME];
     if (apu_fx_wanted()) {
         static float gain = -1.0f, lfe;
         float spk[APU_FX_SPEAKERS][APU_FX_FRAME];
         apu_fx_run(mixbins, spk);
         if (apu_fx_full()) {
             const float h = 0.70710678f;
+            /* -8.5 dB (to-do 50 step 3): Full DSP as loud as Standard in
+             * play. At 0 dB it matched a recording of xemu with "Use DSP"
+             * (Conker's opening movie, field, Birdy) within 0.3 dB in every
+             * band, so the chain keeps the console's balance: its movie is
+             * 3 dB quieter against play than Standard's. LFE out matched the
+             * recording too (the field sends a lot to it). */
             if (gain < 0.0f) {
                 const char *e = getenv("RECOMP_APU_DSP_GAIN_DB");
-                gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -6.0f) / 20.0f);
+                gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -8.5f) / 20.0f);
                 lfe = env_gain("RECOMP_APU_FOLD_LFE", 0.0f);
                 fprintf(stderr, "[APU] Full DSP: stereo fold, output gain %.2f, LFE %.2f\n",
                         gain, lfe);
             }
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
                 float c = h * spk[2][i] + lfe * spk[3][i];
-                float l = (spk[0][i] + c + h * spk[4][i]) * gain;
-                float r = (spk[1][i] + c + h * spk[5][i]) * gain;
-                l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
-                r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
-                d->monitor.frame_buf[off + i][0] = (int16_t)(l * 32767.0f);
-                d->monitor.frame_buf[off + i][1] = (int16_t)(r * 32767.0f);
+                full_l[i] = (spk[0][i] + c + h * spk[4][i]) * gain;
+                full_r[i] = (spk[1][i] + c + h * spk[5][i]) * gain;
             }
+            full = 1;
         }
     }
-
-    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP && !apu_fx_full()) {
+    if (full) {
+        const int mon = d->monitor.point == MCPX_APU_DEBUG_MON_VP;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float w = apu_fx_share(i), l = full_l[i], r = full_r[i];
+            if (w < 1.0f) {
+                float sl, sr;
+                if (mon) {
+                    sl = d->monitor.frame_buf[off + i][0] / 32767.0f;
+                    sr = d->monitor.frame_buf[off + i][1] / 32767.0f;
+                } else {
+                    table_mix(mixbins, i, &sl, &sr);
+                    sl = sl > 1.0f ? 1.0f : sl < -1.0f ? -1.0f : sl;
+                    sr = sr > 1.0f ? 1.0f : sr < -1.0f ? -1.0f : sr;
+                }
+                l = sl + (l - sl) * w;
+                r = sr + (r - sr) * w;
+            }
+            l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+            r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+            d->monitor.frame_buf[off + i][0] = (int16_t)(l * 32767.0f);
+            d->monitor.frame_buf[off + i][1] = (int16_t)(r * 32767.0f);
+        }
+    } else if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
@@ -535,13 +580,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
             /* (The even-left/odd-right sum that followed was the cheapest
              * mixdown that stopped discarding audio; the table above
              * replaces it.) */
-            float left = 0.0f, right = 0.0f;
+            float left, right;
             if (!s_mix_ready)
                 mixdown_init();
-            for (int b = 0; b < NUM_MIXBINS; ++b) {
-                left  += s_mix_l[b] * mixbins[b][i];
-                right += s_mix_r[b] * mixbins[b][i];
-            }
+            table_mix(mixbins, i, &left, &right);
             if (g_apu_prof_on) {
                 float al = fabsf(left), ar = fabsf(right);
                 float m = al > ar ? al : ar;
