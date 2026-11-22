@@ -22,10 +22,17 @@
  */
 
 #include "apu_state.h"
+#include "apu_fx.h"
 #include "fpconv.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+/* g_xbox_mem_offset, through the .exe's table (apu_host.h). */
+#include "apu_host.h"
+extern const ApuHost *g_apu_host;
+
+#define APU_VA         0xFE800000u
 
 /* ── DSP command doorbell acknowledgement ────────────────────────────────
  *
@@ -40,9 +47,11 @@
  * frame, which is what "the command completed" looks like to the title.
  *
  * ponytail: this is a handshake acknowledgement, not a DSP. It says every
- * command succeeded instantly and computes nothing, so anything whose *result*
- * the title reads back will still be wrong. The real fix is DSP56300 emulation
- * in the GP/EP; this exists so audio init stops blocking everything behind it.
+ * command succeeded instantly; the only work it does is the copy commands 2
+ * and 3 put the effect states into X memory (dsp_command below). Anything
+ * that needs DSP code to run is still missing; a native effect engine would read
+ * those states instead. It exists so audio init stops blocking everything
+ * behind it.
  *
  * The address is not derivable from the APU registers: GPSADDR/GPFADDR/
  * EPSADDR/EPFADDR point at the DSP's own scratch and frame memory, while the
@@ -169,6 +178,135 @@ static void mixdown_init(void)
     s_mix_ready = 1;
 }
 
+/* ── The doorbell's copy commands ─────────────────────────────────────────
+ *
+ * The doorbell is the command word at +0x810 of DirectSound's shared copy of
+ * the DSP image (XDK 5849: dsp_download_image writes the image header words
+ * 0x800-0x814 and the image from +0x818 into it; Conker's copy is at
+ * 0x82AC8000). The words before it are the command's block:
+ *
+ *   +0x800  X destination, in words from X:0x80 (where the effect states start)
+ *   +0x804  the image header's code size in words (the state area starts at
+ *           image +0x818 + 4 x this)
+ *   +0x808  source: byte offset in the shared copy
+ *   +0x80C  word count
+ *   +0x810  command: 3 = load and start (at boot: the whole state area),
+ *                    2 = copy (CommitDeferredSettings: an effect's changed
+ *                        words, e.g. the I3DL2 reverb's converted listener)
+ *
+ * On the console the GP's loader copies those words into its X memory, where
+ * the effects read their state. Acknowledging without copying left X memory
+ * empty: only SetEffectData's immediate writes ever landed there, never the
+ * load or a deferred change. Doing the copy puts in X memory what the
+ * console's GP has, so native effects can read their state where the
+ * DSP code reads it. Code (P) and Y are not copied: no DSP code runs.
+ *
+ *   RECOMP_APU_DSP_COPY=0   acknowledge only (the old stub, for A/B)
+ *   RECOMP_APU_DSP_LOG=1    [APUDSP] per command (first 20, then every 100th)
+ *                           and the effect list at command 3; =2 adds the
+ *                           words each logged command copied */
+#define DSP_CMD_BLOCK  0x800u             /* doorbell - 0x10 */
+#define DSP_STATE_X    0x80u              /* +0x800 counts from here */
+#define DSP_XMEM_WORDS (NV_PAPU_GPMIXBUF / 4u)   /* GP X memory: 0x1400 words */
+#define DSP_SHARED_MAX 0x20000u           /* sanity bound on +0x808 / +0x80C */
+
+static int s_dsp_copy = -1, s_dsp_log = -1;
+
+static uint32_t rd32(const uint8_t *p)
+{
+    return *(const volatile uint32_t *)p;
+}
+
+static void dsp_log_fx_table(const uint8_t *shared, uint32_t code_words,
+                             uint32_t state_words)
+{
+    /* The effect descriptors follow the state area: a count, a word, then
+     * {code, bytes, state, bytes, Y, bytes, scratch, bytes} per effect
+     * (_work/r3/sound/dspstate.py reads the same table in the image file). */
+    uint32_t t = 0x818u + (code_words + state_words) * 4u;
+    uint32_t n;
+
+    if (t + 8u > DSP_SHARED_MAX)
+        return;
+    n = rd32(shared + t);
+    fprintf(stderr, "[APUDSP] effect list at +0x%X: %u effect(s)\n", t, n);
+    if (n > 64 || t + 8u + n * 32u > DSP_SHARED_MAX)
+        return;
+    for (uint32_t i = 0; i < n; i++) {
+        const uint8_t *e = shared + t + 8u + i * 32u;
+        uint32_t st = rd32(e + 8);
+        char where[24] = "";
+        if (st >= APU_VA + 0x30000u && st < APU_VA + 0x30000u + DSP_XMEM_WORDS * 4u)
+            snprintf(where, sizeof where, " = X:0x%X", (st - APU_VA - 0x30000u) / 4u);
+        fprintf(stderr, "[APUDSP] effect %2u: code 0x%08X %5u B, state 0x%08X%s"
+                        " %5u B, Y 0x%08X %u B, scratch 0x%08X %u B\n",
+                i, rd32(e), rd32(e + 4), st, where, rd32(e + 12), rd32(e + 16),
+                rd32(e + 20), rd32(e + 24), rd32(e + 28));
+    }
+}
+
+static void dsp_command(MCPXAPUState *d, uint32_t doorbell, uint32_t cmd)
+{
+    static unsigned s_count;
+    const uint8_t *shared = d->ram_ptr + (doorbell - (DSP_CMD_BLOCK + 0x10u));
+    const uint8_t *blk = shared + DSP_CMD_BLOCK;
+    uint32_t xdst = rd32(blk), code_words = rd32(blk + 4);
+    uint32_t src = rd32(blk + 8), n = rd32(blk + 12);
+    uint32_t x = DSP_STATE_X + xdst;
+    int show;
+
+    if (s_dsp_copy < 0) {
+        const char *e = getenv("RECOMP_APU_DSP_COPY");
+        const char *l = getenv("RECOMP_APU_DSP_LOG");
+        s_dsp_copy = !(e && *e == '0');
+        s_dsp_log = (l && *l) ? atoi(l) : 0;
+        fprintf(stderr, "[APUDSP] doorbell copies %s\n",
+                s_dsp_copy ? "on (X memory gets the effect states)"
+                           : "off (RECOMP_APU_DSP_COPY=0: acknowledged only)");
+    }
+    if (!s_dsp_copy || (cmd != 2 && cmd != 3))
+        return;
+    s_count++;
+    show = s_dsp_log && (s_count <= 20 || s_count % 100 == 0);
+
+    if (n == 0 || n > DSP_XMEM_WORDS || xdst >= DSP_XMEM_WORDS || src & 3u ||
+        src < 0x818u || src > DSP_SHARED_MAX || src + n * 4u > DSP_SHARED_MAX ||
+        x + n > DSP_XMEM_WORDS) {
+        static int refused;
+        if (refused++ < 10)
+            fprintf(stderr, "[APUDSP] command %u refused: %u words +0x%X -> X:0x%X"
+                            " (out of range; acknowledged only)\n", cmd, n, src, x);
+        return;
+    }
+
+    volatile uint32_t *xmem = (volatile uint32_t *)
+        ((uintptr_t)*g_apu_host->mem_offset + APU_VA + 0x30000u + NV_PAPU_GPXMEM);
+    const uint8_t *from = shared + src;
+    for (uint32_t i = 0; i < n; i++)
+        xmem[x + i] = rd32(from + i * 4u) & 0x00FFFFFFu;
+
+    if (show) {
+        fprintf(stderr, "[APUDSP] command %u #%u: %u words +0x%X -> X:0x%X\n",
+                cmd, s_count, n, src, x);
+        if (s_dsp_log >= 2)
+            for (uint32_t i = 0; i < n; i += 8) {
+                char line[128];
+                int len = snprintf(line, sizeof line, "[APUDSP]   X:0x%04X", x + i);
+                for (uint32_t k = i; k < n && k < i + 8 && len < (int)sizeof line - 8; k++)
+                    len += snprintf(line + len, sizeof line - len, " %06X", xmem[x + k]);
+                fprintf(stderr, "%s\n", line);
+            }
+    }
+    if (cmd == 3) {
+        if (s_dsp_log)
+            dsp_log_fx_table(shared, code_words, n);
+        /* The effect list follows the state area (dsp_log_fx_table). */
+        apu_fx_load(shared, 0x818u + (code_words + n) * 4u,
+                    (volatile uint32_t *)((uintptr_t)*g_apu_host->mem_offset +
+                                          APU_VA + 0x30000u + NV_PAPU_GPXMEM));
+    }
+}
+
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
@@ -178,12 +316,16 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
     if (!d->ram_ptr)
         return;
     for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
-        if (*slot) {
+        volatile uint32_t *slot = (volatile uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+        uint32_t cmd = *slot;
+        if (cmd) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)
                 fprintf(stderr, "[APU] DSP doorbell 0x%08X: command 0x%08X"
-                                " acknowledged\n", s_dsp_ack[i], *slot);
+                                " acknowledged\n", s_dsp_ack[i], cmd);
+            /* Copy before clearing: DirectSound spins until the word is 0,
+             * so it never changes the block while the copy runs. */
+            dsp_command(d, s_dsp_ack[i], cmd);
             *slot = 0;
         }
     }
@@ -227,11 +369,6 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
  * memory (the GPSADDR/EPSADDR page list) into program memory. No DSP code
  * runs; this only puts what the guest loaded where it reads it back. */
 #define DSP_BOOT_WORDS 0x800
-#define APU_VA         0xFE800000u
-
-/* g_xbox_mem_offset, through the .exe's table (apu_host.h). */
-#include "apu_host.h"
-extern const ApuHost *g_apu_host;
 
 static void dsp_bootstrap(MCPXAPUState *d, uint32_t *regs, uint32_t window,
                           uint32_t pmem, hwaddr sge_base, uint32_t max_sge,
@@ -337,7 +474,38 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
         }
     }
 
-    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+    /* The effects image's chain (apu_fx.c): with RECOMP_APU_PROCESSING=full
+     * its speaker bins replace the monitor mix's slice, folded to stereo
+     * (L = FL + C/sqrt2 + BL/sqrt2, R likewise; LFE left out unless
+     * RECOMP_APU_FOLD_LFE gives a gain) at RECOMP_APU_DSP_GAIN_DB (default
+     * -6, the monitor mix's headroom). With only RECOMP_APU_FX_LOG it runs
+     * for its log and plays nothing. */
+    if (apu_fx_wanted()) {
+        static float gain = -1.0f, lfe;
+        float spk[APU_FX_SPEAKERS][APU_FX_FRAME];
+        apu_fx_run(mixbins, spk);
+        if (apu_fx_full()) {
+            const float h = 0.70710678f;
+            if (gain < 0.0f) {
+                const char *e = getenv("RECOMP_APU_DSP_GAIN_DB");
+                gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -6.0f) / 20.0f);
+                lfe = env_gain("RECOMP_APU_FOLD_LFE", 0.0f);
+                fprintf(stderr, "[APU] Full DSP: stereo fold, output gain %.2f, LFE %.2f\n",
+                        gain, lfe);
+            }
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                float c = h * spk[2][i] + lfe * spk[3][i];
+                float l = (spk[0][i] + c + h * spk[4][i]) * gain;
+                float r = (spk[1][i] + c + h * spk[5][i]) * gain;
+                l = l > 1.0f ? 1.0f : l < -1.0f ? -1.0f : l;
+                r = r > 1.0f ? 1.0f : r < -1.0f ? -1.0f : r;
+                d->monitor.frame_buf[off + i][0] = (int16_t)(l * 32767.0f);
+                d->monitor.frame_buf[off + i][1] = (int16_t)(r * 32767.0f);
+            }
+        }
+    }
+
+    if (d->monitor.point != MCPX_APU_DEBUG_MON_VP && !apu_fx_full()) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
             /* Bins 2..31 used to be computed and then dropped on the floor.
              * On hardware the GP and EP mix the submixes down; here they are
