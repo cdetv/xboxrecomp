@@ -3,7 +3,7 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass. The command doorbell's copy commands (3 = load, 2 = copy) are done, so GP X memory holds the effect states DirectSound keeps in its shared copy of the image (`apu_dsp.c`; `RECOMP_APU_DSP_COPY=0` = acknowledge only, `RECOMP_APU_DSP_LOG=1|2` = `[APUDSP]` lines).
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass. The command doorbell's copy commands (3 = load, 2 = copy) are done, so GP X memory holds the effect states DirectSound keeps in its shared copy of the image (`apu_dsp.c`; `RECOMP_APU_DSP_COPY=0` = acknowledge only, `RECOMP_APU_DSP_LOG=1|2` = `[APUDSP]` lines). No DSP56300 core runs: `apu_fx.c` recognises the effects of an XDK 5849 image by their code (gain, mixer, filter, crosstalk, I3DL2 reverb; a C port of yacineolivier-maker's MIT `dsp_image.cpp`) and runs them on the bins, reading their state from that X memory. `RECOMP_APU_PROCESSING=full` plays the chain's speakers (folded to stereo) instead of the monitor mix; `RECOMP_APU_FX_LOG=1|2` = `[APUFX]` lines, `RECOMP_APU_FX_OFF=<kind>,..` leaves effects out. The I3DL2 listener comes from the game (`xbox_ApuSetI3dl2Listener`).
 - **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
 
 Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
@@ -18,6 +18,7 @@ Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
 | `apu_core.c` | 762 | MMIO handlers, frame thread, waveOut output, test tone |
 | `apu_vp.c` | 1,247 | Voice Processor — decode, resample, mix, envelopes, HRTF |
 | `apu_dsp.c` | 90 | GP/EP stubs (mixbin 0/1 passthrough) |
+| `apu_fx.c` | 690 | Native GP effects: the effects image's chain run in C (MIT) |
 | `apu_mmio_hook.c` | 253 | VEH x86-64 instruction decoder for 0xFE800000+ MMIO |
 | `apu_shim.h` | 431 | QEMU compatibility (threads, atomics, clocks → Win32) |
 | `apu_debug.h` | 104 | Debug logging macros |
