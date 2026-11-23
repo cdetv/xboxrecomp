@@ -47,6 +47,17 @@ void xbox_ApuSetOutputGain(float gain);
  * it changes. Any thread. */
 void xbox_ApuSetI3dl2Listener(const void *listener48);
 
+/* Room reverb (Conker to-do 232): a listener of the runtime's choosing (a
+ * DSI3DL2LISTENER, 48 bytes, e.g. one of the title's presets) in place of
+ * the game's, the reverb's wet output scaled by strength (0..1, glided over
+ * ~43 ms; a new listener crossfades as the game's do). It plays in both
+ * processings: Full DSP through the effects image's chain as the console
+ * would, Standard with the reverb's four outputs folded into the monitor
+ * mix (FL + BL / sqrt2, FR + BR / sqrt2) at Full DSP's output gain.
+ * NULL = back to the game's listener (and nothing extra in Standard).
+ * Any thread. */
+void xbox_ApuSetRoomReverb(const void *listener48, float strength);
+
 /* How the APU's output is made (any thread; applies at the frame thread's
  * next frame, crossfaded over ~21 ms, so a switch never clicks):
  *   processing: APU_PROCESSING_STANDARD = the VP monitor mix (xemu with

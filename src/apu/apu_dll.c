@@ -94,5 +94,6 @@ int xemu_apu_connect(const ApuHost *host, ApuApi *api)
     api->speaker_test_sound = xbox_ApuSpeakerTestSound;
     api->speaker_test       = xbox_ApuSpeakerTest;
     api->output_channels    = xbox_ApuOutputChannels;
+    api->set_room_reverb    = xbox_ApuSetRoomReverb;
     return 1;
 }
