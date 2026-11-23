@@ -18,6 +18,7 @@ add_library(xbox_apu_emu OBJECT
     apu_core.c
     apu_vp.c
     apu_dsp.c
+    apu_fx.c
     apu_xaudio2.c
     apu_dll.c
 )

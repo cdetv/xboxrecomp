@@ -41,6 +41,70 @@ void xbox_ApuSetPaused(int on);
  * most 8, +18 dB). Changes glide over ~15 ms. Any thread. */
 void xbox_ApuSetOutputGain(float gain);
 
+/* The title's I3DL2 listener (a DSI3DL2LISTENER, 48 bytes) for the effects
+ * image's reverb (apu_fx.c, Full DSP): the runtime can't find it on its own
+ * (it sits in a DirectSound object), so the game's glue hands it over when
+ * it changes. Any thread. */
+void xbox_ApuSetI3dl2Listener(const void *listener48);
+
+/* Room reverb (Conker to-do 232): a listener of the runtime's choosing (a
+ * DSI3DL2LISTENER, 48 bytes, e.g. one of the title's presets) in place of
+ * the game's, the reverb's wet output scaled by strength (0..1, glided over
+ * ~43 ms; a new listener crossfades as the game's do). It plays in both
+ * processings: Full DSP through the effects image's chain as the console
+ * would, Standard with the reverb's four outputs folded into the monitor
+ * mix (FL + BL / sqrt2, FR + BR / sqrt2) at Full DSP's output gain.
+ * NULL = back to the game's listener (and nothing extra in Standard).
+ * Any thread. */
+void xbox_ApuSetRoomReverb(const void *listener48, float strength);
+
+/* How the APU's output is made (any thread; applies at the frame thread's
+ * next frame, crossfaded over ~21 ms, so a switch never clicks):
+ *   processing: APU_PROCESSING_STANDARD = the VP monitor mix (xemu with
+ *     use_dsp off; or RECOMP_APU_MIXDOWN's table), APU_PROCESSING_FULL = the
+ *     effects image's chain (apu_fx.c) and its speaker bins, folded to the
+ *     output;
+ *   output: APU_OUTPUT_STEREO (speakers: Full DSP's crosstalk as the game
+ *     sets it), APU_OUTPUT_HEADPHONES (Full DSP without the crosstalk's cross
+ *     term: the HRTF ears straight to their sides; Standard has no crosstalk,
+ *     so it plays as Stereo), APU_OUTPUT_SURROUND (5.1: only from the start,
+ *     RECOMP_APU_OUTPUT=surround before the APU and the kernel's XC_AUDIO
+ *     read it; always Full DSP, six channels where the device has six
+ *     speakers, else Full DSP's stereo fold; asked later it waits for the
+ *     next start, and a 5.1 run ignores the others until then),
+ *     APU_OUTPUT_MONO (both sides the same, 0.5 x (L + R) after the stereo
+ *     fold; Full DSP without the crosstalk's cross term, as Headphones: on
+ *     one channel it would only take the bass out of 3D sounds).
+ * Until the first call RECOMP_APU_PROCESSING (standard | full) and
+ * RECOMP_APU_OUTPUT (stereo | headphones | surround | mono) decide. */
+#define APU_PROCESSING_STANDARD 0
+#define APU_PROCESSING_FULL     1
+#define APU_OUTPUT_STEREO       0
+#define APU_OUTPUT_HEADPHONES   1
+#define APU_OUTPUT_SURROUND     2
+#define APU_OUTPUT_MONO         3
+void xbox_ApuSetAudioMode(int processing, int output);
+
+/* Speaker test: a sound played on one speaker at a time, the game's own
+ * output faded out (21 ms) while it plays and back after; the master volume
+ * applies. xbox_ApuSpeakerTestSound hands over the sound once (mono 16-bit
+ * PCM at any rate; copied, made 48 kHz, plus an octave-down low-passed copy
+ * for the subwoofer). xbox_ApuSpeakerTest(speaker): 0-5 = FL FR C LFE BL
+ * BR (on a stereo output 0 / 1 = left / right; C and the backs fold as the
+ * game's speakers do, LFE stays silent there), APU_SPEAKER_BOTH = both
+ * front speakers at once (Mono), APU_SPEAKER_ALL = each of the output's
+ * speakers in turn (stereo: L R; six channels: FL C FR BR BL LFE) with
+ * 0.5 s between, -1 = stop, APU_SPEAKER_ASK = only ask. Returns the speaker
+ * playing now (-1 none). Not while xbox_ApuSetPaused holds the APU. Any
+ * thread. xbox_ApuOutputChannels: the channels the output stage makes (2,
+ * or 6 for 5.1 on a device with six speakers). */
+#define APU_SPEAKER_BOTH  6
+#define APU_SPEAKER_ALL   7
+#define APU_SPEAKER_ASK  (-2)
+void xbox_ApuSpeakerTestSound(const int16_t *pcm, int frames, int rate);
+int  xbox_ApuSpeakerTest(int speaker);
+int  xbox_ApuOutputChannels(void);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

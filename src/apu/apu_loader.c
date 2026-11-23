@@ -139,6 +139,36 @@ void xbox_ApuSetOutputGain(float gain)
     if (apu()) s_apu->set_output_gain(gain);
 }
 
+void xbox_ApuSetI3dl2Listener(const void *listener48)
+{
+    if (apu()) s_apu->set_i3dl2_listener(listener48);
+}
+
+void xbox_ApuSetAudioMode(int processing, int output)
+{
+    if (apu()) s_apu->set_audio_mode(processing, output);
+}
+
+void xbox_ApuSpeakerTestSound(const int16_t *pcm, int frames, int rate)
+{
+    if (apu()) s_apu->speaker_test_sound(pcm, frames, rate);
+}
+
+int xbox_ApuSpeakerTest(int speaker)
+{
+    return apu() ? s_apu->speaker_test(speaker) : -1;
+}
+
+int xbox_ApuOutputChannels(void)
+{
+    return apu() ? s_apu->output_channels() : 2;
+}
+
+void xbox_ApuSetRoomReverb(const void *listener48, float strength)
+{
+    if (apu()) s_apu->set_room_reverb(listener48, strength);
+}
+
 #else
 
 MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr);

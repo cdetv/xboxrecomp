@@ -174,10 +174,16 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_AUDIO:
-        /* Stereo PCM matches the two-channel host output. 1 means mono;
-         * advertising AC3 requires an encoded-output path. */
+        /* Stereo PCM matches the two-channel host output. 1 means mono.
+         * RECOMP_APU_OUTPUT=surround (the APU's 5.1 output, read here at
+         * each query; titles read it once at boot): surround + AC3, as a
+         * console set to Dolby Digital. DirectSound then pans 3D voices
+         * over the front and back pairs and skips the encoder's stereo
+         * fold; no AC3 is encoded (the APU takes the GP's six speaker bins
+         * as PCM, apu_core.c). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 0x00000000;
+            const char *out = getenv("RECOMP_APU_OUTPUT");
+            *(PULONG)Value = (out && !strcmp(out, "surround")) ? 0x00010002 : 0x00000000;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

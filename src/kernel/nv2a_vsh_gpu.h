@@ -83,6 +83,42 @@ void nv2a_vsh_gpu_input_stats(uint64_t *batches, uint64_t *bytes,
  * cache, RECOMP_VSH_INPUT_CACHE) and their bytes, not copied again. */
 void nv2a_vsh_gpu_cache_stats(uint64_t *hits, uint64_t *hit_bytes);
 
+/* ---- the constant buffer ring (nv2a_draw_d3d11.c) ------------------------
+ *
+ * The per-draw constants (the draw's own cbuffer C, the fetch rows above and
+ * the pixel shader's cbuffer D) go into one dynamic constant buffer that is
+ * appended to with MAP_WRITE_NO_OVERWRITE and bound at an offset
+ * (VSSetConstantBuffers1), instead of a DISCARD of a buffer of their own per
+ * draw. Needs D3D11.1's ConstantBufferOffsetting and
+ * MapNoOverwriteOnDynamicConstantBuffer. Off by default (measured neutral
+ * on the AMD card, 2026-11-22): RECOMP_CB_RING=1 turns it on, =2 uses it in
+ * even flips only (held-picture check); unset or =0 is the old path.
+ * A stream's piece is not copied again when its bytes are those of the
+ * stream's last put in this lap of the ring. */
+enum { NV2A_CRING_CONSTS, NV2A_CRING_ROWS, NV2A_CRING_CBD,
+       NV2A_CRING_STREAMS };
+
+/* 1 when this call should use the ring (it exists and the switch allows it
+ * in this flip). */
+int nv2a_cring_use(void);
+
+/* Called at the start of every draw, before any piece of it is put: starts
+ * the ring again (one DISCARD) when it has less room left than a draw can
+ * use. The ring wraps nowhere else: a wrap between two puts of one draw
+ * would leave the first piece, already bound, in memory the discard
+ * replaced. */
+void nv2a_cring_draw_begin(void);
+
+/* Puts `bytes` (at most 1024) of stream `stream` into the ring, or finds
+ * them already there; *first and *num are the range to bind, in 16-byte
+ * constants (multiples of 16). 0 when the ring could not be written (or
+ * is full, past the room nv2a_cring_draw_begin keeps): use the old path. */
+int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
+                   uint32_t *first, uint32_t *num);
+
+/* Binds that range to vertex shader constant buffer slot `slot`. */
+void nv2a_cring_bind_vs(uint32_t slot, uint32_t first, uint32_t num);
+
 /* ---- step 3: drawing with them ----------------------------------------- */
 
 struct ID3D11VertexShader;
@@ -137,10 +173,11 @@ void nv2a_vsh_gpu_precompile_stats(uint32_t *compiled, uint32_t *had,
                                    uint32_t *failed, uint32_t *waiting);
 
 /* RECOMP_SHADER_CACHE_TOUCH=1: a shader cache file (.vso or .cso) a level
- * actually used gets its write time set to now; a title's pre-compile pass
- * then deletes what is older than its start. Off (or path NULL): nothing.
- * The startup load of every .vso is not a use. */
-void nv2a_vsh_gpu_cache_touch(const char *path);
+ * actually used, or a combiner setup's file ps_setups.bin lists, gets its
+ * write time set to now; a title's pre-compile pass then deletes what is
+ * older than its start. Off (or path NULL): nothing, returns 0. The startup
+ * load of every .vso is not a use. Returns 1 when the file got the time. */
+int nv2a_vsh_gpu_cache_touch(const char *path);
 
 /* Called (when set) with each program's hash the first time a drawing
  * shader is asked for it: nv2a_vsh_prescan.c's way to see what is drawn

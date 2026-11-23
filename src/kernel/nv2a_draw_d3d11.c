@@ -478,10 +478,15 @@ static void note_evicted(uint32_t addr)
  * reported with the [GPU] lines. A sampling profile shows the executor
  * sleeping and reading the clock inside the driver, called from d3d_draw
  * (run 205); this says which call the driver is making it wait in. */
-enum { CT_TEXTURES, CT_VB, CT_IB, CT_CB, CT_DRAW, CT_PRESENT, CT_N };
+enum { CT_TEXTURES, CT_VB, CT_IB, CT_CB, CT_DRAW, CT_PRESENT, CT_INPUTS,
+       CT_TCLAMP, CT_N };
 static const char *const CT_NAME[CT_N] = {
     "textures+samplers", "vertex Map", "index Map", "constants Map",
-    "state+DrawIndexed", "Present"
+    "state+DrawIndexed", "Present",
+    /* The GPU path's vertex inputs (spans hashed and copied into the ring,
+     * the fetch rows) and the vertex program's constants, and cbuffer D:
+     * untimed until the executor's cheap wins (step 1). */
+    "inputs+program constants", "cbuffer D"
 };
 static int s_ct_on = -1;
 static uint64_t s_ct_ticks[CT_N], s_ct_count[CT_N];
@@ -1737,20 +1742,19 @@ static ID3D11SamplerState *s_bsamp;
  * that long, so nothing is shown (Conker's boot loading screen never
  * appeared, 2026-10-30). The bytecode is kept beside the vertex-program
  * shaders (RECOMP_VSH_GPU_CACHE) as <key>.cso, key = hash of the source,
- * entry, target and flags, so it compiles once per machine. Unset: no cache. */
-static FILE *shader_file(const char *src, const char *entry,
-                         const char *target, const char *mode, char *path,
-                         size_t cap)
+ * entry, target and flags, so it compiles once per machine. Unset: no cache.
+ * shader_path: that file's name (0 without a cache); shader_file opens it. */
+static int shader_path(const char *src, const char *entry,
+                       const char *target, char *path, size_t cap)
 {
     const char *dir = getenv("RECOMP_VSH_GPU_CACHE");
     uint64_t h = 0xCBF29CE484222325ull;
     const char *parts[3];
     size_t i, n;
     int p;
-    FILE *f = NULL;
 
     if (!dir || !dir[0] || !strcmp(dir, "0") || strlen(dir) > MAX_PATH)
-        return NULL;
+        return 0;
     parts[0] = src;
     parts[1] = entry;
     parts[2] = target;
@@ -1758,8 +1762,19 @@ static FILE *shader_file(const char *src, const char *entry,
         for (i = 0, n = strlen(parts[p]) + 1; i < n; i++)
             h = (h ^ (uint8_t)parts[p][i]) * 0x100000001B3ull;
     h = (h ^ D3DCOMPILE_OPTIMIZATION_LEVEL3) * 0x100000001B3ull;
-    CreateDirectoryA(dir, NULL);
     snprintf(path, cap, "%s\\%016llX.cso", dir, (unsigned long long)h);
+    return 1;
+}
+
+static FILE *shader_file(const char *src, const char *entry,
+                         const char *target, const char *mode, char *path,
+                         size_t cap)
+{
+    FILE *f = NULL;
+
+    if (!shader_path(src, entry, target, path, cap))
+        return NULL;
+    CreateDirectoryA(getenv("RECOMP_VSH_GPU_CACHE"), NULL);
     if (fopen_s(&f, path, mode))
         f = NULL;
     return f;
@@ -1878,7 +1893,12 @@ typedef struct {
  * not in the cache (a new toolkit's source, a pre-compile pass deleted
  * it) is made when drawn, as before.
  * Off during a pre-compile pass (RECOMP_SHADER_CACHE_TOUCH): the pass
- * needs to see which files its levels use. */
+ * needs to see which files its levels use. There the listed setups' files
+ * are only marked used (write time now, nv2a_vsh_gpu_cache_touch), so the
+ * pass's clean-up keeps them: setups only real play draws (an intro the
+ * pass skips, say) were deleted before, and the next run, finding them
+ * listed but gone, made them mid-level again. A file of an older source
+ * (another name) is not marked and still goes. */
 #define PS_SPEC_MAX 2048                /* setups kept; past it, the one shader */
 #define PS_LIST_MAGIC 0x314B5350u       /* "PSK1" */
 typedef struct {
@@ -2127,8 +2147,8 @@ static void ps_list_load(void)
     const char *tv = getenv("RECOMP_SHADER_CACHE_TOUCH");
     int touch = tv && atoi(tv) != 0;
     int pre = !(pv && pv[0] == '0') && !touch;
-    char path[MAX_PATH + 32];
-    uint32_t hdr[2], t = s_pss_pqt, dup = 0;
+    char path[MAX_PATH + 32], cso[MAX_PATH + 32];
+    uint32_t hdr[2], t = s_pss_pqt, dup = 0, kept = 0;
     PsKey k;
     FILE *f;
 
@@ -2165,6 +2185,14 @@ static void ps_list_load(void)
         }
         e->listed = 1;
         s_pss_listed++;
+        if (touch) {
+            /* A pre-compile pass: its file counts as used (kept). */
+            char *src = ps_spec_source(&k);
+            if (src && shader_path(src, "ps", "ps_4_0", cso, sizeof cso)
+                && nv2a_vsh_gpu_cache_touch(cso))
+                kept++;
+            free(src);
+        }
         if (pre) {
             e->state = PS_QUEUED;
             s_pss_pq[t++ % PS_SPEC_MAX] = (uint32_t)(e - s_pss);
@@ -2178,6 +2206,10 @@ static void ps_list_load(void)
             pre ? "loading them ahead (RECOMP_PS_PRELOAD)"
                 : touch ? "made when drawn (a pre-compile pass)"
                         : "made when drawn (RECOMP_PS_PRELOAD=0)", 10);
+    if (touch)
+        fprintf(stderr, "[GPU] d3d11: pre-compile pass: %u of the %u listed"
+                " setups' shaders in the cache, marked used (kept)%c", kept,
+                s_pss_listed, 10);
     if (pre && s_pss_listed) {
         /* Workers read the entries below the tail, published last. */
         s_pss_pre_left = (LONG)s_pss_listed;
@@ -2278,6 +2310,8 @@ uint32_t nv2a_d3d11_ps_spec_pending(uint32_t *compiled)
 
 /* The fixed pipeline objects. 0 when they cannot be made; batches are then
  * counted and skipped as before. */
+static void cr_init(void);              /* the constant buffer ring, below */
+
 static int draw_setup(void)
 {
 #define EL(name, idx, off) { name, idx, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, \
@@ -2319,6 +2353,8 @@ static int draw_setup(void)
             bd.ByteWidth = sizeof s_cbd;
             hr = ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cb1);
         }
+        if (SUCCEEDED(hr))
+            cr_init();                  /* optional: failing leaves the old path */
     }
     if (SUCCEEDED(hr)) {
         /* The zeta copy pass. Without it a zeta surface read as a texture
@@ -2426,6 +2462,190 @@ static int buf_fill(ID3D11Buffer *b, const void *src, size_t bytes)
     return 1;
 }
 
+/* ── The constant buffer ring (executor cheaper wins, step 3) ──────────────
+ *
+ * Every batch put its GpuConsts (cbuffer C) and, on the GPU path, its fetch
+ * rows into buffers of their own with MAP_WRITE_DISCARD (the driver renames
+ * the buffer each time) and cbuffer D when it changed. Now one constant
+ * buffer is appended to with MAP_WRITE_NO_OVERWRITE, in 256-byte pieces, and
+ * each draw binds its piece with VSSetConstantBuffers1 / PSSetConstantBuffers1
+ * (offsets in 16-byte constants, multiples of 16); only a wrap discards. A
+ * piece whose bytes equal the same stream's last one in this lap is not
+ * written at all: the draw binds the old one (consecutive draws of a merged
+ * run, repeated combiner setups, an unchanged cbuffer D).
+ * D3D11.1 only: ConstantBufferOffsetting and MapNoOverwriteOnDynamicConstant
+ * Buffer must both be reported, else the old path stays (RECOMP_CB_RING=0
+ * forces it; =2 uses the ring in even flips only, for the held-picture
+ * check: neighbouring frames must be identical). */
+#define CR_BYTES     (4u << 20)
+#define CR_UNIT      256u
+#define CR_LAST_MAX  1024u
+typedef struct {
+    int      valid;
+    uint32_t lap, first, num, bytes;
+    uint8_t  data[CR_LAST_MAX];
+} CrLast;
+static ID3D11Buffer *s_cr;
+static int      s_cr_on = -1;           /* 0 off, 1 on, 2 even flips only */
+static uint32_t s_cr_at, s_cr_lap = 1;
+static CrLast   s_cr_last[NV2A_CRING_STREAMS];
+static uint64_t s_cr_puts, s_cr_hits, s_cr_wraps, s_cr_bytes;
+
+static void cr_init(void)
+{
+    const char *e = getenv("RECOMP_CB_RING");
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opt;
+    D3D11_BUFFER_DESC bd;
+    const char *why = NULL;
+
+    /* Off unless asked for: measured neutral on the AMD card (a DISCARD
+     * Map of a constant buffer costs ~0.13 us there, the ring's offset
+     * binds cost about as much), 2026-11-22. =1 on, =2 even flips only. */
+    s_cr_on = e && e[0] == '1' ? 1 : e && e[0] == '2' ? 2 : 0;
+    if (!s_cr_on) {
+        why = e ? "RECOMP_CB_RING=0" : "off by default";
+    } else {
+        memset(&opt, 0, sizeof opt);
+        if (!s_ctx1 || FAILED(ID3D11Device_CheckFeatureSupport(s_dev,
+                D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof opt)))
+            why = "no D3D11.1 options";
+        else if (!opt.ConstantBufferOffsetting)
+            why = "ConstantBufferOffsetting not supported";
+        else if (!opt.MapNoOverwriteOnDynamicConstantBuffer)
+            why = "NO_OVERWRITE on a constant buffer not supported";
+    }
+    if (!why) {
+        memset(&bd, 0, sizeof bd);
+        bd.ByteWidth = CR_BYTES;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(ID3D11Device_CreateBuffer(s_dev, &bd, NULL, &s_cr)))
+            why = "the buffer could not be made";
+    }
+    if (why)
+        s_cr_on = 0;
+    fprintf(stderr, "[GPU] d3d11: constant buffer ring %s%s%s%c",
+            s_cr_on == 2 ? "on in even flips only (=2)" : s_cr_on ? "on"
+            : "off", why ? ": " : "", why ? why : "", 10);
+}
+
+int nv2a_cring_use(void)
+{
+    return s_cr && (s_cr_on == 1 || (s_cr_on == 2 && !(g_pb.flips & 1)));
+}
+
+/* The start of every draw: when less than CR_RESERVE (room for all the
+ * pieces one draw can put, with the receiver passes and the cut-out depth
+ * pass) is left, start the ring again now, before the draw has put or
+ * bound anything. The discard maps and unmaps without writing. */
+#define CR_RESERVE 4096u
+
+void nv2a_cring_draw_begin(void)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+
+    if (!nv2a_cring_use() || s_cr_at + CR_RESERVE <= CR_BYTES)
+        return;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cr, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;                         /* puts fail at the end: old path */
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cr, 0);
+    s_cr_at = 0;
+    s_cr_lap = s_cr_lap + 1 ? s_cr_lap + 1 : 1;
+    s_cr_wraps++;
+}
+
+int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
+                   uint32_t *first, uint32_t *num)
+{
+    CrLast *l;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_MAP how = D3D11_MAP_WRITE_NO_OVERWRITE;
+    uint32_t n;
+
+    if (!s_cr || stream < 0 || stream >= NV2A_CRING_STREAMS || !bytes
+        || bytes > CR_LAST_MAX)
+        return 0;
+    l = &s_cr_last[stream];
+    s_cr_puts++;
+    if (l->valid && l->lap == s_cr_lap && l->bytes == bytes
+        && !memcmp(l->data, src, bytes)) {
+        *first = l->first;
+        *num = l->num;
+        s_cr_hits++;
+        return 1;
+    }
+    n = (bytes + CR_UNIT - 1) / CR_UNIT * CR_UNIT;
+    /* Never wraps here: a DISCARD inside a draw would leave that draw's
+     * earlier pieces, already bound, in memory the discard replaced
+     * (undefined contents: one draw with garbage constants every lap, seen
+     * in the held-picture check). Wraps are nv2a_cring_draw_begin's, which
+     * keeps room for a whole draw; past that the caller uses the old path. */
+    if (s_cr_at + n > CR_BYTES)
+        return 0;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cr, 0,
+                                       how, 0, &m)))
+        return 0;
+    memcpy((uint8_t *)m.pData + s_cr_at, src, bytes);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cr, 0);
+    l->valid = 1;
+    l->lap = s_cr_lap;
+    l->bytes = bytes;
+    l->first = s_cr_at / 16u;
+    l->num = n / 16u;
+    memcpy(l->data, src, bytes);
+    *first = l->first;
+    *num = l->num;
+    s_cr_at += n;
+    s_cr_bytes += n;
+    return 1;
+}
+
+void nv2a_cring_bind_vs(uint32_t slot, uint32_t first, uint32_t num)
+{
+    ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, slot, 1, &s_cr, &first,
+                                               &num);
+}
+
+/* Where the last batch's cbuffer C went, so a draw that rebinds it (the
+ * cut-out passes) binds the same piece: the ring's range, or s_cb. */
+static struct { int ring; uint32_t first, num; } s_kb;
+
+/* GpuConsts for the next draw: into the ring, else into s_cb. 0 on failure. */
+static int consts_put(const GpuConsts *k)
+{
+    uint32_t first, num;
+
+    if (nv2a_cring_use()
+        && nv2a_cring_put(NV2A_CRING_CONSTS, k, sizeof *k, &first, &num)) {
+        s_kb.ring = 1;
+        s_kb.first = first;
+        s_kb.num = num;
+        return 1;
+    }
+    s_kb.ring = 0;
+    return buf_fill(s_cb, k, sizeof *k);
+}
+
+static void consts_bind_vs(void)
+{
+    if (s_kb.ring)
+        ID3D11DeviceContext1_VSSetConstantBuffers1(s_ctx1, 0, 1, &s_cr,
+                                                   &s_kb.first, &s_kb.num);
+    else
+        ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+}
+
+static void consts_bind_ps(void)
+{
+    if (s_kb.ring)
+        ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 0, 1, &s_cr,
+                                                   &s_kb.first, &s_kb.num);
+    else
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+}
+
 /* Stage st reads its surface as it is (RTT_DIRECT): coordinates scaled into
  * the texture's part of it, and the clamp for the shader. */
 static void tclamp_stage(GpuConsts *k, int st)
@@ -2436,13 +2656,28 @@ static void tclamp_stage(GpuConsts *k, int st)
     s_cbd.tclamp[st][1] = s_rtt_direct[st][3];
 }
 
+/* Whether cbuffer D (pixel shader slot 1) is bound from the ring: set by
+ * tclamp_upload, which then binds it itself; else s_cb1 is bound by the
+ * draw (d3d_draw), as before the ring. */
+static int s_cbd_ring;
+
 /* cbuffer D up to date for this draw; 0 when it could not be written. */
 static int tclamp_upload(void)
 {
     static float last[sizeof s_cbd / sizeof(float)];
     static int valid;
+    uint32_t first, num;
     if (!s_cb1)
         return 0;
+    if (nv2a_cring_use()
+        && nv2a_cring_put(NV2A_CRING_CBD, &s_cbd, sizeof s_cbd, &first,
+                          &num)) {
+        s_cbd_ring = 1;
+        ID3D11DeviceContext1_PSSetConstantBuffers1(s_ctx1, 1, 1, &s_cr,
+                                                   &first, &num);
+        return 1;
+    }
+    s_cbd_ring = 0;
     if (valid && !memcmp(last, &s_cbd, sizeof last))
         return 1;
     if (!buf_fill(s_cb1, &s_cbd, sizeof s_cbd))
@@ -3013,11 +3248,39 @@ uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
 #define TEX_SAMPLE_LINE   64u
 #define TEX_SAMPLE_MIN    4096u         /* smaller: a full hash costs little */
 #define TEX_CALM_MS       500
+/* A texture unchanged for TEX_LONG_CALM_MS gets its periodic full hash every
+ * 83-100 ms (TEX_LONG_FULL_MS less a per-address spread) instead of every
+ * 17-33 ms. RECOMP_TEX_LONG_CALM (on; =0 the 17-33 ms for all). */
+#define TEX_LONG_CALM_MS  2000
+#define TEX_LONG_FULL_MS  100
 
 static int s_tex_sample = -1;
+static int s_tex_long = -1;
 static LONGLONG s_tex_qpf, s_tex_now;
 static uint32_t s_tex_now_flip = ~0u;
 static uint32_t s_tex_sampled, s_tex_full, s_tex_missed;
+
+/* What the texture checks do and cost (RECOMP_EXEC_STATS=1 prints these per
+ * 10 s, exec_stats_tick; executor cheap wins, step 1). Counting only: nothing
+ * here changes a check. A bind reaches guest memory unless the texture is a
+ * GPU surface; it is answered by the flip's earlier check (flip_hit), by a
+ * sample hash, or by a full hash, and the full hash is counted by why it
+ * was taken. */
+typedef struct {
+    uint64_t binds;                     /* texture_stage calls on guest memory */
+    uint64_t flip_hit;                  /* already checked this flip */
+    uint64_t why[6];                    /* full hashes by why they were taken: */
+    /* 0 no entry yet, 1 under 4 KB or sampling off, 2 not calm 0.5 s yet
+     * (or no sample), 3 calm and the periodic full check was due, 4 the
+     * sample changed, 5 check mode: the sample missed a change */
+    uint64_t due_long, missed_long;     /* of why[3] / why[5]: textures calm 2 s+ */
+    uint64_t full_n, full_bytes;        /* full hashes and the bytes in them */
+    uint64_t full_same, full_changed;   /* their result, for a known texture */
+    uint64_t samp_n, samp_bytes;        /* sample hashes and their bytes */
+    uint64_t check_n, check_bytes;      /* check mode's extra full hashes */
+    uint64_t upload_bytes;              /* guest bytes read for uploads */
+} TexStats;     /* all uint64_t: exec_stats_tick diffs it as an array */
+static TexStats s_tx;
 
 static int tex_sample_mode(void)
 {
@@ -3031,6 +3294,15 @@ static int tex_sample_mode(void)
         s_tex_qpf = f.QuadPart;
     }
     return s_tex_sample;
+}
+
+static int tex_long_calm(void)
+{
+    if (s_tex_long < 0) {
+        const char *e = getenv("RECOMP_TEX_LONG_CALM");
+        s_tex_long = !(e && e[0] == '0');
+    }
+    return s_tex_long;
 }
 
 /* The clock, read once a flip. */
@@ -3055,6 +3327,9 @@ static uint64_t tex_sample_hash(const uint8_t *p, size_t n, const uint8_t *pal)
     h = hash_fast(p + n - TEX_SAMPLE_LINE, TEX_SAMPLE_LINE, h);
     if (pal)
         h = hash_fast(pal, 256 * 4, h);
+    s_tx.samp_n++;
+    s_tx.samp_bytes += (o / TEX_SAMPLE_STRIDE + 1) * TEX_SAMPLE_LINE
+                       + (pal ? 256 * 4 : 0);
     return h;
 }
 
@@ -4371,7 +4646,8 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     uint64_t hash;
     GpuTexture *e = NULL;
     ID3D11ShaderResourceView *rtt;
-    int i, sampling;
+    int i, sampling, why;               /* why: index into s_tx.why */
+    int lcalm = 0;                      /* calm for TEX_LONG_CALM_MS (counters) */
     uint32_t cube = t->cube ? 1u : 0u, face_stride = 0;
     uint32_t d3 = cube ? 6u : volume && t->depth > 1 ? t->depth : 1, z;
     size_t slice = (size_t)t->width * t->height;
@@ -4450,7 +4726,9 @@ guest:
         *flags |= cube ? TEX_CUBE : TEX_VOLUME;
     if (e)
         s_tex_levels[st] = e->replaced ? e->replaced : lv;
+    s_tx.binds++;
     if (e && e->hashed_flip == g_pb.flips) {
+        s_tx.flip_hit++;
         e->used = s_tex_tick;
         s_stat.tex_reused++;
         return e->srv;
@@ -4461,29 +4739,43 @@ guest:
     if (!cube)
         note_stale_read(st, bytes);
     sampling = e && bytes >= TEX_SAMPLE_MIN && tex_sample_mode();
+    why = !e ? 0 : !sampling ? 1 : 2;
     if (sampling) {
         LONGLONG now = tex_now();
-        if (e->sample_ok && now - e->calm_at >= s_tex_qpf * TEX_CALM_MS / 1000
-            && now < e->full_due
-            && tex_sample_hash(mem + t->offset, bytes,
-                               palette ? mem + palette : NULL) == e->sample) {
-            int trust = 1;
-            if (s_tex_sample == 2) {    /* check mode: is the full hash the same? */
-                uint64_t full = hash_fast(mem + t->offset, bytes,
-                                          0xCBF29CE484222325ull);
-                if (palette)
-                    full = hash_fast(mem + palette, 256 * 4, full);
-                if (full != e->hash) {
-                    s_tex_missed++;
-                    trust = 0;
+        /* The same test as one && chain, read in steps for the counters:
+         * calm (2: not yet), then not due for a full hash (3: due), then
+         * the sample unchanged (4: it changed). */
+        if (e->sample_ok && now - e->calm_at >= s_tex_qpf * TEX_CALM_MS / 1000) {
+            why = 3;
+            lcalm = now - e->calm_at >= s_tex_qpf * TEX_LONG_CALM_MS / 1000;
+            if (now < e->full_due) {
+                why = 4;
+                if (tex_sample_hash(mem + t->offset, bytes,
+                                    palette ? mem + palette : NULL)
+                    == e->sample) {
+                    int trust = 1;
+                    if (s_tex_sample == 2) { /* check mode: same full hash? */
+                        uint64_t full = hash_fast(mem + t->offset, bytes,
+                                                  0xCBF29CE484222325ull);
+                        if (palette)
+                            full = hash_fast(mem + palette, 256 * 4, full);
+                        s_tx.check_n++;
+                        s_tx.check_bytes += bytes + (palette ? 256 * 4 : 0);
+                        if (full != e->hash) {
+                            s_tex_missed++;
+                            trust = 0;
+                            why = 5;
+                            s_tx.missed_long += lcalm;
+                        }
+                    }
+                    if (trust) {
+                        s_tex_sampled++;
+                        e->hashed_flip = g_pb.flips;
+                        e->used = s_tex_tick;
+                        s_stat.tex_reused++;
+                        return e->srv;
+                    }
                 }
-            }
-            if (trust) {
-                s_tex_sampled++;
-                e->hashed_flip = g_pb.flips;
-                e->used = s_tex_tick;
-                s_stat.tex_reused++;
-                return e->srv;
             }
         }
         s_tex_full++;
@@ -4491,11 +4783,33 @@ guest:
     hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
     if (palette)
         hash = hash_fast(mem + palette, 256 * 4, hash);
+    s_tx.full_n++;
+    s_tx.full_bytes += bytes + (palette ? 256 * 4 : 0);
+    s_tx.why[why]++;
+    if (why == 3)
+        s_tx.due_long += lcalm;
+    if (e) {
+        if (e->hash == hash)
+            s_tx.full_same++;
+        else
+            s_tx.full_changed++;
+    }
     if (e && e->hash == hash) {
         if (sampling) {
-            /* The next full hash 17-33 ms on, spread by address. */
-            e->full_due = tex_now() + s_tex_qpf / 60
-                        + s_tex_qpf / 60 * ((e->addr * 2654435761u) >> 24) / 256;
+            /* The next full hash 17-33 ms on, spread by address; for a
+             * texture unchanged for TEX_LONG_CALM_MS, 83-100 ms on
+             * (RECOMP_TEX_LONG_CALM, executor cheaper wins step 4: user
+             * 2026-11-22, a CPU-written texture that changes only between
+             * the sampled lines shows stale for up to 100 ms, not 33). */
+            LONGLONG now = tex_now();
+            LONGLONG spread = s_tex_qpf / 60
+                            * ((e->addr * 2654435761u) >> 24) / 256;
+            if (tex_long_calm() && now - e->calm_at
+                    >= s_tex_qpf * TEX_LONG_CALM_MS / 1000)
+                e->full_due = now + s_tex_qpf * TEX_LONG_FULL_MS / 1000
+                            - spread;
+            else
+                e->full_due = now + s_tex_qpf / 60 + spread;
             e->sample = tex_sample_hash(mem + t->offset, bytes,
                                         palette ? mem + palette : NULL);
             e->sample_ok = 1;
@@ -4693,6 +5007,7 @@ make:
     e->calm_at = tex_now();
     e->used = s_tex_tick;
     s_stat.tex_uploads++;
+    s_tx.upload_bytes += bytes;
     s_tex_levels[st] = e->lv;
     return e->srv;
 }
@@ -5734,9 +6049,15 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
         if (g_pb.idx[i] > hi) hi = g_pb.idx[i];
     }
     vsh_gpu_arrays(arr);
-    if (!nv2a_vsh_gpu_inputs(arr, used, lo, hi) || !nv2a_vsh_gpu_constants()) {
-        s_stat.vsh_cpu_inputs++;
-        return NULL;
+    {
+        uint64_t ct0 = ct_now();
+        int ok = nv2a_vsh_gpu_inputs(arr, used, lo, hi)
+                 && nv2a_vsh_gpu_constants();
+        ct_add(CT_INPUTS, ct0);
+        if (!ok) {
+            s_stat.vsh_cpu_inputs++;
+            return NULL;
+        }
     }
     return vs;
 }
@@ -5978,8 +6299,10 @@ static void cutout_depth(GpuConsts *k, int c, uint32_t nidx)
     }
     k->mode[2] = s_cut[c].func;
     k->mode[3] = s_cut[c].ref;
-    if (!buf_fill(s_cb, k, sizeof *k))
+    if (!consts_put(k))
         return;
+    consts_bind_vs();                   /* the ring's piece, or s_cb as before */
+    consts_bind_ps();
     g_pb.depth_mask = 1;
     g_pb.stencil_wmask = 0;
     ds = ds_state();
@@ -6050,8 +6373,8 @@ static int cutout_parts(GpuConsts *k, int c, const uint32_t *end,
         if (cut_bound) {
             ID3D11DeviceContext_OMSetBlendState(s_ctx, bs, bf, 0xFFFFFFFFu);
             ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, ds, ref);
-            ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-            ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+            consts_bind_vs();           /* the batch's cbuffer C again */
+            consts_bind_ps();
         }
         ID3D11DeviceContext_DrawIndexed(s_ctx, cnt, start, 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, s_bs_no_colour, NULL,
@@ -6267,6 +6590,7 @@ static void d3d_draw(void)
     memset(&s_cbd, 0, sizeof s_cbd);
     s_rtt_target = si;
     s_draw_seq++;
+    nv2a_cring_draw_begin();            /* wraps the constant ring between draws only */
 
     if (program || combiners) {
         /* Through the title's own program, or the fixed-function vertex
@@ -6730,7 +7054,7 @@ static void d3d_draw(void)
     }
     {
         uint64_t ct0 = ct_now();
-        int ok = buf_fill(s_cb, &k, sizeof k);
+        int ok = consts_put(&k);
         ct_add(CT_CB, ct0);
         if (!ok)
             return;
@@ -6784,15 +7108,21 @@ static void d3d_draw(void)
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
     ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
-    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
+    consts_bind_vs();
     {
         ID3D11PixelShader *sp = ps_spec(&k);
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
     }
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
-    if (!tclamp_upload())
-        return;
-    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb1);
+    consts_bind_ps();
+    {
+        uint64_t ct0 = ct_now();
+        int ok = tclamp_upload();
+        ct_add(CT_TCLAMP, ct0);
+        if (!ok)
+            return;
+    }
+    if (!s_cbd_ring)                    /* the ring's piece is bound by tclamp_upload */
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 1, 1, &s_cb1);
     /* The target before the textures: a surface read as it is
      * (RECOMP_RTT_DIRECT) is often the one the batch before drew into, still
      * bound as the target, and D3D unbinds a view that overlaps a bound
@@ -7867,11 +8197,128 @@ static void gpu_mem_log(void)
                 s_bb_h, 10);
 }
 
+/* RECOMP_EXEC_STATS=1 (executor cheap wins, step 1): every 10 s, what the
+ * executor's back end did in that window, as counts and per flip: batches,
+ * the texture checks by kind (answered by the flip's earlier check, by a
+ * sample hash, by a full hash and why that was taken), the bytes hashed and
+ * uploaded, and the vertex inputs copied and drawn from the ring's cache.
+ * Counting only: no check or upload behaves differently with it on. */
+typedef struct {
+    uint64_t flips, batches, drawn, uploads, tex_made, sampled, missed;
+    uint64_t in_batches, in_bytes, in_wraps, in_hits, in_hit_bytes;
+    uint64_t cr_puts, cr_hits, cr_bytes, cr_wraps;  /* the constant ring */
+    TexStats tx;
+} ExecStats;
+
+static void exec_stats_snap(ExecStats *cur)
+{
+    memset(cur, 0, sizeof *cur);
+    cur->flips = g_pb.flips;
+    cur->batches = s_stat.batches;
+    cur->drawn = s_stat.drawn;
+    cur->uploads = s_stat.tex_uploads;
+    cur->tex_made = s_stat.tex_made;
+    cur->sampled = s_tex_sampled;
+    cur->missed = s_tex_missed;
+    nv2a_vsh_gpu_input_stats(&cur->in_batches, &cur->in_bytes,
+                             &cur->in_wraps);
+    nv2a_vsh_gpu_cache_stats(&cur->in_hits, &cur->in_hit_bytes);
+    cur->cr_puts = s_cr_puts;
+    cur->cr_hits = s_cr_hits;
+    cur->cr_bytes = s_cr_bytes;
+    cur->cr_wraps = s_cr_wraps;
+    cur->tx = s_tx;
+}
+
+static void exec_stats_tick(void)
+{
+    static int on = -1;
+    static ULONGLONG t0;
+    static ExecStats prev;
+    ExecStats cur, d;
+    ULONGLONG now;
+    uint64_t *c, *p, *o, flips;
+    size_t i;
+    double secs, f;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_EXEC_STATS");
+        on = e && *e && *e != '0';
+        if (on)
+            fprintf(stderr, "[EXECSTAT] on: a block of counts every 10 s%c",
+                    10);
+    }
+    if (!on)
+        return;
+    now = GetTickCount64();
+    if (!t0) {                          /* the first window starts here */
+        t0 = now;
+        exec_stats_snap(&prev);
+        return;
+    }
+    if (now - t0 < 10000)
+        return;
+    exec_stats_snap(&cur);
+    c = (uint64_t *)&cur;
+    p = (uint64_t *)&prev;
+    o = (uint64_t *)&d;
+    for (i = 0; i < sizeof cur / sizeof *c; i++)
+        o[i] = c[i] - p[i];
+    secs = (double)(now - t0) / 1000.0;
+    flips = d.flips ? d.flips : 1;
+    f = (double)flips;
+#define EXECN(x) ((unsigned long long)(x))
+    fprintf(stderr, "[EXECSTAT] %.1f s: %llu flips, %llu batches (%.0f a flip,"
+            " %llu drawn)%c", secs, EXECN(d.flips), EXECN(d.batches),
+            (double)d.batches / f, EXECN(d.drawn), 10);
+    fprintf(stderr, "[EXECSTAT]   texture binds on guest memory %llu (%.0f a"
+            " flip): answered by the flip's earlier check %llu, by a sample"
+            " hash %llu, by a full hash %llu%c", EXECN(d.tx.binds),
+            (double)d.tx.binds / f, EXECN(d.tx.flip_hit), EXECN(d.sampled),
+            EXECN(d.tx.full_n), 10);
+    fprintf(stderr, "[EXECSTAT]   full hashes %llu (%.1f a flip, %.2f MB, %.2f"
+            " MB a flip): first sight %llu, under 4 KB or sampling off %llu,"
+            " not calm yet %llu, calm and due %llu (%llu of them calm 2 s+),"
+            " sample changed %llu, check mode: sample missed %llu (%llu"
+            " calm 2 s+); result: same bytes %llu, changed %llu%c",
+            EXECN(d.tx.full_n), (double)d.tx.full_n / f,
+            (double)d.tx.full_bytes / 1048576.0,
+            (double)d.tx.full_bytes / 1048576.0 / f, EXECN(d.tx.why[0]),
+            EXECN(d.tx.why[1]), EXECN(d.tx.why[2]), EXECN(d.tx.why[3]),
+            EXECN(d.tx.due_long), EXECN(d.tx.why[4]), EXECN(d.tx.why[5]),
+            EXECN(d.tx.missed_long), EXECN(d.tx.full_same),
+            EXECN(d.tx.full_changed), 10);
+    fprintf(stderr, "[EXECSTAT]   sample hashes %llu (%.2f MB); check mode's"
+            " extra full hashes %llu (%.2f MB); uploads %llu (%.2f MB read,"
+            " %llu textures made)%c", EXECN(d.tx.samp_n),
+            (double)d.tx.samp_bytes / 1048576.0, EXECN(d.tx.check_n),
+            (double)d.tx.check_bytes / 1048576.0, EXECN(d.uploads),
+            (double)d.tx.upload_bytes / 1048576.0, EXECN(d.tex_made), 10);
+    fprintf(stderr, "[EXECSTAT]   vertex inputs: %llu batches, %.2f MB copied"
+            " (%.2f MB a flip), %llu spans (%.2f MB) drawn from the ring's"
+            " cache, %llu ring wraps%c", EXECN(d.in_batches),
+            (double)d.in_bytes / 1048576.0,
+            (double)d.in_bytes / 1048576.0 / f, EXECN(d.in_hits),
+            (double)d.in_hit_bytes / 1048576.0, EXECN(d.in_wraps), 10);
+    if (s_cr_on)
+        fprintf(stderr, "[EXECSTAT]   constant ring: %llu pieces asked for"
+                " (%.0f a flip), %llu already there (%.0f %%), %.2f MB"
+                " written, %llu wraps%c", EXECN(d.cr_puts),
+                (double)d.cr_puts / f, EXECN(d.cr_hits),
+                d.cr_puts ? 100.0 * (double)d.cr_hits / (double)d.cr_puts
+                          : 0.0,
+                (double)d.cr_bytes / 1048576.0, EXECN(d.cr_wraps), 10);
+#undef EXECN
+    prev = cur;
+    t0 = now;
+}
+
 static void d3d_present(void)
 {
     heavy_report();
     pace_count();
     gpu_mem_log();
+    exec_stats_tick();
 
     int seq = -1;
 
