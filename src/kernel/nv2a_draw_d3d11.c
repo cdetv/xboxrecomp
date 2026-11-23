@@ -2495,6 +2495,27 @@ int nv2a_cring_use(void)
     return s_cr && (s_cr_on == 1 || (s_cr_on == 2 && !(g_pb.flips & 1)));
 }
 
+/* The start of every draw: when less than CR_RESERVE (room for all the
+ * pieces one draw can put, with the receiver passes and the cut-out depth
+ * pass) is left, start the ring again now, before the draw has put or
+ * bound anything. The discard maps and unmaps without writing. */
+#define CR_RESERVE 4096u
+
+void nv2a_cring_draw_begin(void)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+
+    if (!nv2a_cring_use() || s_cr_at + CR_RESERVE <= CR_BYTES)
+        return;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cr, 0,
+                                       D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return;                         /* puts fail at the end: old path */
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cr, 0);
+    s_cr_at = 0;
+    s_cr_lap = s_cr_lap + 1 ? s_cr_lap + 1 : 1;
+    s_cr_wraps++;
+}
+
 int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
                    uint32_t *first, uint32_t *num)
 {
@@ -2516,12 +2537,13 @@ int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
         return 1;
     }
     n = (bytes + CR_UNIT - 1) / CR_UNIT * CR_UNIT;
-    if (s_cr_at + n > CR_BYTES) {       /* full: start again, one discard */
-        how = D3D11_MAP_WRITE_DISCARD;
-        s_cr_at = 0;
-        s_cr_lap = s_cr_lap + 1 ? s_cr_lap + 1 : 1;
-        s_cr_wraps++;
-    }
+    /* Never wraps here: a DISCARD inside a draw would leave that draw's
+     * earlier pieces, already bound, in memory the discard replaced
+     * (undefined contents: one draw with garbage constants every lap, seen
+     * in the held-picture check). Wraps are nv2a_cring_draw_begin's, which
+     * keeps room for a whole draw; past that the caller uses the old path. */
+    if (s_cr_at + n > CR_BYTES)
+        return 0;
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cr, 0,
                                        how, 0, &m)))
         return 0;
@@ -6341,6 +6363,7 @@ static void d3d_draw(void)
     memset(&s_cbd, 0, sizeof s_cbd);
     s_rtt_target = si;
     s_draw_seq++;
+    nv2a_cring_draw_begin();            /* wraps the constant ring between draws only */
 
     if (program || combiners) {
         /* Through the title's own program, or the fixed-function vertex

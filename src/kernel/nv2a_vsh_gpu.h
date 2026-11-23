@@ -101,10 +101,17 @@ enum { NV2A_CRING_CONSTS, NV2A_CRING_ROWS, NV2A_CRING_CBD,
  * in this flip). */
 int nv2a_cring_use(void);
 
+/* Called at the start of every draw, before any piece of it is put: starts
+ * the ring again (one DISCARD) when it has less room left than a draw can
+ * use. The ring wraps nowhere else: a wrap between two puts of one draw
+ * would leave the first piece, already bound, in memory the discard
+ * replaced. */
+void nv2a_cring_draw_begin(void);
+
 /* Puts `bytes` (at most 1024) of stream `stream` into the ring, or finds
  * them already there; *first and *num are the range to bind, in 16-byte
- * constants (multiples of 16). 0 when the ring could not be written: use
- * the old path. */
+ * constants (multiples of 16). 0 when the ring could not be written (or
+ * is full, past the room nv2a_cring_draw_begin keeps): use the old path. */
 int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
                    uint32_t *first, uint32_t *num);
 
