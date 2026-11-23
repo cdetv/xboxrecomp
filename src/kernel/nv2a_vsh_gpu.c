@@ -1501,6 +1501,18 @@ int nv2a_vsh_gpu_inputs(const Nv2aVshArray a[NV2A_VSH_INPUTS], uint32_t used,
         }
     }
     s_in_batches++;
+    {
+        /* The fetch rows go into the constant buffer ring when it is on
+         * (nv2a_cring_*, executor cheaper wins step 3): not written at all
+         * when they equal the last draw's. */
+        uint32_t first, num;
+        if (nv2a_cring_use()
+            && nv2a_cring_put(NV2A_CRING_ROWS, rows, sizeof rows, &first,
+                              &num)) {
+            nv2a_cring_bind_vs(NV2A_VSH_HLSL_FETCH_CBUFFER, first, num);
+            goto rows_done;
+        }
+    }
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_acb, 0,
             D3D11_MAP_WRITE_DISCARD, 0, &ms)))
         return 0;
@@ -1508,6 +1520,7 @@ int nv2a_vsh_gpu_inputs(const Nv2aVshArray a[NV2A_VSH_INPUTS], uint32_t used,
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_acb, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx,
             NV2A_VSH_HLSL_FETCH_CBUFFER, 1, &s_acb);
+rows_done:
     ID3D11DeviceContext_VSSetShaderResources(s_ctx,
             NV2A_VSH_HLSL_FETCH_SRV, 1, &s_ring_srv);
     return 1;

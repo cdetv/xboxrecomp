@@ -1045,7 +1045,14 @@ static struct {
     uint64_t flush_after_exec, flush_after_idle, flush_in_swm;
     uint64_t kick_n, kick_ticks;      /* flush answered -> PUT seen moved */
     uint64_t swm_n, swm_ticks;
+    /* The same trap round trips by software method code (param & 31). */
+    uint64_t swm_code_n[32], swm_code_ticks[32];
 } s_turn;
+
+extern void kernel_pgraph_swm_profile(int on);
+extern void kernel_pgraph_swm_stats(uint32_t code, unsigned long long *n,
+                                    unsigned long long *wake_ticks,
+                                    unsigned long long *run_ticks);
 
 static uint64_t turn_now(void)
 {
@@ -1070,6 +1077,9 @@ static DWORD WINAPI turn_sampler_thread(LPVOID param)
     uint64_t prev_idle_n = 0, prev_fe = 0, prev_fi = 0, prev_fs = 0;
     uint64_t prev_kick_n = 0, prev_kick_ticks = 0, prev_swm_n = 0;
     uint64_t prev_swm_ticks = 0;
+    uint64_t prev_code_n[32] = {0}, prev_code_ticks[32] = {0};
+    unsigned long long prev_k_n[32] = {0}, prev_k_wake[32] = {0};
+    unsigned long long prev_k_run[32] = {0};
 
     if (every < 1.0)
         every = 20.0;
@@ -1150,6 +1160,42 @@ static DWORD WINAPI turn_sampler_thread(LPVOID param)
                     kn ? turn_ms(s_turn.kick_ticks - prev_kick_ticks) / kn : 0.0,
                     (unsigned long long)sn,
                     turn_ms(s_turn.swm_ticks - prev_swm_ticks));
+            {
+                /* Executor cheap wins, step 1: what a trap costs by code.
+                 * "round trip" is the executor's wait from posting to being
+                 * handed back; "wake" the timer thread's delay before it
+                 * starts on it; "handler" the ISR + DPC it then runs (what
+                 * a hook on the executor thread would still have to do). */
+                int c, any = 0;
+                for (c = 0; c < 32; c++) {
+                    uint64_t cn = s_turn.swm_code_n[c] - prev_code_n[c];
+                    unsigned long long kn2, kw, kr;
+                    unsigned long long dn, dw, dr;
+                    if (!cn)
+                        continue;
+                    kernel_pgraph_swm_stats((uint32_t)c, &kn2, &kw, &kr);
+                    dn = kn2 - prev_k_n[c];
+                    dw = kw - prev_k_wake[c];
+                    dr = kr - prev_k_run[c];
+                    if (!any)
+                        fprintf(stderr, "[TURN] traps by code (per second;"
+                                " round trip / wake / handler, mean us each):\n");
+                    any = 1;
+                    fprintf(stderr, "[TURN]   code %X: %6.1f/s, %6.1f us round"
+                            " trip, %6.1f us wake, %6.1f us handler, %.1f ms"
+                            " a second\n", c, cn / secs,
+                            turn_ms(s_turn.swm_code_ticks[c] - prev_code_ticks[c])
+                                * 1000.0 / cn,
+                            dn ? turn_ms(dw) * 1000.0 / dn : 0.0,
+                            dn ? turn_ms(dr) * 1000.0 / dn : 0.0,
+                            turn_ms(s_turn.swm_code_ticks[c]
+                                    - prev_code_ticks[c]) / secs);
+                    prev_code_n[c] = s_turn.swm_code_n[c];
+                    prev_code_ticks[c] = s_turn.swm_code_ticks[c];
+                    prev_k_n[c] = kn2; prev_k_wake[c] = kw;
+                    prev_k_run[c] = kr;
+                }
+            }
             fflush(stderr);
 
             memset(joint, 0, sizeof joint);
@@ -1450,8 +1496,11 @@ void xbox_Nv2aSoftwareMethod(uint32_t subch, uint32_t param)
             exec_pause(s_ack_regs, bell);
     }
     if (s_turn_on) {
+        uint64_t d = turn_now() - turn_t0;
         s_turn.swm_n++;
-        s_turn.swm_ticks += turn_now() - turn_t0;
+        s_turn.swm_ticks += d;
+        s_turn.swm_code_n[param & 0x1Fu]++;
+        s_turn.swm_code_ticks[param & 0x1Fu] += d;
         InterlockedExchange(&s_turn_phase, turn_prev);
     }
 }
@@ -1686,10 +1735,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                          * first eight. A wrap whose start was not found
                          * or lies past PUT is always shown: the segment
                          * after it was walked from a guess. */
-                        if (getenv("RECOMP_PB_WRAP_TRACE")
-                                || !start || (start & 0x0FFFFFFFu) > put) {
+                        /* Read once: a wrap comes every few frames and a
+                         * getenv walks the whole environment block
+                         * (executor cheaper wins step 2). */
+                        static int wt_read;
+                        static const char *wt;
+                        if (!wt_read) {
+                            wt = getenv("RECOMP_PB_WRAP_TRACE");
+                            wt_read = 1;
+                        }
+                        if (wt || !start || (start & 0x0FFFFFFFu) > put) {
                             static unsigned wraps;
-                            const char *wt = getenv("RECOMP_PB_WRAP_TRACE");
                             if (wraps++ < 8 || (wt && !strcmp(wt, "all"))
                                     || !start || (start & 0x0FFFFFFFu) > put)
                                 fprintf(stderr, "  [NV2A] pushbuffer wrapped "
@@ -1791,6 +1847,7 @@ static void xbox_Nv2aAckStart(void)
     if (g_nv2a_ack_thread && getenv("RECOMP_TURN_PROFILE")) {
         QueryPerformanceFrequency(&s_turn_freq);
         s_turn_on = 1;
+        kernel_pgraph_swm_profile(1);
         CloseHandle(CreateThread(NULL, 0, turn_sampler_thread,
                                  g_nv2a_memory, 0, NULL));
         fprintf(stderr, "  [TURN] game/executor turn profile on, report every"
