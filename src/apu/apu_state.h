@@ -558,6 +558,15 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
  * the APU base. Plain memory plus the boot ROM's program load; see apu_dsp.c. */
 uint32_t mcpx_apu_gp_ep_read(MCPXAPUState *d, hwaddr addr);
 void mcpx_apu_vp_prof_voices(void);
+/* Samples written to RECOMP_APU_WAV so far (the [APUEV] trace's "wav" column). */
+uint32_t mcpx_apu_wav_frames(void);
+/* RECOMP_APU_SSL_WAIT (apu_vp.c): a stream voice about to finish a packet it
+ * started moments ago while the title has not refilled the other one yet.
+ * The frame thread waits for the refill (d->lock free) before the next frame;
+ * on its time limit it gives those voices up until their next refill. */
+bool mcpx_apu_vp_ssl_wait_needed(MCPXAPUState *d);
+void mcpx_apu_vp_ssl_wait_give_up(MCPXAPUState *d);
+int64_t mcpx_apu_vp_ssl_wait_limit_us(void);
 void mcpx_apu_gp_ep_write(MCPXAPUState *d, hwaddr addr, uint32_t val);
 
 /* RECOMP_APU_PROFILE: what the frame thread did, summed over 5 s and printed
@@ -602,6 +611,10 @@ struct ApuProfile {
      * time spent waiting. idle_frames counts the silent frames. */
     unsigned long trap_waits, trap_timeouts;
     double t_trap, max_trap;
+    /* Stream packet refills waited for (RECOMP_APU_SSL_WAIT): waits, waits
+     * that hit the limit, and the time spent. */
+    unsigned long ssl_waits, ssl_wait_timeouts;
+    double t_ssl_wait, max_ssl_wait;
 };
 extern struct ApuProfile g_apu_prof;
 extern int g_apu_prof_on;
