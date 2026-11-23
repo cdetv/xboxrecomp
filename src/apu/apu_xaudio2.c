@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <xaudio2.h>
 #include <mmdeviceapi.h>
+#include <spatialaudioclient.h>
 
 #pragma comment(lib, "xaudio2.lib")
 #pragma comment(lib, "ole32.lib")
@@ -95,6 +96,42 @@ static int xa2_output_present(void)
     return SUCCEEDED(hr);
 }
 
+/* A spatial sound format (Windows Sonic / Dolby Atmos / DTS for headphones)
+ * is on for the default output: Windows' spatial client offers it movable
+ * sound objects (0 when none is on: every endpoint answers the static mask
+ * and "7.1 supported" alike, so those can't tell). Windows 10 then still
+ * offers apps the device's own stereo mix format, so XAudio2's default
+ * channels are 2 (seen 2026-11-22: Sonic on Bluetooth headphones), but a
+ * 7.1 stream is rendered by the spatial renderer, its speakers placed around
+ * the listener. Wine's spatial client answers 0 objects. */
+static int xa2_spatial_on(void)
+{
+    static const GUID clsid_enum = { 0xBCDE0395, 0xE52F, 0x467C,
+        { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+    static const GUID iid_enum = { 0xA95664D2, 0x9614, 0x4F35,
+        { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+    static const GUID iid_spatial = { 0xBBF8E066, 0xAAAA, 0x49BE,
+        { 0x9A, 0x4D, 0xFD, 0x2A, 0x85, 0x8E, 0xA2, 0x7F } };
+    IMMDeviceEnumerator *en = NULL;
+    IMMDevice *dev = NULL;
+    ISpatialAudioClient *sp = NULL;
+    UINT32 objects = 0;
+
+    if (FAILED(CoCreateInstance(&clsid_enum, NULL, CLSCTX_ALL, &iid_enum, (void **)&en)) || !en)
+        return 0;
+    if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(en, eRender, eConsole, &dev)) && dev) {
+        if (SUCCEEDED(IMMDevice_Activate(dev, &iid_spatial, CLSCTX_INPROC_SERVER, NULL,
+                                         (void **)&sp)) && sp) {
+            if (FAILED(ISpatialAudioClient_GetMaxDynamicObjectCount(sp, &objects)))
+                objects = 0;
+            ISpatialAudioClient_Release(sp);
+        }
+        IMMDevice_Release(dev);
+    }
+    IMMDeviceEnumerator_Release(en);
+    return objects > 0;
+}
+
 /* A speaker's channel number in a device's channel mask, or -1. */
 static int xa2_speaker(DWORD mask, DWORD bit, int channels)
 {
@@ -130,8 +167,16 @@ static int xa2_surround_plan(void)
         mask = 0;
     n = (int)det.InputChannels;
     g_xa2_dev_ch = n;
-    if (!mask)      /* the device names no speakers: Windows' usual layouts */
-        mask = n >= 8 ? 0x63F : n >= 6 ? 0x60F : n == 2 ? 0x3 : 0;
+    {
+        int named = 0;
+        for (DWORD b = mask; b; b &= b - 1)
+            named++;
+        /* No speakers named, or fewer than the voice has (a 7.1 voice on a
+         * stereo device with spatial sound on still reports the device's
+         * 0x3): Windows' usual layouts. */
+        if (named < n)
+            mask = n >= 8 ? 0x63F : n >= 6 ? 0x60F : n == 2 ? 0x3 : 0;
+    }
     fl = xa2_speaker(mask, 0x1, n);
     fr = xa2_speaker(mask, 0x2, n);
     c = xa2_speaker(mask, 0x4, n);
@@ -234,6 +279,30 @@ int xa2_init(void)
     g_xa2_dev_ch = 0;
     if (g_xa2_want_ch == 6 && xa2_surround_plan())
         g_xa2_src_ch = 6;
+    else if (g_xa2_want_ch == 6 && g_xa2_dev_ch < 6 && xa2_spatial_on()) {
+        /* A stereo device with spatial sound on: 7.1 for Windows' spatial
+         * renderer (xa2_spatial_on). Back to the device's own channels if
+         * that fails. */
+        IXAudio2MasteringVoice_DestroyVoice(g_xa2_master);
+        g_xa2_master = NULL;
+        fprintf(stderr, "[XA2] spatial sound on for this output (Windows Sonic / Dolby Atmos /"
+                " DTS): opened as 7.1\n");
+        hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master, 8, XA2_SAMPLE_RATE, 0,
+                                           NULL, NULL, 0);
+        if (FAILED(hr)) {
+            fprintf(stderr, "[XA2] 7.1 mastering voice failed: 0x%08lX\n", hr);
+            g_xa2_master = NULL;
+            hr = IXAudio2_CreateMasteringVoice(g_xa2, &g_xa2_master,
+                XAUDIO2_DEFAULT_CHANNELS, XA2_SAMPLE_RATE, 0, NULL, NULL, 0);
+            if (FAILED(hr)) {
+                fprintf(stderr, "[XA2] CreateMasteringVoice failed: 0x%08lX\n", hr);
+                goto fail;
+            }
+            g_xa2_dev_ch = 0;
+        }
+        if (xa2_surround_plan())
+            g_xa2_src_ch = 6;
+    }
 
     if (g_xa2_src_ch == 6) {
         /* FL FR C LFE + the surround pair: Windows' 5.1 (side surrounds).
