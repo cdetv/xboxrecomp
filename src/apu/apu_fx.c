@@ -215,6 +215,13 @@ static float s_rev_mem[6000 * 4 + 680 + 612 + 640 + 720 + 1392 + 1684 + 2044 + 2
                        + 24000 * 2];
 static Reverb s_rev;
 
+/* Room reverb (xbox_ApuSetRoomReverb): the wet output's level, gliding to
+ * its target over ~43 ms (1 with the game's own listener: exactly as
+ * before), and this frame's wet output for Standard (apu_fx_room_wet). */
+static float s_wet = 1.0f, s_wet_to = 1.0f;
+static float s_wet_out[4][APU_FX_FRAME];
+static int s_wet_have;
+
 static float pole_run(Pole *p, float x)
 {
     return p->z = p->a * p->z + p->b * x + 1e-20f;   /* the offset keeps out denormals */
@@ -424,12 +431,18 @@ static void reverb_run(Reverb *r, const float *in, float *out[4])
                 r->fade = fminf(r->fade + 1 / 128.0f, 1.0f);
             }
             reverb_frame(r, x, o);
+            if (s_wet != s_wet_to)
+                s_wet = fabsf(s_wet_to - s_wet) <= 1 / 1024.0f ? s_wet_to
+                      : s_wet + (s_wet_to > s_wet ? 1 / 1024.0f : -1 / 1024.0f);
             for (int k = 0; k < 4; k++)
-                r->held[k] = o[k] * r->fade;
+                r->held[k] = o[k] * r->fade * s_wet;
         }
-        for (int k = 0; k < 4; k++)
+        for (int k = 0; k < 4; k++) {
             out[k][i] = limit(out[k][i] + r->held[k]);
+            s_wet_out[k][i] = r->held[k];
+        }
     }
+    s_wet_have = 1;
 }
 
 /* ── The effects ────────────────────────────────────────────────────────── */
@@ -603,6 +616,18 @@ static uint32_t s_l_taken;
 static float s_l_now[12];
 static int s_l_have;
 
+/* The room reverb (xbox_ApuSetRoomReverb), handed over the same way; the
+ * frame thread takes it at a frame's start (apu_fx_frame_begin), so the
+ * chain runs for it in Standard too (apu_fx_wanted). */
+static volatile uint32_t s_r_seq;
+static volatile uint32_t s_r_raw[12];
+static volatile int s_r_on;
+static volatile float s_r_strength;
+static uint32_t s_r_taken;
+static int s_room;                /* frame thread: our listener plays */
+static uint32_t s_room_raw[12];
+static int s_room_new;            /* taken, not yet given to the reverb */
+
 static void listener_floats(const uint32_t raw[12], float p[12])
 {
     for (int i = 0; i < 12; i++) {
@@ -766,12 +791,15 @@ void xbox_ApuSetAudioMode(int processing, int output)
     apu_fx_set_mode(processing, output);
 }
 
+static void take_room(void);
+
 void apu_fx_frame_begin(void)
 {
     static uint32_t frame;            /* APU frames so far: x 32 = output samples */
     int want;
     cfg();
     take_output(frame);
+    take_room();
     want = (s_surround || (s_req >= 0 ? s_req : s_full)) && s_fx_count > 0;
     s_w0 = s_w1;
     if (want != s_on) {
@@ -793,7 +821,7 @@ void apu_fx_frame_begin(void)
 int apu_fx_wanted(void)
 {
     cfg();
-    return s_fx_count > 0 && (s_on || s_w0 > 0.0f || s_w1 > 0.0f || s_log);
+    return s_fx_count > 0 && (s_on || s_w0 > 0.0f || s_w1 > 0.0f || s_log || s_room);
 }
 
 int apu_fx_full(void)
@@ -834,29 +862,117 @@ void xbox_ApuSetI3dl2Listener(const void *listener48)
     apu_fx_set_listener(listener48);
 }
 
-static void take_listener(void)
+void apu_fx_set_room_reverb(const void *listener48, float strength)
 {
-    uint32_t s1 = s_l_seq, raw[12];
-    if (s1 == s_l_taken || (s1 & 1))
+    const uint32_t *w = (const uint32_t *)listener48;
+    s_r_seq++;
+    FX_BARRIER();
+    if (w)
+        for (int i = 0; i < 12; i++)
+            s_r_raw[i] = w[i];
+    s_r_strength = strength < 0.0f ? 0.0f : strength > 1.0f ? 1.0f : strength;
+    s_r_on = w != NULL;
+    FX_BARRIER();
+    s_r_seq++;
+}
+
+/* xbox_ApuSetRoomReverb (apu.h): the DLL's side. */
+void xbox_ApuSetRoomReverb(const void *listener48, float strength)
+{
+    apu_fx_set_room_reverb(listener48, strength);
+}
+
+/* Frame thread, a frame's start: a new room reverb asked. Turned on while
+ * Full DSP is not heard, the reverb's lines may hold an old tail (the chain
+ * stopped running mid-way): cleared, so nothing from back then plays. */
+static void take_room(void)
+{
+    uint32_t s1 = s_r_seq, raw[12];
+    int on;
+    float strength;
+    if (s1 == s_r_taken || (s1 & 1))
         return;
     FX_BARRIER();
     for (int i = 0; i < 12; i++)
-        raw[i] = s_l_raw[i];
+        raw[i] = s_r_raw[i];
+    on = s_r_on;
+    strength = s_r_strength;
     FX_BARRIER();
-    if (s_l_seq != s1)
-        return;   /* written meanwhile: the next frame takes it */
-    s_l_taken = s1;
-    listener_floats(raw, s_l_now);
-    s_l_have = 1;
-    reverb_set(&s_rev, s_l_now);
-    if (s_log)
-        fprintf(stderr, "[APUFX] listener: room %.0f HF %.0f decay %.2f s ratio %.2f"
+    if (s_r_seq != s1)
+        return;
+    s_r_taken = s1;
+    if (on && !s_room && s_w1 <= 0.0f && !s_log && s_rev.on)
+        reverb_clear(&s_rev);
+    if (on && !memcmp(raw, s_room_raw, sizeof raw) && s_room) {
+        s_wet_to = strength;       /* only the strength changed */
+        return;
+    }
+    memcpy(s_room_raw, raw, sizeof raw);
+    s_room = on;
+    s_wet_to = on ? strength : 1.0f;
+    s_room_new = 1;
+}
+
+/* The game's listener as the reverb's (always taken, played only while no
+ * room reverb is set), then a new room reverb. */
+static void take_listener(void)
+{
+    uint32_t s1 = s_l_seq, raw[12];
+    static const float k_none[12] = {   /* preset 25's: silent */
+        -10000.0f, -10000.0f, 0.0f, 1.0f, 1.0f, -10000.0f, 0.0f, -10000.0f, 0.0f,
+        0.0f, 0.0f, 5000.0f,
+    };
+    const float *p = NULL;
+    const char *what = "listener";
+    int room_change = 0;
+
+    if (s1 != s_l_taken && !(s1 & 1)) {
+        FX_BARRIER();
+        for (int i = 0; i < 12; i++)
+            raw[i] = s_l_raw[i];
+        FX_BARRIER();
+        if (s_l_seq == s1) {      /* else written meanwhile: the next frame takes it */
+            s_l_taken = s1;
+            listener_floats(raw, s_l_now);
+            s_l_have = 1;
+            if (!s_room)
+                p = s_l_now;
+        }
+    }
+    if (s_room_new) {
+        static float room[12];
+        s_room_new = 0;
+        room_change = 1;
+        if (s_room) {
+            listener_floats(s_room_raw, room);
+            p = room;
+            what = "room reverb";
+        } else {
+            p = s_l_have ? s_l_now : k_none;
+            what = "room reverb off, the game's listener again";
+        }
+    }
+    if (!p)
+        return;
+    reverb_set(&s_rev, p);
+    if (s_log || room_change)
+        fprintf(stderr, "[APUFX] %s: room %.0f HF %.0f decay %.2f s ratio %.2f"
                 " reflections %.0f mB %.3f s reverb %.0f mB %.3f s diffusion %.0f"
-                " density %.0f HF ref %.0f -> %s\n",
-                s_l_now[0], s_l_now[1], s_l_now[3], s_l_now[4], s_l_now[5],
-                s_l_now[6], s_l_now[7], s_l_now[8], s_l_now[9], s_l_now[10],
-                s_l_now[11], (s_rev.pending ? s_rev.next_silent : s_rev.silent)
-                                 ? "silent" : "on");
+                " density %.0f HF ref %.0f, strength %.2f -> %s\n", what,
+                p[0], p[1], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11],
+                s_wet_to, (s_rev.pending ? s_rev.next_silent : s_rev.silent)
+                              ? "silent" : "on");
+}
+
+/* Standard's room reverb (apu_dsp.c): this frame's wet output, front left,
+ * front right, back left, back right; 0 when no room reverb is set or the
+ * reverb did not run. */
+int apu_fx_room_wet(float out[4][APU_FX_FRAME])
+{
+    if (!s_room || !s_wet_have)
+        return 0;
+    memcpy(out, s_wet_out, sizeof s_wet_out);
+    return 1;
 }
 
 /* ── One frame ─────────────────────────────────────────────────────────── */
@@ -887,6 +1003,7 @@ void apu_fx_run(float bins[APU_FX_BINS][APU_FX_FRAME],
     double t0 = s_log ? now_us() : 0.0;
 
     take_listener();
+    s_wet_have = 0;
     /* The voice processor writes every bin fresh each frame. */
     for (uint32_t b = 0; b < APU_FX_BINS; b++) {
         float *d = buf_at(X_BIN_READ + b * X_BIN_STRIDE);

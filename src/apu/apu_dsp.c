@@ -499,12 +499,29 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      * Standard's slice is the monitor mix the VP left there (or the table's
      * mix). With only RECOMP_APU_FX_LOG it runs for its log and plays
      * nothing. */
-    int full = 0;
+    int full = 0, room = 0;
     float full_l[NUM_SAMPLES_PER_FRAME], full_r[NUM_SAMPLES_PER_FRAME];
+    /* Room reverb in Standard (xbox_ApuSetRoomReverb, Conker to-do 232): the
+     * reverb's wet output folded as Full DSP folds its speakers, at Full
+     * DSP's output gain (Standard's level in play), added to Standard's
+     * slice. Nothing while no room reverb is set. */
+    float room_l[NUM_SAMPLES_PER_FRAME], room_r[NUM_SAMPLES_PER_FRAME];
     if (apu_fx_wanted()) {
-        static float gain = -1.0f, lfe;
-        float spk[APU_FX_SPEAKERS][APU_FX_FRAME];
+        static float gain = -1.0f, lfe, room_gain = -1.0f;
+        float spk[APU_FX_SPEAKERS][APU_FX_FRAME], wet[4][APU_FX_FRAME];
         apu_fx_run(mixbins, spk);
+        if (apu_fx_room_wet(wet)) {
+            const float h = 0.70710678f;
+            if (room_gain < 0.0f) {
+                const char *e = getenv("RECOMP_APU_DSP_GAIN_DB");
+                room_gain = powf(10.0f, ((e && *e) ? (float)atof(e) : -8.5f) / 20.0f);
+            }
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                room_l[i] = (wet[0][i] + h * wet[2][i]) * room_gain;
+                room_r[i] = (wet[1][i] + h * wet[3][i]) * room_gain;
+            }
+            room = 1;
+        }
         if (apu_fx_full() && apu_out_channels() == 6) {
             /* 5.1 (to-do 50 step 4): the six speakers as they are, at Full
              * DSP's gain. While Full DSP fades in (or before the effects
@@ -528,6 +545,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 } else if (w < 1.0f) {
                     sl = d->monitor.frame_buf[off + i][0] / 32767.0f;
                     sr = d->monitor.frame_buf[off + i][1] / 32767.0f;
+                }
+                if (w < 1.0f && room) {
+                    sl += room_l[i];
+                    sr += room_r[i];
                 }
                 o[0] += sl * (1.0f - w);
                 o[1] += sr * (1.0f - w);
@@ -579,6 +600,10 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                     table_mix(mixbins, i, &sl, &sr);
                     sl = sl > 1.0f ? 1.0f : sl < -1.0f ? -1.0f : sl;
                     sr = sr > 1.0f ? 1.0f : sr < -1.0f ? -1.0f : sr;
+                }
+                if (room) {
+                    sl += room_l[i];
+                    sr += room_r[i];
                 }
                 l = sl + (l - sl) * w;
                 r = sr + (r - sr) * w;
@@ -641,6 +666,16 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+        }
+    }
+    if (room && !full) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            for (int c = 0; c < 2; c++) {
+                float x = d->monitor.frame_buf[off + i][c]
+                        + (c ? room_r[i] : room_l[i]) * 32767.0f;
+                x = x > 32767.0f ? 32767.0f : x < -32768.0f ? -32768.0f : x;
+                d->monitor.frame_buf[off + i][c] = (int16_t)lrintf(x);
+            }
         }
     }
 

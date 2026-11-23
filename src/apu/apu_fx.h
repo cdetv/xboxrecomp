@@ -65,6 +65,15 @@ void apu_fx_run(float bins[APU_FX_BINS][APU_FX_FRAME],
  * its next frame and fades over to it. */
 void apu_fx_set_listener(const void *listener48);
 
+/* Room reverb (xbox_ApuSetRoomReverb, apu.h; any thread): our own listener
+ * in place of the game's, its wet output at strength (0..1); NULL = the
+ * game's listener again. While set the chain runs in Standard too. */
+void apu_fx_set_room_reverb(const void *listener48, float strength);
+
+/* Standard's room reverb (frame thread, after apu_fx_run): the reverb's wet
+ * output this frame (FL, FR, BL, BR); 0 when no room reverb plays. */
+int apu_fx_room_wet(float out[4][APU_FX_FRAME]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -164,6 +164,11 @@ int xbox_ApuOutputChannels(void)
     return apu() ? s_apu->output_channels() : 2;
 }
 
+void xbox_ApuSetRoomReverb(const void *listener48, float strength)
+{
+    if (apu()) s_apu->set_room_reverb(listener48, strength);
+}
+
 #else
 
 MCPXAPUState *mcpx_apu_init_core(uint8_t *ram_ptr);
