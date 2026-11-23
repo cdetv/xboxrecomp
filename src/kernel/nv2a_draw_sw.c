@@ -1684,9 +1684,114 @@ int pb_rc_input_stage(int st)
     return in < (uint32_t)st ? (int)in : st - 1;
 }
 
+/* RECOMP_DOT_MODES (on; =0 off, the modes read zero as before 2026-11-23). */
+int pb_dot_modes_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_DOT_MODES");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* PS_DOTMAPPING (xemu psh.c's dotmap_*): how a dot-product stage turns its
+ * input stage's colour into a vector. The input is the colour as a stage
+ * result holds it (a signed channel as its two's-complement byte read
+ * unsigned, as the combiners see it). HILO_1 and the HILO hemisphere
+ * mappings (4-7) pass the colour through, as xemu's hemisphere ones do: no
+ * HILO texture format is read here. */
+void pb_dot_map(int st, const float in[4], float v[3])
+{
+    uint32_t m = st > 0 ? (g_pb.dot_rgb_mapping >> ((st - 1) * 4)) & 0xFu : 0;
+    int j;
+
+    for (j = 0; j < 3; j++) {
+        float x = in[j] * 255.0f;
+        switch (m) {
+        case 1:                                     /* MINUS1_TO_1_D3D */
+            v[j] = (x - 128.0f) / 127.0f;
+            break;
+        case 2:                                     /* MINUS1_TO_1_GL */
+            v[j] = x >= 128.0f ? (x - 255.5f) / 127.5f : (x + 0.5f) / 127.5f;
+            break;
+        case 3:                                     /* MINUS1_TO_1 */
+            v[j] = sign3(in[j]);
+            break;
+        default:                                    /* ZERO_TO_ONE */
+            v[j] = in[j];
+            break;
+        }
+    }
+}
+
+/* One [TEXMODE] line per stage setup (program, dot mapping, other-stage
+ * input) a draw uses with a mode 8 or above, the first time; up to 32
+ * setups. Says which modes are drawn and which read zero, so a title's
+ * use of the rarer texture shader modes shows in any run's log. */
+void pb_note_stage_modes(void)
+{
+    static const char *const names[] = {
+        "BRDF", "DOT_ST", "DOT_ZW", "DOT_RFLCT_DIFF", "DOT_RFLCT_SPEC",
+        "DOT_STR_3D", "DOT_STR_CUBE", "DPNDNT_AR", "DPNDNT_GB", "DOTPRODUCT",
+        "DOT_RFLCT_SPEC_CONST"
+    };
+    static uint32_t last_p = 0xFFFFFFFFu, last_map, last_in;
+    static uint32_t seen[32][3];
+    static int nseen;
+    uint32_t p = g_pb.rc.stage_program & 0xFFFFFu, m[4], st;
+    char drawn[96], zero[96];
+    size_t nd = 0, nz = 0;
+    int i, any = 0;
+
+    if (p == last_p && g_pb.dot_rgb_mapping == last_map
+        && g_pb.other_stage_input == last_in)
+        return;
+    last_p = p;
+    last_map = g_pb.dot_rgb_mapping;
+    last_in = g_pb.other_stage_input;
+    for (st = 0; st < 4; st++) {
+        m[st] = (p >> (st * 5)) & 0x1Fu;
+        any |= m[st] >= 8;
+    }
+    if (!any || nseen >= 32)
+        return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i][0] == p && seen[i][1] == last_map && seen[i][2] == last_in)
+            return;
+    seen[nseen][0] = p;
+    seen[nseen][1] = last_map;
+    seen[nseen][2] = last_in;
+    nseen++;
+    drawn[0] = zero[0] = 0;
+    for (st = 0; st < 4; st++) {
+        const char *n;
+        if (m[st] < 8)
+            continue;
+        n = m[st] <= 18 ? names[m[st] - 8] : "reserved";
+        if (pb_dot_modes_on() && st > 0 && (m[st] == 17 || (m[st] == 9 && st >= 2)))
+            nd += (size_t)snprintf(drawn + nd, sizeof drawn - nd, " t%u %s", st, n);
+        else
+            nz += (size_t)snprintf(zero + nz, sizeof zero - nz, " t%u %s", st, n);
+        if (nd >= sizeof drawn) nd = sizeof drawn - 1;
+        if (nz >= sizeof zero) nz = sizeof zero - 1;
+    }
+    fprintf(stderr, "[TEXMODE] stage modes [%u, %u, %u, %u] (program %05X), dot"
+            " mapping %03X, stages 2 / 3 read t%u / t%u, combiners %s, flip %u:"
+            " drawn%s%s; read as zero%s%s\n", m[0], m[1], m[2], m[3], p,
+            last_map, (last_in >> 16) & 0xFu, (last_in >> 20) & 0xFu,
+            g_pb.rc_seen ? "on" : "off", g_pb.flips, nd ? ":" : " none",
+            drawn, nz ? ":" : " none", zero);
+    fflush(stderr);
+}
+
+/* The dot-product stages' dots for the pixel being drawn (rc_stage_fetch). */
+static float s_dot[4];
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
  * (xemu psh.c). `prev` holds the earlier stages' results, which the
- * bump-env modes read. Returns 0 when a clip-plane stage kills the pixel. */
+ * bump-env and dot-product modes read. Returns 0 when a clip-plane stage
+ * kills the pixel. */
 static int rc_stage_fetch(int st, const float c[4], const float prev[][4],
                           float out[4])
 {
@@ -1759,8 +1864,29 @@ static int rc_stage_fetch(int st, const float c[4], const float prev[][4],
         }
         return 1;
     }
+    case 9: case 17: {                            /* DOT_ST, DOTPRODUCT */
+        /* The stage's coordinates (s, t, r, no divide by q) dotted with its
+         * input stage's colour, mapped to a vector (pb_dot_map). DOTPRODUCT
+         * keeps the dot for the next stage and reads zero; DOT_ST reads
+         * its 2D texture at (the previous stage's dot, its own), in the
+         * units rc_texel takes (texels for a linear texture). BarnArena's
+         * flood: a normal map on stage 0, DOTPRODUCT then DOT_ST into the
+         * game's 256x256 copy of the screen: refraction (Conker to-do 281). */
+        float v[3];
+        uint32_t pm = st > 0 ? (g_pb.rc.stage_program >> ((st - 1) * 5)) & 0x1F : 0;
+        out[0] = out[1] = out[2] = out[3] = 0.0f;
+        if (st == 0 || !pb_dot_modes_on() || (mode == 9 && st < 2))
+            return 1;
+        pb_dot_map(st, prev[pb_rc_input_stage(st)], v);
+        s_dot[st] = c[0] * v[0] + c[1] * v[1] + c[2] * v[2];
+        if (mode == 9)
+            rc_texel(t, 0, pm == 9 || pm == 17 ? s_dot[st - 1] : 0.0f,
+                     s_dot[st], out);
+        return 1;
+    }
     default:
-        /* ponytail: the dot-product modes read zero -- add them when a
+        /* ponytail: the other dot-product and dependent-read modes read
+         * zero ([TEXMODE] names any a title uses) -- add them when a
          * title's look depends on one. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
