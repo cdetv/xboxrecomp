@@ -2461,9 +2461,12 @@ static void cr_init(void)
     D3D11_BUFFER_DESC bd;
     const char *why = NULL;
 
-    s_cr_on = e && e[0] == '0' ? 0 : e && e[0] == '2' ? 2 : 1;
+    /* Off unless asked for: measured neutral on the AMD card (a DISCARD
+     * Map of a constant buffer costs ~0.13 us there, the ring's offset
+     * binds cost about as much), 2026-11-22. =1 on, =2 even flips only. */
+    s_cr_on = e && e[0] == '1' ? 1 : e && e[0] == '2' ? 2 : 0;
     if (!s_cr_on) {
-        why = "RECOMP_CB_RING=0";
+        why = e ? "RECOMP_CB_RING=0" : "off by default";
     } else {
         memset(&opt, 0, sizeof opt);
         if (!s_ctx1 || FAILED(ID3D11Device_CheckFeatureSupport(s_dev,

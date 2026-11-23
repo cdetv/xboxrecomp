@@ -90,8 +90,9 @@ void nv2a_vsh_gpu_cache_stats(uint64_t *hits, uint64_t *hit_bytes);
  * appended to with MAP_WRITE_NO_OVERWRITE and bound at an offset
  * (VSSetConstantBuffers1), instead of a DISCARD of a buffer of their own per
  * draw. Needs D3D11.1's ConstantBufferOffsetting and
- * MapNoOverwriteOnDynamicConstantBuffer; RECOMP_CB_RING=0 keeps the old
- * path, =2 uses the ring in even flips only (held-picture check).
+ * MapNoOverwriteOnDynamicConstantBuffer. Off by default (measured neutral
+ * on the AMD card, 2026-11-22): RECOMP_CB_RING=1 turns it on, =2 uses it in
+ * even flips only (held-picture check); unset or =0 is the old path.
  * A stream's piece is not copied again when its bytes are those of the
  * stream's last put in this lap of the ring. */
 enum { NV2A_CRING_CONSTS, NV2A_CRING_ROWS, NV2A_CRING_CBD,
