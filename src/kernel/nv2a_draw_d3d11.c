@@ -1650,6 +1650,8 @@ static struct {
     float tfill[4][4];                  /* RECOMP_BOOST_FILL, see rtt_fill */
     float tsmooth[4][4];                /* x: xbox_SetTextureSmooth's */
     float tnear[4];                     /* receiver_draw's passes */
+    uint32_t tdot[4];                   /* x: SET_DOT_RGBMAPPING, y: dot-product
+                                         * modes drawn (pb_dot_modes_on) */
 } s_cbd;
 /* Per stage reading a surface as it is: coordinate scale x y, clamp x y
  * (texture_from_surface, RECOMP_RTT_DIRECT). */
@@ -6405,12 +6407,23 @@ static void d3d_draw(void)
         path = combiners ? PATH_COMBINERS : PATH_MODULATE;
         s_rtt_path = path;
         ct0 = ct_now();
+        if (combiners && pb_dot_modes_on()) {
+            s_cbd.tdot[0] = g_pb.dot_rgb_mapping;
+            s_cbd.tdot[1] = 1;
+        }
         for (st = 0; st < 4; st++) {
             uint32_t m = (g_pb.rc.stage_program >> (st * 5)) & 0x1F;
             const Texture *t = &g_pb.texs[st];
+            int dot = combiners && s_cbd.tdot[1] && st > 0
+                      && (m == 17 || (m == 9 && st >= 2));
+            /* The dot-product stages read their input stage's colour
+             * (stage_fetch0); DOT_ST also samples, at the dots. */
+            if (dot)
+                k.bsc[st][2] = (float)pb_rc_input_stage(st);
             /* Without combiners only stage 0 is sampled (xf_rows). Bump-env
              * stages (6, 7) sample too, at coordinates the shader shifts. */
-            if (combiners ? !((m >= 1 && m <= 3) || m == 6 || m == 7) : st != 0)
+            if (combiners ? !((m >= 1 && m <= 3) || m == 6 || m == 7
+                              || (dot && m == 9)) : st != 0)
                 continue;
             if (m == 6 || m == 7) {
                 memcpy(k.bmat[st], t->bump_mat, sizeof k.bmat[st]);

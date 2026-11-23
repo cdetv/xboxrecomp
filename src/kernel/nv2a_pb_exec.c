@@ -398,6 +398,7 @@ static void draw_primitive(void)
         return;
     if (!s_mg_drawing)
         draw_count();
+    pb_note_stage_modes();
 
     s_be->draw();
     if (s_shadow)
@@ -1565,6 +1566,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x1E70: g_pb.rc.stage_program = param; break;
     case 0x17F8: g_pb.clip_plane_mode = param; break;
     case 0x1E78: g_pb.other_stage_input = param; break;
+    case 0x1E74: g_pb.dot_rgb_mapping = param & 0xFFFu; break; /* SET_DOT_RGBMAPPING */
 
     /* Alpha test and fog. */
     case 0x0300: g_pb.alpha_test = param; break;
