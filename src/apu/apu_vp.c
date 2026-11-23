@@ -253,7 +253,6 @@ static bool apu_stereo_lpf_on(void)
 }
 
 #define DECLICK_DECAY 0.98620f            /* exp(-1/72): 1.5 ms at 48 kHz */
-static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
 static uint32_t s_dc_frame[MCPX_HW_MAX_VOICES];     /* frame a voice last mixed */
 static float    s_dc_bin_g[MCPX_HW_MAX_VOICES][8];  /* its bin gains then */
 static float    s_dc_mon_g[MCPX_HW_MAX_VOICES][6];  /* its monitor gains then */
@@ -325,24 +324,217 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * idle; this says who paused them and what they were waiting for. */
 static uint8_t s_prof_was_empty[MCPX_HW_MAX_VOICES];
 
+/* RECOMP_APU_EV_VOICE=<n>: the trace below for voice n only (no 6000-line
+ * cap), each line with the RECOMP_APU_WAV sample it falls in, and "short"
+ * lines: a frame the voice filled only partly (arg = samples it made). */
+static int apu_ev_voice(void)
+{
+    static int ev = -2;
+    if (ev == -2) {
+        const char *e = getenv("RECOMP_APU_EV_VOICE");
+        ev = (e && *e) ? atoi(e) : -1;
+        if (ev >= 0)
+            fprintf(stderr, "[APU] event trace for voice %d only\n", ev);
+    }
+    return ev;
+}
+
+/* RECOMP_APU_EV_DUMP=<file> with RECOMP_APU_EV_VOICE: every frame the voice
+ * makes, as a record of u32 vp frame, u32 wav sample (RECOMP_APU_WAV), u32
+ * samples made, then 32 x 2 float (its samples before gains). */
+static uint32_t s_vp_frame;               /* mcpx_apu_vp_frame count */
+static void ev_dump(uint16_t v, int got, float samples[][2])
+{
+    static FILE *f;
+    static int checked;
+    (void)v;
+    if (!checked) {
+        const char *p = getenv("RECOMP_APU_EV_DUMP");
+        checked = 1;
+        if (p && *p)
+            f = fopen(p, "wb");
+        fprintf(stderr, "[APU] voice dump to %s: %s\n", p ? p : "(none)",
+                f ? "open" : "not open");
+    }
+    if (!f)
+        return;
+    uint32_t hdr[3] = { s_vp_frame, mcpx_apu_wav_frames(), (uint32_t)got };
+    fwrite(hdr, sizeof hdr, 1, f);
+    fwrite(samples, sizeof(float) * 2, NUM_SAMPLES_PER_FRAME, f);
+}
+
 static void prof_event(MCPXAPUState *d, const char *what, unsigned int v,
                        uint32_t arg)
 {
     static unsigned int n;
     static int64_t t0;
     int64_t now;
+    const int only = apu_ev_voice();
 
-    if (!g_apu_prof_on || n >= 6000 || v >= MCPX_HW_MAX_VOICES)
+    if (!g_apu_prof_on || v >= MCPX_HW_MAX_VOICES)
         return;
-    if (!voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
-                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
+    if (only >= 0 ? (int)v != only : n >= 6000)
+        return;
+    if (only < 0 && !voice_get_mask(d, (uint16_t)v, NV_PAVS_VOICE_CFG_FMT,
+                                    NV_PAVS_VOICE_CFG_FMT_DATA_TYPE))
         return;
     now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
     if (!t0)
         t0 = now;
     n++;
-    fprintf(stderr, "  [APUEV] %8.3f %-7s v%-3u 0x%08X\n",
-            (now - t0) / 1000.0, what, v, arg);
+    if (only >= 0)
+        fprintf(stderr, "  [APUEV] %8.3f %-7s v%-3u 0x%08X wav %u\n",
+                (now - t0) / 1000.0, what, v, arg, mcpx_apu_wav_frames());
+    else
+        fprintf(stderr, "  [APUEV] %8.3f %-7s v%-3u 0x%08X\n",
+                (now - t0) / 1000.0, what, v, arg);
+}
+
+/* ============================================================
+ * Stream packet refills (RECOMP_APU_SSL_WAIT)
+ *
+ * A stream voice plays two packet lists in turn, SSL A and SSL B. When one
+ * is done the APU interrupts, and DirectSound refills that list with the
+ * next packet while the voice plays the other. On the console that refill
+ * comes within microseconds of the interrupt; here the title's service
+ * thread writes it a few ms later. A packet shorter than that delay ran out
+ * first, and the voice went on into the other list as it still stood: the
+ * packet it had just played, again. Conker's Rock Solid loop outside the
+ * Uga Buga club (a 22 kHz stream, packets of 8192 samples and a 50-sample
+ * tail at the loop end) replayed 0.2 s of old sound at some of its loop
+ * ends: a pop every few loops, a "bouncing" crackle through room reverb.
+ *
+ * Now a list is marked used when the voice finishes it and ready again
+ * when the title writes it with packets in it. Before each frame, a voice
+ * that entered its list moments ago (a short packet: the title cannot have
+ * missed a long one), has less than this frame's samples left in it and
+ * finds the other list still holding the packet it played (not emptied:
+ * an emptied list is a stream ending) makes the frame thread wait for the
+ * refill, d->lock free, up to RECOMP_APU_SSL_WAIT_MS (default 20; Conker's
+ * refills came 4-12 ms after the interrupt). A
+ * stream that has really ended times out once and is left alone until its
+ * next refill. RECOMP_APU_SSL_WAIT=0: no wait (the old replay, for A/B).
+ * ============================================================ */
+
+static uint8_t  s_ssl_used[MCPX_HW_MAX_VOICES][2];  /* played, not refilled */
+static uint8_t  s_ssl_given_up[MCPX_HW_MAX_VOICES]; /* timed out until refill */
+static uint32_t s_ssl_enter[MCPX_HW_MAX_VOICES];    /* vp frame it entered its list */
+static uint8_t  s_ssl_recent[MCPX_HW_MAX_VOICES];   /* entered one lately */
+#define SSL_WAIT_RECENT_FRAMES 30u                  /* 20 ms of output */
+
+static bool ssl_wait_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_SSL_WAIT");
+        on = (e && *e) ? (atoi(e) != 0) : 1;
+        fprintf(stderr, "[APU] stream refill wait (short packets): %s\n",
+                on ? "on" : "off (RECOMP_APU_SSL_WAIT=0)");
+    }
+    return on != 0;
+}
+
+int64_t mcpx_apu_vp_ssl_wait_limit_us(void)
+{
+    static int64_t us = -1;
+    if (us < 0) {
+        const char *e = getenv("RECOMP_APU_SSL_WAIT_MS");
+        int ms = (e && *e) ? atoi(e) : 20;
+        if (ms < 1) ms = 1;
+        if (ms > 100) ms = 100;
+        us = (int64_t)ms * 1000;
+    }
+    return ssl_wait_on() ? us : 0;
+}
+
+/* The title wrote a list: with packets in it, it is ready again. */
+static void ssl_written(int v, int ssl, unsigned int count)
+{
+    if (count) {
+        s_ssl_used[v][ssl] = 0;
+        s_ssl_given_up[v] = 0;
+    }
+}
+
+/* Samples (source frames) left in voice v's current list. */
+static uint32_t ssl_samples_left(MCPXAPUState *d, uint16_t v)
+{
+    int cur = d->vp.ssl[v].ssl_index;
+    int count = d->vp.ssl[v].count[cur];
+    uint32_t left = 0;
+    uint32_t cbo = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_OFFSET,
+                                  NV_PAVS_VOICE_PAR_OFFSET_CBO);
+    for (int seg = d->vp.ssl[v].ssl_seg; seg < count; seg++) {
+        hwaddr addr = d->regs[NV_PAPU_VPSSLADDR] +
+                      (hwaddr)(d->vp.ssl[v].base[cur] + seg) * 8;
+        uint32_t len = ldl_le_phys(address_space_memory, addr + 4) & 0xFFFF;
+        if (seg == d->vp.ssl[v].ssl_seg)
+            len = len > cbo ? len - cbo : 0;
+        left += len;
+    }
+    return left;
+}
+
+static bool ssl_voice_waits(MCPXAPUState *d, uint16_t v)
+{
+    if (!s_ssl_recent[v] || s_ssl_given_up[v])
+        return false;
+    if (s_vp_frame - s_ssl_enter[v] > SSL_WAIT_RECENT_FRAMES) {
+        s_ssl_recent[v] = 0;           /* a long packet: no race to fear */
+        return false;
+    }
+    if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE) ||
+        voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                       NV_PAVS_VOICE_PAR_STATE_PAUSED) ||
+        !voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                        NV_PAVS_VOICE_CFG_FMT_DATA_TYPE) ||
+        !voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                        NV_PAVS_VOICE_CFG_FMT_PERSIST)) {
+        s_ssl_recent[v] = 0;
+        return false;
+    }
+    int other = 1 - d->vp.ssl[v].ssl_index;
+    /* Only a list still holding the packet just played: one the title has
+     * emptied (count 0) is a stream that ended, or a refill under way, and
+     * plays as before (an empty frame), with no wait. */
+    if (!d->vp.ssl[v].count[other] || !s_ssl_used[v][other])
+        return false;
+    /* This frame's source frames at the voice's pitch, with room for the
+     * envelope's pitch swing and the resampler's look-ahead. */
+    int16_t p = (int16_t)voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+                                        NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
+    float step = powf(2.0f, p / 4096.0f);
+    if (step > 16.0f) step = 16.0f;          /* RS_MAX_STEP */
+    uint32_t need = (uint32_t)(NUM_SAMPLES_PER_FRAME * step * 1.5f) + 4;
+    return ssl_samples_left(d, v) < need;
+}
+
+bool mcpx_apu_vp_ssl_wait_needed(MCPXAPUState *d)
+{
+    if (!ssl_wait_on())
+        return false;
+    for (uint16_t v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        if (s_ssl_recent[v] && ssl_voice_waits(d, v))
+            return true;
+    return false;
+}
+
+void mcpx_apu_vp_ssl_wait_give_up(MCPXAPUState *d)
+{
+    for (uint16_t v = 0; v < MCPX_HW_MAX_VOICES; v++)
+        if (s_ssl_recent[v] && ssl_voice_waits(d, v)) {
+            s_ssl_given_up[v] = 1;
+            prof_event(d, "giveup", v, 0);
+            if (g_apu_prof_on) {
+                int cur = d->vp.ssl[v].ssl_index;
+                fprintf(stderr, "  [APUPROF] stream refill wait given up: v%u, %u samples"
+                        " left in list %c (%d segments), list %c %s, entered %u frames ago\n",
+                        v, ssl_samples_left(d, v), 'A' + cur, d->vp.ssl[v].count[cur],
+                        'A' + (1 - cur), d->vp.ssl[v].count[1 - cur] ? "played" : "empty",
+                        s_vp_frame - s_ssl_enter[v]);
+            }
+        }
 }
 
 /* ============================================================
@@ -458,6 +650,9 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                        NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
         d->vp.ssl[selected_handle].ssl_seg = 0;
         d->vp.ssl[selected_handle].ssl_index = 0;
+        s_ssl_used[selected_handle][0] = s_ssl_used[selected_handle][1] = 0;
+        s_ssl_given_up[selected_handle] = 0;
+        s_ssl_recent[selected_handle] = 0;
 
         unsigned int ea_start = GET_MASK(argument, NV1BA0_PIO_VOICE_ON_ENVA);
         voice_set_mask(d, (uint16_t)selected_handle, NV_PAVS_VOICE_PAR_STATE,
@@ -689,6 +884,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        ssl_written(current_voice, ssl, d->vp.ssl[current_voice].count[ssl]);
         break;
     }
     case NV1BA0_PIO_SET_VOICE_SSL_B: {
@@ -700,6 +896,7 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_BASE);
         d->vp.ssl[current_voice].count[ssl] =
             (uint8_t)GET_MASK(argument, NV1BA0_PIO_SET_VOICE_SSL_A_COUNT);
+        ssl_written(current_voice, ssl, d->vp.ssl[current_voice].count[ssl]);
         break;
     }
 
@@ -1179,6 +1376,9 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 int next_index = (ssl_index + 1) % 2;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
+                s_ssl_used[v][ssl_index] = 1;
+                s_ssl_enter[v] = s_vp_frame;
+                s_ssl_recent[v] = 1;
                 if (g_apu_prof_on) g_apu_prof.ssl_done++;
                 prof_event(d, "done", v, (uint32_t)ssl_index);
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1186,6 +1386,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
             }
         } else {
             if (loop) {
+                if (apu_ev_voice() == (int)v) {
+                    prof_event(d, "loop", v, cbo);
+                    prof_event(d, " .ebo", v, ebo);
+                    prof_event(d, " .lbo", v, lbo);
+                }
                 cbo = lbo;
             } else {
                 cbo = ebo;
@@ -1427,6 +1632,8 @@ static void voice_process(MCPXAPUState *d,
             if (count == 0 && ++empty > 4) break;
             got += count;
         }
+        if (got < NUM_SAMPLES_PER_FRAME && apu_ev_voice() == (int)v)
+            prof_event(d, "short", v, (uint32_t)got);
         /* Ended (or ran dry) inside the frame: decay from the last sample
          * rather than drop to zero. */
         if (dc && got > 0 && got < NUM_SAMPLES_PER_FRAME) {
@@ -1439,6 +1646,9 @@ static void voice_process(MCPXAPUState *d,
             }
         }
     }
+    if (apu_ev_voice() == (int)v)      /* multipass: 1000 + its bin */
+        ev_dump(v, multipass ? 1000 + (int)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                  NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN) : got, samples);
 
     int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                 NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);

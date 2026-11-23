@@ -227,11 +227,13 @@ static void prof_report(void)
                 " resets %lu, %.0f ms given up | waits: isr gate %.0f ms (max"
                 " %.1f, busy %lu), d->lock %.0f ms (max %.1f), longest loop"
                 " %.1f ms | fe trap waits %lu (%.0f ms, max %.1f), given up"
+                " %lu | stream refill waits %lu (%.0f ms, max %.1f), given up"
                 " %lu\n",
                 p->xa2_starved, p->xa2_dropped, p->throttle_resets,
                 p->throttle_lost_ms, p->t_gate, p->max_gate, p->gate_busy,
                 p->t_relock, p->max_relock, p->max_loop, p->trap_waits,
-                p->t_trap, p->max_trap, p->trap_timeouts);
+                p->t_trap, p->max_trap, p->trap_timeouts, p->ssl_waits,
+                p->t_ssl_wait, p->max_ssl_wait, p->ssl_wait_timeouts);
         {
             /* 0..the most the queue may hold (3, or 6 with pacing). */
             char depth[7 * 24] = "";
@@ -697,6 +699,11 @@ static inline void monitor_add(int16_t *slot, int32_t s)
 static FILE    *g_wav;
 static uint32_t g_wav_frames;
 static int      g_wav_ch = 2;      /* 6: a 5.1 WAV (WAVE_FORMAT_EXTENSIBLE) */
+
+uint32_t mcpx_apu_wav_frames(void)
+{
+    return g_wav_frames;
+}
 
 /* A 5.1 WAV: FL FR C LFE + the side pair (Windows' 5.1), 16-bit PCM. */
 static void wav_write_header6(void)
@@ -1444,6 +1451,49 @@ static void wait_fe_trap(MCPXAPUState *d, int64_t *since_us)
     }
 }
 
+/* A stream voice about to run out of a short packet before the title has
+ * refilled its other one (mcpx_apu_vp_ssl_wait_needed): wait for the refill
+ * with d->lock free, as wait_fe_trap waits for a trap's routine, so the
+ * voice plays on into the new packet instead of the old one. The time comes
+ * back afterwards (throttle runs the frames back to back; the XAudio2 queue
+ * bridges a few ms). */
+static void wait_ssl_refill(MCPXAPUState *d)
+{
+    const int64_t limit = mcpx_apu_vp_ssl_wait_limit_us();
+    int64_t start;
+    double t0;
+
+    if (limit <= 0 || !mcpx_apu_vp_ssl_wait_needed(d))
+        return;
+    start = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+    t0 = g_apu_prof_on ? prof_now_ms() : 0.0;
+    for (;;) {
+        if (d->set_irq) {
+            update_irq(d);
+            d->set_irq = false;
+        }
+        apu_deliver_irq(d);           /* the done interrupt, if held */
+        if (!mcpx_apu_vp_ssl_wait_needed(d))
+            break;
+        if (qatomic_read(&d->exiting) || d->pause_requested ||
+            qatomic_read(&g_host_paused))
+            break;                    /* asked again on the next frame */
+        if (qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start >= limit) {
+            mcpx_apu_vp_ssl_wait_give_up(d);
+            if (g_apu_prof_on) g_apu_prof.ssl_wait_timeouts++;
+            break;
+        }
+        /* d->lock is free meanwhile: the title's refill gets in. */
+        qemu_cond_timedwait(&d->cond, &d->lock, 1);
+    }
+    if (g_apu_prof_on) {
+        double ms = prof_now_ms() - t0;
+        g_apu_prof.ssl_waits++;
+        g_apu_prof.t_ssl_wait += ms;
+        if (ms > g_apu_prof.max_ssl_wait) g_apu_prof.max_ssl_wait = ms;
+    }
+}
+
 /* ============================================================
  * APU frame thread (background processing)
  * ============================================================ */
@@ -1503,6 +1553,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             fe_stop_since = 0;
 
         if (apu_active && !g_test_tone.active) {
+            wait_ssl_refill(d);
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
             se_frame(d);
         } else {
