@@ -215,6 +215,14 @@ void xbox_InputSetBackgroundPads(int on);
 typedef int (*xbox_InputPadHook)(DWORD dwPort, XBOX_INPUT_STATE *pad);
 void xbox_InputSetPadOverlay(xbox_InputPadHook fn);
 void xbox_InputSetPadFilter(xbox_InputPadHook fn);
+/* The final hook sees what the title will get: the controller after the
+ * filter with the keyboard and mouse merged in (or the keyboard alone when
+ * no controller is there), on the same reading thread, just before the
+ * state is returned. A game's rule that must cover keys and pad alike (a
+ * button kept up for a moment, a stick turned) belongs here, since the
+ * filter runs before the keyboard's buttons and sticks are added. It may
+ * change anything; not called when the read fails (no controller, no keys). */
+void xbox_InputSetPadFinal(xbox_InputPadHook fn);
 
 /** The lowest-numbered connected host pad, or -1. */
 int  xbox_InputFirstHostPad(void);
