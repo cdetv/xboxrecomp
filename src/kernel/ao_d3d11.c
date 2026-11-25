@@ -59,7 +59,7 @@
  * links without the D3D11 back end. */
 #define AO_SPAN_DEF  0.25f
 #define AO_LUMA_DEF  0.0f
-#define AO_FLOOR_DEF 0.5f
+#define AO_FLOOR_DEF 0.3f               /* Conker's look B (user 2026-11-25) */
 static float s_span = -1.0f, s_luma = -1.0f, s_floor = -1.0f;
 
 static float env_or(const char *name, float lo, float hi, float def)
