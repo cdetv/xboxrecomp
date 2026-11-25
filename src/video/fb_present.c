@@ -374,6 +374,27 @@ static WINDOWPLACEMENT s_saved_place;
 #define FB_WM_SET_FULLSCREEN (WM_APP + 2)
 #define FB_WM_SET_MODE       (WM_APP + 5)
 #define FB_WM_REPLACE        (WM_APP + 6)
+#define FB_WM_VIEW_SHOW      (WM_APP + 7)
+
+/* The D3D11 back end's swap chain is on this window itself, the picture
+ * fitted on black where the view is laid out (xbox_FramebufferWindowGpu-
+ * ViewRect), not on the view: in exclusive full screen, and always under
+ * Wine (nv2a_draw_d3d11.c present_on_window). The view stays hidden then:
+ * it would cover the picture. */
+static volatile LONG   s_on_frame;
+
+static int fb_view_hidden(void)
+{
+    return s_exclusive || s_on_frame;
+}
+
+/* Any thread; the view belongs to the window's own thread. */
+void xbox_FramebufferWindowOnFrame(int on)
+{
+    LONG v = on ? 1 : 0;
+    if (InterlockedExchange(&s_on_frame, v) != v && s_fb_running && s_hwnd)
+        PostMessageA(s_hwnd, FB_WM_VIEW_SHOW, 0, 0);
+}
 
 void xbox_FramebufferWindowSetFullscreen(int on)
 {
@@ -557,10 +578,10 @@ static void fb_set_fullscreen(HWND h, int on)
         fb_place(h);
     }
     excl = on && s_full_kind == DM_EXCLUSIVE;
+    InterlockedExchange(&s_exclusive, excl);
     /* The view would cover the swap chain on this window. */
     if (s_gpu_view)
-        ShowWindow(s_gpu_view, excl ? SW_HIDE : SW_SHOWNA);
-    InterlockedExchange(&s_exclusive, excl);
+        ShowWindow(s_gpu_view, fb_view_hidden() ? SW_HIDE : SW_SHOWNA);
     fprintf(stderr, "  [FBWIN] %s\n", !on ? "windowed"
             : excl ? "full screen (exclusive)" : "full screen (borderless)");
     fflush(stderr);
@@ -768,7 +789,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
             s_gpu_view = CreateWindowExA(0, "XboxRecompGpuView", "",
                                          WS_CHILD | WS_DISABLED
-                                         | (s_exclusive ? 0 : WS_VISIBLE),
+                                         | (fb_view_hidden() ? 0 : WS_VISIBLE),
                                          0, 0, 1, 1, h, NULL,
                                          GetModuleHandleA(NULL), NULL);
             fb_layout_gpu_view(h);
@@ -867,6 +888,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case FB_WM_REPLACE:
         fb_place(h);
+        return 0;
+
+    case FB_WM_VIEW_SHOW:
+        if (s_gpu_view)
+            ShowWindow(s_gpu_view, fb_view_hidden() ? SW_HIDE : SW_SHOWNA);
         return 0;
 
     case WM_KEYDOWN:
@@ -1217,6 +1243,7 @@ int xbox_FramebufferWindowPlacement(int *x, int *y, int *w, int *h, int *m)
 }
 void xbox_FramebufferWindowSetDisplayMode(int mode) { (void)mode; }
 int xbox_FramebufferWindowExclusive(void) { return 0; }
+void xbox_FramebufferWindowOnFrame(int on) { (void)on; }
 void xbox_FramebufferWindowReplace(void) { }
 int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h)
 { (void)x; (void)y; (void)w; (void)h; return 0; }

@@ -746,10 +746,20 @@ static BOOL any_held(const XBOX_INPUT_STATE *s)
 
 static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
-static xbox_InputPadHook volatile g_pad_overlay, g_pad_filter;
+static xbox_InputPadHook volatile g_pad_overlay, g_pad_filter, g_pad_final;
 
 void xbox_InputSetPadOverlay(xbox_InputPadHook fn) { g_pad_overlay = fn; }
 void xbox_InputSetPadFilter(xbox_InputPadHook fn) { g_pad_filter = fn; }
+void xbox_InputSetPadFinal(xbox_InputPadHook fn) { g_pad_final = fn; }
+
+/* What the title gets, keyboard included: the final hook's turn. */
+static DWORD pad_final(DWORD dwPort, XBOX_INPUT_STATE *pState)
+{
+    xbox_InputPadHook fn = g_pad_final;
+    if (fn)
+        fn(dwPort, pState);
+    return ERROR_SUCCESS;
+}
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
@@ -857,10 +867,10 @@ static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
             g_pad_filter(dwPort, pState);
         /* No pad: keyboard and mouse alone are the player. */
         if (keyboard_port(dwPort) && xbox_KbmState(pState))
-            return ERROR_SUCCESS;
+            return pad_final(dwPort, pState);
         if (keyboard_port(dwPort) && keyboard_enabled()) {
             keyboard_state(pState);
-            return ERROR_SUCCESS;
+            return pad_final(dwPort, pState);
         }
         return result;
     }
@@ -933,7 +943,7 @@ have_pad:
         pState->dwPacketNumber = kb.dwPacketNumber;
     }
 
-    return ERROR_SUCCESS;
+    return pad_final(dwPort, pState);
 }
 
 /* ---- rumble ----------------------------------------------------------------
@@ -1132,6 +1142,7 @@ int  xbox_InputAssignActive(void) { return 0; }
 unsigned xbox_InputPortsInUse(void) { return 1u; }
 void xbox_InputSetPadOverlay(xbox_InputPadHook fn) { (void)fn; }
 void xbox_InputSetPadFilter(xbox_InputPadHook fn) { (void)fn; }
+void xbox_InputSetPadFinal(xbox_InputPadHook fn) { (void)fn; }
 void xbox_InputSetBackgroundPads(int on) { (void)on; }
 BOOL xbox_InputHostPadConnected(DWORD slot)
 {

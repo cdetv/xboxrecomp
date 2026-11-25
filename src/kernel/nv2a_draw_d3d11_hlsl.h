@@ -25,9 +25,10 @@
  * 2D textures sample their mip chain (SampleGrad, with the coordinates'
  * derivatives taken once at the top of ps, outside any branch); the
  * software sampler reads level 0 only, so distant surfaces differ.
- * ponytail: volumes and cube maps level 0 only (SampleLevel 0); the
- * dot-product stage modes read as the software path's fallbacks do, near
- * enough: an unbound stage reads white.
+ * ponytail: volumes, cube maps and DOT_ST level 0 only (SampleLevel 0);
+ * of the dot-product and dependent-read stage modes only DOTPRODUCT and
+ * DOT_ST are drawn, the others read zero as the software path's fallback
+ * does; an unbound stage reads white.
  */
 #ifndef NV2A_DRAW_D3D11_HLSL_H
 #define NV2A_DRAW_D3D11_HLSL_H
@@ -117,8 +118,10 @@ NV2A_D3D11_HLSL_COMMON
 "   tnear (RECOMP_BOOST_NEAREST, receiver_draw): x 1 = this pass only\n"
 "   writes its depth (into an R32F target, blend MIN); y 1 = only the\n"
 "   fragment at the depth nearz holds for this pixel is drawn. */\n"
+"/* tdot: x SET_DOT_RGBMAPPING (4 bits a stage from stage 1), y 1 = the\n"
+"   dot-product modes are drawn (RECOMP_DOT_MODES). */\n"
 "cbuffer D : register(b1) { float4 tclamp[4]; float4 tfill[4];\n"
-"                           float4 tsmooth[4]; float4 tnear; };\n"
+"                           float4 tsmooth[4]; float4 tnear; uint4 tdot; };\n"
 "Texture2D<float> nearz : register(t15);\n"
 "/* The pixel's centre on its target (ps sets it), for tfill. */\n"
 "static float2 PIX;\n"
@@ -242,14 +245,43 @@ NV2A_D3D11_HLSL_COMMON
 "  return on ? (v >= 0.0 ? v : v + 256.0 / 255.0) : x;\n"
 "}\n"
 "\n"
+"/* pb_dot_map (nv2a_draw_sw.c): stage st's PS_DOTMAPPING of its input\n"
+"   stage ip's colour p, as a vector. A signed input read -1..1 (SG) where\n"
+"   the mapping is the signed one, as bump-env reads it. */\n"
+"float3 dot_map(uint st, uint ip, float4 p) {\n"
+"  uint dm = (tdot.x >> ((st - 1) * 4)) & 15, sm = (uint)bsc[ip].w;\n"
+"  float3 x = p.rgb * 255.0;\n"
+"  if (dm == 1) return (x - 128.0) / 127.0;\n"
+"  if (dm == 2) return x >= 128.0 ? (x - 255.5) / 127.5 : (x + 0.5) / 127.5;\n"
+"  if (dm == 3) {\n"
+"    float3 r = float3(sign3(p.r), sign3(p.g), sign3(p.b));\n"
+"    if (sm & 2) r.r = SG[ip].r;\n"
+"    if (sm & 4) r.g = SG[ip].g;\n"
+"    if (sm & 8) r.b = SG[ip].b;\n"
+"    return r;\n"
+"  }\n"
+"  return p.rgb;\n"
+"}\n"
+"/* The dot-product stages' dots for this pixel (stage_fetch0). */\n"
+"static float DOT[4] = { 0.0, 0.0, 0.0, 0.0 };\n"
+"\n"
 "/* rc_stage_fetch: what stage st contributes, by its program mode; P holds\n"
-"   the earlier stages' results (bump-env reads one). */\n"
+"   the earlier stages' results (bump-env and the dot products read one). */\n"
 "float4 stage_fetch0(Texture2D t, Texture3D v, Texture2DArray cu,\n"
 "                    SamplerState s, uint st, float4 c, float4 g,\n"
 "                    float4 P[4]) {\n"
 "  uint m = (K_PROG >> (st * 5)) & 31, j;\n"
 "  bool cb = (K_BOUND >> (st + 8)) & 1;\n"
 "  if (m == 0) return float4(0, 0, 0, 1);\n"
+"  /* DOTPRODUCT (17) keeps (s, t, r) . the mapped input colour for the next\n"
+"     stage and reads zero; DOT_ST (9) reads its 2D texture at (the previous\n"
+"     stage's dot, its own), at level 0 (rc_stage_fetch). */\n"
+"  if ((m == 17 || (m == 9 && st >= 2)) && st > 0 && tdot.y != 0) {\n"
+"    uint ip = (uint)bsc[st].z;\n"
+"    DOT[st] = dot(c.xyz, dot_map(st, ip, P[ip]));\n"
+"    if (m == 17) return float4(0, 0, 0, 0);\n"
+"    return texel(t, s, st, float2(DOT[st - 1], DOT[st]), float4(0, 0, 0, 0));\n"
+"  }\n"
 "  if (cb) {\n"
 "    float q = c.w != 0.0 ? c.w : 1.0;\n"
 "    if (m == 3) return cube_fetch(cu, s, st, c.xyz);\n"

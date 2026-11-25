@@ -165,6 +165,7 @@ typedef struct Nv2aPbState {
     int      rc_seen;
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE */
     uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT */
+    uint32_t dot_rgb_mapping;           /* SET_DOT_RGBMAPPING: 4 bits a stage from 1 */
     uint32_t alpha_test, alpha_func, alpha_ref;
     uint32_t fog_enable, fog_mode, fog_color;
     float    fog_param[2];
@@ -307,6 +308,15 @@ uint32_t pb_tex_bytes(const Texture *t);
 /* pb_rc_input_stage: the earlier stage a bump-env stage (1-3) reads its
  * du/dv from: stage 0 for stage 1, SHADER_OTHER_STAGE_INPUT for 2 and 3. */
 int pb_rc_input_stage(int st);
+/* pb_dot_modes_on: the dot-product stage modes DOTPRODUCT (17) and DOT_ST
+ * (9) are drawn (RECOMP_DOT_MODES, on; =0 they read zero, as before).
+ * pb_dot_map: stage st's PS_DOTMAPPING (0-7) of its input stage's colour,
+ * the colour as a stage result holds it; v gets the vector (xemu psh.c).
+ * pb_note_stage_modes: one [TEXMODE] line per stage setup a draw uses with a
+ * mode 8 or above (the dot-product and dependent-read modes), once each. */
+int pb_dot_modes_on(void);
+void pb_dot_map(int st, const float in[4], float v[3]);
+void pb_note_stage_modes(void);
 /* pb_point_quad: the square a POINTS vertex p (screen space, as
  * pb_transform_batch gives it) covers, as four corners clockwise from the
  * top left; under SET_POINT_SMOOTH_ENABLE stage 3's coordinates run from
