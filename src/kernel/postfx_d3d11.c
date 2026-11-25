@@ -25,8 +25,10 @@
  *   sharpen   AMD FidelityFX CAS, sharpen-only (RECOMP_SHARPEN, percent;
  *             xbox_SetSharpen), 0 = off; behind FSR's EASU, FSR's own RCAS
  *             instead, at the same setting
- *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
- *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged
+ *   picture   black level, gamma, contrast, saturation, in that order
+ *             (RECOMP_BLACK_LEVEL percent, xbox_SetBlackLevel, 0 =
+ *             unchanged; RECOMP_GAMMA, RECOMP_CONTRAST, RECOMP_SATURATION,
+ *             xbox_SetPicture, each 1.0 = unchanged)
  *   crt       scanlines, or a CRT look: scanlines plus a slight curve,
  *             glow and vignette (RECOMP_CRT=off|scanlines|crt,
  *             RECOMP_CRT_STRENGTH percent; xbox_SetCrt), off by default.
@@ -69,6 +71,7 @@
 
 /* Each as float bits in a LONG, swapped whole. */
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
+static volatile LONG s_black;         /* black level, percent */
 static volatile LONG s_aa;            /* AA_*, a plain number */
 static volatile LONG s_upscale;       /* UP_*, a plain number */
 static volatile LONG s_fsr_prepare;   /* xbox_PrepareUpscaler asked */
@@ -134,6 +137,7 @@ static float env_float(const char *name, float lo, float hi, float def)
 #define ADJ_LO   0.0f
 #define ADJ_HI   4.0f
 #define SHARP_HI 100.0f
+#define BLACK_HI 50.0f    /* black level, percent either way */
 #define CRT_HI   100.0f
 #define CRT_DEF  50.0f    /* strength when only RECOMP_CRT is given */
 
@@ -161,6 +165,7 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     float g = env_float("RECOMP_GAMMA", GAMMA_LO, GAMMA_HI, 1.0f);
     float c = env_float("RECOMP_CONTRAST", ADJ_LO, ADJ_HI, 1.0f);
     float s = env_float("RECOMP_SATURATION", ADJ_LO, ADJ_HI, 1.0f);
+    float b = env_float("RECOMP_BLACK_LEVEL", -BLACK_HI, BLACK_HI, 0.0f);
     float sh = env_float("RECOMP_SHARPEN", 0.0f, SHARP_HI, 0.0f);
     int aa = env_choice("RECOMP_AA", s_aa_name, AA_MODES, "off, fxaa or smaa");
     int up = env_choice("RECOMP_UPSCALER", s_up_name, UP_MODES,
@@ -173,15 +178,16 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     InterlockedExchange(&s_gamma, fbits(g));
     InterlockedExchange(&s_contrast, fbits(c));
     InterlockedExchange(&s_saturation, fbits(s));
+    InterlockedExchange(&s_black, fbits(b));
     InterlockedExchange(&s_sharpen, fbits(sh));
     InterlockedExchange(&s_aa, aa);
     InterlockedExchange(&s_upscale, up);
     InterlockedExchange(&s_crt, crt);
     InterlockedExchange(&s_crt_strength, fbits(cs));
     s_force = f && !strcmp(f, "1");
-    if (g != 1.0f || c != 1.0f || s != 1.0f)
+    if (g != 1.0f || c != 1.0f || s != 1.0f || b != 0.0f)
         fprintf(stderr, "[GPU] postfx: picture gamma %.2f contrast %.2f"
-                " saturation %.2f%c", g, c, s, 10);
+                " saturation %.2f black level %+.0f %%%c", g, c, s, b, 10);
     if (sh != 0.0f)
         fprintf(stderr, "[GPU] postfx: sharpen %.0f %%%c", sh, 10);
     if (aa != AA_OFF)
@@ -231,6 +237,20 @@ int xbox_SetPicture(float gamma, float contrast, float saturation)
             ok = 0;
     }
     return ok;
+}
+
+/* For a settings menu: the black level in percent, 0 = unchanged. Above 0
+ * lifts the blacks towards grey (+20: black shows as 20 % grey, white stays
+ * white); below 0 deepens them (-20: the darkest fifth goes black, white
+ * stays white). Applied before the gamma. Applies from the next present.
+ * 1 when taken. */
+int xbox_SetBlackLevel(float percent)
+{
+    params();
+    if (!in_range(percent, -BLACK_HI, BLACK_HI))
+        return 0;
+    InterlockedExchange(&s_black, fbits(percent));
+    return 1;
 }
 
 /* For a settings menu: sharpening in percent, 0 = off, 100 = CAS at its
@@ -302,7 +322,7 @@ int xbox_SetCrt(int mode, float strength)
 static int picture_on(void)
 {
     return fval(&s_gamma) != 1.0f || fval(&s_contrast) != 1.0f
-        || fval(&s_saturation) != 1.0f;
+        || fval(&s_saturation) != 1.0f || fval(&s_black) != 0.0f;
 }
 
 /* The crt stage's mode, CRT_OFF at strength 0. */
@@ -325,10 +345,15 @@ int postfx_active(void)
  * po.xy: the viewport's corner in target pixels, po.z nonzero: pixel for
  * pixel, read from pl.xy (the source corner in pixels) on; pl.zw: the
  * source rectangle's far corner in pixels; pa: gamma, contrast,
- * saturation; pc.x: CAS's peak (negative lobe), from the sharpen setting.
+ * saturation, black level (a fraction: 0.2 = +20 %); pc.x: CAS's peak
+ * (negative lobe), from the sharpen setting.
  *
- * pps, the picture stage: a value at 1 is skipped, so a neutral pass gives
- * back exactly what it read. Stretching (po.z zero), it samples
+ * pps, the picture stage, through pic_adjust: black level first (lifted:
+ * v (1 - L) + L, deeper: (v + L) / (1 + L), both keep white at white),
+ * then gamma, contrast and saturation. A value at 1 (black level at 0) is
+ * skipped, so a neutral pass gives back exactly what it read. One function
+ * so that a later output stage can apply the same four. Stretching (po.z
+ * zero), it samples
  * bilinearly, clamped to pc (the source rectangle's outermost pixel
  * centres, in texture units) so nothing beside the rectangle bleeds in.
  *
@@ -373,18 +398,23 @@ static const char s_hlsl[] =
 "  float2 p = float2((id << 1) & 2, id & 2);\n"
 "  return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
 "}\n"
-"float4 pps(float4 p : SV_Position) : SV_Target {\n"
-"  float2 t = p.xy - po.xy;\n"
-"  float4 c = po.z != 0.0 ? pt.Load(int3(t + pl.xy, 0))\n"
-"                         : pt.Sample(psm, clamp(t * pk.xy + pk.zw, pc.xy,\n"
-"                                               pc.zw));\n"
-"  float3 v = c.rgb;\n"
+"float3 pic_adjust(float3 v) {\n"
+"  [branch] if (pa.w != 0.0)\n"
+"    v = pa.w > 0.0 ? saturate(v) * (1.0 - pa.w) + pa.w\n"
+"                   : saturate((v + pa.w) / (1.0 + pa.w));\n"
 "  [branch] if (pa.x != 1.0) v = pow(saturate(v), 1.0 / pa.x);\n"
 "  [branch] if (pa.y != 1.0) v = saturate((v - 0.5) * pa.y + 0.5);\n"
 "  [branch] if (pa.z != 1.0)\n"
 "    v = saturate(lerp(dot(v, float3(0.2126, 0.7152, 0.0722)).xxx, v,\n"
 "                      pa.z));\n"
-"  return float4(v, c.a);\n"
+"  return v;\n"
+"}\n"
+"float4 pps(float4 p : SV_Position) : SV_Target {\n"
+"  float2 t = p.xy - po.xy;\n"
+"  float4 c = po.z != 0.0 ? pt.Load(int3(t + pl.xy, 0))\n"
+"                         : pt.Sample(psm, clamp(t * pk.xy + pk.zw, pc.xy,\n"
+"                                               pc.zw));\n"
+"  return float4(pic_adjust(c.rgb), c.a);\n"
 "}\n"
 "float3 cl(int2 q) {\n"
 "  float3 c = pt.Load(int3(clamp(q, int2(pl.xy), int2(pl.zw) - 1), 0)).rgb;\n"
@@ -1437,6 +1467,7 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
             k[12] = fval(&s_gamma);
             k[13] = fval(&s_contrast);
             k[14] = fval(&s_saturation);
+            k[15] = fval(&s_black) / 100.0f;
             ok = run_pass(ctx, s_ps, in, rtv, ox, oy, vw, vh, k);
             break;
         }
@@ -1456,6 +1487,12 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
 int xbox_SetPicture(float gamma, float contrast, float saturation)
 {
     (void)gamma; (void)contrast; (void)saturation;
+    return 0;
+}
+
+int xbox_SetBlackLevel(float percent)
+{
+    (void)percent;
     return 0;
 }
 

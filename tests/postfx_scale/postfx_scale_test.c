@@ -5,7 +5,9 @@
  * by FSR 1 (checked loosely: close to bilinear, nothing from beside the
  * frame). The frame sits in the corner of a bigger texture whose rest is
  * magenta, as a guest surface padded to its depth buffer's size is, so
- * anything read from beside it shows.
+ * anything read from beside it shows. Also the picture stage's black level
+ * (xbox_SetBlackLevel): neutral pixel for pixel is exact, lifted and
+ * deepened within a level of the formula, alone and behind a shrink.
  *
  *   postfx-scale-test [--hw]   (--hw: the real GPU instead of WARP)
  */
@@ -21,6 +23,9 @@
 
 int xbox_SetUpscaler(int mode);
 int xbox_SetSharpen(float percent);
+int xbox_SetBlackLevel(float percent);
+
+static double s_black;    /* the black level the expected values get, 0..1 */
 
 #define TEX_W 1600
 #define TEX_H 1200
@@ -133,8 +138,28 @@ static double enc(double v)
                                    : 1.055 * pow(v, 1.0 / 2.4) - 0.055);
 }
 
-/* Channel c of the expected pixel x,y: area average (shrink) or bilinear. */
+/* The black level (s_black, a fraction) on a 0..255 value, as pps does
+ * it: lifted v (1 - L) + L, deeper (v + L) / (1 + L), clamped. */
+static double black(double e)
+{
+    double v = e / 255.0, l = s_black;
+    if (l > 0.0)
+        v = v * (1.0 - l) + l;
+    else if (l < 0.0)
+        v = (v + l) / (1.0 + l);
+    return 255.0 * (v < 0.0 ? 0.0 : v > 1.0 ? 1.0 : v);
+}
+
+/* Channel c of the expected pixel x,y: area average (shrink) or bilinear,
+ * then the black level. */
+static double expect_raw(int fw, int fh, int x, int y, int c, int shrink);
+
 static double expect(int fw, int fh, int x, int y, int c, int shrink)
+{
+    return black(expect_raw(fw, fh, x, y, c, shrink));
+}
+
+static double expect_raw(int fw, int fh, int x, int y, int c, int shrink)
 {
     unsigned char p[4];
     double sx = (double)fw / OUT_W, sy = (double)fh / OUT_H, s = 0.0;
@@ -222,6 +247,25 @@ int main(int argc, char **argv)
     check("shrink 125 %", 800, 600, 1, 1);
     check("bilinear 50 %", 320, 240, 0, 1);
     check("bilinear 75 %", 480, 360, 0, 1);
+    /* The picture stage pixel for pixel: neutral gives back exactly what
+     * it read; the black level within a level of the formula, alone and
+     * after a shrink (through a 16-bit float intermediate). */
+    check("picture neutral", 640, 480, 0, 0);
+    s_black = 0.2;
+    xbox_SetBlackLevel(20.0f);
+    check("black level +20 %", 640, 480, 0, 1);
+    check("black level +20 % shrink 200 %", 1280, 960, 1, 1);
+    s_black = -0.2;
+    xbox_SetBlackLevel(-20.0f);
+    check("black level -20 %", 640, 480, 0, 1);
+    check("black level -20 % bilinear 50 %", 320, 240, 0, 1);
+    if (xbox_SetBlackLevel(51.0f) || xbox_SetBlackLevel(-51.0f)) {
+        puts("FAIL black level: 51 % taken");
+        s_fail = 1;
+    }
+    s_black = 0.0;
+    xbox_SetBlackLevel(0.0f);
+    check("picture neutral again", 640, 480, 0, 0);
     xbox_SetUpscaler(1);
     /* FSR: sharper than bilinear, so only loosely like it; magenta from
      * beside the frame would push the blue and red far off at the edge. */
