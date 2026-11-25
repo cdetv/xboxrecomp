@@ -22,6 +22,11 @@ compiles (see NOTICE).
 the other anti-aliasing shader, vendored in `third_party/smaa/` with its
 own copy of the same text (see NOTICE).
 
+`ConkerLR-Recomp.txt` is the MIT licence and copyright notice of
+yacineolivier-maker's ConkerLR-Recomp, whose DSP sound effects
+`src/apu/apu_fx.c` ports and whose ambient occlusion shader
+`src/kernel/ao_d3d11.c` takes over (see NOTICE).
+
 `FidelityFX-FSR.txt` is AMD's MIT licence and copyright notice for
 FidelityFX Super Resolution 1.0, the upscaler (EASU) and its sharpener
 (RCAS), vendored in `third_party/fsr1/` with AMD's own `license.txt` (see

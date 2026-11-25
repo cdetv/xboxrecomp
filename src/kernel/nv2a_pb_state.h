@@ -395,7 +395,21 @@ typedef struct {
  *                     (whole numbers, e.g. 4:3), centred with black bars
  *                     where the window is another shape, instead of
  *                     filling the window; 0:0 = fill it again (the
- *                     default). The last one before a flip counts. */
+ *                     default). The last one before a flip counts.
+ *   NV_HOST_FX_AO     ambient occlusion (ao_d3d11.c) over the current colour
+ *                     surface's clip, from its depth buffer: darkens creases
+ *                     and corners. Ask for it after the opaque scenery and
+ *                     before anything blended or furry (whatever is drawn
+ *                     after is untouched). p0/p1 the camera's near/far
+ *                     planes, p2/p3 its projection's x / y scale (m00, m11),
+ *                     p4 the radius in world units, p5 the strength (0..1),
+ *                     p6 flags (bit 0 the AO term alone, as grey, for
+ *                     tuning; bit 1 leave pixels with stencil >= 8 alone;
+ *                     bit 2 work at full size above 1080 lines too), p7 the
+ *                     distance where it has faded out (it starts fading at
+ *                     0.3 of that). All floats but p6.
+ * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
+ * for water, 11 for motion blur: a new effect takes 12 or more. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   8u
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
@@ -403,6 +417,10 @@ typedef struct {
 #define NV_HOST_FX_DOF   1u
 #define NV_HOST_FX_WIRE  2u
 #define NV_HOST_FX_ASPECT 3u
+#define NV_HOST_FX_AO    10u
+#define NV_HOST_AO_ALONE   1u           /* NV_HOST_FX_AO p6 bits */
+#define NV_HOST_AO_STENCIL 2u
+#define NV_HOST_AO_FULL    4u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 
