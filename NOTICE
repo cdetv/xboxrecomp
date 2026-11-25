@@ -147,6 +147,27 @@ MIT — GamepadMotionHelpers, included unchanged
   LICENSES/GamepadMotionHelpers.txt.
 
 
+MIT — ported from yacineolivier-maker's ConkerLR-Recomp
+-------------------------------------------------------
+
+  https://github.com/yacineolivier-maker/ConkerLR-Recomp (commit 2013160)
+
+  src/apu/apu_fx.c            the DSP's sound effects (gain, mixer,
+                              filter, speaker crosstalk, the I3DL2
+                              reverb), a C port of sdk/runtime/xdk/
+                              dsp_image.cpp
+  src/kernel/ao_d3d11.c       the occlusion shader (ps_gtao: GTAO after
+                              Jimenez et al. 2016, XeGTAO's "high"
+                              preset) and the depth-checked 5-tap blur,
+                              from src/common/rendu_shaders.h, taken over
+                              from D3D12 to D3D11
+                              (c) 2026 yacineolivier-maker and the
+                              ConkerLR-Recomp contributors
+
+  Licensed under the MIT licence; the full text, with the copyright
+  notice, is in LICENSES/ConkerLR-Recomp.txt.
+
+
 Derived algorithms — credited, independently implemented
 --------------------------------------------------------
 

@@ -50,6 +50,7 @@
 #include <dxgi1_4.h>    /* IDXGIAdapter3: video memory use */
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
+#include "ao_d3d11.h"
 #include "vsync_d3d11.h"
 #include "tex_replace.h"
 
@@ -471,6 +472,7 @@ static struct {
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
+    uint32_t ao_drawn, ao_skipped;      /* host ambient occlusion (ao_d3d11.c) */
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
@@ -584,11 +586,12 @@ static void ct_report(void)
  * (roughly: the GPU overlaps neighbours). Read back GT_FRAMES frames later,
  * reported with the [GPU] lines as [GPUTIME]. For frames the graphics card
  * makes slow: a big render size, see which draws fill the most. */
-enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_POST,
-       GT_OVERLAY, GT_N };
+enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_AO,
+       GT_POST, GT_OVERLAY, GT_N };
 static const char *const GT_NAME[GT_N] = {
     "opaque draws", "blended draws", "surface copies", "depth reads",
-    "clears", "depth of field", "frame to screen (filters)", "menus"
+    "clears", "depth of field", "ambient occlusion",
+    "frame to screen (filters)", "menus"
 };
 #define GT_FRAMES 4
 #define GT_MARKS  4096
@@ -8049,6 +8052,10 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: host depth of field: %u drawn, %u not"
                 " (no surface, depth buffer or shaders)%c", s_stat.dof_drawn,
                 s_stat.dof_skipped, 10);
+    if (s_stat.ao_drawn || s_stat.ao_skipped)
+        fprintf(stderr, "[GPU] d3d11: host ambient occlusion: %u drawn, %u"
+                " not (not the frame, no depth buffer, or no shaders)%c",
+                s_stat.ao_drawn, s_stat.ao_skipped, 10);
     fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
             " flip) from guest memory inside a GPU surface or zeta buffer"
             " (stale); surface binds:"
@@ -8250,6 +8257,46 @@ static float host_float(uint32_t bits)
     return f;
 }
 
+/* NV_HOST_FX_AO: ambient occlusion over the current colour surface's clip
+ * (ao_d3d11.c). Only on a frame-sized surface with a depth buffer: a mark
+ * that lands while a small target is current (a game drawing a light map
+ * mid-scene) is counted and skipped. */
+static void d3d_host_ao(const uint32_t *p)
+{
+    AoParams ap;
+    int si, zi;
+
+    si = surface_current();
+    zi = si >= 0 && s_surf[si].w >= 320 && g_pb.clip_w >= 64
+             && g_pb.clip_h >= 48
+         ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                        s_surf[si].tw, s_surf[si].th) : -1;
+    ap.zn = host_float(p[0]);
+    ap.zf = host_float(p[1]);
+    ap.sx = host_float(p[2]);
+    ap.sy = host_float(p[3]);
+    ap.radius = host_float(p[4]);
+    ap.strength = host_float(p[5]);
+    ap.flags = p[6];
+    ap.fade_end = host_float(p[7]);
+    if (zi < 0 || !ao_draw(s_dev, s_ctx, s_surf[si].tex, s_surf[si].rtv,
+                           s_zeta[zi].srv_z, s_zeta[zi].srv_s,
+                           to_host(g_pb.clip_x, surf_sx(si)),
+                           to_host(g_pb.clip_y, surf_sy(si)),
+                           to_host(g_pb.clip_w, surf_sx(si)),
+                           to_host(g_pb.clip_h, surf_sy(si)), &ap)) {
+        s_stat.ao_skipped++;
+        return;
+    }
+    s_stat.ao_drawn++;
+    gt_mark(GT_AO, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host ambient occlusion on %08X, %ux%u"
+                " (radius %g, strength %g, flags %u)%c", s_surf[si].addr,
+                g_pb.clip_w, g_pb.clip_h, (double)ap.radius,
+                (double)ap.strength, ap.flags, 10);
+}
+
 static void d3d_host_effect(uint32_t id, const uint32_t *p)
 {
     DofParams dp;
@@ -8270,6 +8317,10 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
             s_aspect_w = w;
             s_aspect_h = h;
         }
+        return;
+    }
+    if (id == NV_HOST_FX_AO) {
+        d3d_host_ao(p);
         return;
     }
     if (id != NV_HOST_FX_DOF)
