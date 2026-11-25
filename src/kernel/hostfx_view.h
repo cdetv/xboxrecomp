@@ -1,6 +1,6 @@
 /**
  * HLSL pieces shared by the host effects that work from the depth buffer
- * (ao_d3d11.c; motion blur next): a C string to put in front of an
+ * (ao_d3d11.c, mblur_d3d11.c): a C string to put in front of an
  * effect's own shader text.
  *
  *   hfx_vs     the full-screen triangle (SV_VertexID 0..2, no buffers)

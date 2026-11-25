@@ -51,6 +51,7 @@
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
 #include "ao_d3d11.h"
+#include "mblur_d3d11.h"
 #include "vsync_d3d11.h"
 #include "tex_replace.h"
 
@@ -473,6 +474,7 @@ static struct {
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
     uint32_t ao_drawn, ao_skipped;      /* host ambient occlusion (ao_d3d11.c) */
+    uint32_t mblur_drawn, mblur_skipped; /* host motion blur (mblur_d3d11.c) */
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
@@ -587,10 +589,10 @@ static void ct_report(void)
  * reported with the [GPU] lines as [GPUTIME]. For frames the graphics card
  * makes slow: a big render size, see which draws fill the most. */
 enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_AO,
-       GT_POST, GT_OVERLAY, GT_N };
+       GT_MBLUR, GT_POST, GT_OVERLAY, GT_N };
 static const char *const GT_NAME[GT_N] = {
     "opaque draws", "blended draws", "surface copies", "depth reads",
-    "clears", "depth of field", "ambient occlusion",
+    "clears", "depth of field", "ambient occlusion", "motion blur",
     "frame to screen (filters)", "menus"
 };
 #define GT_FRAMES 4
@@ -8056,6 +8058,10 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: host ambient occlusion: %u drawn, %u"
                 " not (not the frame, no depth buffer, or no shaders)%c",
                 s_stat.ao_drawn, s_stat.ao_skipped, 10);
+    if (s_stat.mblur_drawn || s_stat.mblur_skipped)
+        fprintf(stderr, "[GPU] d3d11: host motion blur: %u drawn, %u not"
+                " (not the frame, no depth buffer, or no shaders)%c",
+                s_stat.mblur_drawn, s_stat.mblur_skipped, 10);
     fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
             " flip) from guest memory inside a GPU surface or zeta buffer"
             " (stale); surface binds:"
@@ -8297,6 +8303,50 @@ static void d3d_host_ao(const uint32_t *p)
                 (double)ap.strength, ap.flags, 10);
 }
 
+/* NV_HOST_FX_MBLUR: camera motion blur over the current colour surface's
+ * clip (mblur_d3d11.c); like the ambient occlusion, only on a frame-sized
+ * surface with a depth buffer. */
+static void d3d_host_mblur(const uint32_t *p)
+{
+    MblurParams mp;
+    int si, zi, i;
+
+    si = surface_current();
+    zi = si >= 0 && s_surf[si].w >= 320 && g_pb.clip_w >= 64
+             && g_pb.clip_h >= 48
+         ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                        s_surf[si].tw, s_surf[si].th) : -1;
+    for (i = 0; i < 4; i++)
+        mp.q[i] = host_float(p[i]);
+    for (i = 0; i < 3; i++)
+        mp.t[i] = host_float(p[4 + i]);
+    mp.zn = host_float(p[7]);
+    mp.zf = host_float(p[8]);
+    mp.sx = host_float(p[9]);
+    mp.sy = host_float(p[10]);
+    mp.amount = host_float(p[11]);
+    mp.max_blur = host_float(p[12]);
+    mp.centre = host_float(p[13]);
+    mp.flags = p[14];
+    if (zi < 0 || !mblur_draw(s_dev, s_ctx, s_surf[si].tex, s_surf[si].rtv,
+                              s_zeta[zi].srv_z,
+                              to_host(g_pb.clip_x, surf_sx(si)),
+                              to_host(g_pb.clip_y, surf_sy(si)),
+                              to_host(g_pb.clip_w, surf_sx(si)),
+                              to_host(g_pb.clip_h, surf_sy(si)),
+                              (float)g_pb.clip_h, &mp)) {
+        s_stat.mblur_skipped++;
+        return;
+    }
+    s_stat.mblur_drawn++;
+    gt_mark(GT_MBLUR, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host motion blur on %08X, %ux%u (share"
+                " %g, longest %g, middle %g, flags %u)%c", s_surf[si].addr,
+                g_pb.clip_w, g_pb.clip_h, (double)mp.amount,
+                (double)mp.max_blur, (double)mp.centre, mp.flags, 10);
+}
+
 static void d3d_host_effect(uint32_t id, const uint32_t *p)
 {
     DofParams dp;
@@ -8321,6 +8371,10 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
     }
     if (id == NV_HOST_FX_AO) {
         d3d_host_ao(p);
+        return;
+    }
+    if (id == NV_HOST_FX_MBLUR) {
+        d3d_host_mblur(p);
         return;
     }
     if (id != NV_HOST_FX_DOF)
