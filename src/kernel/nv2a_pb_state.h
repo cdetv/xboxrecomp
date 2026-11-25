@@ -377,7 +377,8 @@ typedef struct {
  * state. Not 0x0100: the walk (nv2a_pb_scan.c) takes a NO_OPERATION with
  * a parameter on any subchannel for a software-method trap, and a float
  * parameter there sent the title's interrupt handler garbage (a crash).
- *   NV_HOST_PARAM(i)  0x0800 + 4 i, i < NV_HOST_PARAMS: parameter i
+ *   NV_HOST_PARAM(i)  0x0800 + 4 i, i < NV_HOST_PARAMS (16): parameter i;
+ *                     each keeps its value until set again
  *   NV_HOST_EFFECT    0x0880: run effect `param` with the parameters set
  * Effects (back end host_effect):
  *   NV_HOST_FX_DOF    depth of field over the current colour surface, from
@@ -411,7 +412,7 @@ typedef struct {
  * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
  * for water, 11 for motion blur: a new effect takes 12 or more. */
 #define NV_HOST_SUBCH    7u
-#define NV_HOST_PARAMS   8u
+#define NV_HOST_PARAMS   16u            /* 0x0800..0x083C, below NV_HOST_EFFECT */
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u

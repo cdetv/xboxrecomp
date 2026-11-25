@@ -1244,9 +1244,13 @@ static void host_method(uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
-    if (g_pb_ftrace == 2)
-        fprintf(stderr, "[FTRACE] host effect %u: %08X %08X %08X %08X %08X"
-                " %08X%c", param, p[0], p[1], p[2], p[3], p[4], p[5], 10);
+    if (g_pb_ftrace == 2) {
+        char line[NV_HOST_PARAMS * 9 + 1];
+        unsigned i;
+        for (i = 0; i < NV_HOST_PARAMS; i++)
+            snprintf(line + 9 * i, 10, " %08X", p[i]);
+        fprintf(stderr, "[FTRACE] host effect %u:%s%c", param, line, 10);
+    }
     if (s_be->host_effect)
         s_be->host_effect(param, p);
     if (s_shadow && s_shadow->host_effect)
