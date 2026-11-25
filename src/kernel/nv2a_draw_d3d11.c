@@ -63,7 +63,9 @@ extern int xbox_RenderRes(unsigned *w, unsigned *h);
 extern int xbox_SetRenderRes(unsigned w, unsigned h);
 extern void xbox_FramebufferWindowShapeChanged(unsigned w, unsigned h);
 extern int xbox_FramebufferWindowExclusive(void);
+extern void xbox_FramebufferWindowOnFrame(int on);
 extern void xbox_FramebufferWindowReplace(void);
+extern int xbox_HostIsWine(void);
 extern int xbox_FramebufferWindowGpuViewRect(int *x, int *y, int *w, int *h);
 extern void xbox_FitAspect(int cw, int ch, int w, int h, int *x, int *y,
                            int *fw, int *fh);
@@ -251,10 +253,40 @@ static int                   s_swap_tries;  /* failed remakes in a row */
  * The frame is still drawn at the render resolution, into s_canvas
  * (s_back_rtv's texture, s_bb_w x s_bb_h), and fitted onto the monitor on
  * black at each present (canvas_to_out), where the hidden GPU view would
- * show it, so a host overlay's mouse mapping holds. */
+ * show it, so a host overlay's mouse mapping holds. With RECOMP_PRESENT_ON_
+ * WINDOW (present_on_window, on under Wine) the swap chain is on the frame
+ * window this way in every display mode; exclusive full screen then only
+ * takes the monitor. */
 static int                   s_excl;        /* swap chain on the frame window */
 static int                   s_excl_on;     /* and holding the monitor */
 static int                   s_excl_broken; /* could not be made: never again */
+
+/* RECOMP_PRESENT_ON_WINDOW=1|0 (default 1 under Wine, 0 on Windows): the
+ * swap chain on the frame window itself, the picture fitted on black as in
+ * exclusive full screen, not on the aspect-keeping child view. Wine draws a
+ * child window's Vulkan picture offscreen and copies it into its toplevel
+ * (winex11 needs_offscreen_rendering: "child window, needs compositing"),
+ * with _WINE_ALLOW_FLIP = 0 on it, so gamescope (the Steam Deck's Game
+ * Mode) never takes those frames directly: Steam's frame limit did not hold
+ * them back (40 set, 60 drawn, 40 shown), FIFO followed Xwayland's own
+ * 59.81 Hz, and the copy cost ~3 W at 60 fps. On the toplevel the limit
+ * holds (a steady 40.00, the Deck 12.4 W instead of 22.6; Conker to-do 271,
+ * 2026-11-21). 1 on Windows: the same path there, for tests. */
+static int present_on_window(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PRESENT_ON_WINDOW");
+        int wine = xbox_HostIsWine();
+        on = e && *e ? atoi(e) != 0 : wine;
+        fprintf(stderr, "[GPU] d3d11: swap chain on %s (RECOMP_PRESENT_ON_"
+                "WINDOW=%d, %s)%c", on ? "the frame window, the picture"
+                " fitted on black" : "the picture's view", on,
+                e && *e ? "set" : wine ? "Wine" : "Windows", 10);
+    }
+    return on;
+}
 static ULONGLONG             s_excl_retry;  /* no SetFullscreenState before */
 static ID3D11Texture2D      *s_canvas;
 static ID3D11RenderTargetView *s_out_rtv;
@@ -961,6 +993,7 @@ static int ensure_swap_chain(void)
     DXGI_SWAP_CHAIN_DESC1 d;
     HWND hwnd, view;
     HRESULT hr;
+    int frame;
 
     if (s_swap)
         return 1;
@@ -970,12 +1003,16 @@ static int ensure_swap_chain(void)
     if (!hwnd)
         return 0;
     /* The swap chain goes on the window's aspect-keeping child view, so a
-     * resized window scales the picture without stretching it. */
+     * resized window scales the picture without stretching it; on the
+     * window itself in exclusive full screen or with RECOMP_PRESENT_ON_
+     * WINDOW (the view hidden then: told before it is made). */
+    frame = !s_excl_broken && (xbox_FramebufferWindowExclusive()
+                               || present_on_window());
+    xbox_FramebufferWindowOnFrame(frame);
     view = (HWND)xbox_FramebufferWindowGpuView(s_bb_w, s_bb_h);
     if (!view)
         view = hwnd;
-    s_excl = !s_excl_broken && view != hwnd
-             && xbox_FramebufferWindowExclusive();
+    s_excl = frame && view != hwnd;
 
     memset(&d, 0, sizeof d);
     d.Width = s_bb_w;
@@ -1011,14 +1048,15 @@ static int ensure_swap_chain(void)
             hr = E_FAIL;
         }
     } else {
-        fail(s_excl ? "CreateSwapChainForHwnd (full screen)"
+        fail(s_excl ? "CreateSwapChainForHwnd (frame window)"
                     : "CreateSwapChainForHwnd", hr);
     }
     if (FAILED(hr)) {
         if (s_excl) {
-            /* Shown in the view as borderless instead. */
-            fprintf(stderr, "[GPU] d3d11: exclusive full screen not"
-                    " available: borderless%c", 10);
+            /* Shown in the view (as borderless) instead. */
+            fprintf(stderr, "[GPU] d3d11: swap chain on the frame window"
+                    " not available: on the view (exclusive full screen"
+                    " as borderless)%c", 10);
             s_excl_broken = 1;
             s_excl = 0;
             return ensure_swap_chain();
@@ -1033,9 +1071,11 @@ static int ensure_swap_chain(void)
     /* From here on the window is ours; GDI would draw over every frame. */
     xbox_FramebufferWindowGpuOwned(1);
     if (s_excl)
-        fprintf(stderr, "[GPU] d3d11: swap chain on the frame window for"
-                " exclusive full screen (%ux%u, the frame %ux%u)%c", s_out_w,
-                s_out_h, s_bb_w, s_bb_h, 10);
+        fprintf(stderr, "[GPU] d3d11: swap chain on the frame window %s"
+                " (%ux%u, the frame %ux%u)%c",
+                xbox_FramebufferWindowExclusive() ? "for exclusive full screen"
+                : "(RECOMP_PRESENT_ON_WINDOW)", s_out_w, s_out_h, s_bb_w,
+                s_bb_h, 10);
     else
         fprintf(stderr, "[GPU] d3d11: swap chain on the framebuffer window"
                 " (%ux%u)%c", s_bb_w, s_bb_h, 10);
@@ -1062,17 +1102,19 @@ static void resize_out(void)
 }
 
 /* Exclusive full screen as the window asks (fb_present.c): the swap chain
- * remade on the right window when it comes or goes; while it is wanted,
- * the monitor taken whenever the window has the focus (Windows lets go of
- * it when another window gets the focus: Alt+Tab, a message box), retried
- * every 2 s when refused. Before each present.
+ * remade on the right window when it comes or goes (with RECOMP_PRESENT_ON_
+ * WINDOW it stays on the frame window, and only the monitor is let go);
+ * while it is wanted, the monitor taken whenever the window has the focus
+ * (Windows lets go of it when another window gets the focus: Alt+Tab, a
+ * message box), retried every 2 s when refused. Before each present.
  *
  * RECOMP_EXCLUSIVE_ANYFOCUS=1 (debug): also while no window has the focus
  * at all, as on a PC nobody is at (a test run started from a script). */
 static void apply_display_mode(void)
 {
     static int anyfocus = -1;
-    int want = !s_excl_broken && xbox_FramebufferWindowExclusive();
+    int excl = !s_excl_broken && xbox_FramebufferWindowExclusive();
+    int frame = !s_excl_broken && (excl || present_on_window());
     HWND hwnd = (HWND)xbox_FramebufferWindowHandle();
     HWND fg;
     BOOL fs = FALSE;
@@ -1084,7 +1126,7 @@ static void apply_display_mode(void)
 
     if (s_shadow || !s_swap || !hwnd)
         return;
-    if (want != s_excl) {
+    if (frame != s_excl) {
         int was = s_excl_on;
         drop_swap_chain();
         s_excl_retry = 0;
@@ -1099,6 +1141,22 @@ static void apply_display_mode(void)
     }
     if (!s_excl)
         return;
+    if (!excl) {
+        /* On the frame window without exclusive full screen: let go of
+         * the monitor if it was held, and follow the window's size. */
+        if (s_excl_on) {
+            IDXGISwapChain1_SetFullscreenState(s_swap, FALSE, NULL);
+            s_excl_on = 0;
+            fprintf(stderr, "[GPU] d3d11: exclusive full screen off (the"
+                    " swap chain stays on the frame window)%c", 10);
+            resize_out();
+            xbox_FramebufferWindowReplace();
+        }
+        if (GetClientRect(hwnd, &r) && r.right > 0 && r.bottom > 0
+            && ((uint32_t)r.right != s_out_w || (uint32_t)r.bottom != s_out_h))
+            resize_out();
+        return;
+    }
     if (FAILED(IDXGISwapChain1_GetFullscreenState(s_swap, &fs, NULL)))
         fs = FALSE;
     if (s_excl_on && !fs) {
