@@ -15,11 +15,14 @@
  *             the frame)
  *   blur      the motion of the pixel's point (now minus then, host pixels)
  *             times the share smeared, capped at the longest smear, faded
- *             to nothing inside the sharp middle; then the average of 8
- *             samples (12 above 1440 lines) spread evenly along it, centred
- *             on the pixel, the whole row of them shifted by a per-pixel
- *             dither so the steps between samples read as fine noise, not as
- *             copies of the picture; averaged in linear light (power 2.2) so
+ *             to nothing inside the sharp middle; then the average of
+ *             samples spread evenly along it, centred on the pixel, one per
+ *             ~3 pixels of smear (4 to 16; up to 24 above 1080 lines, 32
+ *             above 1440: with a fixed 8, a 48-pixel smear showed its dither
+ *             as a fine pattern, Conker's field 2026-11-25), the whole row of
+ *             them shifted by a per-pixel dither so the steps between samples
+ *             read as fine noise, not as copies of the picture; averaged in
+ *             linear light (power 2.2) so
  *             lights smear bright. Depth 1 (sky, nothing drawn there): a
  *             direction, moved by the turn only. RGB only: alpha, depth and
  *             stencil stay the title's
@@ -49,7 +52,7 @@ HOSTFX_VIEW_HLSL
 "    float4 cam;   /* near, far, 1 / x scale, 1 / y scale */\n"
 "    float4 opt;   /* x scale, y scale, longest smear (host px), sharp\n"
 "                     middle (share of the half diagonal) */\n"
-"    float4 misc;  /* samples, motion view */\n"
+"    float4 misc;  /* most samples, motion view */\n"
 "};\n"
 "Texture2D<float>  t_z   : register(t0);\n"
 "Texture2D<float4> t_src : register(t1);\n"
@@ -80,8 +83,9 @@ HOSTFX_VIEW_HLSL
 "                               / max(opt.z, 1e-3)), 1);\n"
 "    float2 lp = pos.xy - rect.xy;\n"
 "    float4 c = t_src.Load(int3(lp, 0));\n"
-"    if (dot(m, m) < 0.25) return c;\n"
-"    int n = (int)misc.x;\n"
+"    float len = length(m);\n"
+"    if (len < 0.5) return c;\n"
+"    int n = (int)clamp(ceil(len / 3.0), 4.0, misc.x);\n"
 "    float j = frac(52.9829189 * frac(dot(pos.xy,\n"
 "                                         float2(0.06711056, 0.00583715))));\n"
 "    float3 sum = float3(0, 0, 0);\n"
@@ -279,7 +283,7 @@ int mblur_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     k[16] = p->sx; k[17] = p->sy;
     k[18] = p->max_blur * (float)h / guest_h;
     k[19] = p->centre < 0.0f ? 0.0f : p->centre > 1.0f ? 1.0f : p->centre;
-    k[20] = h > 1440 ? 12.0f : 8.0f;
+    k[20] = h > 1440 ? 32.0f : h > 1080 ? 24.0f : 16.0f;
     k[21] = view ? 1.0f : 0.0f;
     k[22] = k[23] = 0.0f;
     if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource *)s_cb, 0,
