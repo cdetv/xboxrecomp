@@ -3335,6 +3335,23 @@ static void tex_link(GpuTexture *e)
     s_tex_next[i] = s_tex_head[tex_bucket(e->addr)];
     s_tex_head[tex_bucket(e->addr)] = (uint16_t)(i + 1);
 }
+
+/* Every texture dropped, between two frames: the replacement textures
+ * changed (tex_replace_reload), so each one is made again from the guest's
+ * bytes at its next bind and looked up in the new list. A short hitch, only
+ * on a switch: as a level load, everything in view goes up again. A texture
+ * still bound to the context keeps its own reference until it is unbound. */
+static void tex_drop_all(void)
+{
+    int i, n = 0;
+    for (i = 0; i < GPU_TEXTURES; i++)
+        if (s_tex[i].tex) {
+            tex_drop(&s_tex[i]);
+            n++;
+        }
+    fprintf(stderr, "[GPU] d3d11: the replacement textures changed: %d texture(s)"
+            " dropped, made again at their next draw%c", n, 10);
+}
 static uint32_t  *s_texels;             /* decode scratch */
 static size_t     s_texels_cap;
 
@@ -8111,6 +8128,11 @@ static void d3d_present(void)
         } while (hold);
     }
     s_shown_stale = 1;
+    /* A new pack list (tex_replace_set_packs, e.g. from the overlay above):
+     * listed here, between two frames, on this thread, which is the one
+     * that looks replacements up. */
+    if (tex_replace_reload())
+        tex_drop_all();
 }
 
 /* Visibility reports (d3d_get_report, below): FIFO [head, tail) and counts. */

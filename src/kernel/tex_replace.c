@@ -2,15 +2,17 @@
  * Replacement textures: the PNG folder, the pack folders and the hash dump
  * (tex_replace.h).
  *
- * The folders are listed once, on first use: the packs (each with its
+ * The folders are listed on first use: the packs (each with its
  * subfolders, named by the title's namer or by hash) and the base folder
  * (its PNGs right in it, by hash), every hash kept from the highest one
  * (the first pack; the base folder last). Each PNG is decoded (WIC) the
  * first time its hash comes up, then kept: a texture the title evicts and
- * loads again goes back up without touching the file. Files added while the
- * game runs are not seen until the next start.
- * ponytail: decoded pixels are never freed; a pack bigger than memory would
- * need an LRU here.
+ * loads again goes back up without touching the file. A new pack list
+ * (tex_replace_set_packs after the first texture) is listed again by the
+ * back end between two frames (tex_replace_reload), every decoded picture
+ * freed; files added while the game runs are seen from then.
+ * ponytail: decoded pixels are freed only on a new list; a pack bigger than
+ * memory would need an LRU here.
  */
 #include "tex_replace.h"
 
@@ -41,8 +43,14 @@ static Replacement *s_rep;
 static int          s_nrep, s_caprep;
 
 #define MAX_PACKS 64
-static WCHAR          *s_pack[MAX_PACKS];   /* tex_replace_set_packs, in order */
+static WCHAR          *s_pack[MAX_PACKS];   /* the packs listed, in order */
 static int             s_npack;
+/* tex_replace_set_packs' list, from any thread, until the back end's thread
+ * takes it (take_wanted). */
+static SRWLOCK         s_want_lock = SRWLOCK_INIT;
+static WCHAR          *s_want[MAX_PACKS];
+static int             s_nwant;
+static volatile LONG   s_want_new;          /* s_want not taken yet */
 static TexReplaceNamer s_namer;
 static void           *s_namer_ctx;
 
@@ -250,29 +258,53 @@ void tex_replace_set_namer(TexReplaceNamer namer, void *ctx)
 
 int tex_replace_set_packs(const char *const *dirs, int n)
 {
-    int i;
-    if (s_init)
-        return 0;
-    for (i = 0; i < s_npack; i++)
-        free(s_pack[i]);
-    s_npack = 0;
-    for (i = 0; i < n && s_npack < MAX_PACKS; i++) {
-        WCHAR *w = (WCHAR *)malloc(MAX_PATH * sizeof *w);
-        if (!w)
-            break;
-        to_wide_dir(dirs[i], w);
-        s_pack[s_npack++] = w;
+    WCHAR *w[MAX_PACKS];
+    int i, k = 0;
+
+    for (i = 0; i < n && k < MAX_PACKS; i++) {
+        if (!(w[k] = (WCHAR *)malloc(MAX_PATH * sizeof(WCHAR)))) {
+            while (k)
+                free(w[--k]);
+            return 0;
+        }
+        to_wide_dir(dirs[i], w[k++]);
     }
+    AcquireSRWLockExclusive(&s_want_lock);
+    for (i = 0; i < s_nwant; i++)
+        free(s_want[i]);
+    if (k)
+        memcpy(s_want, w, (size_t)k * sizeof *w);
+    s_nwant = k;
+    InterlockedExchange(&s_want_new, 1);
+    ReleaseSRWLockExclusive(&s_want_lock);
     return 1;
 }
 
-static void init(void)
+/* The list tex_replace_set_packs left, if there is one, becomes the packs
+ * listed. 1 when it did. */
+static int take_wanted(void)
+{
+    int i;
+    if (!s_want_new)
+        return 0;
+    AcquireSRWLockExclusive(&s_want_lock);
+    for (i = 0; i < s_npack; i++)
+        free(s_pack[i]);
+    if (s_nwant)
+        memcpy(s_pack, s_want, (size_t)s_nwant * sizeof *s_want);
+    s_npack = s_nwant;
+    s_nwant = 0;
+    InterlockedExchange(&s_want_new, 0);
+    ReleaseSRWLockExclusive(&s_want_lock);
+    return 1;
+}
+
+/* Every folder listed into s_rep (empty before): the packs in order, then
+ * the base folder underneath. */
+static void list_all(void)
 {
     const char *e;
     int i;
-    if (s_init)
-        return;
-    s_init = 1;
     for (i = 0; i < s_npack; i++) {
         DWORD a = GetFileAttributesW(s_pack[i]);
         PackCount c;
@@ -297,6 +329,16 @@ static void init(void)
         scan(dir, s_npack);             /* underneath every pack */
     }
     finish();
+}
+
+static void init(void)
+{
+    const char *e;
+    if (s_init)
+        return;
+    s_init = 1;
+    take_wanted();
+    list_all();
     e = getenv("RECOMP_TEX_HASH_DUMP");
     if (e && *e) {
         to_wide_dir(e, s_dump_dir);
@@ -311,6 +353,27 @@ int tex_replace_active(void)
 {
     init();
     return s_nrep > 0 || s_dump;
+}
+
+int tex_replace_reload(void)
+{
+    LARGE_INTEGER t0, t1, f;
+    int i;
+    if (!s_init || !s_want_new)
+        return 0;                       /* not listed yet: init takes the list */
+    QueryPerformanceCounter(&t0);
+    take_wanted();
+    for (i = 0; i < s_nrep; i++)
+        free(s_rep[i].px);
+    s_nrep = 0;
+    fprintf(stderr, "[TEXREP] new pack list (%d pack(s)): listing the folders again\n",
+            s_npack);
+    list_all();
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "[TEXREP] %d texture(s) replaced now (listed in %.0f ms)\n", s_nrep,
+            (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return 1;
 }
 
 /* Decode r's PNG into B8G8R8A8 rows. 1 on success. */
@@ -471,6 +534,7 @@ int tex_replace_set_packs(const char *const *dirs, int n)
     return 1;
 }
 int tex_replace_active(void) { return 0; }
+int tex_replace_reload(void) { return 0; }
 const uint32_t *tex_replace_find(uint64_t hash, uint32_t *w, uint32_t *h)
 {
     (void)hash; (void)w; (void)h;
