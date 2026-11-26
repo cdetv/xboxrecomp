@@ -16,7 +16,21 @@
 
 #include <stdint.h>
 
-/* 1 when RECOMP_TEX_REPLACE or RECOMP_TEX_HASH_DUMP is set (read once). */
+/* Pack folders, read after RECOMP_TEX_REPLACE's (its PNGs right in it):
+ * each pack with all its subfolders, in the order given; the first pack's
+ * PNG wins on a hash two have, and any pack wins over the base folder. A
+ * PNG in a pack goes by the namer when the title set one (its path inside
+ * the pack, UTF-8 with '\' separators, e.g. "Level\Bank\wall.png" -> the
+ * hash, 0 for none), else by the hash its name starts with, as in the base
+ * folder. Both are set before the first texture: the folders are listed
+ * once. tex_replace_set_packs returns 0 (and changes nothing) when that
+ * already happened. dirs are UTF-8 paths; n = 0 for none. */
+typedef uint64_t (*TexReplaceNamer)(const char *path_in_pack, void *ctx);
+void tex_replace_set_namer(TexReplaceNamer namer, void *ctx);
+int  tex_replace_set_packs(const char *const *dirs, int n);
+
+/* 1 when there are replacements (RECOMP_TEX_REPLACE or packs) or
+ * RECOMP_TEX_HASH_DUMP is set (read once). */
 int tex_replace_active(void);
 
 /* The replacement for hash: its pixels (B8G8R8A8, w x h, decoded on first
