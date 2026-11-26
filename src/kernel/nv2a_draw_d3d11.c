@@ -7097,7 +7097,9 @@ static void d3d_draw(void)
          * (s_hlsl_lit): bits 0-3 the debug view (xbox_SetLitView), bit 4
          * culling is off (so which side faces the camera matters), bit 5
          * the side the title's culling keeps is D3D's front (clockwise:
-         * the base rasteriser states keep D3D's default winding). */
+         * the base rasteriser states keep D3D's default winding), bits
+         * 8-23 the blob softness (xbox_SetBlobSoftness; all of it below
+         * 2^24, so the float holds it exactly). */
         int lm = gvs && g_pb.prim != NV_PRIM_POINTS ? nv2a_vsh_lit_mode() : 0;
         if (lm && !(lm == 2 && (g_pb.flips & 1))) {
             uint32_t w = nv2a_vsh_lit_word(nv2a_vsh_gpu_lit());
@@ -7106,7 +7108,8 @@ static void d3d_draw(void)
                 ID3D11VertexShader *lvs =
                     (ID3D11VertexShader *)nv2a_vsh_gpu_lit_shader(0);
                 if (lps && lvs) {
-                    uint32_t f = (uint32_t)nv2a_vsh_lit_view() & 15u;
+                    uint32_t f = ((uint32_t)nv2a_vsh_lit_view() & 15u)
+                                 | nv2a_vsh_lit_soft_bits();
                     if (!g_pb.cull_enable)
                         f |= 16u | ((g_pb.cull_face == 0x405)
                                     != (g_pb.front_face != 0x900) ? 32u : 0u);

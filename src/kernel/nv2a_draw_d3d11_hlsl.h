@@ -730,19 +730,35 @@ NV2A_D3D11_HLSL_VG
 "  return d > 0.0 ? d : 0.0;\n" \
 "}\n" \
 "/* The blobs: per group, four blobs a row; strength x rcc(distance^2) of\n" \
-"   each blob the point is at or above the clip height of. */\n" \
-"float lit_blobs(float3 p) {\n" \
+"   each blob the point is at or above the clip height of. ramp > 0 (per\n" \
+"   pixel, soft blobs: xbox_SetBlobSoftness): that step becomes a smooth\n" \
+"   one, ramp x sqrt(strength) either side of the clip height. */\n" \
+"float lit_blobs(float3 p, float ramp) {\n" \
 "  float s = 0.0; uint g;\n" \
 "  [unroll] for (g = 0; g < 3; g++) if ((LIT_GROUPS >> g) & 1u) {\n" \
 "    uint b = K_LIT_BLOBS + 4u * g;\n" \
 "    float4 dx = vc[b] - p.x, dy = vc[b + 1u] - p.y;\n" \
 "    float4 d2 = dy * dy + dx * dx;\n" \
-"    float4 st = (float4)(p.zzzz >= vc[b + 2u]) * vc[b + 3u];\n" \
+"    float4 on = (float4)(p.zzzz >= vc[b + 2u]);\n" \
+"    if (ramp > 0.0) {\n" \
+"      float4 e = max(ramp * sqrt(abs(vc[b + 3u])), 1e-6);\n" \
+"      on = smoothstep(-e, e, p.zzzz - vc[b + 2u]);\n" \
+"    }\n" \
+"    float4 st = on * vc[b + 3u];\n" \
 "    float4 r = float4(lit_rcc(d2.x), lit_rcc(d2.y), lit_rcc(d2.z),\n" \
 "                      lit_rcc(d2.w));\n" \
 "    s += dot(r, st);\n" \
 "  }\n" \
 "  return s;\n" \
+"}\n" \
+"/* The blobs' sum as the shadow it casts. knee > 0 (per pixel): it reaches\n" \
+"   full shadow (1) through a rounded corner, knee either side of 1, so\n" \
+"   where blobs overlap or a blob's middle starts the shadow darkens\n" \
+"   without a band; 0: the program's own sum. */\n" \
+"float lit_knee(float s, float k) {\n" \
+"  if (k <= 0.0) return s;\n" \
+"  float d = s - (1.0 - k);\n" \
+"  return d <= 0.0 ? s : d >= 2.0 * k ? 1.0 : s - d * d / (4.0 * k);\n" \
 "}\n" \
 "/* key x (1 - blobs), floored as the program floors it. */\n" \
 "float lit_term(float key, float s) {\n" \
@@ -751,11 +767,12 @@ NV2A_D3D11_HLSL_VG
 "  return t;\n" \
 "}\n" \
 "/* The colours as the program writes them (layouts A-D); alphas as they\n" \
-"   came, but oD1.w when the program writes a blob or normal term there. */\n" \
-"void lit_colours(float3 n, float3 p, float4 f, inout float4 d0,\n" \
-"                 inout float4 d1) {\n" \
+"   came, but oD1.w when the program writes a blob or normal term there.\n" \
+"   ramp, knee: the blobs' softness (0, 0 = the program's own maths). */\n" \
+"void lit_colours(float3 n, float3 p, float4 f, float ramp, float knee,\n" \
+"                 inout float4 d0, inout float4 d1) {\n" \
 "  float3 amb = lit_ambient(n);\n" \
-"  float s = lit_blobs(p);\n" \
+"  float s = lit_knee(lit_blobs(p, ramp), knee);\n" \
 "  float3 kc = lit_term(lit_key(n), s) * vc[K_LIT_COLOUR].xyz;\n" \
 "  if (LIT_LAYOUT == 1u) { d0.rgb = saturate(amb); d1.rgb = saturate(kc); }\n" \
 "  else if (LIT_LAYOUT == 2u) {\n" \
@@ -810,7 +827,7 @@ NV2A_D3D11_HLSL_LIT_MATHS
 "  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2; o.t3 = r.t3;\n"
 "  o.ln = lit_n; o.lp = lit_p; o.lf = lit_f;\n"
 "  if (((uint)zsc.w & 15u) == 1u)\n"
-"    lit_colours(lit_n.xyz, lit_p.xyz, lit_f, o.d0, o.d1);\n"
+"    lit_colours(lit_n.xyz, lit_p.xyz, lit_f, 0.0, 0.0, o.d0, o.d1);\n"
 "  return o;\n"
 "}\n";
 
@@ -841,6 +858,8 @@ NV2A_D3D11_HLSL_LIT_MATHS
 "  V v;\n"
 "  uint m = (uint)zsc.w, view = m & 15u;\n"
 "  bool outside = !(m & 16u) || (front == ((m & 32u) != 0u));\n"
+"  float ramp = (float)((m >> 8) & 255u) * 0.01;\n"
+"  float knee = (float)((m >> 16) & 255u) * 0.01;\n"
 "  v.p = i.p; v.cf = i.cf; v.d0 = i.d0; v.d1 = i.d1; v.fog = i.fog;\n"
 "  v.t0 = i.t0; v.t1 = i.t1; v.t2 = i.t2; v.t3 = i.t3;\n"
 "  if (view == 6u)\n"
@@ -849,11 +868,15 @@ NV2A_D3D11_HLSL_LIT_MATHS
 "    float3 n = normalize(i.ln.xyz);\n"
 "    if (view == 2u) return float4(lit_key(n).xxx, 1);\n"
 "    if (view == 3u) return float4(saturate(lit_ambient(n)), 1);\n"
-"    if (view == 4u) return float4(saturate(1.0 - lit_blobs(i.lp.xyz)).xxx, 1);\n"
+"    if (view == 4u)\n"
+"      return float4(saturate(1.0 - lit_knee(lit_blobs(i.lp.xyz, ramp),\n"
+"                                            knee)).xxx, 1);\n"
 "    if (view == 5u)\n"
-"      return float4(saturate(lit_term(lit_key(n), lit_blobs(i.lp.xyz))\n"
+"      return float4(saturate(lit_term(lit_key(n),\n"
+"                                      lit_knee(lit_blobs(i.lp.xyz, ramp),\n"
+"                                               knee))\n"
 "                             * vc[K_LIT_COLOUR].xyz), 1);\n"
-"    lit_colours(n, i.lp.xyz, i.lf, v.d0, v.d1);\n"
+"    lit_colours(n, i.lp.xyz, i.lf, ramp, knee, v.d0, v.d1);\n"
 "  }\n"
 "  return ps(v);\n"
 "}\n";

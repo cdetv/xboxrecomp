@@ -114,6 +114,30 @@ int nv2a_vsh_lit_view(void)
     return s_view;
 }
 
+static volatile int s_soft_ramp, s_soft_knee;
+
+void xbox_SetBlobSoftness(int ramp, int knee)
+{
+    if (ramp < 0) ramp = 0;
+    if (ramp > 255) ramp = 255;
+    if (knee < 0) knee = 0;
+    if (knee > 100) knee = 100;     /* past 1 the corner would lift s = 0 */
+    s_soft_ramp = ramp;
+    s_soft_knee = knee;
+    fprintf(stderr, "[VSHLIT] blob softness: ramp %d, knee %d\n", ramp, knee);
+}
+
+void nv2a_vsh_lit_soft(int *ramp, int *knee)
+{
+    if (ramp) *ramp = s_soft_ramp;
+    if (knee) *knee = s_soft_knee;
+}
+
+uint32_t nv2a_vsh_lit_soft_bits(void)
+{
+    return ((uint32_t)s_soft_ramp << 8) | ((uint32_t)s_soft_knee << 16);
+}
+
 uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l)
 {
     uint32_t w;

@@ -124,6 +124,19 @@ enum {
 void xbox_SetLitView(int view);
 int nv2a_vsh_lit_view(void);
 
+/* Soft blob shadows (per pixel only: per vertex and the vertex view keep the
+ * program's hard step). ramp: the program's "at or above the clip height"
+ * step becomes a smooth one, ramp hundredths of sqrt(the blob's strength)
+ * either side of the clip height (0-255; 0 = the program's step). knee: the
+ * blobs' sum reaches full shadow (1) through a rounded corner, knee
+ * hundredths either side of it, so overlapping blobs darken without a band
+ * (0-100; 0 = the program's own sum, which may go past 1). Unset = 0, 0. */
+void xbox_SetBlobSoftness(int ramp, int knee);
+void nv2a_vsh_lit_soft(int *ramp, int *knee);
+/* The two as the lit shaders read them in zsc.w: ramp bits 8-15, knee
+ * 16-23. */
+uint32_t nv2a_vsh_lit_soft_bits(void);
+
 /* The title's pattern (xbox_SetLitPattern), or NULL while none is set. */
 const Nv2aLitRegs *nv2a_vsh_lit_regs(void);
 
