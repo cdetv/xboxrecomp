@@ -8,6 +8,7 @@
 #if defined(_WIN32)
 #include "nv2a_vsh_gpu.h"
 #include "nv2a_vsh_hlsl.h"
+#include "nv2a_vsh_lit.h"
 #include "nv2a_attr.h"
 #include "nv2a_pb_state.h"
 
@@ -41,6 +42,7 @@ typedef struct {
     ID3D11GeometryShader *gs;           /* vs_check's outputs to stream-out */
     volatile LONG         draw_state[DRAW_KINDS];
     ID3D11VertexShader   *draw_vs[DRAW_KINDS]; /* each entry, once READY */
+    Nv2aVshLit            lit;          /* per-pixel lighting (nv2a_vsh_lit.h) */
 } VshProg;
 
 static ID3D11Device         *s_dev;
@@ -521,7 +523,27 @@ int nv2a_vsh_gpu_prepare(int *is_new)
     p->hash = hash;
     p->count = count;
     s_cur = p;
+    /* Per-pixel lighting: is this one of the title's lit programs, and
+     * where are its terms (nv2a_vsh_lit.c). Once per program, cheap.
+     * RECOMP_VSHLIT_LOG=1: a [VSHLIT] line for each candidate. */
+    {
+        static int log = -1;
+        if (log < 0)
+            log = getenv("RECOMP_VSHLIT_LOG") != NULL;
+        if (nv2a_vsh_lit_scan(ins, count, nv2a_vsh_lit_regs(), &p->lit)
+            && log) {
+            char d[200];
+            nv2a_vsh_lit_describe(&p->lit, d, sizeof d);
+            fprintf(stderr, "[VSHLIT] %016llX: %s\n",
+                    (unsigned long long)hash, d);
+        }
+    }
     return 1;
+}
+
+const Nv2aVshLit *nv2a_vsh_gpu_lit(void)
+{
+    return s_cur ? &s_cur->lit : NULL;
 }
 
 int nv2a_vsh_gpu_constants(void)

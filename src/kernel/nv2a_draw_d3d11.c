@@ -6754,6 +6754,24 @@ static void d3d_draw(void)
                 g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
                 g_pb.depth_test, g_pb.stencil_test, g_pb.alpha_test,
                 nidx / 3, g_pb.prim, 10);
+        if (program) {
+            /* Which vertex program, and whether it is a lit one
+             * (nv2a_vsh_lit.c): which program draws what, from a trace
+             * with `wireframe models` marks. */
+            uint32_t pc;
+            uint64_t ph;
+            const Nv2aVshIns *pi = nv2a_vsh_decoded(&pc, &ph);
+            if (pi) {
+                Nv2aVshLit pl;
+                char pd[200];
+                if (nv2a_vsh_lit_scan(pi, pc, nv2a_vsh_lit_regs(), &pl))
+                    nv2a_vsh_lit_describe(&pl, pd, sizeof pd);
+                else
+                    snprintf(pd, sizeof pd, "not lit");
+                fprintf(stderr, "[FTRACE]     vsh %016llX (%u instructions):"
+                        " %s%c", (unsigned long long)ph, pc, pd, 10);
+            }
+        }
         {   /* Depth against the depth range and the zeta format (Z16 or
              * Z24): a batch outside the range is culled (raster_state). */
             float z0 = 1e30f, z1 = -1e30f, w0 = 1e30f, w1 = -1e30f;

@@ -19,6 +19,7 @@
 
 #include <stdint.h>
 #include "nv2a_vsh_interp.h"
+#include "nv2a_vsh_lit.h"
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -32,6 +33,11 @@ int nv2a_vsh_gpu_init(struct ID3D11Device *dev, struct ID3D11DeviceContext *ctx)
  * Nothing is compiled here: nv2a_vsh_gpu_run and nv2a_vsh_gpu_draw_shader
  * compile what each needs. */
 int nv2a_vsh_gpu_prepare(int *is_new);
+
+/* The prepared program's per-pixel lighting scan (nv2a_vsh_lit.h; layout
+ * NONE when it is not lit or no title pattern is set), NULL before any
+ * program. Scanned once, when nv2a_vsh_gpu_prepare first sees it. */
+const Nv2aVshLit *nv2a_vsh_gpu_lit(void);
 
 /* Uploads the constants written since the last upload. 0 on failure. */
 int nv2a_vsh_gpu_constants(void);
