@@ -96,6 +96,24 @@ int nv2a_vsh_lit_mode(void)
     return s_regs.key_dir >= 0 ? s_mode : 0;
 }
 
+static volatile int s_view;
+
+void xbox_SetLitView(int view)
+{
+    static const char *const k[NV2A_LIT_VIEWS] = {
+        "off", "vertex", "key", "ambient", "blobs", "term", "face"
+    };
+    if (view < 0 || view >= NV2A_LIT_VIEWS)
+        view = 0;
+    s_view = view;
+    fprintf(stderr, "[VSHLIT] view %s\n", k[view]);
+}
+
+int nv2a_vsh_lit_view(void)
+{
+    return s_view;
+}
+
 uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l)
 {
     uint32_t w;
@@ -106,6 +124,10 @@ uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l)
     if (l->lo_row != 0xFF)
         w |= 0x40u | ((uint32_t)l->lo_row << 8)
              | ((uint32_t)(l->lo_comp & 3) << 16);
+    if (l->d1w)
+        w |= ((uint32_t)(l->d1w & 3) << 18) | ((uint32_t)l->d1w_row << 20)
+             | ((uint32_t)(l->d1w_comp & 3) << 28)
+             | ((uint32_t)(l->d1w_comp2 & 3) << 30);
     return w;
 }
 
@@ -329,6 +351,8 @@ static Sym op_add(const Nv2aLitRegs *R, const Sym *a, const Sym *c, int j)
         if (x->kind == S_BG) {
             r.kind = S_W2;
             r.a = k->a; r.b = k->b;
+            r.f = (uint8_t)(1u << x->a);
+            memcpy(r.c, x->c, sizeof r.c);
             return r;
         }
         /* c - a normal lane: oD1.w */
@@ -504,6 +528,8 @@ static Sym op_dph(const Nv2aLitRegs *R, const Sym A[4], const Sym B[4])
         if (ok && mask && B[0].kind == S_CONST && !B[0].neg) {
             r.kind = S_W1;
             r.a = B[0].a; r.b = B[0].b;
+            r.f = mask;                 /* (W kinds: f holds the groups) */
+            memcpy(r.c, c, sizeof r.c);
             return r;
         }
     }
@@ -661,6 +687,13 @@ static int reads_row(const Nv2aVshIns *I, int lo, int hi)
             && (int)I->cidx <= hi)
             return 1;
     return 0;
+}
+
+/* Layouts whose oD1 the lit pixel shader writes (A, B); in C and D oD1 is
+ * not lighting and passes through as interpolated, its alpha too. */
+static int layout_has_d1(int layout)
+{
+    return layout == NV2A_LIT_A || layout == NV2A_LIT_B;
 }
 
 static int fail(Nv2aVshLit *o, const char *why)
@@ -824,12 +857,19 @@ int nv2a_vsh_lit_scan(const Nv2aVshIns *ins, uint32_t count,
             o->p_comp[j] = (uint8_t)id_lane(term.c[j]);
         }
     }
-    /* oD1.w, for the log */
+    /* oD1.w (the title's combiners may read it: Conker's do), worked out
+     * per pixel too when it is one of these and its blobs are the key
+     * term's */
     switch (out[1][3].kind) {
-    case S_W1: o->d1w = NV2A_LIT_W_BLOBS_MUL; break;
-    case S_W2: o->d1w = NV2A_LIT_W_BLOBS_SUB; break;
+    case S_W1:
+    case S_W2:
+        if (out[1][3].f == term.a && same_vec(out[1][3].c, term.c)
+            && layout_has_d1(o->layout))
+            o->d1w = out[1][3].kind == S_W1 ? NV2A_LIT_W_BLOBS_MUL
+                                            : NV2A_LIT_W_BLOBS_SUB;
+        break;
     case S_W3:
-        for (j = 0; j < 3; j++)
+        for (j = 0; j < 3 && layout_has_d1(o->layout); j++)
             if (term.n[j] == out[1][3].c[0]) {
                 o->d1w = NV2A_LIT_W_NORMAL_SUB;
                 o->d1w_comp2 = (uint8_t)j;

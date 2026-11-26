@@ -624,17 +624,20 @@ static ID3DBlob *lt_compile(const char *src, const char *entry)
 
 /* A made-up lit program (layout C, no blobs: the normal v2 normalised, the
  * ambient's two DPH stages from c100-c111, the key light c120 / colour
- * c121) with the epilogue, drawn three times into 256 x 256 with depth:
- * its drawing shader (vs_gpu) and ps; its lit drawing shader (vs_gpu_lit,
- * the third kind) and ps_lit; the lit one and ps (any other pass a lit
- * batch makes reads V only). ps_lit hands ps the vertex colours as they
- * are (step 2: the plumbing), so all three must be the same to the bit. */
+ * c121) with the epilogue, drawn four times into 256 x 256 with depth:
+ * 0 its drawing shader (vs_gpu) and ps, the program's own colours;
+ * 1 its lit drawing shader (vs_gpu_lit, the third kind) with the vertex
+ *   view (zsc.w 1: the lit maths at each vertex) and ps_lit, which then
+ *   hands them on: the same picture, but for a level of rounding;
+ * 2 the lit one and ps (another pass a lit batch makes reads V only): the
+ *   same to the bit;
+ * 3 the lit pair per pixel: drawn (its difference from 0 is the point). */
 static int lit_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
 {
 #define LT_N 60
-    static uint32_t rgb[3][DT_W * DT_H], z[3][DT_W * DT_H];
+    static uint32_t rgb[4][DT_W * DT_H], z[4][DT_W * DT_H];
     static LtIns prog[24];
-    static char src[sizeof s_hlsl + sizeof s_hlsl_lit];
+    static char src[sizeof s_hlsl + sizeof s_hlsl_lit + 512];
     struct { float pos[4]; float nrm[3]; } vtx[LT_N * 3];
     uint32_t idx[LT_N * 3], k[180], used, i, n = LT_N * 3, pass, np = 0;
     uint32_t covered = 0, bad = 0;
@@ -708,7 +711,12 @@ static int lit_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
         return 0;
     }
     nv2a_vsh_prepare(&used);
-    memcpy(src, s_hlsl, sizeof s_hlsl);
+    /* The lit pixel shader as ps_spec_source_lit makes it, without a
+     * setup's literals (the test draws on path 1). */
+    snprintf(src, sizeof src, "#define K_LIT 0x%Xu\n#define K_LIT_KEY 120u\n"
+             "#define K_LIT_COLOUR 121u\n#define K_LIT_AMB 100u\n"
+             "#define K_LIT_BLOBS 0u\n", nv2a_vsh_lit_word(lit));
+    strcat(src, s_hlsl);
     strcat(src, s_hlsl_lit);
     b1 = lt_compile(s_hlsl, "ps");
     b2 = lt_compile(src, "ps_lit");
@@ -772,8 +780,12 @@ static int lit_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
     init.pSysMem = idx;
     ID3D11Device_CreateBuffer(dev, &bd, &init, &ib);
 
-    for (pass = 0; pass < 3; pass++) {
+    for (pass = 0; pass < 4; pass++) {
         float clear[4] = {0, 0, 0, 0};
+        float view = pass == 1 ? 1.0f : 0.0f;   /* zsc.w */
+        memcpy(&k[147], &view, 4);
+        ID3D11DeviceContext_UpdateSubresource(ctx, (ID3D11Resource *)cb, 0,
+                                              NULL, k, 0, 0);
         ID3D11DeviceContext_RSSetState(ctx, rs);
         ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
         ID3D11DeviceContext_OMSetDepthStencilState(ctx, dss, 0);
@@ -794,27 +806,45 @@ static int lit_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
         ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
         ID3D11DeviceContext_IASetIndexBuffer(ctx, ib, DXGI_FORMAT_R32_UINT, 0);
         ID3D11DeviceContext_VSSetShader(ctx, pass ? lvs : gvs, NULL, 0);
-        ID3D11DeviceContext_PSSetShader(ctx, pass == 1 ? pls : ps, NULL, 0);
-        if (pass == 1)
+        ID3D11DeviceContext_PSSetShader(ctx, pass == 1 || pass == 3 ? pls : ps,
+                                        NULL, 0);
+        if (pass == 1 || pass == 3)
             nv2a_vsh_gpu_bind_ps_constants();
         ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0);
         dt_read(ctx, t.rt, t.rt_stage, rgb[pass]);
         dt_read(ctx, t.ds, t.ds_stage, z[pass]);
     }
-    for (i = 0; i < DT_W * DT_H; i++) {
-        if (rgb[0][i])
-            covered++;
-        if (rgb[1][i] != rgb[0][i] || rgb[2][i] != rgb[0][i]
-            || z[1][i] != z[0][i] || z[2][i] != z[0][i])
-            bad++;
-    }
-    printf("lit: %u of %u pixels covered; %u differ between vs_gpu + ps,"
-           " vs_gpu_lit + ps_lit and vs_gpu_lit + ps%s\n", covered,
-           DT_W * DT_H, bad, hw ? " (hw)" : "");
-    xbox_SetLitPattern(-1, -1, -1, -1, 0);
-    if (covered < DT_W * DT_H / 4 || bad) {
-        puts("FAIL: lit");
-        return 0;
+    {
+        uint32_t off1 = 0, worst1 = 0, bad2 = 0, moved3 = 0, worst3 = 0;
+        for (i = 0; i < DT_W * DT_H; i++) {
+            uint32_t c, d1 = 0, d3 = 0;
+            if (rgb[0][i])
+                covered++;
+            for (c = 0; c < 24; c += 8) {
+                int a = (int)(rgb[0][i] >> c & 255);
+                int e1 = abs((int)(rgb[1][i] >> c & 255) - a);
+                int e3 = abs((int)(rgb[3][i] >> c & 255) - a);
+                if ((uint32_t)e1 > d1) d1 = (uint32_t)e1;
+                if ((uint32_t)e3 > d3) d3 = (uint32_t)e3;
+            }
+            if (d1 > 1 || z[1][i] != z[0][i]) off1++;
+            if (d1 > worst1) worst1 = d1;
+            if (rgb[2][i] != rgb[0][i] || z[2][i] != z[0][i]) bad2++;
+            if (d3) moved3++;
+            if (d3 > worst3) worst3 = d3;
+            if (z[3][i] != z[0][i]) bad2++;
+        }
+        printf("lit: %u of %u pixels covered; the maths at the vertices: %u"
+               " pixels more than a level off the program's (at most %u);"
+               " the lit vertex shader with ps: %u differ; per pixel: %u"
+               " pixels changed (at most %u levels)%s\n", covered,
+               DT_W * DT_H, off1, worst1, bad2, moved3, worst3,
+               hw ? " (hw)" : "");
+        xbox_SetLitPattern(-1, -1, -1, -1, 0);
+        if (covered < DT_W * DT_H / 4 || off1 || bad2 || !moved3) {
+            puts("FAIL: lit");
+            return 0;
+        }
     }
     return 1;
 #undef LT_N

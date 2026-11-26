@@ -2129,10 +2129,13 @@ static char *ps_spec_source_lit(const PsKey *k, uint32_t lit)
         free(base);
         return NULL;
     }
-    at = snprintf(src, n, "#define K_LIT 0x%Xu\n#define K_LIT_KEY %d\n"
-                  "#define K_LIT_COLOUR %d\n#define K_LIT_AMB %d\n"
-                  "#define K_LIT_BLOBS %d\n", lit, r->key_dir, r->key_col,
-                  r->amb_first, r->blob_first);
+    at = snprintf(src, n, "#define K_LIT 0x%Xu\n#define K_LIT_KEY %du\n"
+                  "#define K_LIT_COLOUR %du\n#define K_LIT_AMB %du\n"
+                  "#define K_LIT_BLOBS %du\n", lit,
+                  r->key_dir > 0 ? r->key_dir : 0,
+                  r->key_col > 0 ? r->key_col : 0,
+                  r->amb_first > 0 ? r->amb_first : 0,
+                  r->blob_first > 0 ? r->blob_first : 0);
     memcpy(src + at, base, bn);
     memcpy(src + at + bn, s_hlsl_lit, sizeof s_hlsl_lit);
     free(base);
@@ -6546,6 +6549,8 @@ static void d3d_draw(void)
     ID3D11DepthStencilState *ds;
     ID3D11RasterizerState *rs;
     ID3D11VertexShader *gvs = NULL;     /* the program on the GPU */
+    ID3D11VertexShader *lit_vs;         /* per-pixel lighting's pair, */
+    ID3D11PixelShader *lit_ps;          /*   when this batch uses it */
     uint64_t ct_draw0;
 
     s_stat.batches++;
@@ -7081,6 +7086,40 @@ static void d3d_draw(void)
         k.zsc[2] = (float)(((g_pb.xf_mode & 3) == 2 && g_pb.point_params_enable
                             ? 1 : 0) | (g_pb.point_sprite ? 2 : 0));
     }
+    lit_vs = NULL;
+    lit_ps = NULL;
+    {
+        /* Per-pixel lighting (to-do 51 of Conker, nv2a_vsh_lit.c): a lit
+         * program's triangles draw with its lit vertex shader (kind 2) and
+         * the lit variant of the setup's pixel shader, both or neither: a
+         * shader not ready yet keeps the batch per vertex. Decided before
+         * the constants go up: zsc.w carries the lit shaders' flags
+         * (s_hlsl_lit): bits 0-3 the debug view (xbox_SetLitView), bit 4
+         * culling is off (so which side faces the camera matters), bit 5
+         * the side the title's culling keeps is D3D's front (clockwise:
+         * the base rasteriser states keep D3D's default winding). */
+        int lm = gvs && g_pb.prim != NV_PRIM_POINTS ? nv2a_vsh_lit_mode() : 0;
+        if (lm && !(lm == 2 && (g_pb.flips & 1))) {
+            uint32_t w = nv2a_vsh_lit_word(nv2a_vsh_gpu_lit());
+            if (w && path == PATH_COMBINERS) {
+                ID3D11PixelShader *lps = ps_spec_lit(&k, w);
+                ID3D11VertexShader *lvs =
+                    (ID3D11VertexShader *)nv2a_vsh_gpu_lit_shader(0);
+                if (lps && lvs) {
+                    uint32_t f = (uint32_t)nv2a_vsh_lit_view() & 15u;
+                    if (!g_pb.cull_enable)
+                        f |= 16u | ((g_pb.cull_face == 0x405)
+                                    != (g_pb.front_face != 0x900) ? 32u : 0u);
+                    k.zsc[3] = (float)f;
+                    lit_vs = lvs;
+                    lit_ps = lps;
+                    s_stat.lit_draws++;
+                } else {
+                    s_stat.lit_waits++;
+                }
+            }
+        }
+    }
     {
         uint64_t ct0 = ct_now();
         int ok = consts_put(&k);
@@ -7137,36 +7176,13 @@ static void d3d_draw(void)
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
     {
-        /* Per-pixel lighting (to-do 51 of Conker, nv2a_vsh_lit.c): a lit
-         * program's triangles draw with its lit vertex shader (kind 2) and
-         * the lit variant of the setup's pixel shader, both or neither: a
-         * shader not ready yet keeps the batch per vertex. */
-        ID3D11VertexShader *vs = gvs ? gvs : s_vs;
-        ID3D11PixelShader *sp = NULL;
-        int lit = 0, lm = gvs && g_pb.prim != NV_PRIM_POINTS
-                          ? nv2a_vsh_lit_mode() : 0;
-        if (lm && !(lm == 2 && (g_pb.flips & 1))) {
-            uint32_t w = nv2a_vsh_lit_word(nv2a_vsh_gpu_lit());
-            if (w && k.mode[0] == PATH_COMBINERS) {
-                ID3D11PixelShader *lps = ps_spec_lit(&k, w);
-                ID3D11VertexShader *lvs =
-                    (ID3D11VertexShader *)nv2a_vsh_gpu_lit_shader(0);
-                if (lps && lvs) {
-                    vs = lvs;
-                    sp = lps;
-                    lit = 1;
-                    s_stat.lit_draws++;
-                } else {
-                    s_stat.lit_waits++;
-                }
-            }
-        }
-        ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+        /* A lit batch (decided above, before the constants went up). */
+        ID3D11PixelShader *sp = lit_ps ? lit_ps : ps_spec(&k);
+        ID3D11DeviceContext_VSSetShader(s_ctx, lit_vs ? lit_vs
+                                               : gvs ? gvs : s_vs, NULL, 0);
         consts_bind_vs();
-        if (!lit)
-            sp = ps_spec(&k);
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
-        if (lit)
+        if (lit_ps)
             nv2a_vsh_gpu_bind_ps_constants();
     }
     consts_bind_ps();

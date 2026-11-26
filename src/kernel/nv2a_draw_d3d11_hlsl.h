@@ -687,14 +687,98 @@ NV2A_D3D11_HLSL_VG
 "  return o;\n"
 "}\n";
 
+/* Per-pixel lighting's maths (nv2a_vsh_lit.h has the pattern), for the lit
+ * vertex shader (its vertex check) and the lit pixel shader: the program's
+ * own formula, step by step as the scan found it, from the captured normal
+ * n, blob x / y / height p and factor f, with the title's rows (K_LIT_*,
+ * defined ahead of the source) and the program word K_LIT
+ * (nv2a_vsh_lit_word). Reads vc[] (cbuffer VshC, b3): the constants the
+ * vertex program read. At a vertex, with the program's own normal, it
+ * gives the program's colours (the vertex view checks that). */
+#define NV2A_D3D11_HLSL_LIT_MATHS \
+"#define LIT_LAYOUT (K_LIT & 7u)\n" \
+"#define LIT_GROUPS ((K_LIT >> 3) & 7u)\n" \
+"#define LIT_FLOOR ((K_LIT >> 6) & 1u)\n" \
+"#define LIT_FROW ((K_LIT >> 8) & 255u)\n" \
+"#define LIT_FCOMP ((K_LIT >> 16) & 3u)\n" \
+"#define LIT_WKIND ((K_LIT >> 18) & 3u)\n" \
+"#define LIT_WROW ((K_LIT >> 20) & 255u)\n" \
+"#define LIT_WCOMP ((K_LIT >> 28) & 3u)\n" \
+"#define LIT_WN (K_LIT >> 30)\n" \
+"float lit_abs(float x) { return asfloat(asuint(x) & 0x7FFFFFFFu); }\n" \
+"float lit_rcc(float x) {   /* the ILU's rcc, as vsh_rcc */\n" \
+"  float r = 1.0 / x, s = r < 0.0 ? -1.0 : 1.0;\n" \
+"  if (lit_abs(r) < 5.42101e-20) r = s * 5.42101e-20;\n" \
+"  if (lit_abs(r) > 1.884467e19) r = s * 1.884467e19;\n" \
+"  return r;\n" \
+"}\n" \
+"float lit_dph(float3 n, float4 c) { return dot(n, c.xyz) + c.w; }\n" \
+"/* The ambient: per channel, two DPH stages over its four rows. */\n" \
+"float3 lit_ambient(float3 n) {\n" \
+"  float3 a; uint ch;\n" \
+"  [unroll] for (ch = 0; ch < 3; ch++) {\n" \
+"    uint r = K_LIT_AMB + 4u * ch;\n" \
+"    float3 s = float3(lit_dph(n, vc[r]), lit_dph(n, vc[r + 1u]),\n" \
+"                      lit_dph(n, vc[r + 2u]));\n" \
+"    a[ch] = dot(n, s) + lit_dph(n, vc[r + 3u]);\n" \
+"  }\n" \
+"  return a;\n" \
+"}\n" \
+"/* The key light: LIT's y of dot(n, -key). */\n" \
+"float lit_key(float3 n) {\n" \
+"  float d = dot(n, -vc[K_LIT_KEY].xyz);\n" \
+"  return d > 0.0 ? d : 0.0;\n" \
+"}\n" \
+"/* The blobs: per group, four blobs a row; strength x rcc(distance^2) of\n" \
+"   each blob the point is at or above the clip height of. */\n" \
+"float lit_blobs(float3 p) {\n" \
+"  float s = 0.0; uint g;\n" \
+"  [unroll] for (g = 0; g < 3; g++) if ((LIT_GROUPS >> g) & 1u) {\n" \
+"    uint b = K_LIT_BLOBS + 4u * g;\n" \
+"    float4 dx = vc[b] - p.x, dy = vc[b + 1u] - p.y;\n" \
+"    float4 d2 = dy * dy + dx * dx;\n" \
+"    float4 st = (float4)(p.zzzz >= vc[b + 2u]) * vc[b + 3u];\n" \
+"    float4 r = float4(lit_rcc(d2.x), lit_rcc(d2.y), lit_rcc(d2.z),\n" \
+"                      lit_rcc(d2.w));\n" \
+"    s += dot(r, st);\n" \
+"  }\n" \
+"  return s;\n" \
+"}\n" \
+"/* key x (1 - blobs), floored as the program floors it. */\n" \
+"float lit_term(float key, float s) {\n" \
+"  float t = key - key * s;\n" \
+"  if (LIT_FLOOR) { float lo = vc[LIT_FROW][LIT_FCOMP]; t = t >= lo ? t : lo; }\n" \
+"  return t;\n" \
+"}\n" \
+"/* The colours as the program writes them (layouts A-D); alphas as they\n" \
+"   came, but oD1.w when the program writes a blob or normal term there. */\n" \
+"void lit_colours(float3 n, float3 p, float4 f, inout float4 d0,\n" \
+"                 inout float4 d1) {\n" \
+"  float3 amb = lit_ambient(n);\n" \
+"  float s = lit_blobs(p);\n" \
+"  float3 kc = lit_term(lit_key(n), s) * vc[K_LIT_COLOUR].xyz;\n" \
+"  if (LIT_LAYOUT == 1u) { d0.rgb = saturate(amb); d1.rgb = saturate(kc); }\n" \
+"  else if (LIT_LAYOUT == 2u) {\n" \
+"    d0.rgb = saturate(amb * f.xyz); d1.rgb = saturate(kc);\n" \
+"  }\n" \
+"  else if (LIT_LAYOUT == 3u) d0.rgb = saturate(kc + amb);\n" \
+"  else d0.rgb = saturate(kc + amb * f.xyz);\n" \
+"  if (LIT_WKIND == 1u) d1.a = saturate(vc[LIT_WROW][LIT_WCOMP] * (1.0 - s));\n" \
+"  else if (LIT_WKIND == 2u) d1.a = saturate(vc[LIT_WROW][LIT_WCOMP] - s);\n" \
+"  else if (LIT_WKIND == 3u) d1.a = saturate(vc[LIT_WROW][LIT_WCOMP] - n[LIT_WN]);\n" \
+"}\n"
+
 /* A lit program's triangles (per-pixel lighting, nv2a_vsh_lit.c; the third
  * drawing shader kind, nv2a_vsh_gpu_lit_shader): vs_gpu as it is, plus the
  * lighting terms the program's lit translation captured (nv2a_vsh_hlsl_lit:
  * the normal, the blob x / y / height, the ambient's factor), handed on
  * after VG's own fields and before the clip distances, so the pixel shaders
  * that read V still link and ps_lit (s_hlsl_lit) reads them in order. The
- * position path is vs_gpu's to the letter (precise). */
+ * position path is vs_gpu's to the letter (precise). The vertex view
+ * (zsc.w & 15 == 1, xbox_SetLitView) puts the per-pixel maths' colours at
+ * the vertex in place of the program's: they must be the same picture. */
 static const char s_hlsl_vsh_lit[] =
+NV2A_D3D11_HLSL_LIT_MATHS
 "struct VGL {\n"
 "  float4 p : SV_Position;\n"
 "  nointerpolation float4 cf : COLOR0;\n"
@@ -725,17 +809,24 @@ static const char s_hlsl_vsh_lit[] =
 "  o.cf = r.d0; o.d0 = r.d0; o.d1 = r.d1; o.fog = fog_factor(r.fog.x);\n"
 "  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2; o.t3 = r.t3;\n"
 "  o.ln = lit_n; o.lp = lit_p; o.lf = lit_f;\n"
+"  if (((uint)zsc.w & 15u) == 1u)\n"
+"    lit_colours(lit_n.xyz, lit_p.xyz, lit_f, o.d0, o.d1);\n"
 "  return o;\n"
 "}\n";
 
 /* The lit pixel shader's entry, appended after s_hlsl (with or without a
  * setup's K_ literals; ps_spec_source_lit adds K_LIT, the program's
- * nv2a_vsh_lit_word, and the title's rows): ps_lit takes VGL's fields and
- * hands ps the vertex colours as they are (step 2 of to-do 51: the
- * plumbing; the same picture as ps). The vertex program's constants are
- * bound at b3 for it too (nv2a_vsh_gpu_bind_ps_constants). */
+ * nv2a_vsh_lit_word, and the title's rows): ps_lit works the lighting out
+ * at the pixel from VGL's terms -- the interpolated normal renormalised, as
+ * the program normalises its own -- and hands ps the colours. The vertex
+ * program's constants are bound at b3 for it too
+ * (nv2a_vsh_gpu_bind_ps_constants). zsc.w (d3d_draw): bits 0-3 the debug
+ * view (NV2A_LIT_VIEW_*), bit 4 culling is off, bit 5 the side the title's
+ * culling keeps is D3D's front. With culling off the other side (the
+ * inside of a sleeve through a stump) keeps the vertex colours. */
 static const char s_hlsl_lit[] =
 "cbuffer VshC : register(b3) { float4 vc[193]; };\n"
+NV2A_D3D11_HLSL_LIT_MATHS
 "struct VL {\n"
 "  float4 p : SV_Position;\n"
 "  nointerpolation float4 cf : COLOR0;\n"
@@ -746,10 +837,24 @@ static const char s_hlsl_lit[] =
 "  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
 "  float4 ln : TEXCOORD4; float4 lp : TEXCOORD5; float4 lf : TEXCOORD6;\n"
 "};\n"
-"float4 ps_lit(VL i) : SV_Target {\n"
+"float4 ps_lit(VL i, bool front : SV_IsFrontFace) : SV_Target {\n"
 "  V v;\n"
+"  uint m = (uint)zsc.w, view = m & 15u;\n"
+"  bool outside = !(m & 16u) || (front == ((m & 32u) != 0u));\n"
 "  v.p = i.p; v.cf = i.cf; v.d0 = i.d0; v.d1 = i.d1; v.fog = i.fog;\n"
 "  v.t0 = i.t0; v.t1 = i.t1; v.t2 = i.t2; v.t3 = i.t3;\n"
+"  if (view == 6u)\n"
+"    return outside ? float4(0, 1, 0, 1) : float4(1, 0, 0, 1);\n"
+"  if (view != 1u && outside) {\n"
+"    float3 n = normalize(i.ln.xyz);\n"
+"    if (view == 2u) return float4(lit_key(n).xxx, 1);\n"
+"    if (view == 3u) return float4(saturate(lit_ambient(n)), 1);\n"
+"    if (view == 4u) return float4(saturate(1.0 - lit_blobs(i.lp.xyz)).xxx, 1);\n"
+"    if (view == 5u)\n"
+"      return float4(saturate(lit_term(lit_key(n), lit_blobs(i.lp.xyz))\n"
+"                             * vc[K_LIT_COLOUR].xyz), 1);\n"
+"    lit_colours(n, i.lp.xyz, i.lf, v.d0, v.d1);\n"
+"  }\n"
 "  return ps(v);\n"
 "}\n";
 

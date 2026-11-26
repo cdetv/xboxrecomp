@@ -1040,9 +1040,28 @@ static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
 
     if (!s)
         return NULL;
-    n = strlen(s_dhead);
-    if (n >= cap) { free(s); return NULL; }
-    memcpy(s, s_dhead, n);
+    n = 0;
+    if (kind == 2) {
+        /* What the lit maths (s_hlsl_vsh_lit's vertex view) read: the
+         * program's word and the title's rows (0 for a row it has none
+         * of: never read then, but fxc checks constant indices). */
+        const Nv2aLitRegs *r = nv2a_vsh_lit_regs();
+        int at;
+        if (!r) { free(s); return NULL; }
+        at = snprintf(s, cap, "#define K_LIT 0x%Xu\n#define K_LIT_KEY %du\n"
+                      "#define K_LIT_COLOUR %du\n#define K_LIT_AMB %du\n"
+                      "#define K_LIT_BLOBS %du\n", nv2a_vsh_lit_word(lit),
+                      r->key_dir > 0 ? r->key_dir : 0,
+                      r->key_col > 0 ? r->key_col : 0,
+                      r->amb_first > 0 ? r->amb_first : 0,
+                      r->blob_first > 0 ? r->blob_first : 0);
+        if (at < 0 || (size_t)at >= cap) { free(s); return NULL; }
+        n = (size_t)at;
+    }
+    m = strlen(s_dhead);
+    if (n + m >= cap) { free(s); return NULL; }
+    memcpy(s + n, s_dhead, m);
+    n += m;
     m = nv2a_vsh_hlsl_fetch_only(s + n, cap - n);
     if (!m) { free(s); return NULL; }
     n += m;

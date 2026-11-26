@@ -102,9 +102,27 @@ void nv2a_vsh_lit_describe(const Nv2aVshLit *l, char *buf, size_t cap);
 
 /* What a lit program's pixel shader depends on, as one word (0: not lit):
  * the layout (bits 0-2), the blob groups (3-5), a floor (bit 6; its row
- * bits 8-15, component 16-17). Programs with the same word share their
- * pixel shaders (one per combiner setup). */
+ * bits 8-15, component 16-17), how oD1.w is written (18-19, NV2A_LIT_W_*;
+ * its row 20-27, component 28-29, the normal's component 30-31). Programs
+ * with the same word share their pixel shaders (one per combiner setup). */
 uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l);
+
+/* Debug views (xbox_SetLitView), drawn by the lit pixel shader in place of
+ * the lit batches' colours: */
+enum {
+    NV2A_LIT_VIEW_OFF = 0,
+    NV2A_LIT_VIEW_VERTEX,   /* the maths per vertex in the lit vertex shader
+                               (must equal the program's own colours) */
+    NV2A_LIT_VIEW_KEY,      /* the key light alone, grey */
+    NV2A_LIT_VIEW_AMBIENT,  /* the ambient alone */
+    NV2A_LIT_VIEW_BLOBS,    /* 1 - the blob shadows, grey */
+    NV2A_LIT_VIEW_TERM,     /* key x (1 - blobs) x the key colour */
+    NV2A_LIT_VIEW_FACE,     /* the side the title's culling keeps green,
+                               the other red */
+    NV2A_LIT_VIEWS
+};
+void xbox_SetLitView(int view);
+int nv2a_vsh_lit_view(void);
 
 /* The title's pattern (xbox_SetLitPattern), or NULL while none is set. */
 const Nv2aLitRegs *nv2a_vsh_lit_regs(void);
