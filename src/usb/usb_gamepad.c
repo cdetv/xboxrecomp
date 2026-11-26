@@ -307,7 +307,10 @@ static uint8_t synthetic_buttons(void)
  * is pressed as soon as it is read. With RECOMP_FB_DUMP and a short
  * RECOMP_PB_REPORT_MS that makes a loop: look at the frame, append a press,
  * look again. A line "mouse:<dx>,<dy>" moves the keyboard-and-mouse pad's
- * mouse instead (no time, no hold). Lines go one after another with a 200 ms
+ * mouse instead (no time, no hold), at once; "mouse:<dx>,<dy>:<ms>" spreads
+ * the move evenly over <ms>, a part at each poll, as a real mouse's reports
+ * come (a turn that is smooth frame to frame; the next such line takes over
+ * after the rest of this one). Lines go one after another with a 200 ms
  * release between; a line starting with "&" ("&rt:300") is pressed at once,
  * on top of whatever is held (a tap of RT while LT stays held).
  * xbox_PadLiveLine hands over the same lines from inside the process. A fixed timeline cannot do that on a rasterised run, where
@@ -451,8 +454,43 @@ static void pad_script_compact(unsigned long t)
     s_script_len = n;
 }
 
+extern void xbox_KbmMouseMove(long dx, long dy);
+
+/* A "mouse:<dx>,<dy>:<ms>" move being spread out (QPC: GetTickCount's
+ * 15.6 ms steps would bunch it into some frames and skip others). */
+static struct {
+    long x, y, done_x, done_y;
+    LONGLONG start, dur;
+    int on;
+} s_spread;
+
+/* The part of the spread move due by now. */
+static void mouse_spread_step(void)
+{
+    LARGE_INTEGER now;
+    double f;
+    long wx, wy;
+
+    if (!s_spread.on)
+        return;
+    QueryPerformanceCounter(&now);
+    f = s_spread.dur > 0 ? (double)(now.QuadPart - s_spread.start)
+                           / (double)s_spread.dur : 1.0;
+    if (f >= 1.0) {
+        f = 1.0;
+        s_spread.on = 0;
+    }
+    wx = (long)((double)s_spread.x * f);
+    wy = (long)((double)s_spread.y * f);
+    if (wx != s_spread.done_x || wy != s_spread.done_y) {
+        xbox_KbmMouseMove(wx - s_spread.done_x, wy - s_spread.done_y);
+        s_spread.done_x = wx;
+        s_spread.done_y = wy;
+    }
+}
+
 /* One live line (from the RECOMP_PAD_LIVE file or xbox_PadLiveLine),
- * scheduled at t: a press, or "mouse:<dx>,<dy>". */
+ * scheduled at t: a press, or "mouse:<dx>,<dy>[:<ms>]". */
 static void pad_live_line(const char *pending, unsigned long t)
 {
     static unsigned long next_free[USB_GAMEPAD_MAX];
@@ -462,9 +500,27 @@ static void pad_live_line(const char *pending, unsigned long t)
      * pad (kbm_pad.c), as the window's raw input would give it, so
      * mouse look can be tested with nobody at the mouse. */
     if (npending > 6 && same_word(pending, "mouse:", 6)) {
-        extern void xbox_KbmMouseMove(long dx, long dy);
         long mx = 0, my = 0;
-        if (sscanf(pending + 6, "%ld,%ld", &mx, &my) == 2) {
+        unsigned long ms = 0;
+        int n = sscanf(pending + 6, "%ld,%ld:%lu", &mx, &my, &ms);
+        if (n == 3 && ms > 0) {
+            LARGE_INTEGER now, freq;
+            if (s_spread.on) {          /* the rest of the last one first */
+                s_spread.start -= s_spread.dur;
+                mouse_spread_step();
+            }
+            QueryPerformanceCounter(&now);
+            QueryPerformanceFrequency(&freq);
+            s_spread.x = mx;
+            s_spread.y = my;
+            s_spread.done_x = s_spread.done_y = 0;
+            s_spread.start = now.QuadPart;
+            s_spread.dur = (LONGLONG)((double)freq.QuadPart * ms / 1000.0);
+            s_spread.on = 1;
+            fprintf(stderr, "  PAD: live mouse %ld,%ld over %lu ms at t=%lu"
+                    " ms\n", mx, my, ms, t);
+            fflush(stderr);
+        } else if (n >= 2) {
             xbox_KbmMouseMove(mx, my);
             fprintf(stderr, "  PAD: live mouse %ld,%ld at t=%lu ms\n",
                     mx, my, t);
@@ -543,6 +599,7 @@ static void pad_live_poll(unsigned long t)
         for (i = 0; i < n; i++)
             pad_live_line(lines[i], t);
     }
+    mouse_spread_step();
     if (!checked) {
         checked = 1;
         path = getenv("RECOMP_PAD_LIVE");
