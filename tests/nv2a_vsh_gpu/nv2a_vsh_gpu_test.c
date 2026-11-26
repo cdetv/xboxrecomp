@@ -46,6 +46,20 @@ uint64_t nv2a_hash_fast(const void *p, size_t n, uint64_t h)
     return h;
 }
 
+/* The back end's constant buffer ring (nv2a_draw_d3d11.c, executor cheaper
+ * wins step 3): off here, so every draw takes the old path. */
+int nv2a_cring_use(void) { return 0; }
+int nv2a_cring_put(int stream, const void *src, uint32_t bytes,
+                   uint32_t *first, uint32_t *num)
+{
+    (void)stream; (void)src; (void)bytes; (void)first; (void)num;
+    return 0;
+}
+void nv2a_cring_bind_vs(uint32_t slot, uint32_t first, uint32_t num)
+{
+    (void)slot; (void)first; (void)num;
+}
+
 static uint32_t s_rng = 12345u;
 
 static uint32_t rnd(void)
@@ -569,6 +583,243 @@ static int draw_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
     return 1;
 }
 
+/* ---- per-pixel lighting's plumbing (Conker to-do 51) ------------------ */
+
+/* An instruction from its fields (the layout at the top of
+ * nv2a_vsh_interp.c); a source with mux 0 is not read. oa -1: no output. */
+typedef struct { int mux, reg, neg, swz; } LtSrc;
+typedef struct {
+    int mac, ilu, ci, vi;
+    LtSrc a, b, c;
+    int td, mm, im, oa, om, oi;
+} LtIns;
+
+static void lt_encode(const LtIns *p, int final, uint32_t w[4])
+{
+    w[0] = 0;
+    w[1] = (uint32_t)(p->ilu << 25 | p->mac << 21 | p->ci << 13 | p->vi << 9
+                      | p->a.swz | p->a.neg << 8);
+    w[2] = (uint32_t)(p->a.mux << 26 | p->a.reg << 28 | p->b.swz << 17
+                      | p->b.neg << 25 | p->b.mux << 11 | p->b.reg << 13
+                      | p->c.swz << 2 | p->c.neg << 10 | p->c.reg >> 2);
+    w[3] = (uint32_t)(p->c.mux << 28 | (p->c.reg & 3) << 30 | p->mm << 24
+                      | p->td << 20 | p->im << 16 | final);
+    if (p->oa >= 0)
+        w[3] |= (uint32_t)(p->om << 12 | 1 << 11 | p->oa << 3 | p->oi << 2);
+}
+
+static ID3DBlob *lt_compile(const char *src, const char *entry)
+{
+    ID3DBlob *code = NULL, *err = NULL;
+    if (FAILED(D3DCompile(src, strlen(src), "lit_test", NULL, NULL, entry,
+                          "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code,
+                          &err))) {
+        printf("FAIL: lit: pixel shader %s: %s\n", entry,
+               err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "?");
+        code = NULL;
+    }
+    if (err) ID3D10Blob_Release(err);
+    return code;
+}
+
+/* A made-up lit program (layout C, no blobs: the normal v2 normalised, the
+ * ambient's two DPH stages from c100-c111, the key light c120 / colour
+ * c121) with the epilogue, drawn three times into 256 x 256 with depth:
+ * its drawing shader (vs_gpu) and ps; its lit drawing shader (vs_gpu_lit,
+ * the third kind) and ps_lit; the lit one and ps (any other pass a lit
+ * batch makes reads V only). ps_lit hands ps the vertex colours as they
+ * are (step 2: the plumbing), so all three must be the same to the bit. */
+static int lit_test(ID3D11Device *dev, ID3D11DeviceContext *ctx, int hw)
+{
+#define LT_N 60
+    static uint32_t rgb[3][DT_W * DT_H], z[3][DT_W * DT_H];
+    static LtIns prog[24];
+    static char src[sizeof s_hlsl + sizeof s_hlsl_lit];
+    struct { float pos[4]; float nrm[3]; } vtx[LT_N * 3];
+    uint32_t idx[LT_N * 3], k[180], used, i, n = LT_N * 3, pass, np = 0;
+    uint32_t covered = 0, bad = 0;
+    const float c58[4] = {DT_W / 2.0f, -DT_H / 2.0f, 16777215.0f, 0};
+    const float c59[4] = {DT_W / 2.0f, DT_H / 2.0f, 0, 0};
+    const float key[4] = {0.267f, -0.535f, 0.802f, 0}, col[4] = {0.8f, 0.7f,
+                                                                0.6f, 0.1f};
+    ID3D11VertexShader *gvs, *lvs;
+    ID3D11PixelShader *ps = NULL, *pls = NULL;
+    ID3D11Buffer *cb = NULL, *ib = NULL;
+    ID3D11RasterizerState *rs = NULL;
+    ID3D11DepthStencilState *dss = NULL;
+    ID3DBlob *b1, *b2;
+    D3D11_BUFFER_DESC bd;
+    D3D11_SUBRESOURCE_DATA init;
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_DEPTH_STENCIL_DESC dsd;
+    D3D11_VIEWPORT vp = {0, 0, DT_W, DT_H, 0, 1};
+    Nv2aVshArray arr[NV2A_VSH_INPUTS];
+    const Nv2aVshLit *lit;
+    DtTarget t;
+    int ch, j;
+
+    /* mov oPos, v0 / dp3 r0.w, v2, v2 / rsq r1.xyz, r0.w / mul r2.xyz, r1, v2 /
+     * per channel: dph r3.xyzw, r2, c[100 + 4 ch ..]; dph r5.<ch>, r2, r3 /
+     * dp3 r4.x, r2, -c120 / lit r1.y, r4 / mad o3.xyz, r1.y, c121, r5 /
+     * the epilogue. */
+    prog[np++] = (LtIns){1, 0, 0, 0, {V, 0, 0, XYZW}, {0}, {0}, 0, 0, 0, 0, 0xF, 0};
+    prog[np++] = (LtIns){5, 0, 0, 2, {V, 2, 0, XYZW}, {V, 2, 0, XYZW}, {0}, 0, 1, 0, -1, 0, 0};
+    prog[np++] = (LtIns){0, 4, 0, 0, {0}, {0}, {T, 0, 0, WWWW}, 1, 0, 0xE, -1, 0, 0};
+    prog[np++] = (LtIns){2, 0, 0, 2, {T, 1, 0, XYZW}, {V, 2, 0, XYZW}, {0}, 2, 0xE, 0, -1, 0, 0};
+    for (ch = 0; ch < 3; ch++) {
+        for (j = 0; j < 4; j++)
+            prog[np++] = (LtIns){6, 0, 100 + 4 * ch + j, 0, {T, 2, 0, XYZW},
+                                 {C, 0, 0, XYZW}, {0}, 3, 8 >> j, 0, -1, 0, 0};
+        prog[np++] = (LtIns){6, 0, 0, 0, {T, 2, 0, XYZW}, {T, 3, 0, XYZW}, {0},
+                             5, 8 >> ch, 0, -1, 0, 0};
+    }
+    prog[np++] = (LtIns){5, 0, 120, 0, {T, 2, 0, XYZW}, {C, 0, 1, XYZW}, {0}, 4, 8, 0, -1, 0, 0};
+    prog[np++] = (LtIns){0, 7, 0, 0, {0}, {0}, {T, 4, 0, XYZW}, 1, 0, 4, -1, 0, 0};
+    prog[np++] = (LtIns){4, 0, 121, 0, {T, 1, 0, 0x55}, {C, 0, 0, XYZW}, {T, 5, 0, XYZW}, 0, 0, 0, 3, 0xE, 0};
+    prog[np++] = (LtIns){2, 3, 58, 0, {T, 12, 0, XYZW}, {C, 0, 0, XYZW}, {T, 12, 0, WWWW}, 7, 0, 8, 0, 0xE, 0};
+    prog[np++] = (LtIns){4, 0, 59, 0, {T, 12, 0, XYZW}, {T, 1, 0, XXXX}, {C, 0, 0, XYZW}, 0, 0, 0, 0, 0xE, 0};
+    for (i = 0; i < np; i++) {
+        uint32_t w[4];
+        lt_encode(&prog[i], i == np - 1, w);
+        nv2a_vsh_set_instruction(i, w);
+    }
+    nv2a_vsh_set_start_slot(1);
+    nv2a_vsh_set_start_slot(0);
+    for (i = 100; i < 112; i++) {
+        float c[4];
+        for (j = 0; j < 4; j++)
+            c[j] = (float)(rnd() % 400) / 1000.0f - 0.1f;
+        nv2a_vsh_set_constant(i, c);
+    }
+    nv2a_vsh_set_constant(120, key);
+    nv2a_vsh_set_constant(121, col);
+    nv2a_vsh_set_constant(58, c58);
+    nv2a_vsh_set_constant(59, c59);
+    xbox_SetLitPattern(120, 121, 100, -1, 0);
+    nv2a_vsh_gpu_lit_source(s_hlsl_vsh_lit, "vs_gpu_lit");
+    if (!nv2a_vsh_gpu_prepare(NULL) || !(lit = nv2a_vsh_gpu_lit())
+        || lit->layout != NV2A_LIT_C) {
+        puts("FAIL: lit: the made-up program is not found lit (layout C)");
+        return 0;
+    }
+    if (!(gvs = nv2a_vsh_gpu_draw_shader(1))
+        || !(lvs = nv2a_vsh_gpu_lit_shader(1))) {
+        puts("FAIL: lit: a drawing shader did not compile");
+        return 0;
+    }
+    nv2a_vsh_prepare(&used);
+    memcpy(src, s_hlsl, sizeof s_hlsl);
+    strcat(src, s_hlsl_lit);
+    b1 = lt_compile(s_hlsl, "ps");
+    b2 = lt_compile(src, "ps_lit");
+    memset(&t, 0, sizeof t);
+    if (!b1 || !b2
+        || FAILED(ID3D11Device_CreatePixelShader(dev,
+                  ID3D10Blob_GetBufferPointer(b1), ID3D10Blob_GetBufferSize(b1),
+                  NULL, &ps))
+        || FAILED(ID3D11Device_CreatePixelShader(dev,
+                  ID3D10Blob_GetBufferPointer(b2), ID3D10Blob_GetBufferSize(b2),
+                  NULL, &pls))
+        || !dt_target(dev, &t)) {
+        puts("FAIL: lit: draw objects");
+        return 0;
+    }
+
+    memset(k, 0, sizeof k);
+    {
+        float rtv[4] = {2.0f / DT_W, -2.0f / DT_H, -1.0f, 1.0f};
+        float zsc = 1.0f / 16777215.0f;
+        memcpy(&k[0], rtv, sizeof rtv);
+        k[20] = 1;                      /* path 1: the colour (nothing bound) */
+        memcpy(&k[144], &zsc, 4);
+    }
+    memset(&bd, 0, sizeof bd);
+    bd.ByteWidth = sizeof k;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    init.pSysMem = k;
+    init.SysMemPitch = init.SysMemSlicePitch = 0;
+    ID3D11Device_CreateBuffer(dev, &bd, &init, &cb);
+    memset(&rd, 0, sizeof rd);
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    ID3D11Device_CreateRasterizerState(dev, &rd, &rs);
+    memset(&dsd, 0, sizeof dsd);
+    dsd.DepthEnable = TRUE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dsd.DepthFunc = D3D11_COMPARISON_LESS;
+    ID3D11Device_CreateDepthStencilState(dev, &dsd, &dss);
+
+    for (i = 0; i < n; i++) {
+        float w = 0.5f + (float)(rnd() % 3500) / 1000.0f;
+        vtx[i].pos[0] = ((float)(rnd() % 2401) - 1200.0f) / 1000.0f * w;
+        vtx[i].pos[1] = ((float)(rnd() % 2401) - 1200.0f) / 1000.0f * w;
+        vtx[i].pos[2] = (float)(rnd() % 1000) / 1000.0f * w;
+        vtx[i].pos[3] = w;
+        for (j = 0; j < 3; j++)
+            vtx[i].nrm[j] = ((float)(rnd() % 2001) - 1000.0f) / 400.0f;
+        idx[i] = i;
+    }
+    memset(arr, 0, sizeof arr);
+    arr[0].src = (const uint8_t *)vtx[0].pos;
+    arr[0].type = 2; arr[0].size = 4; arr[0].stride = sizeof vtx[0];
+    arr[0].last = UINT32_MAX;
+    arr[2].src = (const uint8_t *)vtx[0].nrm;
+    arr[2].type = 2; arr[2].size = 3; arr[2].stride = sizeof vtx[0];
+    arr[2].last = UINT32_MAX;
+    bd.ByteWidth = n * 4;
+    bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+    init.pSysMem = idx;
+    ID3D11Device_CreateBuffer(dev, &bd, &init, &ib);
+
+    for (pass = 0; pass < 3; pass++) {
+        float clear[4] = {0, 0, 0, 0};
+        ID3D11DeviceContext_RSSetState(ctx, rs);
+        ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp);
+        ID3D11DeviceContext_OMSetDepthStencilState(ctx, dss, 0);
+        ID3D11DeviceContext_OMSetBlendState(ctx, NULL, NULL, 0xFFFFFFFFu);
+        ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &t.rtv, t.dsv);
+        ID3D11DeviceContext_IASetPrimitiveTopology(ctx,
+                D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, t.rtv, clear);
+        ID3D11DeviceContext_ClearDepthStencilView(ctx, t.dsv,
+                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        if (!nv2a_vsh_gpu_inputs(arr, used, 0, n - 1)
+            || !nv2a_vsh_gpu_constants()) {
+            puts("FAIL: lit: inputs");
+            return 0;
+        }
+        ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &cb);
+        ID3D11DeviceContext_VSSetConstantBuffers(ctx, 0, 1, &cb);
+        ID3D11DeviceContext_IASetInputLayout(ctx, NULL);
+        ID3D11DeviceContext_IASetIndexBuffer(ctx, ib, DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_VSSetShader(ctx, pass ? lvs : gvs, NULL, 0);
+        ID3D11DeviceContext_PSSetShader(ctx, pass == 1 ? pls : ps, NULL, 0);
+        if (pass == 1)
+            nv2a_vsh_gpu_bind_ps_constants();
+        ID3D11DeviceContext_DrawIndexed(ctx, n, 0, 0);
+        dt_read(ctx, t.rt, t.rt_stage, rgb[pass]);
+        dt_read(ctx, t.ds, t.ds_stage, z[pass]);
+    }
+    for (i = 0; i < DT_W * DT_H; i++) {
+        if (rgb[0][i])
+            covered++;
+        if (rgb[1][i] != rgb[0][i] || rgb[2][i] != rgb[0][i]
+            || z[1][i] != z[0][i] || z[2][i] != z[0][i])
+            bad++;
+    }
+    printf("lit: %u of %u pixels covered; %u differ between vs_gpu + ps,"
+           " vs_gpu_lit + ps_lit and vs_gpu_lit + ps%s\n", covered,
+           DT_W * DT_H, bad, hw ? " (hw)" : "");
+    xbox_SetLitPattern(-1, -1, -1, -1, 0);
+    if (covered < DT_W * DT_H / 4 || bad) {
+        puts("FAIL: lit");
+        return 0;
+    }
+    return 1;
+#undef LT_N
+}
+
 /* nv2a_vsh_gpu_precompile_stats's waiting count reaching 0, or 60 s. */
 static int pre_wait(uint32_t *compiled, uint32_t *had, uint32_t *failed)
 {
@@ -727,6 +978,8 @@ int main(int argc, char **argv)
     if (!fetch_test(hw))
         return 1;
     if (!draw_test(dev, ctx, hw))
+        return 1;
+    if (!lit_test(dev, ctx, hw))
         return 1;
     i = precompile_test();
     remove_cache(cache);

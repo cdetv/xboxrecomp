@@ -80,6 +80,35 @@ const Nv2aLitRegs *nv2a_vsh_lit_regs(void)
     return s_regs.key_dir >= 0 ? &s_regs : NULL;
 }
 
+static volatile int s_mode;
+
+void xbox_SetPerPixelLighting(int mode)
+{
+    if (mode < 0 || mode > 2)
+        mode = 1;
+    s_mode = mode;
+    fprintf(stderr, "[VSHLIT] per-pixel lighting %s\n",
+            mode == 2 ? "on in even frames" : mode ? "on" : "off");
+}
+
+int nv2a_vsh_lit_mode(void)
+{
+    return s_regs.key_dir >= 0 ? s_mode : 0;
+}
+
+uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l)
+{
+    uint32_t w;
+
+    if (!l || l->layout == NV2A_LIT_NONE)
+        return 0;
+    w = (uint32_t)l->layout | ((uint32_t)(l->groups & 7) << 3);
+    if (l->lo_row != 0xFF)
+        w |= 0x40u | ((uint32_t)l->lo_row << 8)
+             | ((uint32_t)(l->lo_comp & 3) << 16);
+    return w;
+}
+
 /* ---- values ------------------------------------------------------------- */
 
 /* Ids: 0 the zero; a write 1 + (ins * 2 + unit) * 4 + lane (unit 0 MAC,

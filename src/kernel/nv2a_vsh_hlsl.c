@@ -209,7 +209,25 @@ static const char *ilu_expr(uint32_t op)
     }
 }
 
-static void put_ins(Out *o, const Nv2aVshIns *I, uint32_t n)
+/* A lit program's captures inside instruction n's block, after its writes
+ * (nv2a_vsh_hlsl_lit): the sources and results are the block's A, B, M, I. */
+static void put_lit(Out *o, const Nv2aVshLit *l, uint32_t n)
+{
+    static const char ax[] = "xyz", sw[] = "xyzw";
+    int j;
+
+    if (n == l->n_ins)
+        put(o, "    lit_n = %c;\n", l->n_src ? 'B' : 'A');
+    for (j = 0; j < 3 && l->groups; j++)
+        if (n == l->p_ins[j])
+            put(o, "    lit_p.%c = %c.%c;\n", ax[j], l->p_unit[j] ? 'I' : 'M',
+                sw[l->p_comp[j] & 3]);
+    if ((l->layout == NV2A_LIT_B || l->layout == NV2A_LIT_D) && n == l->f_ins)
+        put(o, "    lit_f = %c;\n", l->f_src ? 'B' : 'A');
+}
+
+static void put_ins(Out *o, const Nv2aVshIns *I, uint32_t n,
+                    const Nv2aVshLit *lit)
 {
     static const char abc[] = "ABC";
     char m[8], t[8];
@@ -252,11 +270,13 @@ static void put_ins(Out *o, const Nv2aVshIns *I, uint32_t n)
         else             /* an idle unit's result is 0 (z: see the prelude) */
             put(o, "    %s%s = z%s;\n", out_name(I->oaddr), m, m);
     }
+    if (lit)
+        put_lit(o, lit, n);
     put(o, "  }\n");
 }
 
-size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
-                     size_t cap)
+static size_t translate(const Nv2aVshIns *ins, uint32_t count,
+                        const Nv2aVshLit *lit, char *buf, size_t cap)
 {
     Out o;
     uint32_t n;
@@ -268,11 +288,29 @@ size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
     o.len = 0;
     o.full = 0;
     buf[0] = 0;
+    if (lit)
+        put(&o, "static float4 lit_n = float4(0, 0, 0, 0);\n"
+                "static float4 lit_p = float4(0, 0, 0, 0);\n"
+                "static float4 lit_f = float4(1, 1, 1, 1);\n");
     put(&o, "%s", k_prelude);
     for (n = 0; n < count; n++)
-        put_ins(&o, &ins[n], n);
+        put_ins(&o, &ins[n], n, lit);
     put(&o, "%s", k_epilogue);
     return o.full ? 0 : o.len;
+}
+
+size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
+                     size_t cap)
+{
+    return translate(ins, count, NULL, buf, cap);
+}
+
+size_t nv2a_vsh_hlsl_lit(const Nv2aVshIns *ins, uint32_t count,
+                         const Nv2aVshLit *lit, char *buf, size_t cap)
+{
+    if (!lit || lit->layout == NV2A_LIT_NONE)
+        return 0;
+    return translate(ins, count, lit, buf, cap);
 }
 
 /* ---- vertex inputs ----------------------------------------------------- */

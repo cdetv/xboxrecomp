@@ -157,6 +157,21 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait);
 void nv2a_vsh_gpu_point_source(const char *tail, const char *entry);
 struct ID3D11VertexShader *nv2a_vsh_gpu_point_shader(int wait);
 
+/* The same for a lit program's triangles (per-pixel lighting, to-do 51 of
+ * Conker): a third drawing shader per lit program, the program translated
+ * with its lighting terms captured (nv2a_vsh_hlsl_lit) and this tail and
+ * entry handing them on. NULL for a program the scan did not find lit
+ * (nv2a_vsh_gpu_lit), until it is made, or without the tail. Kept in the
+ * disk cache under its own key; the pre-compiler makes it too while
+ * per-pixel lighting is on (nv2a_vsh_lit_mode). */
+void nv2a_vsh_gpu_lit_source(const char *tail, const char *entry);
+struct ID3D11VertexShader *nv2a_vsh_gpu_lit_shader(int wait);
+
+/* The program constants' buffer (cbuffer VshC, b3) bound for the pixel
+ * shader too: a lit draw's pixel shader reads the very constants its
+ * vertex shader read (the lights), no copy. */
+void nv2a_vsh_gpu_bind_ps_constants(void);
+
 /* Drawing shaders made, failed, waiting for a thread; their compile time
  * (summed over the threads). Pre-compiled ones are not in these. */
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,

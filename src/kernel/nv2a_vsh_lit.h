@@ -100,8 +100,22 @@ int nv2a_vsh_lit_scan(const Nv2aVshIns *ins, uint32_t count,
  * or "per vertex (<why>)", for [VSHLIT] lines. */
 void nv2a_vsh_lit_describe(const Nv2aVshLit *l, char *buf, size_t cap);
 
+/* What a lit program's pixel shader depends on, as one word (0: not lit):
+ * the layout (bits 0-2), the blob groups (3-5), a floor (bit 6; its row
+ * bits 8-15, component 16-17). Programs with the same word share their
+ * pixel shaders (one per combiner setup). */
+uint32_t nv2a_vsh_lit_word(const Nv2aVshLit *l);
+
 /* The title's pattern (xbox_SetLitPattern), or NULL while none is set. */
 const Nv2aLitRegs *nv2a_vsh_lit_regs(void);
+
+/* Per-pixel lighting on (xbox_SetPerPixelLighting): 0 off, 1 on, 2 on in
+ * even frames only (the held-picture check: neighbouring frames compared,
+ * cmp_alt.py). Always 0 while no pattern is set. */
+int nv2a_vsh_lit_mode(void);
+
+/* For the title (a setting, at once): 0 off, 1 on, 2 even frames only. */
+void xbox_SetPerPixelLighting(int mode);
 
 /* For the title, once at start-up, before anything draws: its lit
  * programs' constant rows (above). key_dir < 0 forgets the pattern. */

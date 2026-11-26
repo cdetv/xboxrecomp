@@ -466,6 +466,8 @@ static struct {
     uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t movie_43;                  /* movie batches drawn in 4:3 */
     uint32_t near_draws;                /* receiver_draw's two-pass draws */
+    uint32_t lit_draws, lit_waits;      /* per-pixel lit; lit programs drawn
+                                         * per vertex (a shader not ready) */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
@@ -2023,6 +2025,8 @@ typedef struct {
 #define PS_LIST_MAGIC 0x314B5350u       /* "PSK1" */
 typedef struct {
     PsKey key;
+    uint32_t lit;                       /* a lit program's variant
+                                         * (nv2a_vsh_lit_word; 0: ps) */
     uint64_t h;
     volatile LONG state;                /* PS_* */
     volatile LONG taken;                /* a worker has it (it can be queued
@@ -2101,6 +2105,37 @@ static char *ps_spec_source(const PsKey *k)
                        k->icw[s][2], k->icw[s][3]);
     at += snprintf(src + at, n - at, "};\n");
     memcpy(src + at, s_hlsl, sizeof s_hlsl);
+    return src;
+}
+
+/* A lit program's variant of one setup (per-pixel lighting, to-do 51 of
+ * Conker): K_LIT (nv2a_vsh_lit_word) and the title's rows ahead of the
+ * setup's source, then the entry ps_lit (s_hlsl_lit). lit 0: the plain
+ * source, byte for byte (the shader cache keys on it). */
+static char *ps_spec_source_lit(const PsKey *k, uint32_t lit)
+{
+    const Nv2aLitRegs *r = nv2a_vsh_lit_regs();
+    char *base, *src;
+    size_t bn, n;
+    int at;
+
+    if (!lit)
+        return ps_spec_source(k);
+    if (!r || !(base = ps_spec_source(k)))
+        return NULL;
+    bn = strlen(base);
+    n = bn + sizeof s_hlsl_lit + 512;
+    if (!(src = (char *)malloc(n))) {
+        free(base);
+        return NULL;
+    }
+    at = snprintf(src, n, "#define K_LIT 0x%Xu\n#define K_LIT_KEY %d\n"
+                  "#define K_LIT_COLOUR %d\n#define K_LIT_AMB %d\n"
+                  "#define K_LIT_BLOBS %d\n", lit, r->key_dir, r->key_col,
+                  r->amb_first, r->blob_first);
+    memcpy(src + at, base, bn);
+    memcpy(src + at + bn, s_hlsl_lit, sizeof s_hlsl_lit);
+    free(base);
     return src;
 }
 
@@ -2192,9 +2227,9 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
             continue;
         }
         QueryPerformanceCounter(&t0);
-        src = ps_spec_source(&e->key);
-        code = src ? compile_src_ex(src, "ps", "ps_4_0", 1, &loaded,
-                                    pre ? s_pss_pre_flags : 0)
+        src = ps_spec_source_lit(&e->key, e->lit);
+        code = src ? compile_src_ex(src, e->lit ? "ps_lit" : "ps", "ps_4_0",
+                                    1, &loaded, pre ? s_pss_pre_flags : 0)
                    : NULL;
         free(src);
         if (code && FAILED(ID3D11Device_CreatePixelShader(s_dev,
@@ -2220,7 +2255,8 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
         InterlockedAdd64(&s_pss_us, us);
         InterlockedIncrement(e->ps ? (loaded ? &s_pss_loaded : &s_pss_compiled)
                                    : &s_pss_failed);
-        if (e->ps && !InterlockedExchange(&e->listed, 1))
+        /* (A lit variant is not listed: the list holds setups only.) */
+        if (e->ps && !e->lit && !InterlockedExchange(&e->listed, 1))
             ps_list_add(&e->key);
         InterlockedExchange(&e->state, e->ps ? PS_READY : PS_FAILED);
         InterlockedDecrement(&s_pss_busy);
@@ -2237,11 +2273,13 @@ static uint64_t ps_hash(const PsKey *key)
     return h;
 }
 
-/* key's entry; with add, a new one when absent (*fresh = 1: the caller
- * sets its state at once, as a probe stops at the first PS_EMPTY). NULL:
- * absent and not added (the table stays half empty at most, so a probe
- * always ends). Executor thread only. */
-static PsSpec *ps_find(const PsKey *key, uint64_t h, int add, int *fresh)
+/* key's entry (lit: a lit program's variant, 0 the plain one); with add, a
+ * new one when absent (*fresh = 1: the caller sets its state at once, as a
+ * probe stops at the first PS_EMPTY). NULL: absent and not added (the
+ * table stays half empty at most, so a probe always ends). Executor thread
+ * only. */
+static PsSpec *ps_find(const PsKey *key, uint32_t lit, uint64_t h, int add,
+                       int *fresh)
 {
     uint32_t i, at;
 
@@ -2250,12 +2288,14 @@ static PsSpec *ps_find(const PsKey *key, uint64_t h, int add, int *fresh)
          i++, at = (at + 1) % PS_SPEC_MAX) {
         if (s_pss[at].state == PS_EMPTY)
             break;
-        if (s_pss[at].h == h && !memcmp(&s_pss[at].key, key, sizeof *key))
+        if (s_pss[at].h == h && s_pss[at].lit == lit
+            && !memcmp(&s_pss[at].key, key, sizeof *key))
             return &s_pss[at];
     }
     if (!add || i == PS_SPEC_MAX || s_pss_n >= PS_SPEC_MAX / 2)
         return NULL;
     s_pss[at].key = *key;
+    s_pss[at].lit = lit;
     s_pss[at].h = h;
     s_pss_n++;
     *fresh = 1;
@@ -2310,7 +2350,7 @@ static void ps_list_load(void)
     QueryPerformanceCounter(&s_pss_pre_t0);
     while (fread(&k, sizeof k, 1, f) == 1) {
         int fresh;
-        PsSpec *e = ps_find(&k, ps_hash(&k), 1, &fresh);
+        PsSpec *e = ps_find(&k, 0, ps_hash(&k), 1, &fresh);
         if (!e)
             break;                      /* the table's half is full */
         if (!fresh) {
@@ -2357,10 +2397,28 @@ static void ps_list_load(void)
 }
 
 /* The pixel shader of k's setup when it is ready; NULL: the one shader
- * (off, not compiled yet, failed, table full). Executor thread only. */
+ * (off, not compiled yet, failed, table full). lit: a lit program's
+ * variant (ps_spec_source_lit), 0 the plain one; *last remembers the
+ * caller's last entry. Executor thread only. */
+static ID3D11PixelShader *ps_spec_for(const GpuConsts *k, uint32_t lit,
+                                      PsSpec **lastp);
+
 static ID3D11PixelShader *ps_spec(const GpuConsts *k)
 {
     static PsSpec *last;
+    return ps_spec_for(k, 0, &last);
+}
+
+static ID3D11PixelShader *ps_spec_lit(const GpuConsts *k, uint32_t lit)
+{
+    static PsSpec *last;
+    return lit ? ps_spec_for(k, lit, &last) : NULL;
+}
+
+static ID3D11PixelShader *ps_spec_for(const GpuConsts *k, uint32_t lit,
+                                      PsSpec **lastp)
+{
+    PsSpec *last = *lastp;
     PsKey key;
     PsSpec *e;
     int fresh;
@@ -2395,10 +2453,11 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
         || (s_pss_on == 2 && (g_pb.flips & 1)))
         return NULL;
     ps_key(k, &key);
-    if (last && !memcmp(&last->key, &key, sizeof key)) {
+    if (last && last->lit == lit && !memcmp(&last->key, &key, sizeof key)) {
         e = last;
     } else {
-        e = ps_find(&key, ps_hash(&key), 1, &fresh);
+        e = ps_find(&key, lit, ps_hash(&key) ^ ((uint64_t)lit << 32), 1,
+                    &fresh);
         if (!e)
             return NULL;
         if (fresh) {
@@ -2409,7 +2468,7 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
             e->seen = 1;
             s_pss_seen++;
         }
-        last = e;
+        *lastp = e;
     }
     if (e->state != PS_READY) {
         if (e->state == PS_IDLE) {
@@ -5962,6 +6021,7 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
             nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw,
                                      "vs_gpu");
             nv2a_vsh_gpu_point_source(s_hlsl_vsh_points, "vs_gpu_pts");
+            nv2a_vsh_gpu_lit_source(s_hlsl_vsh_lit, "vs_gpu_lit");
         }
         fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s, points"
                 " on the %s%c", s_vsh_gpu ? "GPU" : "CPU",
@@ -7076,11 +7136,38 @@ static void d3d_draw(void)
                                                &offset);
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
-    ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
-    consts_bind_vs();
     {
-        ID3D11PixelShader *sp = ps_spec(&k);
+        /* Per-pixel lighting (to-do 51 of Conker, nv2a_vsh_lit.c): a lit
+         * program's triangles draw with its lit vertex shader (kind 2) and
+         * the lit variant of the setup's pixel shader, both or neither: a
+         * shader not ready yet keeps the batch per vertex. */
+        ID3D11VertexShader *vs = gvs ? gvs : s_vs;
+        ID3D11PixelShader *sp = NULL;
+        int lit = 0, lm = gvs && g_pb.prim != NV_PRIM_POINTS
+                          ? nv2a_vsh_lit_mode() : 0;
+        if (lm && !(lm == 2 && (g_pb.flips & 1))) {
+            uint32_t w = nv2a_vsh_lit_word(nv2a_vsh_gpu_lit());
+            if (w && k.mode[0] == PATH_COMBINERS) {
+                ID3D11PixelShader *lps = ps_spec_lit(&k, w);
+                ID3D11VertexShader *lvs =
+                    (ID3D11VertexShader *)nv2a_vsh_gpu_lit_shader(0);
+                if (lps && lvs) {
+                    vs = lvs;
+                    sp = lps;
+                    lit = 1;
+                    s_stat.lit_draws++;
+                } else {
+                    s_stat.lit_waits++;
+                }
+            }
+        }
+        ID3D11DeviceContext_VSSetShader(s_ctx, vs, NULL, 0);
+        consts_bind_vs();
+        if (!lit)
+            sp = ps_spec(&k);
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
+        if (lit)
+            nv2a_vsh_gpu_bind_ps_constants();
     }
     consts_bind_ps();
     {
@@ -7876,8 +7963,55 @@ static void exec_stats_tick(void)
     t0 = now;
 }
 
+/* RECOMP_D3D_DEBUG=1: the device made with the D3D11 debug layer (the
+ * Graphics Tools; without them the device is made as usual and a line
+ * says so), and its messages copied into the log at each present as
+ * [D3DDBG] lines: the first three of each kind, then a count at the
+ * report. For checks such as a vertex and pixel shader that do not link
+ * (per-pixel lighting's lit pair, to-do 51 of Conker). */
+static ID3D11InfoQueue *s_dbgq;
+#define DBG_IDS 64
+static struct { D3D11_MESSAGE_ID id; uint32_t n; } s_dbg_ids[DBG_IDS];
+static uint32_t s_dbg_nids, s_dbg_total;
+
+static void d3d_debug_drain(void)
+{
+    static const char *const sev[] = { "corruption", "error", "warning",
+                                       "info", "message" };
+    UINT64 n, i;
+
+    if (!s_dbgq)
+        return;
+    n = ID3D11InfoQueue_GetNumStoredMessages(s_dbgq);
+    for (i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        D3D11_MESSAGE *m;
+        uint32_t j;
+        if (FAILED(ID3D11InfoQueue_GetMessage(s_dbgq, i, NULL, &len))
+            || !(m = (D3D11_MESSAGE *)malloc(len)))
+            continue;
+        if (SUCCEEDED(ID3D11InfoQueue_GetMessage(s_dbgq, i, m, &len))) {
+            for (j = 0; j < s_dbg_nids && s_dbg_ids[j].id != m->ID; j++)
+                ;
+            if (j == s_dbg_nids && j < DBG_IDS) {
+                s_dbg_ids[j].id = m->ID;
+                s_dbg_nids++;
+            }
+            s_dbg_total++;
+            if (j < DBG_IDS && s_dbg_ids[j].n++ < 3)
+                fprintf(stderr, "[D3DDBG] %s %d: %.*s%c",
+                        (unsigned)m->Severity < 5 ? sev[m->Severity] : "?",
+                        (int)m->ID, (int)m->DescriptionByteLength,
+                        m->pDescription, 10);
+        }
+        free(m);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(s_dbgq);
+}
+
 static void d3d_present(void)
 {
+    d3d_debug_drain();
     heavy_report();
     gpu_mem_log();
     exec_stats_tick();
@@ -8034,6 +8168,14 @@ static void d3d_report(void)
     if (s_stat.tex_smooth)
         fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
                 " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
+    if (s_stat.lit_draws || s_stat.lit_waits)
+        fprintf(stderr, "[GPU] d3d11: per-pixel lit draws: %u (%u per vertex:"
+                " shader not ready)%c", s_stat.lit_draws, s_stat.lit_waits, 10);
+    if (s_dbgq) {
+        d3d_debug_drain();
+        fprintf(stderr, "[D3DDBG] %u debug layer messages of %u kinds%c",
+                s_dbg_total, s_dbg_nids, 10);
+    }
     if (s_stat.movie_43)
         fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
                 " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
@@ -8554,15 +8696,36 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
     static const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0
     };
-    D3D_FEATURE_LEVEL got;
+    D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
     IDXGIDevice *dxgi_dev = NULL;
     IDXGIAdapter *adapter = NULL;
     HRESULT hr;
 
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                           (UINT)(sizeof levels / sizeof levels[0]),
-                           D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+    {
+        const char *dbg = getenv("RECOMP_D3D_DEBUG");
+        hr = E_FAIL;
+        if (dbg && dbg[0] && dbg[0] != '0') {
+            hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT
+                                   | D3D11_CREATE_DEVICE_DEBUG, levels,
+                                   (UINT)(sizeof levels / sizeof levels[0]),
+                                   D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+            if (SUCCEEDED(hr)
+                && SUCCEEDED(ID3D11Device_QueryInterface(s_dev,
+                             &IID_ID3D11InfoQueue, (void **)&s_dbgq)))
+                fprintf(stderr, "[D3DDBG] D3D11 debug layer on (RECOMP_D3D_"
+                        "DEBUG): its messages in [D3DDBG] lines%c", 10);
+            else
+                fprintf(stderr, "[D3DDBG] no D3D11 debug layer (0x%08lX; the"
+                        " Graphics Tools not installed?): device made as"
+                        " usual%c", (unsigned long)hr, 10);
+        }
+        if (FAILED(hr))
+            hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                                   (UINT)(sizeof levels / sizeof levels[0]),
+                                   D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+    }
     if (FAILED(hr)) {
         fail("D3D11CreateDevice", hr);
         return NULL;

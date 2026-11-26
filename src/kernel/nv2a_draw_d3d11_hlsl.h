@@ -687,4 +687,70 @@ NV2A_D3D11_HLSL_VG
 "  return o;\n"
 "}\n";
 
+/* A lit program's triangles (per-pixel lighting, nv2a_vsh_lit.c; the third
+ * drawing shader kind, nv2a_vsh_gpu_lit_shader): vs_gpu as it is, plus the
+ * lighting terms the program's lit translation captured (nv2a_vsh_hlsl_lit:
+ * the normal, the blob x / y / height, the ambient's factor), handed on
+ * after VG's own fields and before the clip distances, so the pixel shaders
+ * that read V still link and ps_lit (s_hlsl_lit) reads them in order. The
+ * position path is vs_gpu's to the letter (precise). */
+static const char s_hlsl_vsh_lit[] =
+"struct VGL {\n"
+"  float4 p : SV_Position;\n"
+"  nointerpolation float4 cf : COLOR0;\n"
+"  float4 d0 : COLOR1;\n"
+"  float4 d1 : COLOR2;\n"
+"  float fog : FOG;\n"
+"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
+"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
+"  float4 ln : TEXCOORD4; float4 lp : TEXCOORD5; float4 lf : TEXCOORD6;\n"
+"  float2 cd : SV_ClipDistance0;\n"
+"};\n"
+"VGL vs_gpu_lit(uint id : SV_VertexID) {\n"
+"  float4 v[16]; VshOut r; VGL o;\n"
+"  vsh_inputs(id, v);\n"
+"  r = vsh_prog(v);\n"
+"  {\n"
+"    precise float w = r.pos.w;\n"
+"    precise float4 p = float4((r.pos.x * rt.x + rt.z) * w,\n"
+"                              (r.pos.y * rt.y + rt.w) * w,\n"
+"                              r.pos.z * zsc.x * w, w);\n"
+"    o.p = p;\n"
+"    o.cd.x = w - 1e-3;\n"
+"    o.cd.y = vc[58].z != 0.0 ? (r.pos.z - vc[59].z) / vc[58].z * w : 0.0;\n"
+"    if (!all(isfinite(r.pos))) {\n"
+"      o.p = asfloat(0x7FC00000u).xxxx; o.cd = asfloat(0x7FC00000u).xx;\n"
+"    }\n"
+"  }\n"
+"  o.cf = r.d0; o.d0 = r.d0; o.d1 = r.d1; o.fog = fog_factor(r.fog.x);\n"
+"  o.t0 = r.t0; o.t1 = r.t1; o.t2 = r.t2; o.t3 = r.t3;\n"
+"  o.ln = lit_n; o.lp = lit_p; o.lf = lit_f;\n"
+"  return o;\n"
+"}\n";
+
+/* The lit pixel shader's entry, appended after s_hlsl (with or without a
+ * setup's K_ literals; ps_spec_source_lit adds K_LIT, the program's
+ * nv2a_vsh_lit_word, and the title's rows): ps_lit takes VGL's fields and
+ * hands ps the vertex colours as they are (step 2 of to-do 51: the
+ * plumbing; the same picture as ps). The vertex program's constants are
+ * bound at b3 for it too (nv2a_vsh_gpu_bind_ps_constants). */
+static const char s_hlsl_lit[] =
+"cbuffer VshC : register(b3) { float4 vc[193]; };\n"
+"struct VL {\n"
+"  float4 p : SV_Position;\n"
+"  nointerpolation float4 cf : COLOR0;\n"
+"  float4 d0 : COLOR1;\n"
+"  float4 d1 : COLOR2;\n"
+"  float fog : FOG;\n"
+"  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1;\n"
+"  float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
+"  float4 ln : TEXCOORD4; float4 lp : TEXCOORD5; float4 lf : TEXCOORD6;\n"
+"};\n"
+"float4 ps_lit(VL i) : SV_Target {\n"
+"  V v;\n"
+"  v.p = i.p; v.cf = i.cf; v.d0 = i.d0; v.d1 = i.d1; v.fog = i.fog;\n"
+"  v.t0 = i.t0; v.t1 = i.t1; v.t2 = i.t2; v.t3 = i.t3;\n"
+"  return ps(v);\n"
+"}\n";
+
 #endif

@@ -27,11 +27,14 @@
 #define VSH_IN_SIZE  (NV2A_VSH_INPUTS * 16)
 
 /* draw_state: the drawing shader not asked for yet, waiting for a worker,
- * made, or failed. Two kinds of drawing shader per program: kind 0 for
+ * made, or failed. Three kinds of drawing shader per program: kind 0 for
  * triangles (nv2a_vsh_gpu_draw_shader), kind 1 for a POINTS batch, each
- * point drawn as its sprite square (nv2a_vsh_gpu_point_shader). */
+ * point drawn as its sprite square (nv2a_vsh_gpu_point_shader), kind 2 for
+ * a lit program's triangles drawn with per-pixel lighting (its lit
+ * translation, nv2a_vsh_gpu_lit_shader). */
 enum { DRAW_NONE, DRAW_QUEUED, DRAW_READY, DRAW_FAILED };
-enum { DRAW_KINDS = 2 };
+enum { DRAW_KINDS = 3 };
+static const char *const k_kind_name[DRAW_KINDS] = { "", "point ", "lit " };
 
 typedef struct {
     uint64_t hash;
@@ -982,13 +985,13 @@ static void compile_draw(DrawJob *j)
     if (FAILED(hr)) {
         fprintf(stderr, "[VSHGPU] program %016llX: %sdraw shader failed"
                 " (0x%08lX): %s\n", (unsigned long long)j->p->hash,
-                j->kind ? "point " : "", (unsigned long)hr,
+                k_kind_name[j->kind], (unsigned long)hr,
                 err ? (const char *)ID3D10Blob_GetBufferPointer(err) : "");
         vs = NULL;
     } else {
         fprintf(stderr, "[VSHGPU] program %016llX: %u instructions, %sdraw"
                 " shader compiled in %.1f ms\n", (unsigned long long)j->p->hash,
-                j->p->count, j->kind ? "point " : "", ms);
+                j->p->count, k_kind_name[j->kind], ms);
     }
     if (s_dump > 0)
         fprintf(stderr, "%s\n", j->src);
@@ -1019,11 +1022,18 @@ void nv2a_vsh_gpu_point_source(const char *tail, const char *entry)
     s_dentry[1] = entry;
 }
 
+void nv2a_vsh_gpu_lit_source(const char *tail, const char *entry)
+{
+    s_dtail[2] = tail;
+    s_dentry[2] = entry;
+}
+
 /* head, the fetch of the inputs in `used`, the program, tail: into a buffer
  * of its own, for the worker, which frees it. NULL when the program does
- * not translate. */
+ * not translate. Kind 2 translates the program with its lighting terms
+ * captured (lit: its scan). */
 static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
-                         int kind, size_t *len)
+                         int kind, const Nv2aVshLit *lit, size_t *len)
 {
     size_t cap = 160 * 1024, n, m;
     char *s = (char *)malloc(cap);
@@ -1039,7 +1049,8 @@ static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
     m = nv2a_vsh_hlsl_inputs(used, s + n, cap - n);
     if (!m) { free(s); return NULL; }
     n += m;
-    m = nv2a_vsh_hlsl(ins, count, s + n, cap - n);
+    m = kind == 2 ? nv2a_vsh_hlsl_lit(ins, count, lit, s + n, cap - n)
+                  : nv2a_vsh_hlsl(ins, count, s + n, cap - n);
     if (!m) { free(s); return NULL; }
     n += m;
     m = strlen(s_dtail[kind]);
@@ -1052,24 +1063,54 @@ static char *draw_source(const Nv2aVshIns *ins, uint32_t count, uint32_t used,
 /* One program found in memory: its drawing shader made and kept in the disk
  * cache (and its file) unless it is there already, exactly as the drawing
  * path would make it, so that path finds it by the same key. No VshProg:
- * the program may never be drawn. */
+ * the program may never be drawn. A lit program also gets its lit kind
+ * (2) while per-pixel lighting is on: a second pass, counted as a program
+ * of its own. */
+static void precompile_kind(const Nv2aVshIns *ins, uint32_t count,
+                            uint32_t used, uint64_t hash, int kind,
+                            const Nv2aVshLit *lit);
+
 static void precompile_job(PreJob *pj)
 {
     Nv2aVshIns ins[NV2A_VSH_SLOTS];
+    Nv2aVshLit lit;
+    uint32_t count, used;
+    uint64_t hash;
+
+    int two;
+
+    count = nv2a_vsh_decode_words(pj->words, pj->count, ins, &used, &hash);
+    free(pj->words);
+    two = count && s_dentry[2] && nv2a_vsh_lit_mode()
+          && nv2a_vsh_lit_scan(ins, count, nv2a_vsh_lit_regs(), &lit)
+          && lit.layout != NV2A_LIT_NONE;
+    if (two) {
+        /* Busy for both, so a pre-compile pass never sees the queue
+         * empty between the two. */
+        EnterCriticalSection(&s_q_cs);
+        s_pre_busy++;
+        LeaveCriticalSection(&s_q_cs);
+    }
+    precompile_kind(ins, count, used, hash, 0, NULL);
+    if (two)
+        precompile_kind(ins, count, used, hash, 2, &lit);
+}
+
+static void precompile_kind(const Nv2aVshIns *ins, uint32_t count,
+                            uint32_t used, uint64_t hash, int kind,
+                            const Nv2aVshLit *lit)
+{
     ID3DBlob *code = NULL, *err = NULL;
     ID3D11VertexShader *vs = NULL;
-    uint32_t count, used;
-    uint64_t hash, key = 0;
+    uint64_t key = 0;
     size_t len = 0;
     char *src = NULL;
     double t0 = now_ms(), ms = 0.0;
     int had = 0, loaded = 0;
     HRESULT hr = E_FAIL;
 
-    count = nv2a_vsh_decode_words(pj->words, pj->count, ins, &used, &hash);
     if (count)
-        src = draw_source(ins, count, used, 0, &len);
-    free(pj->words);
+        src = draw_source(ins, count, used, kind, lit, &len);
     if (src) {
         key = src_key(src, len);
         EnterCriticalSection(&s_q_cs);
@@ -1080,7 +1121,7 @@ static void precompile_job(PreJob *pj)
         if (had || loaded)
             cache_touch(key);           /* a scan found it: used */
         if (!had && !loaded) {
-            hr = draw_compile(src, len, s_dentry[0], &code, &err);
+            hr = draw_compile(src, len, s_dentry[kind], &code, &err);
             if (SUCCEEDED(hr))
                 hr = ID3D11Device_CreateVertexShader(s_dev,
                         ID3D10Blob_GetBufferPointer(code),
@@ -1093,12 +1134,12 @@ static void precompile_job(PreJob *pj)
             ms = now_ms() - t0;
             if (vs)
                 fprintf(stderr, "[VSHPRE] program %016llX: %u instructions,"
-                        " pre-compiled in %.1f ms\n", (unsigned long long)hash,
-                        count, ms);
+                        " %spre-compiled in %.1f ms\n", (unsigned long long)hash,
+                        count, k_kind_name[kind], ms);
             else
-                fprintf(stderr, "[VSHPRE] program %016llX: draw shader failed"
+                fprintf(stderr, "[VSHPRE] program %016llX: %sdraw shader failed"
                         " (0x%08lX): %s\n", (unsigned long long)hash,
-                        (unsigned long)hr,
+                        k_kind_name[kind], (unsigned long)hr,
                         err ? (const char *)ID3D10Blob_GetBufferPointer(err)
                             : "");
         }
@@ -1265,7 +1306,8 @@ static ID3D11VertexShader *draw_shader_kind(int wait, int kind)
 {
     VshProg *p = s_cur;
 
-    if (!s_ready || !p || p->failed || p == &s_spare || !s_dentry[kind])
+    if (!s_ready || !p || p->failed || p == &s_spare || !s_dentry[kind]
+        || (kind == 2 && p->lit.layout == NV2A_LIT_NONE))
         return NULL;
     if (p->draw_state[kind] == DRAW_READY)
         return p->draw_vs[kind];
@@ -1287,7 +1329,7 @@ static ID3D11VertexShader *draw_shader_kind(int wait, int kind)
             return NULL;
         j.p = p;
         j.kind = kind;
-        j.src = draw_source(ins, count, used, kind, &j.len);
+        j.src = draw_source(ins, count, used, kind, &p->lit, &j.len);
         if (!j.src) {
             fprintf(stderr, "[VSHGPU] program %016llX: %u instructions do not"
                     " translate\n", (unsigned long long)p->hash, count);
@@ -1311,9 +1353,14 @@ static ID3D11VertexShader *draw_shader_kind(int wait, int kind)
                         (unsigned long long)p->hash, count, va, buf);
             }
         }
-        if (nv2a_vsh_gpu_new_program_hook
-            && p->draw_state[1 - kind] == DRAW_NONE)
-            nv2a_vsh_gpu_new_program_hook(p->hash);
+        {   /* the first kind asked for this program */
+            int k2, first = 1;
+            for (k2 = 0; k2 < DRAW_KINDS; k2++)
+                if (k2 != kind && p->draw_state[k2] != DRAW_NONE)
+                    first = 0;
+            if (nv2a_vsh_gpu_new_program_hook && first)
+                nv2a_vsh_gpu_new_program_hook(p->hash);
+        }
         EnterCriticalSection(&s_q_cs);
         if (cache_on() && (d = disk_find(j.key)) != NULL) {
             /* Loaded at startup or pre-compiled: drawn on the GPU from its
@@ -1327,7 +1374,8 @@ static ID3D11VertexShader *draw_shader_kind(int wait, int kind)
             cache_touch(j.key);         /* drawn: used */
             fprintf(stderr, "[VSHGPU] program %016llX: draw shader from the"
                     " cache%s%s\n", (unsigned long long)p->hash,
-                    pre ? " (pre-compiled)" : "", kind ? " (points)" : "");
+                    pre ? " (pre-compiled)" : "",
+                    kind == 1 ? " (points)" : kind == 2 ? " (lit)" : "");
             return p->draw_vs[kind];
         }
         p->draw_state[kind] = DRAW_QUEUED;
@@ -1352,6 +1400,18 @@ struct ID3D11VertexShader *nv2a_vsh_gpu_draw_shader(int wait)
 struct ID3D11VertexShader *nv2a_vsh_gpu_point_shader(int wait)
 {
     return draw_shader_kind(wait, 1);
+}
+
+struct ID3D11VertexShader *nv2a_vsh_gpu_lit_shader(int wait)
+{
+    return draw_shader_kind(wait, 2);
+}
+
+void nv2a_vsh_gpu_bind_ps_constants(void)
+{
+    if (s_ready)
+        ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, NV2A_VSH_HLSL_CBUFFER,
+                                                 1, &s_cb);
 }
 
 void nv2a_vsh_gpu_draw_stats(uint32_t *compiled, uint32_t *failed,
