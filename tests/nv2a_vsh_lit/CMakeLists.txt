@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.20)
+project(nv2a_vsh_lit_regression C)
+enable_testing()
+add_executable(nv2a-vsh-lit-test nv2a_vsh_lit_test.c ../../src/kernel/nv2a_vsh_lit.c)
+target_include_directories(nv2a-vsh-lit-test PRIVATE ../../src/kernel)
+add_test(NAME nv2a-vsh-lit COMMAND nv2a-vsh-lit-test)

@@ -37,6 +37,7 @@ set(KERNEL_SOURCES
     nv2a_vsh_interp.c
     nv2a_vsh_hlsl.c
     nv2a_vsh_gpu.c
+    nv2a_vsh_lit.c
     nv2a_vsh_scan.c
     nv2a_vsh_prescan.c
     nv2a_combiner.c
