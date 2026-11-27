@@ -5225,7 +5225,7 @@ static int movie_stretch(void)
  * wider than the guest's shape are squeezed back to it round the anchor
  * (d3d_draw). Off again at every present, so a lost "off" never reaches the
  * next frame. */
-static int s_layout_on, s_layout_abs;
+static int s_layout_on, s_layout_abs, s_layout_box;
 static float s_layout_x;               /* share of the clip, or a guest x */
 
 /* Whether this batch samples a movie frame: a bound stage with a YUY2 /
@@ -6622,7 +6622,8 @@ static void d3d_draw(void)
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
     uint32_t offset = 0, ib_offset = 0, path, rtt;
     int strip = 0;
-    int si, st, combiners, program, zi, cut;
+    int si, st, combiners, program, zi, cut, movie43, layout;
+    float lay_a = 0.0f, lay_s = 1.0f, lay_gl = 0.0f, lay_gr = 0.0f;
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *ds;
     ID3D11RasterizerState *rs;
@@ -7154,6 +7155,36 @@ static void d3d_draw(void)
     k.rt[1] = -2.0f / (float)s_surf[si].h;
     k.rt[2] = -1.0f;
     k.rt[3] = 1.0f;
+    /* A movie squeezed to 4:3, or a 2D piece in its guest shape
+     * (NV_HOST_FX_LAYOUT): decided here, as a piece reads its x over a
+     * wider range. Squeezed round host x a, guest x lands on
+     * a (1 - s) + x sx s, so the guest's own width covers only a 4:3 box;
+     * clip space then spans the guest x range [gl, gr] that covers the
+     * whole surface, and a piece sliding in past the guest's edge shows
+     * past the box (as it would past a 4:3 screen's edge) instead of being
+     * cut there (Conker's lives counter at HUD Area 0 %). */
+    {
+        const int wide = surf_sy(si) < surf_sx(si) * 0.999f;
+
+        movie43 = bound && wide && batch_is_movie(bound) && !movie_stretch();
+        layout = !movie43 && s_layout_on && wide;
+    }
+    if (layout) {
+        const float gw = (float)s_surf[si].w, hs = surf_sx(si);
+        const float gx = s_layout_abs ? s_layout_x
+                       : (float)g_pb.clip_x + s_layout_x * (float)g_pb.clip_w;
+        float h0, xl, xr;
+
+        lay_s = surf_sy(si) / hs;
+        lay_a = gx * hs;
+        h0 = lay_a * (1.0f - lay_s);                /* guest x 0 */
+        xl = -h0 / (hs * lay_s);                    /* host 0 */
+        xr = ((float)s_surf[si].tw - h0) / (hs * lay_s);   /* host right */
+        lay_gl = xl < 0.0f ? xl : 0.0f;
+        lay_gr = xr > gw ? xr : gw;
+        k.rt[0] = 2.0f / (lay_gr - lay_gl);
+        k.rt[2] = -2.0f * lay_gl / (lay_gr - lay_gl) - 1.0f;
+    }
     k.mode[0] = path;
     k.mode[1] = bound;
     k.zsc[0] = zeta_scale();
@@ -7219,8 +7250,7 @@ static void d3d_draw(void)
     sc.top = (LONG)to_host(g_pb.clip_y, surf_sy(si));
     sc.right = (LONG)to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
     sc.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
-    if (bound && surf_sy(si) < surf_sx(si) * 0.999f && batch_is_movie(bound)
-        && !movie_stretch()) {
+    if (movie43) {
         /* Squeezed to the guest frame's shape (xbox_SetMovieStretch): every
          * x to cx + (x - cx) * s through the viewport, the scissor with it,
          * and black where the stretched picture would have been. */
@@ -7240,19 +7270,26 @@ static void d3d_draw(void)
             ID3D11DeviceContext1_ClearView(s_ctx1,
                     (ID3D11View *)s_surf[si].rtv, black, bar, 2);
         s_stat.movie_43++;
-    } else if (s_layout_on && surf_sy(si) < surf_sx(si) * 0.999f) {
+    } else if (layout) {
         /* A 2D piece in its guest shape (NV_HOST_FX_LAYOUT): every x to
          * a + (x - a) * s, as the movie squeeze above but round the anchor
-         * and without bars. */
-        const float s = surf_sy(si) / surf_sx(si);
-        const float gx = s_layout_abs ? s_layout_x
-                       : (float)g_pb.clip_x + s_layout_x * (float)g_pb.clip_w;
-        const float a = gx * surf_sx(si);
+         * and without bars, over the range [gl, gr] chosen above. A clip
+         * side inside the frame (a piece's own window) is squeezed with it;
+         * a side at the frame's edge stays there, so nothing is cut at the
+         * 4:3 box (the frame: the shown part of the surface, which is often
+         * padded wider, Conker's 640 of 1024). NV_HOST_LAYOUT_BOX: both
+         * sides squeezed, the draws kept inside the box. */
+        const float hs = surf_sx(si) * lay_s;
+        const uint32_t fl = si == s_shown && s_shown_w ? s_shown_x : 0u;
+        const uint32_t fr = si == s_shown && s_shown_w ? s_shown_x + s_shown_w
+                                                       : s_surf[si].w;
 
-        vp.TopLeftX = a * (1.0f - s);
-        vp.Width = (float)s_surf[si].tw * s;
-        sc.left = (LONG)(a + ((float)sc.left - a) * s + 0.5f);
-        sc.right = (LONG)(a + ((float)sc.right - a) * s + 0.5f);
+        vp.TopLeftX = lay_a * (1.0f - lay_s) + lay_gl * hs;
+        vp.Width = (lay_gr - lay_gl) * hs;
+        if (g_pb.clip_x > fl || s_layout_box)
+            sc.left = (LONG)(lay_a + ((float)sc.left - lay_a) * lay_s + 0.5f);
+        if (g_pb.clip_x + g_pb.clip_w < fr || s_layout_box)
+            sc.right = (LONG)(lay_a + ((float)sc.right - lay_a) * lay_s + 0.5f);
         s_stat.layout_draws++;
     }
     blend_constant(bf);
@@ -8653,6 +8690,7 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
         s_layout_on = p[0] != 0;
         s_layout_x = host_float(p[1]);
         s_layout_abs = (p[2] & NV_HOST_LAYOUT_ABS) != 0;
+        s_layout_box = (p[2] & NV_HOST_LAYOUT_BOX) != 0;
         return;
     }
     if (id == NV_HOST_FX_AO) {

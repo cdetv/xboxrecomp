@@ -434,9 +434,17 @@ typedef struct {
  *                     with a movable centre, no bars). p1 the anchor (float):
  *                     a share of the clip's width (0 its left edge, 0.5 its
  *                     middle, 1 its right edge), or with p2 bit 0 a guest x
- *                     on the surface. Clears and copies are untouched; a
- *                     surface not drawn wider than the guest's is too. Off
- *                     again at every present.
+ *                     on the surface. The squeezed draw still reaches the
+ *                     whole surface (clip space widened to match), and a
+ *                     clip side at the shown frame's edge stays there, so a
+ *                     piece sliding in from off the guest's screen shows
+ *                     past the squeezed box instead of being cut at it;
+ *                     with p2 bit 1 (NV_HOST_LAYOUT_BOX) the clip is
+ *                     squeezed whole instead, so the draws stay inside the
+ *                     box (a whole screen in the guest's shape, cut at its
+ *                     sides). Clears and copies are untouched; a surface not drawn
+ *                     wider than the guest's is too. Off again at every
+ *                     present.
  * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
  * for water, 12 for the HDR scene end: a new effect takes 14 or more. */
 #define NV_HOST_SUBCH    7u
@@ -454,6 +462,7 @@ typedef struct {
 #define NV_HOST_MBLUR_VIEW 1u           /* NV_HOST_FX_MBLUR p14 bits */
 #define NV_HOST_FX_LAYOUT 13u
 #define NV_HOST_LAYOUT_ABS 1u           /* NV_HOST_FX_LAYOUT p2 bits */
+#define NV_HOST_LAYOUT_BOX 2u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 
