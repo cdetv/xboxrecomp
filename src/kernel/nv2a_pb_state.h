@@ -425,8 +425,20 @@ typedef struct {
  *                     (share of the half diagonal; 0 = none), p14 flags
  *                     (bit 0 the motion as colour instead, for testing).
  *                     All floats but p14.
+ *   NV_HOST_FX_LAYOUT a 2D piece drawn for the guest frame's shape (a HUD
+ *                     widget, a speech bubble) keeps that shape on a surface
+ *                     drawn wider (e.g. 640x480 at 1920x1080): from p0 != 0
+ *                     until p0 = 0, each draw's x is squeezed by the
+ *                     surface's y scale / x scale round an anchor, through
+ *                     the viewport and the scissor (the movie 4:3 trick
+ *                     with a movable centre, no bars). p1 the anchor (float):
+ *                     a share of the clip's width (0 its left edge, 0.5 its
+ *                     middle, 1 its right edge), or with p2 bit 0 a guest x
+ *                     on the surface. Clears and copies are untouched; a
+ *                     surface not drawn wider than the guest's is too. Off
+ *                     again at every present.
  * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
- * for water: a new effect takes 12 or more. */
+ * for water, 12 for the HDR scene end: a new effect takes 14 or more. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   16u            /* 0x0800..0x083C, below NV_HOST_EFFECT */
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
@@ -440,6 +452,8 @@ typedef struct {
 #define NV_HOST_AO_FULL    4u
 #define NV_HOST_FX_MBLUR 11u
 #define NV_HOST_MBLUR_VIEW 1u           /* NV_HOST_FX_MBLUR p14 bits */
+#define NV_HOST_FX_LAYOUT 13u
+#define NV_HOST_LAYOUT_ABS 1u           /* NV_HOST_FX_LAYOUT p2 bits */
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 

@@ -465,6 +465,7 @@ static struct {
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t movie_43;                  /* movie batches drawn in 4:3 */
+    uint32_t layout_draws;              /* NV_HOST_FX_LAYOUT squeezes */
     uint32_t near_draws;                /* receiver_draw's two-pass draws */
     uint32_t lit_draws, lit_waits;      /* per-pixel lit; lit programs drawn
                                          * per vertex (a shader not ready) */
@@ -5220,6 +5221,13 @@ static int movie_stretch(void)
     return s_movie_stretch;
 }
 
+/* NV_HOST_FX_LAYOUT (nv2a_pb_state.h): while on, draws on a surface drawn
+ * wider than the guest's shape are squeezed back to it round the anchor
+ * (d3d_draw). Off again at every present, so a lost "off" never reaches the
+ * next frame. */
+static int s_layout_on, s_layout_abs;
+static float s_layout_x;               /* share of the clip, or a guest x */
+
 /* Whether this batch samples a movie frame: a bound stage with a YUY2 /
  * UYVY texture at least 320 wide. */
 static int batch_is_movie(uint32_t bound)
@@ -7232,6 +7240,20 @@ static void d3d_draw(void)
             ID3D11DeviceContext1_ClearView(s_ctx1,
                     (ID3D11View *)s_surf[si].rtv, black, bar, 2);
         s_stat.movie_43++;
+    } else if (s_layout_on && surf_sy(si) < surf_sx(si) * 0.999f) {
+        /* A 2D piece in its guest shape (NV_HOST_FX_LAYOUT): every x to
+         * a + (x - a) * s, as the movie squeeze above but round the anchor
+         * and without bars. */
+        const float s = surf_sy(si) / surf_sx(si);
+        const float gx = s_layout_abs ? s_layout_x
+                       : (float)g_pb.clip_x + s_layout_x * (float)g_pb.clip_w;
+        const float a = gx * surf_sx(si);
+
+        vp.TopLeftX = a * (1.0f - s);
+        vp.Width = (float)s_surf[si].tw * s;
+        sc.left = (LONG)(a + ((float)sc.left - a) * s + 0.5f);
+        sc.right = (LONG)(a + ((float)sc.right - a) * s + 0.5f);
+        s_stat.layout_draws++;
     }
     blend_constant(bf);
     vis_note_scale(surf_sx(si) * surf_sy(si));
@@ -8100,6 +8122,7 @@ static void d3d_debug_drain(void)
 
 static void d3d_present(void)
 {
+    s_layout_on = 0;
     d3d_debug_drain();
     heavy_report();
     gpu_mem_log();
@@ -8273,6 +8296,9 @@ static void d3d_report(void)
     if (s_stat.movie_43)
         fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
                 " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
+    if (s_stat.layout_draws)
+        fprintf(stderr, "[GPU] d3d11: hud layout: %u batches squeezed to the"
+                " guest's shape (host layout)%c", s_stat.layout_draws, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
@@ -8621,6 +8647,12 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
             s_aspect_w = w;
             s_aspect_h = h;
         }
+        return;
+    }
+    if (id == NV_HOST_FX_LAYOUT) {
+        s_layout_on = p[0] != 0;
+        s_layout_x = host_float(p[1]);
+        s_layout_abs = (p[2] & NV_HOST_LAYOUT_ABS) != 0;
         return;
     }
     if (id == NV_HOST_FX_AO) {
