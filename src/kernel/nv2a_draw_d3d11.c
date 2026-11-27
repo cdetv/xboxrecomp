@@ -3261,7 +3261,11 @@ static ID3D11DepthStencilState *ds_state(void)
  * hash_bytes of the same bytes names replacement textures (tex_replace.h),
  * taken only for new or changed bytes: when new bytes
  * match a PNG in RECOMP_TEX_REPLACE, the PNG goes up instead, at its own size
- * (replaced_tex); 2D textures only. */
+ * (replaced_tex); 2D textures only. A PNG bigger than the guest's texture
+ * gets a full mip chain even when the guest has one level, and sampler_stage
+ * moves the guest's level range down by log2 of the ratio: drawn small, a
+ * 4x picture blends down to the guest's own size instead of shimmering
+ * (RECOMP_TEX_REPLACE_MIPS=0 = level 0 only, as before). */
 
 /* Enough for a whole scene. With 128, Conker's first field evicted textures
  * it bound again the same frame and re-decoded ~30 a second while standing
@@ -3275,6 +3279,7 @@ typedef struct {
     uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
     uint32_t lv;                        /* mip levels uploaded (2D only) */
     uint32_t replaced;                  /* a replacement PNG (tex_replace.h): its levels */
+    uint32_t rep_shift;                 /* how much bigger the PNG is, log2, 1/16 levels */
     uint32_t sgn;                       /* channels uploaded signed (tex_signed_mask) */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
@@ -3584,6 +3589,10 @@ static int  s_tex_slot[4];
 /* Mip levels of each stage's texture as bound (1 for a surface or zeta
  * copy), for sampler_stage. Set by texture_stage. */
 static uint32_t s_tex_levels[4];
+/* A replacement bigger than the guest texture: log2 of how much bigger, in
+ * 1/16 levels (0 = none or not bigger), for sampler_stage. Set by
+ * texture_stage. */
+static uint32_t s_tex_shift[4];
 /* Signed channels of each stage's texture as uploaded (FILTER bits 28-31:
  * 1 alpha, 2 red, 4 green, 8 blue), for the shader's bsc[st].w; 0 = none
  * or not a decoded guest texture. Set by texture_stage. */
@@ -4619,8 +4628,24 @@ static void dump_guest_tex(const Texture *t, uint64_t hash)
 
 /* Stage st's texture t (hash, palette, lv levels in the guest) drawn as the
  * replacement px (w x h): a texture of its own size, with a full mip chain
- * when the guest's has levels. The cache entry keeps the guest's key, so the
+ * when the guest's has levels or px is bigger than the guest's texture
+ * (tex_replace_mips below). The cache entry keeps the guest's key, so the
  * same bytes find it again; e (the entry those bytes had, or NULL) goes. */
+/* Levels for replacements bigger than the guest texture (default on;
+ * RECOMP_TEX_REPLACE_MIPS=0 = level 0 only when the guest has one level, as
+ * before, for A/B). A 4x font sheet drawn at about its guest size is shrunk
+ * 2-4x on screen: with one level, bilinear skips texels and the letters'
+ * edges come out jagged (Conker to-do 53). */
+static int tex_replace_mips(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_TEX_REPLACE_MIPS");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
                                               GpuTexture *e, uint64_t hash,
                                               uint32_t palette, uint32_t lv,
@@ -4628,12 +4653,18 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
                                               uint32_t h)
 {
     D3D11_TEXTURE2D_DESC d;
-    uint32_t levels = 1;
+    uint32_t levels = 1, shift = 0;
+    double ratio = (double)w / t->width > (double)h / t->height
+                   ? (double)w / t->width : (double)h / t->height;
 
     if (e)
         tex_drop(e);
     e = tex_take();
-    if (lv > 1)
+    /* Bigger than the guest's: sampler_stage reads its levels shifted by
+     * log2(ratio), so the guest's level 0 is ours at `shift` (3x: 1.58). */
+    if (ratio > 1.0 && tex_replace_mips())
+        shift = (uint32_t)(log2(ratio) * 16.0 + 0.5);
+    if (lv > 1 || shift)
         while ((1u << levels) <= (w > h ? w : h))
             levels++;
     memset(&d, 0, sizeof d);
@@ -4668,6 +4699,7 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     e->d = 1;
     e->lv = lv;
     e->replaced = levels;
+    e->rep_shift = shift;
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
     e->sample_ok = 0;                   /* new bytes: full hashes until calm */
@@ -4677,6 +4709,7 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     s_stat.tex_made++;
     s_stat.tex_uploads++;
     s_tex_levels[st] = levels;
+    s_tex_shift[st] = shift;
     return e->srv;
 }
 
@@ -4701,6 +4734,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     *flags = 0;
     s_tex_src[st] = '-';
     s_tex_levels[st] = 1;
+    s_tex_shift[st] = 0;
     s_tex_sgn[st] = 0;
     if (!t->valid || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
@@ -4767,8 +4801,10 @@ guest:
      * the same frame keeps the first bind's contents until the next flip. */
     if (e && d3 > 1)
         *flags |= cube ? TEX_CUBE : TEX_VOLUME;
-    if (e)
+    if (e) {
         s_tex_levels[st] = e->replaced ? e->replaced : lv;
+        s_tex_shift[st] = e->replaced ? e->rep_shift : 0;
+    }
     s_tx.binds++;
     if (e && e->hashed_flip == g_pb.flips) {
         s_tx.flip_hit++;
@@ -5052,6 +5088,7 @@ make:
     s_stat.tex_uploads++;
     s_tx.upload_bytes += bytes;
     s_tex_levels[st] = e->lv;
+    s_tex_shift[st] = 0;
     return e->srv;
 }
 
@@ -5231,6 +5268,11 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     uint32_t lmin = ((t->control0 >> 18) & 0xFFF) >> 8;
     uint32_t lmax = ((t->control0 >> 6) & 0xFFF) >> 8;
     uint32_t key, bias, lods, color, aniso;
+    /* A replacement bigger than the guest texture (replaced_tex): its levels
+     * 0..shift are sharper than the guest's level 0, so the guest's levels
+     * lmin..lmax are ours shifted by shift (1/16 levels), and a guest with
+     * one level blends ours (trilinear) down to its own size. */
+    uint32_t shift = s_tex_shift[st], own = 0;
     int filt = tex_filter();
     int32_t sbias;
     D3D11_SAMPLER_DESC d;
@@ -5240,12 +5282,21 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
         mip = 0;                        /* nothing to pick from, or off */
     if (filt == 0)
         lmin = 0;                       /* off: level 0, as before mips */
+    if (filt == 0 || s_tex_levels[st] <= 1)
+        shift = 0;
     if (lmin > s_tex_levels[st] - 1)
         lmin = s_tex_levels[st] - 1;
-    if (lmax < lmin || !mip)
+    if (shift) {
+        own = !mip;                     /* the guest has no levels: ours */
+        mip = 2;                        /* blended: a title that turns in 3D
+                                         * (Conker's menu titles ask for the
+                                         * nearest level) would jump between
+                                         * sharp and soft */
+    }
+    if (lmax < lmin || (!mip || own))
         lmax = lmin;
-    bias = mip ? t->filter & 0x1FFF : 0;
-    lods = lmin | lmax << 8;
+    bias = mip && !own ? t->filter & 0x1FFF : 0;
+    lods = lmin | lmax << 8 | shift << 16;
     color = border ? t->border_color : 0;
     aniso = filt >= 2 && mip && lin ? (uint32_t)filt : 0u;
     key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5
@@ -5259,7 +5310,7 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
         static uint64_t seen[16];
         static int nseen;
         uint64_t kind = min | (t->filter & 0x1FFF) << 8 | (uint64_t)lods << 24
-                        | (uint64_t)s_tex_levels[st] << 40;
+                        | (uint64_t)s_tex_levels[st] << 48;
         int k;
         for (k = 0; k < nseen && seen[k] != kind; k++)
             ;
@@ -5267,9 +5318,11 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
             seen[nseen++] = kind;
             fprintf(stderr, "[GPU] d3d11: mip kind: min filter %u, %u levels"
                     " %ux%u fmt 0x%02X, CONTROL0 %08X (levels %u-%u), bias"
-                    " %d/256 (flip %u)%c", min, s_tex_levels[st], t->width,
-                    t->height, t->color, t->control0, lmin, lmax,
-                    (int32_t)((t->filter & 0x1FFF) << 19) >> 19, g_pb.flips, 10);
+                    " %d/256, bigger replacement +%u/16 (flip %u)%c", min,
+                    s_tex_levels[st], t->width, t->height, t->color,
+                    t->control0, lmin, lmax,
+                    (int32_t)((t->filter & 0x1FFF) << 19) >> 19, shift,
+                    g_pb.flips, 10);
         }
     }
     for (i = 0; i < s_nsamp; i++)
@@ -5301,8 +5354,8 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     d.BorderColor[3] = ((color >> 24) & 0xFF) / 255.0f;
     sbias = (int32_t)(bias << 19) >> 19;    /* sign-extend 13 bits */
     d.MipLODBias = (float)sbias / 256.0f;
-    d.MinLOD = (float)lmin;
-    d.MaxLOD = (float)lmax;
+    d.MinLOD = lmin ? (float)lmin + shift / 16.0f : 0.0f;
+    d.MaxLOD = (float)lmax + shift / 16.0f;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp[s_nsamp].s)))
         return NULL;
     s_samp[s_nsamp].key = key;
