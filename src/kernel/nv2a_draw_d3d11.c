@@ -4749,7 +4749,8 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
  * EASU to the texture's scaled size and the quad's bilinear stretch for
  * the rest. */
 #define MOVIE_SLOTS        2            /* the title's two frame surfaces */
-#define MOVIE_SHARPEN_DEF  25.0f        /* percent; RECOMP_MOVIE_SHARPEN */
+#define MOVIE_SHARPEN_DEF  50.0f        /* percent; RECOMP_MOVIE_SHARPEN (Conker
+                                         * user's pick 2026-11-27) */
 static volatile LONG s_movie_up = -1;
 static int s_movie_up_broken;
 static float s_movie_sharp = -1.0f;
@@ -4885,7 +4886,8 @@ static int movie_out_fit(MovieTex *m, uint32_t ow, uint32_t oh, uint32_t w,
     m->levels = levels;
     m->shift = shift;
     fprintf(stderr, "[GPU] d3d11: movie upscaling: %ux%u frames to %ux%u"
-            " (%u levels)%c", w, h, ow, oh, levels, 10);
+            " (%u levels, sharpen %g %%)%c", w, h, ow, oh, levels,
+            (double)movie_sharpen(), 10);
     return 1;
 }
 
