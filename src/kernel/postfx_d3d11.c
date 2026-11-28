@@ -1596,6 +1596,121 @@ int postfx_movie(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                     (float)oh, k);
 }
 
+/* ---- HDR output ------------------------------------------------------------ */
+
+/* hps, the HDR step (postfx_hdr; hdr_d3d11.c): t0 the SDR picture, t1 the
+ * overlay (premultiplied: drawn with straight alpha over transparent black),
+ * t2 / t3 the shown frame and its copy at the scene end (unbound: no 2D
+ * layer known, all of it 2D). hm: the frame's uv = pixel * hm.xy + hm.zw;
+ * hr: the frame's rectangle on the target (x0 y0 x1 y1); hl: paper white
+ * (nits), peak / paper white (>= 1), stretch (0..1), the knee (linear, of
+ * SDR white); ho: output (0 SDR, 1 PQ, 2 scRGB), frame and copy bound, mask
+ * view; ht: the difference that starts / completes "2D" (0..1).
+ *
+ * The picture is made linear with a plain 2.2 gamma, as an SDR monitor
+ * shows it (Windows' own SDR-in-HDR uses the sRGB curve, which lifts the
+ * darkest greys). The stretch works on the brightest channel v (so a
+ * saturated light stretches as much as a white one) and scales all three by
+ * f(v) / v, hue and saturation kept: f(v) = v below the knee, above it
+ * v + s (P - 1) t^2 with t going 0..1 from the knee to white, so SDR white
+ * lands at 1 + s (P - 1) times the paper white (P at 100 %) and the curve
+ * leaves the knee smoothly. The 2D share m (0..1, from how much the frame
+ * differs from its copy, the larger of the three channels) takes the
+ * stretch away. The overlay goes over it in gamma 2.2 terms relative to the
+ * paper white, so it blends exactly as it did over the SDR picture.
+ * PQ: SMPTE ST 2084's constants, 10000 nits = 1. */
+static const char s_hdr_hlsl[] =
+"cbuffer P : register(b0) {\n"
+"  float4 hm; float4 hr; float4 hl; float4 ho; float4 ht;\n"
+"};\n"
+"Texture2D hs : register(t0); Texture2D hu : register(t1);\n"
+"Texture2D hf : register(t2); Texture2D hc : register(t3);\n"
+"SamplerState hsm : register(s0);\n"
+"static const float3x3 to2020 = {\n"
+"  0.6274040, 0.3292820, 0.0433136,\n"
+"  0.0690970, 0.9195400, 0.0113612,\n"
+"  0.0163916, 0.0880132, 0.8955950 };\n"
+"float3 pq(float3 n) {\n"
+"  float3 y = pow(saturate(n / 10000.0), 0.1593017578125);\n"
+"  return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y),\n"
+"             78.84375);\n"
+"}\n"
+"float4 hps(float4 p : SV_Position) : SV_Target {\n"
+"  int2 q = int2(p.xy);\n"
+"  float3 x = pow(saturate(hs.Load(int3(q, 0)).rgb), 2.2);\n"
+"  float4 u = hu.Load(int3(q, 0));\n"
+"  float m = 1.0;\n"
+"  [branch] if (ho.y != 0.0 && all(p.xy >= hr.xy) && all(p.xy < hr.zw)) {\n"
+"    float2 t = p.xy * hm.xy + hm.zw;\n"
+"    float3 d = abs(hf.SampleLevel(hsm, t, 0).rgb\n"
+"                   - hc.SampleLevel(hsm, t, 0).rgb);\n"
+"    m = smoothstep(ht.x, ht.y, max(max(d.r, d.g), d.b));\n"
+"  }\n"
+"  float v = max(max(x.r, x.g), x.b);\n"
+"  float k = saturate((v - hl.w) / (1.0 - hl.w));\n"
+"  x *= 1.0 + (1.0 - m) * hl.z * (hl.y - 1.0) * k * k / max(v, 1e-4);\n"
+"  [branch] if (u.a > 0.0 || any(u.rgb > 0.0))\n"
+"    x = pow(max(u.rgb + pow(x, 1.0 / 2.2) * (1.0 - u.a), 0.0), 2.2);\n"
+"  [branch] if (ho.z != 0.0)\n"
+"    x = lerp(x, float3(0.25 + 0.75 * dot(saturate(x),\n"
+"                       float3(0.2126, 0.7152, 0.0722)), 0.0, 0.0),\n"
+"             0.6 * m);\n"
+"  [branch] if (ho.x == 0.0)\n"
+"    return float4(pow(saturate(x), 1.0 / 2.2), 1.0);\n"
+"  float3 n = x * hl.x;\n"
+"  [branch] if (ho.x == 2.0)\n"
+"    return float4(n / 80.0, 1.0);\n"
+"  return float4(pq(mul(to2020, n)), 1.0);\n"
+"}\n";
+
+#define HDR_KNEE      0.6121f     /* 0.8 ^ 2.2: from 80 % of SDR white */
+#define HDR_DIFF_LO   (0.5f / 255.0f)
+#define HDR_DIFF_HI   (6.0f / 255.0f)
+
+static ID3D11PixelShader *s_hdrps;      /* hps, made on first use */
+static int                s_hdr_broken;
+
+int postfx_hdr(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+               const PostfxHdr *h, ID3D11RenderTargetView *dst, float w,
+               float hgt)
+{
+    ID3D11ShaderResourceView *t[4];
+    float k[20], ratio;
+    int mask;
+
+    if (!h || !h->sdr || !dst || w < 1.0f || hgt < 1.0f || s_hdr_broken
+        || !setup(dev))
+        return 0;
+    if (!s_hdrps && FAILED(make_ps_from(dev, s_hdr_hlsl, sizeof s_hdr_hlsl - 1,
+                                        "hps", "ps_4_0", &s_hdrps))) {
+        fprintf(stderr, "[GPU] postfx: the HDR step's shader could not be"
+                " made%c", 10);
+        s_hdr_broken = 1;
+        return 0;
+    }
+    mask = h->frame && h->scene;
+    ratio = h->paper > 0.0f ? h->peak / h->paper : 1.0f;
+    memset(k, 0, sizeof k);
+    if (mask) {
+        memcpy(&k[0], h->map, 4 * sizeof *k);
+        memcpy(&k[4], h->rect, 4 * sizeof *k);
+    }
+    k[8] = h->paper;
+    k[9] = ratio > 1.0f ? ratio : 1.0f;
+    k[10] = h->stretch < 0.0f ? 0.0f : h->stretch > 1.0f ? 1.0f : h->stretch;
+    k[11] = HDR_KNEE;
+    k[12] = (float)h->out;
+    k[13] = mask ? 1.0f : 0.0f;
+    k[14] = h->mask_view ? 1.0f : 0.0f;
+    k[16] = HDR_DIFF_LO;
+    k[17] = HDR_DIFF_HI;
+    t[0] = h->sdr;
+    t[1] = h->ui;
+    t[2] = mask ? h->frame : NULL;
+    t[3] = mask ? h->scene : NULL;
+    return run_draw(ctx, NULL, s_hdrps, t, 4, dst, 0.0f, 0.0f, w, hgt, k);
+}
+
 #else
 
 int xbox_SetPicture(float gamma, float contrast, float saturation)

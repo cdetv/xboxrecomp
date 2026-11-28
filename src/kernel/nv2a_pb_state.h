@@ -445,8 +445,15 @@ typedef struct {
  *                     sides). Clears and copies are untouched; a surface not drawn
  *                     wider than the guest's is too. Off again at every
  *                     present.
+ *   NV_HOST_FX_SCENE_END the 3D picture of this frame is done: what is drawn
+ *                     on the current colour surface after it (until the
+ *                     flip) is the 2D layer (HUD, text, menus), kept at
+ *                     the paper white by HDR output (hdr_d3d11.c). Asked
+ *                     for again in a frame, the earlier one is forgotten
+ *                     (a full-screen wash drawn after it belongs to the
+ *                     picture). A frame without one is all 2D. No params.
  * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
- * for water, 12 for the HDR scene end: a new effect takes 14 or more. */
+ * for water: a new effect takes 14 or more. */
 #define NV_HOST_SUBCH    7u
 #define NV_HOST_PARAMS   16u            /* 0x0800..0x083C, below NV_HOST_EFFECT */
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
@@ -460,6 +467,7 @@ typedef struct {
 #define NV_HOST_AO_FULL    4u
 #define NV_HOST_FX_MBLUR 11u
 #define NV_HOST_MBLUR_VIEW 1u           /* NV_HOST_FX_MBLUR p14 bits */
+#define NV_HOST_FX_SCENE_END 12u
 #define NV_HOST_FX_LAYOUT 13u
 #define NV_HOST_LAYOUT_ABS 1u           /* NV_HOST_FX_LAYOUT p2 bits */
 #define NV_HOST_LAYOUT_BOX 2u

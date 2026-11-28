@@ -53,6 +53,7 @@
 #include "ao_d3d11.h"
 #include "mblur_d3d11.h"
 #include "vsync_d3d11.h"
+#include "hdr_d3d11.h"
 #include "tex_replace.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -89,6 +90,41 @@ void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
 {
     s_overlay = fn;
 }
+
+/* HDR output (hdr_d3d11.c). s_hdr_out is what the swap chain puts out
+ * (HDR_OUT_*; its format and colour space follow, swap_format). With the
+ * HDR step on for a present (s_hdr_step: HDR out, or RECOMP_HDR=2's mask
+ * view on an SDR monitor), the filter chain draws into s_hdr_in (16-bit
+ * float, the back buffer's size) instead of the back buffer, the overlay
+ * gets s_hdr_in for photos and s_hdr_ui (xbox_GpuOverlayTarget) to draw
+ * into, and postfx_hdr maps both onto the back buffer. */
+typedef struct {
+    ID3D11Texture2D          *tex;
+    ID3D11RenderTargetView   *rtv;
+    ID3D11ShaderResourceView *srv;
+    uint32_t                  w, h;
+} HdrTex;
+static int        s_hdr_out;         /* HDR_OUT_* */
+static int        s_hdr_ever;        /* was ever HDR: colour space set back */
+static int        s_hdr_failed;      /* refused: SDR from now on (said) */
+static int        s_hdr_step;        /* this present */
+static int        s_hdr_ui_used;     /* the overlay asked for s_hdr_ui */
+static HdrMonitor s_hdr_mon;
+static HdrTex     s_hdr_in, s_hdr_ui;
+
+/* NV_HOST_FX_SCENE_END: a copy of the frame surface when the title's 3D
+ * picture is done (copied only while the HDR step runs). Good for the
+ * present that follows when it shows the same surface. */
+static ID3D11Texture2D          *s_scene_tex;
+static ID3D11ShaderResourceView *s_scene_srv;
+static uint32_t s_scene_addr, s_scene_pitch;
+static int      s_scene_valid;
+
+/* What shown_to_back drew last: the shown surface's rectangle (host
+ * pixels) onto the target's rectangle; s_map_ok 0 when nothing was. */
+static float s_map_src[4], s_map_dst[4];
+static int   s_map_ok;
+
 
 /* The title's frame. The swap chain is the render resolution (this size
  * when none is set); DXGI scales it to the window's aspect-keeping view. */
@@ -907,6 +943,42 @@ static ID3D11Texture2D *back_tex(void)
     return t;
 }
 
+/* The swap chain's format (and the exclusive canvas's) for s_hdr_out. */
+static DXGI_FORMAT swap_format(void)
+{
+    return s_hdr_out == HDR_OUT_PQ ? DXGI_FORMAT_R10G10B10A2_UNORM
+         : s_hdr_out == HDR_OUT_SCRGB ? DXGI_FORMAT_R16G16B16A16_FLOAT
+         : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+/* The swap chain's colour space for s_hdr_out, after every new or resized
+ * swap chain (DXGI may reset it): HDR10 (PQ, BT.2020), scRGB (linear
+ * BT.709) or plain sRGB. Not asked for while the swap chain has never been
+ * HDR, so an SDR one stays exactly as before. 1 when set (or not needed). */
+static int hdr_colour_space(void)
+{
+    IDXGISwapChain3 *s3 = NULL;
+    DXGI_COLOR_SPACE_TYPE cs = s_hdr_out == HDR_OUT_PQ
+                               ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                             : s_hdr_out == HDR_OUT_SCRGB
+                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                             : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT sup = 0;
+    int ok = 0;
+
+    if (s_hdr_out == HDR_OUT_SDR && !s_hdr_ever)
+        return 1;
+    if (!s_swap || FAILED(IDXGISwapChain1_QueryInterface(s_swap,
+            &IID_IDXGISwapChain3, (void **)&s3)))
+        return 0;
+    if (SUCCEEDED(IDXGISwapChain3_CheckColorSpaceSupport(s3, cs, &sup))
+        && (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+        && SUCCEEDED(IDXGISwapChain3_SetColorSpace1(s3, cs)))
+        ok = 1;
+    IDXGISwapChain3_Release(s3);
+    return ok;
+}
+
 /* A view on the swap chain's buffer, just made or resized: the back
  * buffer's own, or in exclusive mode the monitor's (s_out_rtv, its size
  * read back). */
@@ -933,10 +1005,14 @@ static int swap_view(void)
         fail("back buffer view", hr);
         return 0;
     }
+    if (!hdr_colour_space() && s_hdr_out != HDR_OUT_SDR)
+        fprintf(stderr, "[HDR] the swap chain did not take its colour"
+                " space%c", 10);
     return 1;
 }
 
-/* Exclusive mode: the s_bb_w x s_bb_h texture the frame is drawn into. */
+/* Exclusive mode: the s_bb_w x s_bb_h texture the frame is drawn into, in
+ * the swap chain's format (canvas_to_out copies it there). */
 static int make_canvas(void)
 {
     D3D11_TEXTURE2D_DESC td;
@@ -947,7 +1023,7 @@ static int make_canvas(void)
     td.Height = s_bb_h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = swap_format();
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1037,7 +1113,7 @@ static int ensure_swap_chain(void)
             d.Height = (UINT)r.bottom;
         }
     }
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.Format = swap_format();
     d.SampleDesc.Count = 1;
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     d.BufferCount = 2;
@@ -8083,13 +8159,363 @@ static int aspect_rect(float *x, float *y, float *w, float *h)
     return 1;
 }
 
-static void shown_to_back(void)
+/* s_map_*: the shown surface's rectangle sx,sy sw x sh onto the target's
+ * dx,dy dw x dh. */
+static void map_note(float sx, float sy, float sw, float sh, float dx,
+                     float dy, float dw, float dh)
+{
+    s_map_src[0] = sx; s_map_src[1] = sy; s_map_src[2] = sw; s_map_src[3] = sh;
+    s_map_dst[0] = dx; s_map_dst[1] = dy; s_map_dst[2] = dw; s_map_dst[3] = dh;
+    s_map_ok = sw > 0.0f && sh > 0.0f && dw > 0.0f && dh > 0.0f;
+}
+
+/* t at w x h in format f, a render target with a shader view; made again
+ * when the size changes. 0 (said once) when it cannot be made. */
+static int hdr_tex_fit(HdrTex *t, uint32_t w, uint32_t h, DXGI_FORMAT f)
+{
+    D3D11_TEXTURE2D_DESC td;
+    HRESULT hr;
+
+    if (t->tex && t->w == w && t->h == h)
+        return 1;
+    if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+    if (t->rtv) ID3D11RenderTargetView_Release(t->rtv);
+    if (t->tex) ID3D11Texture2D_Release(t->tex);
+    memset(t, 0, sizeof *t);
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = f;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->tex);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->tex,
+                                                 NULL, &t->rtv);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)t->tex, NULL, &t->srv);
+    if (FAILED(hr)) {
+        static int said;
+        if (!said++)
+            fail("HDR texture", hr);
+        if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+        if (t->rtv) ID3D11RenderTargetView_Release(t->rtv);
+        if (t->tex) ID3D11Texture2D_Release(t->tex);
+        memset(t, 0, sizeof *t);
+        return 0;
+    }
+    t->w = w;
+    t->h = h;
+    return 1;
+}
+
+/* For the host overlay, during its hook: with the HDR step on, a render
+ * target the back buffer's size, cleared to transparent, to draw into
+ * instead of back_rtv (which then holds the SDR picture, for photos). Its
+ * colours are SDR, shown at the paper white over the HDR picture and
+ * blended as they would be over the SDR one. NULL when the overlay draws
+ * into back_rtv as before. */
+void *xbox_GpuOverlayTarget(void)
+{
+    static const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (!s_hdr_step)
+        return NULL;
+    if (!s_hdr_ui_used) {
+        if (!hdr_tex_fit(&s_hdr_ui, s_hdr_in.w, s_hdr_in.h,
+                         DXGI_FORMAT_B8G8R8A8_UNORM))
+            return NULL;
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_hdr_ui.rtv, clear);
+        s_hdr_ui_used = 1;
+    }
+    return s_hdr_ui.rtv;
+}
+
+/* For the title's side of NV_HOST_FX_SCENE_END: 1 while the HDR step runs
+ * (as of the last present), so the mark is sent only then. */
+int xbox_HdrStepOn(void)
+{
+    return s_hdr_step;
+}
+
+static const char *const s_hdr_out_name[] = {
+    "SDR", "HDR10 (PQ, BT.2020, R10G10B10A2)",
+    "scRGB (linear, 16-bit float)",
+};
+
+/* The swap chain to output out (HDR_OUT_*), between two presents: its
+ * buffers in the new format (the canvas too in exclusive mode), then the
+ * colour space. Refused: SDR from now on (said). */
+static void swap_reformat(int out)
+{
+    int was = s_hdr_out;
+    HRESULT hr;
+
+    s_hdr_out = out;
+    if (out != HDR_OUT_SDR)
+        s_hdr_ever = 1;
+    drop_views();
+    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, s_excl ? s_out_w : s_bb_w,
+                                       s_excl ? s_out_h : s_bb_h,
+                                       swap_format(), s_swap_flags);
+    if (SUCCEEDED(hr) && !hdr_colour_space())
+        hr = E_NOTIMPL;
+    if (FAILED(hr) && out != HDR_OUT_SDR) {
+        fprintf(stderr, "[HDR] the swap chain could not output %s (hr"
+                " 0x%08lX): SDR from now on%c", s_hdr_out_name[out],
+                (unsigned long)hr, 10);
+        s_hdr_failed = 1;
+        s_hdr_out = HDR_OUT_SDR;
+        hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, s_excl ? s_out_w : s_bb_w,
+                                           s_excl ? s_out_h : s_bb_h,
+                                           swap_format(), s_swap_flags);
+        hdr_colour_space();
+    }
+    if (FAILED(hr))
+        fail("ResizeBuffers (HDR output)", hr);
+    if (!swap_view() || (s_excl && !make_canvas())) {
+        /* Remade at the next present, in the format wanted now. */
+        drop_swap_chain();
+        hdr_set_active(s_hdr_out);
+        return;
+    }
+    hdr_set_active(s_hdr_out);
+    if (s_hdr_out != was && s_hdr_out == HDR_OUT_SDR) {
+        fprintf(stderr, "[HDR] output now SDR on %s%c", s_hdr_mon.name[0]
+                ? s_hdr_mon.name : "?", 10);
+    } else if (s_hdr_out != was) {
+        float paper, peak, stretch;
+        hdr_levels(&s_hdr_mon, &paper, &peak, &stretch);
+        fprintf(stderr, "[HDR] output now %s on %s; paper white %.0f nits,"
+                " peak %.0f, highlight stretch %.0f %%%c",
+                s_hdr_out_name[s_hdr_out], s_hdr_mon.name[0] ? s_hdr_mon.name
+                : "?", paper, peak, stretch * 100.0f, 10);
+    }
+}
+
+/* Before each present (held ones too): the window's monitor followed, the
+ * swap chain switched to HDR or back as the setting and that monitor say,
+ * and whether the HDR step runs this present. */
+static void hdr_update(void)
+{
+    int out;
+
+    hdr_follow((HWND)xbox_FramebufferWindowHandle(), &s_hdr_mon);
+    out = s_hdr_failed ? HDR_OUT_SDR : hdr_wanted_out(&s_hdr_mon);
+    if (out != s_hdr_out && s_swap)
+        swap_reformat(out);
+    s_hdr_step = s_swap && (s_hdr_out != HDR_OUT_SDR || hdr_mode() == 2);
+    if (s_hdr_step && !hdr_tex_fit(&s_hdr_in, s_bb_w, s_bb_h,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        s_hdr_step = 0;
+        if (s_hdr_out != HDR_OUT_SDR) {
+            s_hdr_failed = 1;
+            swap_reformat(HDR_OUT_SDR);
+        }
+    }
+}
+
+/* NV_HOST_FX_SCENE_END: the current colour surface copied into s_scene_tex
+ * (only while the HDR step runs: nothing changes for SDR). Marked again in a
+ * frame, the copy is taken again (the haze, a full-screen wash, belongs to
+ * the 3D picture). */
+static void scene_copy(void)
+{
+    D3D11_TEXTURE2D_DESC d, sd;
+    int si;
+
+    if (!s_hdr_step)
+        return;
+    si = surface_current();
+    if (si < 0)
+        return;
+    ID3D11Texture2D_GetDesc(s_surf[si].tex, &d);
+    if (s_scene_tex) {
+        ID3D11Texture2D_GetDesc(s_scene_tex, &sd);
+        if (sd.Width != d.Width || sd.Height != d.Height
+            || sd.Format != d.Format) {
+            ID3D11ShaderResourceView_Release(s_scene_srv);
+            ID3D11Texture2D_Release(s_scene_tex);
+            s_scene_srv = NULL;
+            s_scene_tex = NULL;
+        }
+    }
+    if (!s_scene_tex) {
+        sd = d;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Usage = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        sd.CPUAccessFlags = 0;
+        sd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &sd, NULL, &s_scene_tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_scene_tex, NULL, &s_scene_srv))) {
+            static int said;
+            if (!said++)
+                fail("HDR scene copy", E_FAIL);
+            if (s_scene_tex) ID3D11Texture2D_Release(s_scene_tex);
+            s_scene_tex = NULL;
+            s_scene_srv = NULL;
+            return;
+        }
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_scene_tex,
+                                     (ID3D11Resource *)s_surf[si].tex);
+    s_scene_addr = s_surf[si].addr;
+    s_scene_pitch = s_surf[si].pitch;
+    s_scene_valid = 1;
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host scene end: %08X copied (%ux%u)%c",
+                s_surf[si].addr, d.Width, d.Height, 10);
+}
+
+/* The HDR step, after the overlay: s_hdr_in (the SDR picture) and the
+ * overlay's s_hdr_ui onto the back buffer, the 2D layer told from the 3D
+ * picture by the frame and its scene-end copy. A step that cannot run:
+ * SDR from the next present on. */
+static void hdr_step(void)
+{
+    static int last_why = -1;
+    PostfxHdr h;
+    float paper, peak, stretch;
+    D3D11_TEXTURE2D_DESC fd, sd;
+    int why;                            /* the 2D layer: 0 known, else why not */
+
+    /* Said whenever it changes: 1 no scene-end mark this frame (all 2D: a
+     * menu, a movie, a loading screen), 2 the mark's surface is not the
+     * one shown, 3 their sizes differ, 4 nothing shown. */
+    why = !s_scene_valid ? 1
+        : !s_map_ok || s_shown < 0 || !s_surf[s_shown].tex ? 4
+        : s_surf[s_shown].addr != s_scene_addr
+          || s_surf[s_shown].pitch != s_scene_pitch ? 2 : 0;
+    memset(&h, 0, sizeof h);
+    hdr_levels(&s_hdr_mon, &paper, &peak, &stretch);
+    h.out = s_hdr_out;
+    h.paper = paper;
+    h.peak = peak;
+    h.stretch = s_hdr_out == HDR_OUT_SDR ? 0.0f : stretch;
+    h.mask_view = hdr_mode() == 2;
+    h.sdr = s_hdr_in.srv;
+    h.ui = s_hdr_ui_used ? s_hdr_ui.srv : NULL;
+    if (!why
+        && (s_surf[s_shown].srv
+            || SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_surf[s_shown].tex, NULL,
+                    &s_surf[s_shown].srv)))) {
+        ID3D11Texture2D_GetDesc(s_surf[s_shown].tex, &fd);
+        ID3D11Texture2D_GetDesc(s_scene_tex, &sd);
+        if (fd.Width != sd.Width || fd.Height != sd.Height) {
+            why = 3;
+        } else {
+            /* frame uv = (target pixel - dst corner) * src/dst + src corner,
+             * over the texture's size */
+            float kx = s_map_src[2] / s_map_dst[2];
+            float ky = s_map_src[3] / s_map_dst[3];
+            h.frame = s_surf[s_shown].srv;
+            h.scene = s_scene_srv;
+            h.map[0] = kx / (float)fd.Width;
+            h.map[1] = ky / (float)fd.Height;
+            h.map[2] = (s_map_src[0] - s_map_dst[0] * kx) / (float)fd.Width;
+            h.map[3] = (s_map_src[1] - s_map_dst[1] * ky) / (float)fd.Height;
+            h.rect[0] = s_map_dst[0];
+            h.rect[1] = s_map_dst[1];
+            h.rect[2] = s_map_dst[0] + s_map_dst[2];
+            h.rect[3] = s_map_dst[1] + s_map_dst[3];
+        }
+    }
+    if (why != last_why) {
+        static const char *const what[] = {
+            "known (the frame against its scene-end copy)",
+            "unknown: no scene-end mark this frame (all at paper white)",
+            "unknown: the scene-end copy is of another surface",
+            "unknown: the scene-end copy is another size",
+            "unknown: nothing shown",
+        };
+        fprintf(stderr, "[HDR] 2D layer %s", what[why]);
+        if (why == 2)
+            fprintf(stderr, " (copied %08X pitch %u, shown %08X pitch %u)",
+                    s_scene_addr, s_scene_pitch, s_surf[s_shown].addr,
+                    s_surf[s_shown].pitch);
+        fprintf(stderr, "%c", 10);
+        last_why = why;
+    }
+    if (!postfx_hdr(s_dev, s_ctx, &h, s_back_rtv, (float)s_bb_w,
+                    (float)s_bb_h)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HDR] the HDR step could not run: SDR from now"
+                    " on%c", 10);
+        s_hdr_failed = 1;
+    }
+}
+
+/* RECOMP_BB_DUMP with an HDR back buffer: <prefix>NNNNN.hdr, raw: "HDR1",
+ * width, height, DXGI format (little-endian 32-bit each), then the rows,
+ * 4 bytes a pixel for R10G10B10A2, 8 for R16G16B16A16_FLOAT. */
+static void dump_hdr(int seq)
+{
+    static const char *prefix = (const char *)-1;
+    ID3D11Texture2D *back = NULL, *st = NULL;
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    char path[512];
+    uint32_t hdr[4], bpp, y;
+    FILE *f;
+
+    if (prefix == (const char *)-1)
+        prefix = getenv("RECOMP_BB_DUMP");
+    if (!prefix || seq < 0 || !(back = back_tex()))
+        return;
+    ID3D11Texture2D_GetDesc(back, &d);
+    bpp = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st))) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st,
+                                         (ID3D11Resource *)back);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                              D3D11_MAP_READ, 0, &m))) {
+            snprintf(path, sizeof path, "%s%05d.hdr", prefix, seq);
+            f = fopen(path, "wb");
+            if (f) {
+                memcpy(&hdr[0], "HDR1", 4);
+                hdr[1] = d.Width;
+                hdr[2] = d.Height;
+                hdr[3] = (uint32_t)d.Format;
+                fwrite(hdr, 4, 4, f);
+                for (y = 0; y < d.Height; y++)
+                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+                           bpp, d.Width, f);
+                fclose(f);
+                if (seq == 0)
+                    fprintf(stderr, "  [GPU] d3d11 HDR back buffer dump: %s"
+                            " (%ux%u)%c", path, d.Width, d.Height, 10);
+            }
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+        }
+        ID3D11Texture2D_Release(st);
+    }
+    ID3D11Texture2D_Release(back);
+}
+
+/* The shown frame into dst (the back buffer, or with the HDR step on the
+ * float s_hdr_in, which takes no plain copy from the frame), on black. */
+static void shown_to_back(ID3D11RenderTargetView *dst)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
     float ax, ay, aw, ah;
+    int to_float = dst != s_back_rtv;
 
-    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    s_map_ok = 0;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, dst, black);
     if (s_shown >= 0 && !g_pb_present_black && (back = back_tex())
         && aspect_rect(&ax, &ay, &aw, &ah)) {
         /* At a set shape (NV_HOST_FX_ASPECT): the whole shown rectangle
@@ -8098,9 +8524,10 @@ static void shown_to_back(void)
         float bl = (float)to_host(s_shown_x, sx), bt = (float)to_host(s_shown_y, sy);
         float bw = (float)(to_host(s_shown_x + s_shown_w, sx) - to_host(s_shown_x, sx));
         float bh = (float)(to_host(s_shown_y + s_shown_h, sy) - to_host(s_shown_y, sy));
+        map_note(bl, bt, bw, bh, ax, ay, aw, ah);
         if (!postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex, bl, bt, bw, bh,
-                         s_back_rtv, ax, ay, aw, ah))
-            blit_stretch(s_surf[s_shown].tex, bl, bt, bw, bh, s_back_rtv,
+                         dst, ax, ay, aw, ah))
+            blit_stretch(s_surf[s_shown].tex, bl, bt, bw, bh, dst,
                          ax, ay, aw, ah);
         ID3D11Texture2D_Release(back);
     } else if (s_shown >= 0 && !g_pb_present_black && (back || (back = back_tex()))) {
@@ -8140,24 +8567,32 @@ static void shown_to_back(void)
             uint32_t dh = to_host(s_shown_h, by);
             float fw = (float)(dw < s_bb_w ? dw : s_bb_w);
             float fh = (float)(dh < s_bb_h ? dh : s_bb_h);
+            map_note((float)box.left, (float)box.top, (float)bw, (float)bh,
+                     0.0f, 0.0f, fw, fh);
             if (!postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
                              (float)box.left, (float)box.top, (float)bw,
-                             (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
+                             (float)bh, dst, 0.0f, 0.0f, fw, fh))
                 blit_stretch(s_surf[s_shown].tex, (float)box.left,
                              (float)box.top, (float)bw, (float)bh,
-                             s_back_rtv, 0.0f, 0.0f, fw, fh);
-        } else if (postfx_active()
-                   && postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
-                                  (float)box.left, (float)box.top,
-                                  (float)(box.right - box.left),
-                                  (float)(box.bottom - box.top), s_back_rtv,
-                                  0.0f, 0.0f, (float)(box.right - box.left),
-                                  (float)(box.bottom - box.top))) {
-            /* Filtered, pixel for pixel. */
+                             dst, 0.0f, 0.0f, fw, fh);
         } else {
-            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-                    (ID3D11Resource *)back, 0, 0, 0, 0,
-                    (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+            float cw = (float)(box.right - box.left);
+            float ch = (float)(box.bottom - box.top);
+            map_note((float)box.left, (float)box.top, cw, ch, 0.0f, 0.0f,
+                     cw, ch);
+            if ((to_float || postfx_active())
+                && postfx_draw(s_dev, s_ctx, s_surf[s_shown].tex,
+                               (float)box.left, (float)box.top, cw, ch, dst,
+                               0.0f, 0.0f, cw, ch)) {
+                /* Filtered, pixel for pixel (into s_hdr_in always). */
+            } else if (to_float) {
+                blit_stretch(s_surf[s_shown].tex, (float)box.left,
+                             (float)box.top, cw, ch, dst, 0.0f, 0.0f, cw, ch);
+            } else {
+                ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                        (ID3D11Resource *)back, 0, 0, 0, 0,
+                        (ID3D11Resource *)s_surf[s_shown].tex, 0, &box);
+            }
         }
         ID3D11Texture2D_Release(back);
     }
@@ -8279,6 +8714,7 @@ static void apply_render_res(void)
                                        s_swap_flags);
     if (FAILED(hr))
         fail("ResizeBuffers", hr);
+    hdr_colour_space();
     if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
                                             (void **)&back))) {
         D3D11_TEXTURE2D_DESC d;
@@ -8580,16 +9016,33 @@ static void d3d_present(void)
             apply_render_res();
             if (!s_swap)
                 break;
+            hdr_update();
+            if (!s_swap)
+                break;
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             gt_frame_begin();
-            shown_to_back();
+            shown_to_back(s_hdr_step ? s_hdr_in.rtv : s_back_rtv);
             gt_mark(GT_POST, GT_KEYS);
-            dump_back(seq);
-            seq = -1;                   /* not again for a held frame */
+            if (!s_hdr_step) {
+                dump_back(seq);
+                seq = -1;               /* not again for a held frame */
+            }
+            s_hdr_ui_used = 0;
             hold = overlay
-                 ? overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h) : 0;
+                 ? overlay(s_dev, s_ctx, s_hdr_step ? s_hdr_in.rtv : s_back_rtv,
+                           s_bb_w, s_bb_h) : 0;
             gt_mark(GT_OVERLAY, GT_KEYS);
+            if (s_hdr_step) {
+                /* The overlay drawn into s_hdr_ui (xbox_GpuOverlayTarget):
+                 * the back buffer's dump has it too. */
+                hdr_step();
+                if (s_hdr_out == HDR_OUT_SDR)
+                    dump_back(seq);
+                else
+                    dump_hdr(seq);
+                seq = -1;
+            }
             gt_frame_end();
             /* The title paces itself on the vblank the kernel emulates;
              * whether the present also waits for the monitor is VSync's
@@ -8607,6 +9060,7 @@ static void d3d_present(void)
         } while (hold);
     }
     s_shown_stale = 1;
+    s_scene_valid = 0;                  /* the next frame marks its own */
     /* A new pack list (tex_replace_set_packs, e.g. from the overlay above):
      * listed here, between two frames, on this thread, which is the one
      * that looks replacements up. */
@@ -9077,6 +9531,10 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
         d3d_host_mblur(p);
         return;
     }
+    if (id == NV_HOST_FX_SCENE_END) {
+        scene_copy();
+        return;
+    }
     if (id != NV_HOST_FX_DOF)
         return;
     si = surface_current();
@@ -9355,6 +9813,16 @@ int xbox_RenderScaleSize(unsigned *w, unsigned *h)
     *w = 640;
     *h = 480;
     return 100;
+}
+
+void *xbox_GpuOverlayTarget(void)
+{
+    return NULL;
+}
+
+int xbox_HdrStepOn(void)
+{
+    return 0;
 }
 
 #endif
