@@ -1482,6 +1482,120 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     return ok;
 }
 
+/* ---- movie frames ----------------------------------------------------------- */
+
+/* Movie upscaling (nv2a_draw_d3d11.c movie_stage): yps turns the raw 4:2:2
+ * words of a movie frame (t0, an R8G8B8A8_UINT texture with one texel per
+ * pixel pair: Y0 U Y1 V, or U Y0 V Y1 when pk.y is set; pk.x the pairs a
+ * line, pk.w the lines) into colour, BT.601 limited range with the
+ * software sampler's numbers (pb_tex_texel case 0x24): an even pixel comes
+ * out exactly as there. An odd one takes the mean of its own pair's chroma
+ * and the next pair's (the chroma is sited with the even pixel), where the
+ * sampler repeats its own pair's: no colour steps two pixels wide. With
+ * pk.z set the frame's chroma comes in row pairs (a 4:2:0 source written
+ * out as 4:2:2: lines 2j and 2j+1 the same), so each line also takes a
+ * quarter of the pair across its nearer edge (the chroma sited between the
+ * two lines): no colour steps two lines tall either. */
+static const char s_yuv_hlsl[] =
+"cbuffer P : register(b0) {\n"
+"  float4 pk; float4 po; float4 pl; float4 pa; float4 pc;\n"
+"};\n"
+"Texture2D<uint4> yt : register(t0);\n"
+"float2 ych(int i, int y, bool odd) {\n"
+"  uint4 g = yt.Load(int3(i, y, 0));\n"
+"  uint4 n = yt.Load(int3(min(i + 1, int(pk.x) - 1), y, 0));\n"
+"  if (pk.y != 0.0) { g = g.yxwz; n = n.yxwz; }\n"
+"  float2 uv = float2(g.yw) - 128.0;\n"
+"  if (odd) uv = 0.5 * (uv + float2(n.yw) - 128.0);\n"
+"  return uv;\n"
+"}\n"
+"float4 yps(float4 p : SV_Position) : SV_Target {\n"
+"  int2 q = int2(p.xy - po.xy);\n"
+"  int i = q.x >> 1;\n"
+"  bool odd = (q.x & 1) != 0;\n"
+"  uint4 g = yt.Load(int3(i, q.y, 0));\n"
+"  if (pk.y != 0.0) g = g.yxwz;\n"
+"  float c = float(odd ? g.z : g.x) - 16.0;\n"
+"  float2 uv = ych(i, q.y, odd);\n"
+"  [branch] if (pk.z != 0.0) {\n"
+"    int ny = clamp((q.y & 1) != 0 ? q.y + 1 : q.y - 1, 0, int(pk.w) - 1);\n"
+"    uv = 0.75 * uv + 0.25 * ych(i, ny, odd);\n"
+"  }\n"
+"  float3 v = floor((298.0 * c + float3(409.0 * uv.y,\n"
+"                    -100.0 * uv.x - 208.0 * uv.y, 516.0 * uv.x) + 128.0)\n"
+"                   / 256.0);\n"
+"  return float4(saturate(v / 255.0), 1.0);\n"
+"}\n";
+
+static ID3D11PixelShader *s_yuv;        /* yps, made on first use */
+static int                s_yuv_broken; /* not made, said once */
+static Surf               s_mv_rgb;     /* a movie frame in colour */
+static Surf               s_mv_mid;     /* EASU's output when RCAS follows */
+
+int postfx_movie(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                 ID3D11ShaderResourceView *yuv, unsigned flags, UINT w,
+                 UINT h, ID3D11RenderTargetView *dst, UINT ow, UINT oh,
+                 float sharpen)
+{
+    float k[20];
+    int rcas;
+
+    if (!yuv || !dst || w < 2 || !h || ow < w || oh < h || s_yuv_broken
+        || !setup(dev))
+        return 0;
+    if (!s_yuv && FAILED(make_ps_from(dev, s_yuv_hlsl, sizeof s_yuv_hlsl - 1,
+                                      "yps", "ps_4_0", &s_yuv))) {
+        fprintf(stderr, "[GPU] postfx: the movie colour shader could not be"
+                " made; movies decoded as before%c", 10);
+        s_yuv_broken = 1;
+        return 0;
+    }
+    memset(k, 0, sizeof k);
+    k[0] = (float)(w / 2);
+    k[1] = (flags & POSTFX_MOVIE_UYVY) ? 1.0f : 0.0f;
+    k[2] = (flags & POSTFX_MOVIE_ROW_PAIRS) ? 1.0f : 0.0f;
+    k[3] = (float)h;
+    if (ow == w && oh == h)             /* the colour alone */
+        return run_pass(ctx, s_yuv, yuv, dst, 0.0f, 0.0f, (float)w,
+                        (float)h, k);
+    if (!fsr_setup(dev)
+        || !surf_fit(dev, &s_mv_rgb, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 1)
+        || !run_pass(ctx, s_yuv, yuv, s_mv_rgb.rtv, 0.0f, 0.0f, (float)w,
+                     (float)h, k))
+        return 0;
+    rcas = sharpen > 0.0f
+           && surf_fit(dev, &s_mv_mid, ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+    /* FsrEasuCon(con0..con3, w, h, w, h, ow, oh): the input is its whole
+     * texture, as in postfx_draw's scale stage. */
+    memset(k, 0, sizeof k);
+    k[0] = (float)w / (float)ow;
+    k[1] = (float)h / (float)oh;
+    k[2] = 0.5f * (float)w / (float)ow - 0.5f;
+    k[3] = 0.5f * (float)h / (float)oh - 0.5f;
+    k[8] = 1.0f / (float)w;
+    k[9] = 1.0f / (float)h;
+    k[10] = 1.0f / (float)w;
+    k[11] = -1.0f / (float)h;
+    k[12] = -1.0f / (float)w;
+    k[13] = 2.0f / (float)h;
+    k[14] = 1.0f / (float)w;
+    k[15] = 2.0f / (float)h;
+    k[17] = 4.0f / (float)h;
+    if (!run_pass(ctx, s_easu, s_mv_rgb.srv, rcas ? s_mv_mid.rtv : dst, 0.0f,
+                  0.0f, (float)ow, (float)oh, k))
+        return 0;
+    if (!rcas)
+        return 1;
+    /* RCAS over the whole output, at the chain's own scale: 100 % = 0
+     * stops, each 50 % less one stop less sharp. */
+    memset(k, 0, sizeof k);
+    k[10] = (float)ow;
+    k[11] = (float)oh;
+    k[16] = exp2f(-2.0f * (1.0f - sharpen / 100.0f));
+    return run_pass(ctx, s_rcas, s_mv_mid.srv, dst, 0.0f, 0.0f, (float)ow,
+                    (float)oh, k);
+}
+
 #else
 
 int xbox_SetPicture(float gamma, float contrast, float saturation)

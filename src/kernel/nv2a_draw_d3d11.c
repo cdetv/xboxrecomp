@@ -465,6 +465,8 @@ static struct {
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t movie_43;                  /* movie batches drawn in 4:3 */
+    uint32_t movie_made, movie_reused;  /* upscaled movie frames (movie_stage) */
+    uint32_t movie_paired;              /*   of them with chroma rows in pairs */
     uint32_t layout_draws;              /* NV_HOST_FX_LAYOUT squeezes */
     uint32_t near_draws;                /* receiver_draw's two-pass draws */
     uint32_t lit_draws, lit_waits;      /* per-pixel lit; lit programs drawn
@@ -592,11 +594,11 @@ static void ct_report(void)
  * reported with the [GPU] lines as [GPUTIME]. For frames the graphics card
  * makes slow: a big render size, see which draws fill the most. */
 enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_AO,
-       GT_MBLUR, GT_POST, GT_OVERLAY, GT_N };
+       GT_MBLUR, GT_POST, GT_OVERLAY, GT_MOVIE, GT_N };
 static const char *const GT_NAME[GT_N] = {
     "opaque draws", "blended draws", "surface copies", "depth reads",
     "clears", "depth of field", "ambient occlusion", "motion blur",
-    "frame to screen (filters)", "menus"
+    "frame to screen (filters)", "menus", "movie upscaling"
 };
 #define GT_FRAMES 4
 #define GT_MARKS  4096
@@ -4714,6 +4716,295 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     return e->srv;
 }
 
+/* Movie upscaling (xbox_SetMovieUpscale; RECOMP_MOVIE_UPSCALE=original or 0
+ * off, fsr or 1 on, the default, 2 on even frames only, for the
+ * held-picture check). A movie
+ * frame (batch_is_movie's textures: YUY2 / UYVY, 320 wide and up) goes up
+ * as its raw 4:2:2 words, an R8G8B8A8_UINT texture with one texel per pixel
+ * pair, instead of being decoded texel by texel on the CPU. postfx_movie
+ * turns it into colour with interpolated chroma (across, and down the rows
+ * too when its chroma comes in row pairs: movie_rows_paired), then FSR 1
+ * stretches it
+ * (EASU, then RCAS at RECOMP_MOVIE_SHARPEN percent, 0 = none) to the size
+ * its quad covers on the surface being drawn: the texture's own size in
+ * guest pixels times the surface's scale, across by the y scale when the
+ * movie is squeezed to 4:3 (movie_stretch; d3d_draw's movie43). The quad
+ * then samples that texture by the same coordinates: a linear texture is
+ * read by coordinates normalised by its guest size (tscale), so a bigger
+ * texture needs nothing else. Made once per new frame (hashed once a flip,
+ * as texture_stage does) and per size: at a high frame rate the title
+ * draws one movie frame over several flips. A surface no bigger than the
+ * frame gets the colour pass alone. A failure falls back to the texel-by-
+ * texel path for the rest of the run (said once).
+ * The quad is taken to show the texture at its own size in guest pixels
+ * (Conker's movies: 640x480 over the 640x480 frame). One drawn smaller
+ * (Conker's multiplayer menus show movies in small screens) must not read
+ * the big texture's texels sparsely (shimmer): the output gets a mip chain
+ * and the stage reads it as a bigger replacement texture is read
+ * (replaced_tex, s_tex_shift): trilinear down to the guest's own size.
+ * ponytail: a title that stretches a smaller movie over its screen gets
+ * EASU to the texture's scaled size and the quad's bilinear stretch for
+ * the rest. */
+#define MOVIE_SLOTS        2            /* the title's two frame surfaces */
+#define MOVIE_SHARPEN_DEF  25.0f        /* percent; RECOMP_MOVIE_SHARPEN */
+static volatile LONG s_movie_up = -1;
+static int s_movie_up_broken;
+static float s_movie_sharp = -1.0f;
+typedef struct {
+    uint32_t addr, fmt, w, h, pitch;    /* the guest texture */
+    uint32_t ow, oh;                    /* made at this size */
+    uint32_t levels, shift;             /* mip levels; how much bigger, as
+                                         * replaced_tex's (1/16 levels) */
+    uint64_t hash;
+    uint32_t hashed_flip, used;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} MovieTex;
+static MovieTex s_mv[MOVIE_SLOTS];
+static uint32_t s_mv_tick;
+static ID3D11Texture2D *s_mv_raw;       /* the raw words, w / 2 x h */
+static ID3D11ShaderResourceView *s_mv_raw_srv;
+static uint32_t s_mv_raw_w, s_mv_raw_h;
+
+void xbox_SetMovieUpscale(int on)
+{
+    InterlockedExchange(&s_movie_up, on ? 1 : 0);
+}
+
+static int movie_upscale(void)
+{
+    if (s_movie_up < 0) {
+        const char *e = getenv("RECOMP_MOVIE_UPSCALE");
+        LONG v = !e || !*e ? 1 : *e == '2' ? 2
+               : *e == '0' || !_stricmp(e, "original") || !_stricmp(e, "off")
+                 ? 0 : 1;
+        InterlockedCompareExchange(&s_movie_up, v, -1);
+    }
+    if (s_movie_up_broken)
+        return 0;
+    return s_movie_up == 2 ? !(g_pb.flips & 1) : (int)s_movie_up;
+}
+
+static float movie_sharpen(void)
+{
+    if (s_movie_sharp < 0.0f) {
+        const char *e = getenv("RECOMP_MOVIE_SHARPEN");
+        float f = e && *e ? strtof(e, NULL) : MOVIE_SHARPEN_DEF;
+        s_movie_sharp = f < 0.0f ? 0.0f : f > 100.0f ? 100.0f : f;
+    }
+    return s_movie_sharp;
+}
+
+static void movie_tex_free(MovieTex *m)
+{
+    if (m->srv) ID3D11ShaderResourceView_Release(m->srv);
+    if (m->rtv) ID3D11RenderTargetView_Release(m->rtv);
+    if (m->tex) ID3D11Texture2D_Release(m->tex);
+    memset(m, 0, sizeof *m);
+}
+
+/* t's raw words in s_mv_raw (made again for another size). */
+static int movie_raw_put(const Texture *t, const uint8_t *src)
+{
+    uint32_t w = t->width / 2u;
+
+    if (!s_mv_raw || s_mv_raw_w != w || s_mv_raw_h != t->height) {
+        D3D11_TEXTURE2D_DESC d;
+        if (s_mv_raw_srv) ID3D11ShaderResourceView_Release(s_mv_raw_srv);
+        if (s_mv_raw) ID3D11Texture2D_Release(s_mv_raw);
+        s_mv_raw = NULL;
+        s_mv_raw_srv = NULL;
+        memset(&d, 0, sizeof d);
+        d.Width = w;
+        d.Height = t->height;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_mv_raw))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_mv_raw, NULL, &s_mv_raw_srv))) {
+            if (s_mv_raw) ID3D11Texture2D_Release(s_mv_raw);
+            s_mv_raw = NULL;
+            return 0;
+        }
+        s_mv_raw_w = w;
+        s_mv_raw_h = t->height;
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_mv_raw,
+                                          0, NULL, src, t->pitch,
+                                          t->pitch * t->height);
+    return 1;
+}
+
+/* m's output texture at ow x oh for a w x h frame (made again for another
+ * size): bigger than the frame, a full mip chain, read shifted by how much
+ * bigger (replaced_tex's rule). */
+static int movie_out_fit(MovieTex *m, uint32_t ow, uint32_t oh, uint32_t w,
+                         uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC d;
+    double ratio = (double)ow / w > (double)oh / h ? (double)ow / w
+                                                   : (double)oh / h;
+    uint32_t levels = 1, shift = 0;
+
+    if (m->tex && m->ow == ow && m->oh == oh)
+        return 1;
+    movie_tex_free(m);
+    if (ratio > 1.0) {
+        shift = (uint32_t)(log2(ratio) * 16.0 + 0.5);
+        while ((1u << levels) <= (ow > oh ? ow : oh))
+            levels++;
+    }
+    memset(&d, 0, sizeof d);
+    d.Width = ow;
+    d.Height = oh;
+    d.MipLevels = levels;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    d.MiscFlags = levels > 1 ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &m->tex))
+        || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)m->tex, NULL, &m->rtv))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)m->tex, NULL, &m->srv))) {
+        movie_tex_free(m);
+        return 0;
+    }
+    m->ow = ow;
+    m->oh = oh;
+    m->levels = levels;
+    m->shift = shift;
+    fprintf(stderr, "[GPU] d3d11: movie upscaling: %ux%u frames to %ux%u"
+            " (%u levels)%c", w, h, ow, oh, levels, 10);
+    return 1;
+}
+
+/* Whether frame p's chroma comes in row pairs (lines 2j and 2j+1 the same:
+ * a 4:2:0 source written out as 4:2:2, as Conker's XMV decoder does),
+ * from every 8th pair; postfx_movie then blends it down the rows too. A
+ * frame of one flat colour passes, harmlessly (blending equal rows). */
+static int movie_rows_paired(const Texture *t, const uint8_t *p)
+{
+    uint32_t j, x, c0 = t->color == 0x24u ? 1u : 0u;   /* YUY2: Y U Y V */
+
+    for (j = 0; j + 1 < t->height; j += 16) {
+        const uint8_t *a = p + (size_t)j * t->pitch, *b = a + t->pitch;
+        for (x = c0; x < t->width * 2u; x += 2)
+            if (a[x] != b[x])
+                return 0;
+    }
+    return 1;
+}
+
+static int movie_stretch(void);
+
+/* m's texture for stage st: its levels and shift for sampler_stage. */
+static ID3D11ShaderResourceView *movie_bind(int st, MovieTex *m)
+{
+    m->used = ++s_mv_tick;
+    s_tex_levels[st] = m->levels;
+    s_tex_shift[st] = m->shift;
+    return m->srv;
+}
+
+/* The upscaled frame for stage st's movie texture t (bytes long), or NULL:
+ * not a movie, upscaling off, or a failure (texture_stage then decodes it
+ * as before). */
+static ID3D11ShaderResourceView *movie_stage(int st, const Texture *t,
+                                             uint32_t bytes)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    int si = s_rtt_target, i, paired;
+    float sx, sy, xs;
+    uint32_t ow, oh;
+    uint64_t hash;
+    MovieTex *m = NULL;
+
+    if ((t->color != 0x24u && t->color != 0x25u) || t->width < 320u
+        || (t->width & 1u) || t->pitch < t->width * 2u || si < 0
+        || !movie_upscale())
+        return NULL;
+    sx = surf_sx(si);
+    sy = surf_sy(si);
+    xs = sy < sx * 0.999f && !movie_stretch() ? sy : sx;
+    ow = (uint32_t)((float)t->width * xs + 0.5f);
+    oh = (uint32_t)((float)t->height * sy + 0.5f);
+    if (ow < t->width)
+        ow = t->width;
+    if (oh < t->height)
+        oh = t->height;
+    if (ow > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        ow = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    if (oh > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        oh = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+
+    for (i = 0; i < MOVIE_SLOTS; i++)
+        if (s_mv[i].srv && s_mv[i].addr == t->offset
+            && s_mv[i].fmt == t->color && s_mv[i].w == t->width
+            && s_mv[i].h == t->height && s_mv[i].pitch == t->pitch) {
+            m = &s_mv[i];
+            break;
+        }
+    if (m && m->hashed_flip == g_pb.flips && m->ow == ow && m->oh == oh) {
+        s_stat.movie_reused++;
+        return movie_bind(st, m);
+    }
+    hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
+    if (m && m->hash == hash && m->ow == ow && m->oh == oh) {
+        m->hashed_flip = g_pb.flips;
+        s_stat.movie_reused++;
+        return movie_bind(st, m);
+    }
+    if (!m) {                           /* an empty slot, else the older */
+        m = &s_mv[0];
+        for (i = 1; i < MOVIE_SLOTS; i++)
+            if (!s_mv[i].srv || (m->srv && s_mv[i].used < m->used))
+                m = &s_mv[i];
+        movie_tex_free(m);
+    }
+    paired = movie_rows_paired(t, mem + t->offset);
+    if (!movie_raw_put(t, mem + t->offset)
+        || !movie_out_fit(m, ow, oh, t->width, t->height)
+        || !postfx_movie(s_dev, s_ctx, s_mv_raw_srv,
+                         (t->color == 0x25u ? POSTFX_MOVIE_UYVY : 0u)
+                         | (paired ? POSTFX_MOVIE_ROW_PAIRS : 0u),
+                         t->width, t->height, m->rtv, ow, oh,
+                         movie_sharpen())) {
+        fprintf(stderr, "[GPU] d3d11: movie upscaling failed (%ux%u to"
+                " %ux%u); movies decoded as before from now on%c", t->width,
+                t->height, ow, oh, 10);
+        s_movie_up_broken = 1;
+        movie_tex_free(m);
+        return NULL;
+    }
+    if (m->levels > 1)
+        ID3D11DeviceContext_GenerateMips(s_ctx, m->srv);
+    m->addr = t->offset;
+    m->fmt = t->color;
+    m->w = t->width;
+    m->h = t->height;
+    m->pitch = t->pitch;
+    m->hash = hash;
+    m->hashed_flip = g_pb.flips;
+    s_stat.movie_made++;
+    gt_mark(GT_MOVIE, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     movie frame 0x%08X %ux%u upscaled to"
+                " %ux%u (sharpen %g %%, chroma rows %s)%c", t->offset,
+                t->width, t->height, ow, oh, (double)movie_sharpen(),
+                paired ? "in pairs" : "each its own", 10);
+    if (paired)
+        s_stat.movie_paired++;
+    return movie_bind(st, m);
+}
+
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
                                                int volume)
 {
@@ -4762,6 +5053,13 @@ guest:
     bytes = pb_tex_bytes(t);
     if (!bytes)
         return NULL;
+    if (!cube && d3 == 1) {
+        ID3D11ShaderResourceView *mv = movie_stage(st, t, bytes);
+        if (mv) {
+            s_tex_src[st] = 'M';
+            return mv;
+        }
+    }
     if (cube)
         bytes += 5 * face_stride;       /* all six faces, mips between */
     if (!cube && d3 == 1 && t->levels > 1 && tex_size_from_format(t->color)) {
@@ -8333,6 +8631,11 @@ static void d3d_report(void)
     if (s_stat.movie_43)
         fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
                 " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
+    if (s_stat.movie_made || s_stat.movie_reused)
+        fprintf(stderr, "[GPU] d3d11: movie upscaling: %u frames made (%u"
+                " with chroma rows in pairs), %u binds of one already made"
+                " (xbox_SetMovieUpscale)%c", s_stat.movie_made,
+                s_stat.movie_paired, s_stat.movie_reused, 10);
     if (s_stat.layout_draws)
         fprintf(stderr, "[GPU] d3d11: hud layout: %u batches squeezed to the"
                 " guest's shape (host layout)%c", s_stat.layout_draws, 10);

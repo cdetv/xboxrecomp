@@ -30,6 +30,24 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
                 float sh, ID3D11RenderTargetView *dst, float dx0, float dy0,
                 float dw, float dh);
 
+/* A movie frame for the texture stage that samples it (nv2a_draw_d3d11.c
+ * movie_stage): yuv holds its raw 4:2:2 words as an R8G8B8A8_UINT texture,
+ * one texel per pixel pair (YUY2, or UYVY with POSTFX_MOVIE_UYVY), the
+ * frame w x h; POSTFX_MOVIE_ROW_PAIRS: its chroma comes in row pairs (a
+ * 4:2:0 source), blended down the rows too. Turned into colour with
+ * interpolated chroma into dst at w x h when ow x oh is that size; else
+ * stretched to ow x oh by FSR 1's EASU, then sharpened by its RCAS at
+ * sharpen percent (as RECOMP_SHARPEN behind FSR; 0 = none). ow x oh is
+ * never smaller than w x h. Sets every piece of pipeline state it uses and
+ * leaves no target or view bound: the caller binds its own again. 1 when
+ * drawn; 0 when a shader or texture could not be made. */
+#define POSTFX_MOVIE_UYVY      1u
+#define POSTFX_MOVIE_ROW_PAIRS 2u
+int postfx_movie(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                 ID3D11ShaderResourceView *yuv, unsigned flags, UINT w,
+                 UINT h, ID3D11RenderTargetView *dst, UINT ow, UINT oh,
+                 float sharpen);
+
 #endif
 
 #endif
