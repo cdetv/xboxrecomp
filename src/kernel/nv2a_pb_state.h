@@ -417,7 +417,8 @@ typedef struct {
  * state. Not 0x0100: the walk (nv2a_pb_scan.c) takes a NO_OPERATION with
  * a parameter on any subchannel for a software-method trap, and a float
  * parameter there sent the title's interrupt handler garbage (a crash).
- *   NV_HOST_PARAM(i)  0x0800 + 4 i, i < NV_HOST_PARAMS: parameter i
+ *   NV_HOST_PARAM(i)  0x0800 + 4 i, i < NV_HOST_PARAMS (16): parameter i;
+ *                     each keeps its value until set again
  *   NV_HOST_EFFECT    0x0880: run effect `param` with the parameters set
  * Effects (back end host_effect):
  *   NV_HOST_FX_DOF    depth of field over the current colour surface, from
@@ -435,9 +436,66 @@ typedef struct {
  *                     (whole numbers, e.g. 4:3), centred with black bars
  *                     where the window is another shape, instead of
  *                     filling the window; 0:0 = fill it again (the
- *                     default). The last one before a flip counts. */
+ *                     default). The last one before a flip counts.
+ *   NV_HOST_FX_AO     ambient occlusion (ao_d3d11.c) over the current colour
+ *                     surface's clip, from its depth buffer: darkens creases
+ *                     and corners. Ask for it after the opaque scenery and
+ *                     before anything blended or furry (whatever is drawn
+ *                     after is untouched). p0/p1 the camera's near/far
+ *                     planes, p2/p3 its projection's x / y scale (m00, m11),
+ *                     p4 the radius in world units, p5 the strength (0..1),
+ *                     p6 flags (bit 0 the AO term alone, as grey, for
+ *                     tuning; bit 1 leave pixels with stencil >= 8 alone;
+ *                     bit 2 work at full size above 1080 lines too), p7 the
+ *                     distance where it has faded out (it starts fading at
+ *                     0.3 of that). All floats but p6.
+ *   NV_HOST_FX_MBLUR  camera motion blur (mblur_d3d11.c) over the current
+ *                     colour surface's clip, from its depth buffer: each
+ *                     pixel smeared along the path its point took on screen
+ *                     since the last frame, as if it stood still. Ask for it
+ *                     after the 3D picture, before the HUD. Camera space as
+ *                     hostfx_view.h's (x right, y up, z the distance in
+ *                     front): a point p now was at R p + t in the last
+ *                     frame's camera. p0-p3 R as a unit quaternion (x y z
+ *                     w), p4-p6 t (world units), p7/p8 the camera's
+ *                     near/far planes, p9/p10 its projection's x / y scale
+ *                     (m00, m11), p11 the share of that motion smeared (e.g.
+ *                     exposure / frame time), p12 the longest smear in guest
+ *                     pixels, p13 the radius kept sharp round the middle
+ *                     (share of the half diagonal; 0 = none), p14 flags
+ *                     (bit 0 the motion as colour instead, for testing).
+ *                     All floats but p14.
+ *   NV_HOST_FX_LAYOUT a 2D piece drawn for the guest frame's shape (a HUD
+ *                     widget, a speech bubble) keeps that shape on a surface
+ *                     drawn wider (e.g. 640x480 at 1920x1080): from p0 != 0
+ *                     until p0 = 0, each draw's x is squeezed by the
+ *                     surface's y scale / x scale round an anchor, through
+ *                     the viewport and the scissor (the movie 4:3 trick
+ *                     with a movable centre, no bars). p1 the anchor (float):
+ *                     a share of the clip's width (0 its left edge, 0.5 its
+ *                     middle, 1 its right edge), or with p2 bit 0 a guest x
+ *                     on the surface. The squeezed draw still reaches the
+ *                     whole surface (clip space widened to match), and a
+ *                     clip side at the shown frame's edge stays there, so a
+ *                     piece sliding in from off the guest's screen shows
+ *                     past the squeezed box instead of being cut at it;
+ *                     with p2 bit 1 (NV_HOST_LAYOUT_BOX) the clip is
+ *                     squeezed whole instead, so the draws stay inside the
+ *                     box (a whole screen in the guest's shape, cut at its
+ *                     sides). Clears and copies are untouched; a surface not drawn
+ *                     wider than the guest's is too. Off again at every
+ *                     present.
+ *   NV_HOST_FX_SCENE_END the 3D picture of this frame is done: what is drawn
+ *                     on the current colour surface after it (until the
+ *                     flip) is the 2D layer (HUD, text, menus), kept at
+ *                     the paper white by HDR output (hdr_d3d11.c). Asked
+ *                     for again in a frame, the earlier one is forgotten
+ *                     (a full-screen wash drawn after it belongs to the
+ *                     picture). A frame without one is all 2D. No params.
+ * Numbers 5..7 are taken on the frame-interpolation branch, 8 / 9 are kept
+ * for water: a new effect takes 14 or more. */
 #define NV_HOST_SUBCH    7u
-#define NV_HOST_PARAMS   8u
+#define NV_HOST_PARAMS   16u            /* 0x0800..0x083C, below NV_HOST_EFFECT */
 #define NV_HOST_PARAM(i) (0x0800u + 4u * (i))
 #define NV_HOST_EFFECT   0x0880u
 #define NV_HOST_FX_DOF   1u
@@ -454,6 +512,16 @@ typedef struct {
  * blend mixed different particles (streaks). */
 #define NV_HOST_FX_INTERP_HOLD_ON  6u
 #define NV_HOST_FX_INTERP_HOLD_OFF 7u
+#define NV_HOST_FX_AO    10u
+#define NV_HOST_AO_ALONE   1u           /* NV_HOST_FX_AO p6 bits */
+#define NV_HOST_AO_STENCIL 2u
+#define NV_HOST_AO_FULL    4u
+#define NV_HOST_FX_MBLUR 11u
+#define NV_HOST_MBLUR_VIEW 1u           /* NV_HOST_FX_MBLUR p14 bits */
+#define NV_HOST_FX_SCENE_END 12u
+#define NV_HOST_FX_LAYOUT 13u
+#define NV_HOST_LAYOUT_ABS 1u           /* NV_HOST_FX_LAYOUT p2 bits */
+#define NV_HOST_LAYOUT_BOX 2u
 
 extern const Nv2aPbBackend nv2a_pb_backend_sw;
 

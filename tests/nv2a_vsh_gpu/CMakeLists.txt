@@ -5,6 +5,7 @@ enable_testing()
 add_executable(nv2a-vsh-gpu-test nv2a_vsh_gpu_test.c
     ../../src/kernel/nv2a_vsh_interp.c
     ../../src/kernel/nv2a_vsh_hlsl.c
+    ../../src/kernel/nv2a_vsh_lit.c
     ../../src/kernel/nv2a_vsh_gpu.c)
 target_include_directories(nv2a-vsh-gpu-test PRIVATE ../../src/kernel)
 target_link_libraries(nv2a-vsh-gpu-test PRIVATE d3d11 dxguid d3dcompiler)

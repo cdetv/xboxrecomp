@@ -18,6 +18,7 @@
 
 #include <stddef.h>
 #include "nv2a_vsh_interp.h"
+#include "nv2a_vsh_lit.h"
 
 /* The constants' register: cbuffer VshC : register(b3) { float4 vc[193]; },
  * c[0..191] and then one row that must stay all zero (the temps' start). */
@@ -32,6 +33,17 @@
  * the program cannot be translated (count 0) or buf is too small. */
 size_t nv2a_vsh_hlsl(const Nv2aVshIns *ins, uint32_t count, char *buf,
                      size_t cap);
+
+/* The same for a lit program (nv2a_vsh_lit_scan's lit, a layout), with its
+ * lighting terms captured where the scan found them, into three statics
+ * declared ahead of vsh_prog: `lit_n` (the normal, xyz, at the key light's
+ * dot product), `lit_p` (the blob x, y, height as x, y, z, each right after
+ * the instruction that writes it; 0 without blobs), `lit_f` (layouts B and
+ * D: the factor the ambient is multiplied by, as that op reads it). The
+ * program's own text and outputs are unchanged; nv2a_vsh_hlsl's text for
+ * the same program (the disk cache's key) is not touched. */
+size_t nv2a_vsh_hlsl_lit(const Nv2aVshIns *ins, uint32_t count,
+                         const Nv2aVshLit *lit, char *buf, size_t cap);
 
 /* The vertex inputs read on the GPU (step 2): the batch's attribute bytes in
  * `ByteAddressBuffer vin : register(t0)`, and per input k one row of

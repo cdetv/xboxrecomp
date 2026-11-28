@@ -50,7 +50,10 @@
 #include <dxgi1_4.h>    /* IDXGIAdapter3: video memory use */
 #include "postfx_d3d11.h"
 #include "dof_d3d11.h"
+#include "ao_d3d11.h"
+#include "mblur_d3d11.h"
 #include "vsync_d3d11.h"
+#include "hdr_d3d11.h"
 #include "tex_replace.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -87,6 +90,45 @@ void xbox_SetGpuOverlay(xbox_GpuOverlayFn fn)
 {
     s_overlay = fn;
 }
+
+/* HDR output (hdr_d3d11.c). s_hdr_out is what the swap chain puts out
+ * (HDR_OUT_*; its format and colour space follow, swap_format). With the
+ * HDR step on for a present (s_hdr_step: HDR out, or RECOMP_HDR=2's mask
+ * view on an SDR monitor), the filter chain draws into s_hdr_in (16-bit
+ * float, the back buffer's size) instead of the back buffer, the overlay
+ * gets s_hdr_in for photos and s_hdr_ui (xbox_GpuOverlayTarget) to draw
+ * into, and postfx_hdr maps both onto the back buffer. */
+typedef struct {
+    ID3D11Texture2D          *tex;
+    ID3D11RenderTargetView   *rtv;
+    ID3D11ShaderResourceView *srv;
+    uint32_t                  w, h;
+} HdrTex;
+static int        s_hdr_out;         /* HDR_OUT_* */
+static int        s_hdr_ever;        /* was ever HDR: colour space set back */
+static int        s_hdr_failed;      /* refused: SDR from now on (said) */
+static int        s_hdr_step;        /* this present */
+static int        s_hdr_ui_used;     /* the overlay asked for s_hdr_ui */
+static HdrMonitor s_hdr_mon;
+static HdrTex     s_hdr_in, s_hdr_ui;
+
+/* NV_HOST_FX_SCENE_END: a copy of the frame surface when the title's 3D
+ * picture is done (copied only while the HDR step runs). Good for the
+ * present that follows when it shows the same surface. */
+static ID3D11Texture2D          *s_scene_tex;
+static ID3D11ShaderResourceView *s_scene_srv;
+static uint32_t s_scene_addr, s_scene_pitch;
+static int      s_scene_valid;
+/* Frame interpolation: a scene-end copy taken since the last NV_INTERP_SAVE
+ * (each replay runs the title's stream again, NV_HOST_FX_SCENE_END too, so
+ * every picture saved gets the copy it was drawn with: pic_scene_keep). */
+static int      s_scene_fresh;
+
+/* What shown_to_back drew last: the shown surface's rectangle (host
+ * pixels) onto the target's rectangle; s_map_ok 0 when nothing was. */
+static float s_map_src[4], s_map_dst[4];
+static int   s_map_ok;
+
 
 /* The title's frame. The swap chain is the render resolution (this size
  * when none is set); DXGI scales it to the window's aspect-keeping view. */
@@ -463,14 +505,24 @@ static struct {
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t movie_43;                  /* movie batches drawn in 4:3 */
+    uint32_t movie_part;                /* movie batches in part of the frame,
+                                         * left as the title draws them */
+    uint32_t movie_made, movie_reused;  /* upscaled movie frames (movie_stage) */
+    uint32_t movie_paired;              /*   of them with chroma rows in pairs */
+    uint32_t layout_draws;              /* NV_HOST_FX_LAYOUT squeezes */
     uint32_t near_draws;                /* receiver_draw's two-pass draws */
+    uint32_t lit_draws, lit_waits;      /* per-pixel lit; lit programs drawn
+                                         * per vertex (a shader not ready) */
     uint32_t rtt_binds, rtt_unhandled, rtt_made;
     uint64_t rtt_px;                    /* host pixels those binds copied */
     uint32_t rtt_rects;                 /* of them only the part read */
     uint32_t rtt_direct;                /* surfaces read as they are, no copy */
     uint32_t zeta_clears, zeta_made, zeta_draws, zeta_too_big;
     uint32_t cutout_draws;              /* RECOMP_CUTOUT_DEPTH second draws */
+    uint32_t cutout_tiny;               /*   left out: stage 0 under CUT_MIN_SIDE */
     uint32_t dof_drawn, dof_skipped;    /* host depth of field (dof_d3d11.c) */
+    uint32_t ao_drawn, ao_skipped;      /* host ambient occlusion (ao_d3d11.c) */
+    uint32_t mblur_drawn, mblur_skipped; /* host motion blur (mblur_d3d11.c) */
     uint32_t zeta_reads, zeta_unhandled;
     uint32_t stale_reads, rtt_old, rtt_twin;
     uint32_t evictions, evicted_reads;
@@ -584,11 +636,12 @@ static void ct_report(void)
  * (roughly: the GPU overlaps neighbours). Read back GT_FRAMES frames later,
  * reported with the [GPU] lines as [GPUTIME]. For frames the graphics card
  * makes slow: a big render size, see which draws fill the most. */
-enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_POST,
-       GT_OVERLAY, GT_N };
+enum { GT_OPAQUE, GT_BLEND, GT_COPY, GT_ZCOPY, GT_CLEAR, GT_DOF, GT_AO,
+       GT_MBLUR, GT_POST, GT_OVERLAY, GT_MOVIE, GT_N };
 static const char *const GT_NAME[GT_N] = {
     "opaque draws", "blended draws", "surface copies", "depth reads",
-    "clears", "depth of field", "frame to screen (filters)", "menus"
+    "clears", "depth of field", "ambient occlusion", "motion blur",
+    "frame to screen (filters)", "menus", "movie upscaling"
 };
 #define GT_FRAMES 4
 #define GT_MARKS  4096
@@ -894,6 +947,42 @@ static ID3D11Texture2D *back_tex(void)
     return t;
 }
 
+/* The swap chain's format (and the exclusive canvas's) for s_hdr_out. */
+static DXGI_FORMAT swap_format(void)
+{
+    return s_hdr_out == HDR_OUT_PQ ? DXGI_FORMAT_R10G10B10A2_UNORM
+         : s_hdr_out == HDR_OUT_SCRGB ? DXGI_FORMAT_R16G16B16A16_FLOAT
+         : DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+/* The swap chain's colour space for s_hdr_out, after every new or resized
+ * swap chain (DXGI may reset it): HDR10 (PQ, BT.2020), scRGB (linear
+ * BT.709) or plain sRGB. Not asked for while the swap chain has never been
+ * HDR, so an SDR one stays exactly as before. 1 when set (or not needed). */
+static int hdr_colour_space(void)
+{
+    IDXGISwapChain3 *s3 = NULL;
+    DXGI_COLOR_SPACE_TYPE cs = s_hdr_out == HDR_OUT_PQ
+                               ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                             : s_hdr_out == HDR_OUT_SCRGB
+                               ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                             : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT sup = 0;
+    int ok = 0;
+
+    if (s_hdr_out == HDR_OUT_SDR && !s_hdr_ever)
+        return 1;
+    if (!s_swap || FAILED(IDXGISwapChain1_QueryInterface(s_swap,
+            &IID_IDXGISwapChain3, (void **)&s3)))
+        return 0;
+    if (SUCCEEDED(IDXGISwapChain3_CheckColorSpaceSupport(s3, cs, &sup))
+        && (sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)
+        && SUCCEEDED(IDXGISwapChain3_SetColorSpace1(s3, cs)))
+        ok = 1;
+    IDXGISwapChain3_Release(s3);
+    return ok;
+}
+
 /* A view on the swap chain's buffer, just made or resized: the back
  * buffer's own, or in exclusive mode the monitor's (s_out_rtv, its size
  * read back). */
@@ -920,10 +1009,14 @@ static int swap_view(void)
         fail("back buffer view", hr);
         return 0;
     }
+    if (!hdr_colour_space() && s_hdr_out != HDR_OUT_SDR)
+        fprintf(stderr, "[HDR] the swap chain did not take its colour"
+                " space%c", 10);
     return 1;
 }
 
-/* Exclusive mode: the s_bb_w x s_bb_h texture the frame is drawn into. */
+/* Exclusive mode: the s_bb_w x s_bb_h texture the frame is drawn into, in
+ * the swap chain's format (canvas_to_out copies it there). */
 static int make_canvas(void)
 {
     D3D11_TEXTURE2D_DESC td;
@@ -934,7 +1027,7 @@ static int make_canvas(void)
     td.Height = s_bb_h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = swap_format();
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1024,7 +1117,7 @@ static int ensure_swap_chain(void)
             d.Height = (UINT)r.bottom;
         }
     }
-    d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    d.Format = swap_format();
     d.SampleDesc.Count = 1;
     d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     d.BufferCount = 2;
@@ -2055,6 +2148,8 @@ typedef struct {
 #define PS_LIST_MAGIC 0x314B5350u       /* "PSK1" */
 typedef struct {
     PsKey key;
+    uint32_t lit;                       /* a lit program's variant
+                                         * (nv2a_vsh_lit_word; 0: ps) */
     uint64_t h;
     volatile LONG state;                /* PS_* */
     volatile LONG taken;                /* a worker has it (it can be queued
@@ -2133,6 +2228,40 @@ static char *ps_spec_source(const PsKey *k)
                        k->icw[s][2], k->icw[s][3]);
     at += snprintf(src + at, n - at, "};\n");
     memcpy(src + at, s_hlsl, sizeof s_hlsl);
+    return src;
+}
+
+/* A lit program's variant of one setup (per-pixel lighting, to-do 51 of
+ * Conker): K_LIT (nv2a_vsh_lit_word) and the title's rows ahead of the
+ * setup's source, then the entry ps_lit (s_hlsl_lit). lit 0: the plain
+ * source, byte for byte (the shader cache keys on it). */
+static char *ps_spec_source_lit(const PsKey *k, uint32_t lit)
+{
+    const Nv2aLitRegs *r = nv2a_vsh_lit_regs();
+    char *base, *src;
+    size_t bn, n;
+    int at;
+
+    if (!lit)
+        return ps_spec_source(k);
+    if (!r || !(base = ps_spec_source(k)))
+        return NULL;
+    bn = strlen(base);
+    n = bn + sizeof s_hlsl_lit + 512;
+    if (!(src = (char *)malloc(n))) {
+        free(base);
+        return NULL;
+    }
+    at = snprintf(src, n, "#define K_LIT 0x%Xu\n#define K_LIT_KEY %du\n"
+                  "#define K_LIT_COLOUR %du\n#define K_LIT_AMB %du\n"
+                  "#define K_LIT_BLOBS %du\n", lit,
+                  r->key_dir > 0 ? r->key_dir : 0,
+                  r->key_col > 0 ? r->key_col : 0,
+                  r->amb_first > 0 ? r->amb_first : 0,
+                  r->blob_first > 0 ? r->blob_first : 0);
+    memcpy(src + at, base, bn);
+    memcpy(src + at + bn, s_hlsl_lit, sizeof s_hlsl_lit);
+    free(base);
     return src;
 }
 
@@ -2224,9 +2353,9 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
             continue;
         }
         QueryPerformanceCounter(&t0);
-        src = ps_spec_source(&e->key);
-        code = src ? compile_src_ex(src, "ps", "ps_4_0", 1, &loaded,
-                                    pre ? s_pss_pre_flags : 0)
+        src = ps_spec_source_lit(&e->key, e->lit);
+        code = src ? compile_src_ex(src, e->lit ? "ps_lit" : "ps", "ps_4_0",
+                                    1, &loaded, pre ? s_pss_pre_flags : 0)
                    : NULL;
         free(src);
         if (code && FAILED(ID3D11Device_CreatePixelShader(s_dev,
@@ -2252,7 +2381,8 @@ static DWORD WINAPI ps_spec_worker(LPVOID arg)
         InterlockedAdd64(&s_pss_us, us);
         InterlockedIncrement(e->ps ? (loaded ? &s_pss_loaded : &s_pss_compiled)
                                    : &s_pss_failed);
-        if (e->ps && !InterlockedExchange(&e->listed, 1))
+        /* (A lit variant is not listed: the list holds setups only.) */
+        if (e->ps && !e->lit && !InterlockedExchange(&e->listed, 1))
             ps_list_add(&e->key);
         InterlockedExchange(&e->state, e->ps ? PS_READY : PS_FAILED);
         InterlockedDecrement(&s_pss_busy);
@@ -2269,11 +2399,13 @@ static uint64_t ps_hash(const PsKey *key)
     return h;
 }
 
-/* key's entry; with add, a new one when absent (*fresh = 1: the caller
- * sets its state at once, as a probe stops at the first PS_EMPTY). NULL:
- * absent and not added (the table stays half empty at most, so a probe
- * always ends). Executor thread only. */
-static PsSpec *ps_find(const PsKey *key, uint64_t h, int add, int *fresh)
+/* key's entry (lit: a lit program's variant, 0 the plain one); with add, a
+ * new one when absent (*fresh = 1: the caller sets its state at once, as a
+ * probe stops at the first PS_EMPTY). NULL: absent and not added (the
+ * table stays half empty at most, so a probe always ends). Executor thread
+ * only. */
+static PsSpec *ps_find(const PsKey *key, uint32_t lit, uint64_t h, int add,
+                       int *fresh)
 {
     uint32_t i, at;
 
@@ -2282,12 +2414,14 @@ static PsSpec *ps_find(const PsKey *key, uint64_t h, int add, int *fresh)
          i++, at = (at + 1) % PS_SPEC_MAX) {
         if (s_pss[at].state == PS_EMPTY)
             break;
-        if (s_pss[at].h == h && !memcmp(&s_pss[at].key, key, sizeof *key))
+        if (s_pss[at].h == h && s_pss[at].lit == lit
+            && !memcmp(&s_pss[at].key, key, sizeof *key))
             return &s_pss[at];
     }
     if (!add || i == PS_SPEC_MAX || s_pss_n >= PS_SPEC_MAX / 2)
         return NULL;
     s_pss[at].key = *key;
+    s_pss[at].lit = lit;
     s_pss[at].h = h;
     s_pss_n++;
     *fresh = 1;
@@ -2342,7 +2476,7 @@ static void ps_list_load(void)
     QueryPerformanceCounter(&s_pss_pre_t0);
     while (fread(&k, sizeof k, 1, f) == 1) {
         int fresh;
-        PsSpec *e = ps_find(&k, ps_hash(&k), 1, &fresh);
+        PsSpec *e = ps_find(&k, 0, ps_hash(&k), 1, &fresh);
         if (!e)
             break;                      /* the table's half is full */
         if (!fresh) {
@@ -2389,10 +2523,28 @@ static void ps_list_load(void)
 }
 
 /* The pixel shader of k's setup when it is ready; NULL: the one shader
- * (off, not compiled yet, failed, table full). Executor thread only. */
+ * (off, not compiled yet, failed, table full). lit: a lit program's
+ * variant (ps_spec_source_lit), 0 the plain one; *last remembers the
+ * caller's last entry. Executor thread only. */
+static ID3D11PixelShader *ps_spec_for(const GpuConsts *k, uint32_t lit,
+                                      PsSpec **lastp);
+
 static ID3D11PixelShader *ps_spec(const GpuConsts *k)
 {
     static PsSpec *last;
+    return ps_spec_for(k, 0, &last);
+}
+
+static ID3D11PixelShader *ps_spec_lit(const GpuConsts *k, uint32_t lit)
+{
+    static PsSpec *last;
+    return lit ? ps_spec_for(k, lit, &last) : NULL;
+}
+
+static ID3D11PixelShader *ps_spec_for(const GpuConsts *k, uint32_t lit,
+                                      PsSpec **lastp)
+{
+    PsSpec *last = *lastp;
     PsKey key;
     PsSpec *e;
     int fresh;
@@ -2427,10 +2579,11 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
         || (s_pss_on == 2 && (g_pb.flips & 1)))
         return NULL;
     ps_key(k, &key);
-    if (last && !memcmp(&last->key, &key, sizeof key)) {
+    if (last && last->lit == lit && !memcmp(&last->key, &key, sizeof key)) {
         e = last;
     } else {
-        e = ps_find(&key, ps_hash(&key), 1, &fresh);
+        e = ps_find(&key, lit, ps_hash(&key) ^ ((uint64_t)lit << 32), 1,
+                    &fresh);
         if (!e)
             return NULL;
         if (fresh) {
@@ -2441,7 +2594,7 @@ static ID3D11PixelShader *ps_spec(const GpuConsts *k)
             e->seen = 1;
             s_pss_seen++;
         }
-        last = e;
+        *lastp = e;
     }
     if (e->state != PS_READY) {
         if (e->state == PS_IDLE) {
@@ -3231,7 +3384,11 @@ static ID3D11DepthStencilState *ds_state(void)
  * hash_bytes of the same bytes names replacement textures (tex_replace.h),
  * taken only for new or changed bytes: when new bytes
  * match a PNG in RECOMP_TEX_REPLACE, the PNG goes up instead, at its own size
- * (replaced_tex); 2D textures only. */
+ * (replaced_tex); 2D textures only. A PNG bigger than the guest's texture
+ * gets a full mip chain even when the guest has one level, and sampler_stage
+ * moves the guest's level range down by log2 of the ratio: drawn small, a
+ * 4x picture blends down to the guest's own size instead of shimmering
+ * (RECOMP_TEX_REPLACE_MIPS=0 = level 0 only, as before). */
 
 /* Enough for a whole scene. With 128, Conker's first field evicted textures
  * it bound again the same frame and re-decoded ~30 a second while standing
@@ -3245,6 +3402,7 @@ typedef struct {
     uint32_t cube;                      /* d slices are cube faces (Texture2DArray) */
     uint32_t lv;                        /* mip levels uploaded (2D only) */
     uint32_t replaced;                  /* a replacement PNG (tex_replace.h): its levels */
+    uint32_t rep_shift;                 /* how much bigger the PNG is, log2, 1/16 levels */
     uint32_t sgn;                       /* channels uploaded signed (tex_signed_mask) */
     uint64_t hash;
     uint32_t used;                      /* s_tex_tick at the last bind */
@@ -3304,6 +3462,23 @@ static void tex_link(GpuTexture *e)
     int i = (int)(e - s_tex);
     s_tex_next[i] = s_tex_head[tex_bucket(e->addr)];
     s_tex_head[tex_bucket(e->addr)] = (uint16_t)(i + 1);
+}
+
+/* Every texture dropped, between two frames: the replacement textures
+ * changed (tex_replace_reload), so each one is made again from the guest's
+ * bytes at its next bind and looked up in the new list. A short hitch, only
+ * on a switch: as a level load, everything in view goes up again. A texture
+ * still bound to the context keeps its own reference until it is unbound. */
+static void tex_drop_all(void)
+{
+    int i, n = 0;
+    for (i = 0; i < GPU_TEXTURES; i++)
+        if (s_tex[i].tex) {
+            tex_drop(&s_tex[i]);
+            n++;
+        }
+    fprintf(stderr, "[GPU] d3d11: the replacement textures changed: %d texture(s)"
+            " dropped, made again at their next draw%c", n, 10);
 }
 static uint32_t  *s_texels;             /* decode scratch */
 static size_t     s_texels_cap;
@@ -3537,6 +3712,10 @@ static int  s_tex_slot[4];
 /* Mip levels of each stage's texture as bound (1 for a surface or zeta
  * copy), for sampler_stage. Set by texture_stage. */
 static uint32_t s_tex_levels[4];
+/* A replacement bigger than the guest texture: log2 of how much bigger, in
+ * 1/16 levels (0 = none or not bigger), for sampler_stage. Set by
+ * texture_stage. */
+static uint32_t s_tex_shift[4];
 /* Signed channels of each stage's texture as uploaded (FILTER bits 28-31:
  * 1 alpha, 2 red, 4 green, 8 blue), for the shader's bsc[st].w; 0 = none
  * or not a decoded guest texture. Set by texture_stage. */
@@ -4744,8 +4923,24 @@ static void dump_guest_tex(const Texture *t, uint64_t hash)
 
 /* Stage st's texture t (hash, palette, lv levels in the guest) drawn as the
  * replacement px (w x h): a texture of its own size, with a full mip chain
- * when the guest's has levels. The cache entry keeps the guest's key, so the
+ * when the guest's has levels or px is bigger than the guest's texture
+ * (tex_replace_mips below). The cache entry keeps the guest's key, so the
  * same bytes find it again; e (the entry those bytes had, or NULL) goes. */
+/* Levels for replacements bigger than the guest texture (default on;
+ * RECOMP_TEX_REPLACE_MIPS=0 = level 0 only when the guest has one level, as
+ * before, for A/B). A 4x font sheet drawn at about its guest size is shrunk
+ * 2-4x on screen: with one level, bilinear skips texels and the letters'
+ * edges come out jagged (Conker to-do 53). */
+static int tex_replace_mips(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_TEX_REPLACE_MIPS");
+        on = !(v && v[0] == '0');
+    }
+    return on;
+}
+
 static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
                                               GpuTexture *e, uint64_t hash,
                                               uint32_t palette, uint32_t lv,
@@ -4753,12 +4948,18 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
                                               uint32_t h)
 {
     D3D11_TEXTURE2D_DESC d;
-    uint32_t levels = 1;
+    uint32_t levels = 1, shift = 0;
+    double ratio = (double)w / t->width > (double)h / t->height
+                   ? (double)w / t->width : (double)h / t->height;
 
     if (e)
         tex_drop(e);
     e = tex_take();
-    if (lv > 1)
+    /* Bigger than the guest's: sampler_stage reads its levels shifted by
+     * log2(ratio), so the guest's level 0 is ours at `shift` (3x: 1.58). */
+    if (ratio > 1.0 && tex_replace_mips())
+        shift = (uint32_t)(log2(ratio) * 16.0 + 0.5);
+    if (lv > 1 || shift)
         while ((1u << levels) <= (w > h ? w : h))
             levels++;
     memset(&d, 0, sizeof d);
@@ -4793,6 +4994,7 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     e->d = 1;
     e->lv = lv;
     e->replaced = levels;
+    e->rep_shift = shift;
     e->hash = hash;
     e->hashed_flip = g_pb.flips;
     e->sample_ok = 0;                   /* new bytes: full hashes until calm */
@@ -4802,7 +5004,344 @@ static ID3D11ShaderResourceView *replaced_tex(int st, const Texture *t,
     s_stat.tex_made++;
     s_stat.tex_uploads++;
     s_tex_levels[st] = levels;
+    s_tex_shift[st] = shift;
     return e->srv;
+}
+
+/* Movie upscaling (xbox_SetMovieUpscale; RECOMP_MOVIE_UPSCALE=original or 0
+ * off, fsr or 1 on, the default, 2 on even frames only, for the
+ * held-picture check). A movie
+ * frame (batch_is_movie's textures: YUY2 / UYVY, 320 wide and up) goes up
+ * as its raw 4:2:2 words, an R8G8B8A8_UINT texture with one texel per pixel
+ * pair, instead of being decoded texel by texel on the CPU. postfx_movie
+ * turns it into colour with interpolated chroma (across, and down the rows
+ * too when its chroma comes in row pairs: movie_rows_paired), then FSR 1
+ * stretches it
+ * (EASU, then RCAS at RECOMP_MOVIE_SHARPEN percent, 0 = none) to the size
+ * its quad covers on the surface being drawn: the texture's own size in
+ * guest pixels times the surface's scale, across by the y scale when the
+ * movie is squeezed to 4:3 (movie_stretch; d3d_draw's movie43). The quad
+ * then samples that texture by the same coordinates: a linear texture is
+ * read by coordinates normalised by its guest size (tscale), so a bigger
+ * texture needs nothing else. Made once per new frame (hashed once a flip,
+ * as texture_stage does) and per size: at a high frame rate the title
+ * draws one movie frame over several flips. A surface no bigger than the
+ * frame gets the colour pass alone. A failure falls back to the texel-by-
+ * texel path for the rest of the run (said once).
+ * The quad is taken to show the texture at its own size in guest pixels
+ * (Conker's movies: 640x480 over the 640x480 frame). One drawn smaller
+ * (Conker's multiplayer menus show movies in small screens) must not read
+ * the big texture's texels sparsely (shimmer): the output gets a mip chain
+ * and the stage reads it as a bigger replacement texture is read
+ * (replaced_tex, s_tex_shift): trilinear down to the guest's own size.
+ * ponytail: a title that stretches a smaller movie over its screen gets
+ * EASU to the texture's scaled size and the quad's bilinear stretch for
+ * the rest. */
+#define MOVIE_SLOTS        2            /* the title's two frame surfaces */
+#define MOVIE_SHARPEN_DEF  50.0f        /* percent; RECOMP_MOVIE_SHARPEN (Conker
+                                         * user's pick 2026-11-27) */
+static volatile LONG s_movie_up = -1;
+static int s_movie_up_broken;
+static float s_movie_sharp = -1.0f;
+typedef struct {
+    uint32_t addr, fmt, w, h, pitch;    /* the guest texture */
+    uint32_t ow, oh;                    /* made at this size */
+    uint32_t levels, shift;             /* mip levels; how much bigger, as
+                                         * replaced_tex's (1/16 levels) */
+    uint64_t hash;
+    uint32_t hashed_flip, used;
+    ID3D11Texture2D *tex;
+    ID3D11RenderTargetView *rtv;
+    ID3D11ShaderResourceView *srv;
+} MovieTex;
+static MovieTex s_mv[MOVIE_SLOTS];
+static uint32_t s_mv_tick;
+static ID3D11Texture2D *s_mv_raw;       /* the raw words, w / 2 x h */
+static ID3D11ShaderResourceView *s_mv_raw_srv;
+static uint32_t s_mv_raw_w, s_mv_raw_h;
+
+void xbox_SetMovieUpscale(int on)
+{
+    InterlockedExchange(&s_movie_up, on ? 1 : 0);
+}
+
+static int movie_upscale(void)
+{
+    if (s_movie_up < 0) {
+        const char *e = getenv("RECOMP_MOVIE_UPSCALE");
+        LONG v = !e || !*e ? 1 : *e == '2' ? 2
+               : *e == '0' || !_stricmp(e, "original") || !_stricmp(e, "off")
+                 ? 0 : 1;
+        InterlockedCompareExchange(&s_movie_up, v, -1);
+    }
+    if (s_movie_up_broken)
+        return 0;
+    return s_movie_up == 2 ? !(g_pb.flips & 1) : (int)s_movie_up;
+}
+
+static float movie_sharpen(void)
+{
+    if (s_movie_sharp < 0.0f) {
+        const char *e = getenv("RECOMP_MOVIE_SHARPEN");
+        float f = e && *e ? strtof(e, NULL) : MOVIE_SHARPEN_DEF;
+        s_movie_sharp = f < 0.0f ? 0.0f : f > 100.0f ? 100.0f : f;
+    }
+    return s_movie_sharp;
+}
+
+static void movie_tex_free(MovieTex *m)
+{
+    if (m->srv) ID3D11ShaderResourceView_Release(m->srv);
+    if (m->rtv) ID3D11RenderTargetView_Release(m->rtv);
+    if (m->tex) ID3D11Texture2D_Release(m->tex);
+    memset(m, 0, sizeof *m);
+}
+
+/* t's raw words in s_mv_raw (made again for another size). */
+static int movie_raw_put(const Texture *t, const uint8_t *src)
+{
+    uint32_t w = t->width / 2u;
+
+    if (!s_mv_raw || s_mv_raw_w != w || s_mv_raw_h != t->height) {
+        D3D11_TEXTURE2D_DESC d;
+        if (s_mv_raw_srv) ID3D11ShaderResourceView_Release(s_mv_raw_srv);
+        if (s_mv_raw) ID3D11Texture2D_Release(s_mv_raw);
+        s_mv_raw = NULL;
+        s_mv_raw_srv = NULL;
+        memset(&d, 0, sizeof d);
+        d.Width = w;
+        d.Height = t->height;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+        d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_mv_raw))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_mv_raw, NULL, &s_mv_raw_srv))) {
+            if (s_mv_raw) ID3D11Texture2D_Release(s_mv_raw);
+            s_mv_raw = NULL;
+            return 0;
+        }
+        s_mv_raw_w = w;
+        s_mv_raw_h = t->height;
+    }
+    ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_mv_raw,
+                                          0, NULL, src, t->pitch,
+                                          t->pitch * t->height);
+    return 1;
+}
+
+/* m's output texture at ow x oh for a w x h frame (made again for another
+ * size): bigger than the frame, a full mip chain, read shifted by how much
+ * bigger (replaced_tex's rule). */
+static int movie_out_fit(MovieTex *m, uint32_t ow, uint32_t oh, uint32_t w,
+                         uint32_t h)
+{
+    D3D11_TEXTURE2D_DESC d;
+    double ratio = (double)ow / w > (double)oh / h ? (double)ow / w
+                                                   : (double)oh / h;
+    uint32_t levels = 1, shift = 0;
+
+    if (m->tex && m->ow == ow && m->oh == oh)
+        return 1;
+    movie_tex_free(m);
+    if (ratio > 1.0) {
+        shift = (uint32_t)(log2(ratio) * 16.0 + 0.5);
+        while ((1u << levels) <= (ow > oh ? ow : oh))
+            levels++;
+    }
+    memset(&d, 0, sizeof d);
+    d.Width = ow;
+    d.Height = oh;
+    d.MipLevels = levels;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_DEFAULT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    d.MiscFlags = levels > 1 ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &m->tex))
+        || FAILED(ID3D11Device_CreateRenderTargetView(s_dev,
+                (ID3D11Resource *)m->tex, NULL, &m->rtv))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)m->tex, NULL, &m->srv))) {
+        movie_tex_free(m);
+        return 0;
+    }
+    m->ow = ow;
+    m->oh = oh;
+    m->levels = levels;
+    m->shift = shift;
+    fprintf(stderr, "[GPU] d3d11: movie upscaling: %ux%u frames to %ux%u"
+            " (%u levels, sharpen %g %%)%c", w, h, ow, oh, levels,
+            (double)movie_sharpen(), 10);
+    return 1;
+}
+
+/* Whether frame p's chroma comes in row pairs (lines 2j and 2j+1 the same:
+ * a 4:2:0 source written out as 4:2:2, as Conker's XMV decoder does),
+ * from every 8th pair; postfx_movie then blends it down the rows too. A
+ * frame of one flat colour passes, harmlessly (blending equal rows). */
+static int movie_rows_paired(const Texture *t, const uint8_t *p)
+{
+    uint32_t j, x, c0 = t->color == 0x24u ? 1u : 0u;   /* YUY2: Y U Y V */
+
+    for (j = 0; j + 1 < t->height; j += 16) {
+        const uint8_t *a = p + (size_t)j * t->pitch, *b = a + t->pitch;
+        for (x = c0; x < t->width * 2u; x += 2)
+            if (a[x] != b[x])
+                return 0;
+    }
+    return 1;
+}
+
+static int movie_stretch(void);
+
+/* Whether this movie batch fills its clip (a full-screen movie): its
+ * vertices' screen box covers at least 90 % of the clip both ways. Only
+ * such a movie is squeezed to 4:3 with bars (movie_stretch); one drawn in
+ * a panel of a menu (Conker's multiplayer Mission Brief) is drawn as the
+ * menu round it is, or the bars would blank the menu at both sides. The
+ * vertices: the CPU's (s_rtt_verts), or for a batch on the GPU the
+ * program run on the CPU for its few vertices (pb_transform_batch, once
+ * per batch, as rtt_read_rect does). Not known: full, as before. The
+ * first box of each kind is logged once. */
+static int movie_fills_clip(void)
+{
+    static int said[2];
+    const Nv2aVshOutput *v = s_rtt_verts;
+    uint32_t i, n = s_rtt_n;
+    float x0 = 3e38f, x1 = -3e38f, y0 = 3e38f, y1 = -3e38f;
+    int full;
+
+    if (!v && s_rtt_vk == 'G' && n && n <= RTT_RECT_VERTS)
+        v = s_rtt_verts = pb_transform_batch();
+    if (!v || !n || !g_pb.clip_w || !g_pb.clip_h)
+        return 1;
+    for (i = 0; i < n; i++) {
+        float x = v[i].pos[0], y = v[i].pos[1];
+        if (!(x == x) || !(y == y))
+            continue;                   /* NaN */
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+    }
+    if (x1 < x0 || y1 < y0)
+        return 1;
+    full = x1 - x0 >= 0.9f * (float)g_pb.clip_w
+           && y1 - y0 >= 0.9f * (float)g_pb.clip_h;
+    if (!said[full]++)
+        fprintf(stderr, "[GPU] d3d11: a movie drawn %s: box x %.0f..%.0f y"
+                " %.0f..%.0f of clip %ux%u%s%c", full ? "full screen"
+                : "in part of the frame", (double)x0, (double)x1,
+                (double)y0, (double)y1, g_pb.clip_w, g_pb.clip_h,
+                full ? "" : " (kept with the menu round it: no 4:3 squeeze)",
+                10);
+    return full;
+}
+
+/* m's texture for stage st: its levels and shift for sampler_stage. */
+static ID3D11ShaderResourceView *movie_bind(int st, MovieTex *m)
+{
+    m->used = ++s_mv_tick;
+    s_tex_levels[st] = m->levels;
+    s_tex_shift[st] = m->shift;
+    return m->srv;
+}
+
+/* The upscaled frame for stage st's movie texture t (bytes long), or NULL:
+ * not a movie, upscaling off, or a failure (texture_stage then decodes it
+ * as before). */
+static ID3D11ShaderResourceView *movie_stage(int st, const Texture *t,
+                                             uint32_t bytes)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    int si = s_rtt_target, i, paired;
+    float sx, sy, xs;
+    uint32_t ow, oh;
+    uint64_t hash;
+    MovieTex *m = NULL;
+
+    if ((t->color != 0x24u && t->color != 0x25u) || t->width < 320u
+        || (t->width & 1u) || t->pitch < t->width * 2u || si < 0
+        || !movie_upscale())
+        return NULL;
+    sx = surf_sx(si);
+    sy = surf_sy(si);
+    xs = sy < sx * 0.999f && !movie_stretch() && movie_fills_clip() ? sy
+                                                                    : sx;
+    ow = (uint32_t)((float)t->width * xs + 0.5f);
+    oh = (uint32_t)((float)t->height * sy + 0.5f);
+    if (ow < t->width)
+        ow = t->width;
+    if (oh < t->height)
+        oh = t->height;
+    if (ow > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        ow = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    if (oh > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
+        oh = D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+
+    for (i = 0; i < MOVIE_SLOTS; i++)
+        if (s_mv[i].srv && s_mv[i].addr == t->offset
+            && s_mv[i].fmt == t->color && s_mv[i].w == t->width
+            && s_mv[i].h == t->height && s_mv[i].pitch == t->pitch) {
+            m = &s_mv[i];
+            break;
+        }
+    if (m && m->hashed_flip == g_pb.flips && m->ow == ow && m->oh == oh) {
+        s_stat.movie_reused++;
+        return movie_bind(st, m);
+    }
+    hash = hash_fast(mem + t->offset, bytes, 0xCBF29CE484222325ull);
+    if (m && m->hash == hash && m->ow == ow && m->oh == oh) {
+        m->hashed_flip = g_pb.flips;
+        s_stat.movie_reused++;
+        return movie_bind(st, m);
+    }
+    if (!m) {                           /* an empty slot, else the older */
+        m = &s_mv[0];
+        for (i = 1; i < MOVIE_SLOTS; i++)
+            if (!s_mv[i].srv || (m->srv && s_mv[i].used < m->used))
+                m = &s_mv[i];
+        movie_tex_free(m);
+    }
+    paired = movie_rows_paired(t, mem + t->offset);
+    if (!movie_raw_put(t, mem + t->offset)
+        || !movie_out_fit(m, ow, oh, t->width, t->height)
+        || !postfx_movie(s_dev, s_ctx, s_mv_raw_srv,
+                         (t->color == 0x25u ? POSTFX_MOVIE_UYVY : 0u)
+                         | (paired ? POSTFX_MOVIE_ROW_PAIRS : 0u),
+                         t->width, t->height, m->rtv, ow, oh,
+                         movie_sharpen())) {
+        fprintf(stderr, "[GPU] d3d11: movie upscaling failed (%ux%u to"
+                " %ux%u); movies decoded as before from now on%c", t->width,
+                t->height, ow, oh, 10);
+        s_movie_up_broken = 1;
+        movie_tex_free(m);
+        return NULL;
+    }
+    if (m->levels > 1)
+        ID3D11DeviceContext_GenerateMips(s_ctx, m->srv);
+    m->addr = t->offset;
+    m->fmt = t->color;
+    m->w = t->width;
+    m->h = t->height;
+    m->pitch = t->pitch;
+    m->hash = hash;
+    m->hashed_flip = g_pb.flips;
+    s_stat.movie_made++;
+    gt_mark(GT_MOVIE, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     movie frame 0x%08X %ux%u upscaled to"
+                " %ux%u (sharpen %g %%, chroma rows %s)%c", t->offset,
+                t->width, t->height, ow, oh, (double)movie_sharpen(),
+                paired ? "in pairs" : "each its own", 10);
+    if (paired)
+        s_stat.movie_paired++;
+    return movie_bind(st, m);
 }
 
 static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
@@ -4826,6 +5365,7 @@ static ID3D11ShaderResourceView *texture_stage(int st, uint32_t *flags,
     *flags = 0;
     s_tex_src[st] = '-';
     s_tex_levels[st] = 1;
+    s_tex_shift[st] = 0;
     s_tex_sgn[st] = 0;
     if (!t->valid || !t->offset || !t->width || !t->height
         || t->width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION
@@ -4852,6 +5392,13 @@ guest:
     bytes = pb_tex_bytes(t);
     if (!bytes)
         return NULL;
+    if (!cube && d3 == 1) {
+        ID3D11ShaderResourceView *mv = movie_stage(st, t, bytes);
+        if (mv) {
+            s_tex_src[st] = 'M';
+            return mv;
+        }
+    }
     if (cube)
         bytes += 5 * face_stride;       /* all six faces, mips between */
     if (!cube && d3 == 1 && t->levels > 1 && tex_size_from_format(t->color)) {
@@ -4892,8 +5439,10 @@ guest:
      * the same frame keeps the first bind's contents until the next flip. */
     if (e && d3 > 1)
         *flags |= cube ? TEX_CUBE : TEX_VOLUME;
-    if (e)
+    if (e) {
         s_tex_levels[st] = e->replaced ? e->replaced : lv;
+        s_tex_shift[st] = e->replaced ? e->rep_shift : 0;
+    }
     s_tx.binds++;
     if (e && e->hashed_flip == g_pb.flips) {
         s_tx.flip_hit++;
@@ -5177,6 +5726,7 @@ make:
     s_stat.tex_uploads++;
     s_tx.upload_bytes += bytes;
     s_tex_levels[st] = e->lv;
+    s_tex_shift[st] = 0;
     return e->srv;
 }
 
@@ -5289,7 +5839,9 @@ void xbox_SetTextureSmooth(xbox_TextureSmoothFn fn)
  * movie's size (320 wide and up). On a surface scaled wider than tall (a
  * wide window: x scale above the y scale), its batch is drawn squeezed to
  * the guest frame's own shape round the clip's middle, and the clip's two
- * side strips are cleared to black first. 1 = stretched to the window as
+ * side strips are cleared to black first; only a movie that fills the clip
+ * (movie_fills_clip): one in a menu's panel is drawn as the menu round it
+ * is (the bars would blank the menu). 1 = stretched to the window as
  * the surface is (the old look); RECOMP_STRETCH_FMV=1 the same from the
  * start. Executor thread; a change applies at the next movie batch. */
 static volatile int s_movie_stretch = -1;
@@ -5307,6 +5859,13 @@ static int movie_stretch(void)
     }
     return s_movie_stretch;
 }
+
+/* NV_HOST_FX_LAYOUT (nv2a_pb_state.h): while on, draws on a surface drawn
+ * wider than the guest's shape are squeezed back to it round the anchor
+ * (d3d_draw). Off again at every present, so a lost "off" never reaches the
+ * next frame. */
+static int s_layout_on, s_layout_abs, s_layout_box;
+static float s_layout_x;               /* share of the clip, or a guest x */
 
 /* Whether this batch samples a movie frame: a bound stage with a YUY2 /
  * UYVY texture at least 320 wide. */
@@ -5356,6 +5915,11 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     uint32_t lmin = ((t->control0 >> 18) & 0xFFF) >> 8;
     uint32_t lmax = ((t->control0 >> 6) & 0xFFF) >> 8;
     uint32_t key, bias, lods, color, aniso;
+    /* A replacement bigger than the guest texture (replaced_tex): its levels
+     * 0..shift are sharper than the guest's level 0, so the guest's levels
+     * lmin..lmax are ours shifted by shift (1/16 levels), and a guest with
+     * one level blends ours (trilinear) down to its own size. */
+    uint32_t shift = s_tex_shift[st], own = 0;
     int filt = tex_filter();
     int32_t sbias;
     D3D11_SAMPLER_DESC d;
@@ -5365,12 +5929,21 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
         mip = 0;                        /* nothing to pick from, or off */
     if (filt == 0)
         lmin = 0;                       /* off: level 0, as before mips */
+    if (filt == 0 || s_tex_levels[st] <= 1)
+        shift = 0;
     if (lmin > s_tex_levels[st] - 1)
         lmin = s_tex_levels[st] - 1;
-    if (lmax < lmin || !mip)
+    if (shift) {
+        own = !mip;                     /* the guest has no levels: ours */
+        mip = 2;                        /* blended: a title that turns in 3D
+                                         * (Conker's menu titles ask for the
+                                         * nearest level) would jump between
+                                         * sharp and soft */
+    }
+    if (lmax < lmin || (!mip || own))
         lmax = lmin;
-    bias = mip ? t->filter & 0x1FFF : 0;
-    lods = lmin | lmax << 8;
+    bias = mip && !own ? t->filter & 0x1FFF : 0;
+    lods = lmin | lmax << 8 | shift << 16;
     color = border ? t->border_color : 0;
     aniso = filt >= 2 && mip && lin ? (uint32_t)filt : 0u;
     key = (uint32_t)lin | bu << 1 | bv << 2 | wu << 3 | wv << 4 | mip << 5
@@ -5384,7 +5957,7 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
         static uint64_t seen[16];
         static int nseen;
         uint64_t kind = min | (t->filter & 0x1FFF) << 8 | (uint64_t)lods << 24
-                        | (uint64_t)s_tex_levels[st] << 40;
+                        | (uint64_t)s_tex_levels[st] << 48;
         int k;
         for (k = 0; k < nseen && seen[k] != kind; k++)
             ;
@@ -5392,9 +5965,11 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
             seen[nseen++] = kind;
             fprintf(stderr, "[GPU] d3d11: mip kind: min filter %u, %u levels"
                     " %ux%u fmt 0x%02X, CONTROL0 %08X (levels %u-%u), bias"
-                    " %d/256 (flip %u)%c", min, s_tex_levels[st], t->width,
-                    t->height, t->color, t->control0, lmin, lmax,
-                    (int32_t)((t->filter & 0x1FFF) << 19) >> 19, g_pb.flips, 10);
+                    " %d/256, bigger replacement +%u/16 (flip %u)%c", min,
+                    s_tex_levels[st], t->width, t->height, t->color,
+                    t->control0, lmin, lmax,
+                    (int32_t)((t->filter & 0x1FFF) << 19) >> 19, shift,
+                    g_pb.flips, 10);
         }
     }
     for (i = 0; i < s_nsamp; i++)
@@ -5426,8 +6001,8 @@ static ID3D11SamplerState *sampler_stage(int st, int combiners)
     d.BorderColor[3] = ((color >> 24) & 0xFF) / 255.0f;
     sbias = (int32_t)(bias << 19) >> 19;    /* sign-extend 13 bits */
     d.MipLODBias = (float)sbias / 256.0f;
-    d.MinLOD = (float)lmin;
-    d.MaxLOD = (float)lmax;
+    d.MinLOD = lmin ? (float)lmin + shift / 16.0f : 0.0f;
+    d.MaxLOD = (float)lmax + shift / 16.0f;
     if (FAILED(ID3D11Device_CreateSamplerState(s_dev, &d, &s_samp[s_nsamp].s)))
         return NULL;
     s_samp[s_nsamp].key = key;
@@ -6177,6 +6752,7 @@ static ID3D11VertexShader *vsh_gpu_begin(uint32_t n)
             nv2a_vsh_gpu_draw_source(s_hlsl_vsh_head, s_hlsl_vsh_draw,
                                      "vs_gpu");
             nv2a_vsh_gpu_point_source(s_hlsl_vsh_points, "vs_gpu_pts");
+            nv2a_vsh_gpu_lit_source(s_hlsl_vsh_lit, "vs_gpu_lit");
         }
         fprintf(stderr, "[VSHGPU] vertex programs drawn on the %s, points"
                 " on the %s%c", s_vsh_gpu ? "GPU" : "CPU",
@@ -6391,8 +6967,14 @@ static ID3D11RasterizerState *cull_state(ID3D11RasterizerState *base)
  * second time into depth only, alpha-tested as that earlier batch was: its
  * solid texels then hide what is drawn behind them later, its soft edges
  * still blend as before. Not what the hardware does, so off unless set.
- * Point sprites are left out (cutout_match). */
+ * Point sprites are left out (cutout_match), and so is a stage-0 texture
+ * under CUT_MIN_SIDE texels a side: it holds no shape to cut out, and a
+ * small helper texture many batches share made a pane of glass solid
+ * (Conker's multiplayer Mission Brief: the glass over its movie panel
+ * shares a 4x4 texture with an alpha-tested batch, so its depth pass hid
+ * the movie, drawn behind it later; to-do 294). */
 #define CUT_TEX 32
+#define CUT_MIN_SIDE 16
 static struct {
     uint32_t offset, func, ref;
 } s_cut[CUT_TEX];
@@ -6445,8 +7027,14 @@ static int cutout_match(int zi, uint32_t bound)
      * alpha-tested on stage 0's texture wrote depth over each whole faint
      * square (Conker's floating dust shares an atlas with cut-out scenery
      * and punched square holes in smoke drawn behind it, 2026-10-28). */
-    return i < s_cut_n && g_pb.blend_enable && g_pb.prim != NV_PRIM_POINTS
-           ? (int)i : -1;
+    if (i == s_cut_n || !g_pb.blend_enable || g_pb.prim == NV_PRIM_POINTS)
+        return -1;
+    if (g_pb.texs[0].width < CUT_MIN_SIDE
+        || g_pb.texs[0].height < CUT_MIN_SIDE) {
+        s_stat.cutout_tiny++;           /* no shape to cut out: not a match */
+        return -1;
+    }
+    return (int)i;
 }
 
 /* The second, depth-only draw of the batch d3d_draw just drew (everything
@@ -6700,11 +7288,14 @@ static void d3d_draw(void)
     uint32_t n, i, nidx, bpp, bound = 0, stride = sizeof(Nv2aVshOutput);
     uint32_t offset = 0, ib_offset = 0, path, rtt;
     int strip = 0;
-    int si, st, combiners, program, zi, cut;
+    int si, st, combiners, program, zi, cut, movie43, layout;
+    float lay_a = 0.0f, lay_s = 1.0f, lay_gl = 0.0f, lay_gr = 0.0f;
     ID3D11BlendState *bs;
     ID3D11DepthStencilState *ds;
     ID3D11RasterizerState *rs;
     ID3D11VertexShader *gvs = NULL;     /* the program on the GPU */
+    ID3D11VertexShader *lit_vs;         /* per-pixel lighting's pair, */
+    ID3D11PixelShader *lit_ps;          /*   when this batch uses it */
     uint64_t ct_draw0;
 
     s_stat.batches++;
@@ -6973,6 +7564,24 @@ static void d3d_draw(void)
                 g_pb.blend_sfactor, g_pb.blend_dfactor, g_pb.blend_equation,
                 g_pb.depth_test, g_pb.stencil_test, g_pb.alpha_test,
                 nidx / 3, g_pb.prim, 10);
+        if (program) {
+            /* Which vertex program, and whether it is a lit one
+             * (nv2a_vsh_lit.c): which program draws what, from a trace
+             * with `wireframe models` marks. */
+            uint32_t pc;
+            uint64_t ph;
+            const Nv2aVshIns *pi = nv2a_vsh_decoded(&pc, &ph);
+            if (pi) {
+                Nv2aVshLit pl;
+                char pd[200];
+                if (nv2a_vsh_lit_scan(pi, pc, nv2a_vsh_lit_regs(), &pl))
+                    nv2a_vsh_lit_describe(&pl, pd, sizeof pd);
+                else
+                    snprintf(pd, sizeof pd, "not lit");
+                fprintf(stderr, "[FTRACE]     vsh %016llX (%u instructions):"
+                        " %s%c", (unsigned long long)ph, pc, pd, 10);
+            }
+        }
         {   /* Depth against the depth range and the zeta format (Z16 or
              * Z24): a batch outside the range is culled (raster_state). */
             float z0 = 1e30f, z1 = -1e30f, w0 = 1e30f, w1 = -1e30f;
@@ -7221,6 +7830,40 @@ static void d3d_draw(void)
     k.rt[1] = -2.0f / (float)s_surf[si].h;
     k.rt[2] = -1.0f;
     k.rt[3] = 1.0f;
+    /* A movie squeezed to 4:3, or a 2D piece in its guest shape
+     * (NV_HOST_FX_LAYOUT): decided here, as a piece reads its x over a
+     * wider range. Squeezed round host x a, guest x lands on
+     * a (1 - s) + x sx s, so the guest's own width covers only a 4:3 box;
+     * clip space then spans the guest x range [gl, gr] that covers the
+     * whole surface, and a piece sliding in past the guest's edge shows
+     * past the box (as it would past a 4:3 screen's edge) instead of being
+     * cut there (Conker's lives counter at HUD Area 0 %). */
+    {
+        const int wide = surf_sy(si) < surf_sx(si) * 0.999f;
+
+        movie43 = bound && wide && batch_is_movie(bound) && !movie_stretch();
+        if (movie43 && !movie_fills_clip()) {
+            movie43 = 0;                /* in a menu's panel: as the menu */
+            s_stat.movie_part++;
+        }
+        layout = !movie43 && s_layout_on && wide;
+    }
+    if (layout) {
+        const float gw = (float)s_surf[si].w, hs = surf_sx(si);
+        const float gx = s_layout_abs ? s_layout_x
+                       : (float)g_pb.clip_x + s_layout_x * (float)g_pb.clip_w;
+        float h0, xl, xr;
+
+        lay_s = surf_sy(si) / hs;
+        lay_a = gx * hs;
+        h0 = lay_a * (1.0f - lay_s);                /* guest x 0 */
+        xl = -h0 / (hs * lay_s);                    /* host 0 */
+        xr = ((float)s_surf[si].tw - h0) / (hs * lay_s);   /* host right */
+        lay_gl = xl < 0.0f ? xl : 0.0f;
+        lay_gr = xr > gw ? xr : gw;
+        k.rt[0] = 2.0f / (lay_gr - lay_gl);
+        k.rt[2] = -2.0f * lay_gl / (lay_gr - lay_gl) - 1.0f;
+    }
     k.mode[0] = path;
     k.mode[1] = bound;
     k.zsc[0] = zeta_scale();
@@ -7230,6 +7873,43 @@ static void d3d_draw(void)
         k.zsc[1] = (float)g_pb.point_size / 8.0f;
         k.zsc[2] = (float)(((g_pb.xf_mode & 3) == 2 && g_pb.point_params_enable
                             ? 1 : 0) | (g_pb.point_sprite ? 2 : 0));
+    }
+    lit_vs = NULL;
+    lit_ps = NULL;
+    {
+        /* Per-pixel lighting (to-do 51 of Conker, nv2a_vsh_lit.c): a lit
+         * program's triangles draw with its lit vertex shader (kind 2) and
+         * the lit variant of the setup's pixel shader, both or neither: a
+         * shader not ready yet keeps the batch per vertex. Decided before
+         * the constants go up: zsc.w carries the lit shaders' flags
+         * (s_hlsl_lit): bits 0-3 the debug view (xbox_SetLitView), bit 4
+         * culling is off (so which side faces the camera matters), bit 5
+         * the side the title's culling keeps is D3D's front (clockwise:
+         * the base rasteriser states keep D3D's default winding), bits
+         * 8-23 the blob softness (xbox_SetBlobSoftness; all of it below
+         * 2^24, so the float holds it exactly). */
+        int lm = gvs && g_pb.prim != NV_PRIM_POINTS ? nv2a_vsh_lit_mode() : 0;
+        if (lm && !(lm == 2 && (g_pb.flips & 1))) {
+            uint32_t w = nv2a_vsh_lit_word(nv2a_vsh_gpu_lit());
+            if (w && path == PATH_COMBINERS) {
+                ID3D11PixelShader *lps = ps_spec_lit(&k, w);
+                ID3D11VertexShader *lvs =
+                    (ID3D11VertexShader *)nv2a_vsh_gpu_lit_shader(0);
+                if (lps && lvs) {
+                    uint32_t f = ((uint32_t)nv2a_vsh_lit_view() & 15u)
+                                 | nv2a_vsh_lit_soft_bits();
+                    if (!g_pb.cull_enable)
+                        f |= 16u | ((g_pb.cull_face == 0x405)
+                                    != (g_pb.front_face != 0x900) ? 32u : 0u);
+                    k.zsc[3] = (float)f;
+                    lit_vs = lvs;
+                    lit_ps = lps;
+                    s_stat.lit_draws++;
+                } else {
+                    s_stat.lit_waits++;
+                }
+            }
+        }
     }
     {
         uint64_t ct0 = ct_now();
@@ -7249,8 +7929,7 @@ static void d3d_draw(void)
     sc.top = (LONG)to_host(g_pb.clip_y, surf_sy(si));
     sc.right = (LONG)to_host(g_pb.clip_x + g_pb.clip_w, surf_sx(si));
     sc.bottom = (LONG)to_host(g_pb.clip_y + g_pb.clip_h, surf_sy(si));
-    if (bound && surf_sy(si) < surf_sx(si) * 0.999f && batch_is_movie(bound)
-        && !movie_stretch()) {
+    if (movie43) {
         /* Squeezed to the guest frame's shape (xbox_SetMovieStretch): every
          * x to cx + (x - cx) * s through the viewport, the scissor with it,
          * and black where the stretched picture would have been. */
@@ -7270,6 +7949,27 @@ static void d3d_draw(void)
             ID3D11DeviceContext1_ClearView(s_ctx1,
                     (ID3D11View *)s_surf[si].rtv, black, bar, 2);
         s_stat.movie_43++;
+    } else if (layout) {
+        /* A 2D piece in its guest shape (NV_HOST_FX_LAYOUT): every x to
+         * a + (x - a) * s, as the movie squeeze above but round the anchor
+         * and without bars, over the range [gl, gr] chosen above. A clip
+         * side inside the frame (a piece's own window) is squeezed with it;
+         * a side at the frame's edge stays there, so nothing is cut at the
+         * 4:3 box (the frame: the shown part of the surface, which is often
+         * padded wider, Conker's 640 of 1024). NV_HOST_LAYOUT_BOX: both
+         * sides squeezed, the draws kept inside the box. */
+        const float hs = surf_sx(si) * lay_s;
+        const uint32_t fl = si == s_shown && s_shown_w ? s_shown_x : 0u;
+        const uint32_t fr = si == s_shown && s_shown_w ? s_shown_x + s_shown_w
+                                                       : s_surf[si].w;
+
+        vp.TopLeftX = lay_a * (1.0f - lay_s) + lay_gl * hs;
+        vp.Width = (lay_gr - lay_gl) * hs;
+        if (g_pb.clip_x > fl || s_layout_box)
+            sc.left = (LONG)(lay_a + ((float)sc.left - lay_a) * lay_s + 0.5f);
+        if (g_pb.clip_x + g_pb.clip_w < fr || s_layout_box)
+            sc.right = (LONG)(lay_a + ((float)sc.right - lay_a) * lay_s + 0.5f);
+        s_stat.layout_draws++;
     }
     blend_constant(bf);
     vis_note_scale(surf_sx(si) * surf_sy(si));
@@ -7286,11 +7986,15 @@ static void d3d_draw(void)
                                                &offset);
     ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib_ring.b,
                                          DXGI_FORMAT_R32_UINT, ib_offset);
-    ID3D11DeviceContext_VSSetShader(s_ctx, gvs ? gvs : s_vs, NULL, 0);
-    consts_bind_vs();
     {
-        ID3D11PixelShader *sp = ps_spec(&k);
+        /* A lit batch (decided above, before the constants went up). */
+        ID3D11PixelShader *sp = lit_ps ? lit_ps : ps_spec(&k);
+        ID3D11DeviceContext_VSSetShader(s_ctx, lit_vs ? lit_vs
+                                               : gvs ? gvs : s_vs, NULL, 0);
+        consts_bind_vs();
         ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
+        if (lit_ps)
+            nv2a_vsh_gpu_bind_ps_constants();
     }
     consts_bind_ps();
     {
@@ -7674,10 +8378,12 @@ static void dump_beside_sw(const Nv2aPbDump *sw)
  * the frame is drawn at another scale than the back buffer's. Only the
  * black under a black present (xbox_Nv2aPresentNow). */
 extern int g_pb_present_black;
-/* Rectangle x,y,w,h (guest pixels) of tex, drawn at scale sx, sy, into the
- * back buffer as shown_to_back describes; tex NULL: black only. */
+/* Rectangle x,y,w,h (guest pixels) of tex, drawn at scale sx, sy, into dst
+ * (the back buffer, or the float s_hdr_in while the HDR step runs) as
+ * shown_to_back describes; tex NULL: black only. */
 static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
-                        uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        ID3D11RenderTargetView *dst);
 
 /* NV_HOST_FX_ASPECT: the shape the frame being drawn is shown at (0:0 = the
  * whole back buffer). The executor presents at the flip, before it reads the
@@ -7705,7 +8411,370 @@ static int aspect_rect(float *x, float *y, float *w, float *h)
     return 1;
 }
 
-static void shown_to_back(void)
+/* s_map_*: the shown surface's rectangle sx,sy sw x sh onto the target's
+ * dx,dy dw x dh. */
+static void map_note(float sx, float sy, float sw, float sh, float dx,
+                     float dy, float dw, float dh)
+{
+    s_map_src[0] = sx; s_map_src[1] = sy; s_map_src[2] = sw; s_map_src[3] = sh;
+    s_map_dst[0] = dx; s_map_dst[1] = dy; s_map_dst[2] = dw; s_map_dst[3] = dh;
+    s_map_ok = sw > 0.0f && sh > 0.0f && dw > 0.0f && dh > 0.0f;
+}
+
+/* t at w x h in format f, a render target with a shader view; made again
+ * when the size changes. 0 (said once) when it cannot be made. */
+static int hdr_tex_fit(HdrTex *t, uint32_t w, uint32_t h, DXGI_FORMAT f)
+{
+    D3D11_TEXTURE2D_DESC td;
+    HRESULT hr;
+
+    if (t->tex && t->w == w && t->h == h)
+        return 1;
+    if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+    if (t->rtv) ID3D11RenderTargetView_Release(t->rtv);
+    if (t->tex) ID3D11Texture2D_Release(t->tex);
+    memset(t, 0, sizeof *t);
+    memset(&td, 0, sizeof td);
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = f;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &t->tex);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)t->tex,
+                                                 NULL, &t->rtv);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)t->tex, NULL, &t->srv);
+    if (FAILED(hr)) {
+        static int said;
+        if (!said++)
+            fail("HDR texture", hr);
+        if (t->srv) ID3D11ShaderResourceView_Release(t->srv);
+        if (t->rtv) ID3D11RenderTargetView_Release(t->rtv);
+        if (t->tex) ID3D11Texture2D_Release(t->tex);
+        memset(t, 0, sizeof *t);
+        return 0;
+    }
+    t->w = w;
+    t->h = h;
+    return 1;
+}
+
+/* For the host overlay, during its hook: with the HDR step on, a render
+ * target the back buffer's size, cleared to transparent, to draw into
+ * instead of back_rtv (which then holds the SDR picture, for photos). Its
+ * colours are SDR, shown at the paper white over the HDR picture and
+ * blended as they would be over the SDR one. NULL when the overlay draws
+ * into back_rtv as before. */
+void *xbox_GpuOverlayTarget(void)
+{
+    static const float clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    if (!s_hdr_step)
+        return NULL;
+    if (!s_hdr_ui_used) {
+        if (!hdr_tex_fit(&s_hdr_ui, s_hdr_in.w, s_hdr_in.h,
+                         DXGI_FORMAT_B8G8R8A8_UNORM))
+            return NULL;
+        ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_hdr_ui.rtv, clear);
+        s_hdr_ui_used = 1;
+    }
+    return s_hdr_ui.rtv;
+}
+
+/* For the title's side of NV_HOST_FX_SCENE_END: 1 while the HDR step runs
+ * (as of the last present), so the mark is sent only then. */
+int xbox_HdrStepOn(void)
+{
+    return s_hdr_step;
+}
+
+static const char *const s_hdr_out_name[] = {
+    "SDR", "HDR10 (PQ, BT.2020, R10G10B10A2)",
+    "scRGB (linear, 16-bit float)",
+};
+
+/* The swap chain to output out (HDR_OUT_*), between two presents: its
+ * buffers in the new format (the canvas too in exclusive mode), then the
+ * colour space. Refused: SDR from now on (said). */
+static void swap_reformat(int out)
+{
+    int was = s_hdr_out;
+    HRESULT hr;
+
+    s_hdr_out = out;
+    if (out != HDR_OUT_SDR)
+        s_hdr_ever = 1;
+    drop_views();
+    hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, s_excl ? s_out_w : s_bb_w,
+                                       s_excl ? s_out_h : s_bb_h,
+                                       swap_format(), s_swap_flags);
+    if (SUCCEEDED(hr) && !hdr_colour_space())
+        hr = E_NOTIMPL;
+    if (FAILED(hr) && out != HDR_OUT_SDR) {
+        fprintf(stderr, "[HDR] the swap chain could not output %s (hr"
+                " 0x%08lX): SDR from now on%c", s_hdr_out_name[out],
+                (unsigned long)hr, 10);
+        s_hdr_failed = 1;
+        s_hdr_out = HDR_OUT_SDR;
+        hr = IDXGISwapChain1_ResizeBuffers(s_swap, 0, s_excl ? s_out_w : s_bb_w,
+                                           s_excl ? s_out_h : s_bb_h,
+                                           swap_format(), s_swap_flags);
+        hdr_colour_space();
+    }
+    if (FAILED(hr))
+        fail("ResizeBuffers (HDR output)", hr);
+    if (!swap_view() || (s_excl && !make_canvas())) {
+        /* Remade at the next present, in the format wanted now. */
+        drop_swap_chain();
+        hdr_set_active(s_hdr_out);
+        return;
+    }
+    hdr_set_active(s_hdr_out);
+    if (s_hdr_out != was && s_hdr_out == HDR_OUT_SDR) {
+        fprintf(stderr, "[HDR] output now SDR on %s%c", s_hdr_mon.name[0]
+                ? s_hdr_mon.name : "?", 10);
+    } else if (s_hdr_out != was) {
+        float paper, peak, stretch;
+        hdr_levels(&s_hdr_mon, &paper, &peak, &stretch);
+        fprintf(stderr, "[HDR] output now %s on %s; paper white %.0f nits,"
+                " peak %.0f, highlight stretch %.0f %%%c",
+                s_hdr_out_name[s_hdr_out], s_hdr_mon.name[0] ? s_hdr_mon.name
+                : "?", paper, peak, stretch * 100.0f, 10);
+    }
+}
+
+/* Before each present (held ones too): the window's monitor followed, the
+ * swap chain switched to HDR or back as the setting and that monitor say,
+ * and whether the HDR step runs this present. */
+static void hdr_update(void)
+{
+    int out;
+
+    hdr_follow((HWND)xbox_FramebufferWindowHandle(), &s_hdr_mon);
+    out = s_hdr_failed ? HDR_OUT_SDR : hdr_wanted_out(&s_hdr_mon);
+    if (out != s_hdr_out && s_swap)
+        swap_reformat(out);
+    s_hdr_step = s_swap && (s_hdr_out != HDR_OUT_SDR || hdr_mode() == 2);
+    if (s_hdr_step && !hdr_tex_fit(&s_hdr_in, s_bb_w, s_bb_h,
+                                   DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        s_hdr_step = 0;
+        if (s_hdr_out != HDR_OUT_SDR) {
+            s_hdr_failed = 1;
+            swap_reformat(HDR_OUT_SDR);
+        }
+    }
+}
+
+/* NV_HOST_FX_SCENE_END: the current colour surface copied into s_scene_tex
+ * (only while the HDR step runs: nothing changes for SDR). Marked again in a
+ * frame, the copy is taken again (the haze, a full-screen wash, belongs to
+ * the 3D picture). */
+static void scene_copy(void)
+{
+    D3D11_TEXTURE2D_DESC d, sd;
+    int si;
+
+    if (!s_hdr_step)
+        return;
+    si = surface_current();
+    if (si < 0)
+        return;
+    ID3D11Texture2D_GetDesc(s_surf[si].tex, &d);
+    if (s_scene_tex) {
+        ID3D11Texture2D_GetDesc(s_scene_tex, &sd);
+        if (sd.Width != d.Width || sd.Height != d.Height
+            || sd.Format != d.Format) {
+            ID3D11ShaderResourceView_Release(s_scene_srv);
+            ID3D11Texture2D_Release(s_scene_tex);
+            s_scene_srv = NULL;
+            s_scene_tex = NULL;
+        }
+    }
+    if (!s_scene_tex) {
+        sd = d;
+        sd.MipLevels = 1;
+        sd.ArraySize = 1;
+        sd.Usage = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        sd.CPUAccessFlags = 0;
+        sd.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &sd, NULL, &s_scene_tex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)s_scene_tex, NULL, &s_scene_srv))) {
+            static int said;
+            if (!said++)
+                fail("HDR scene copy", E_FAIL);
+            if (s_scene_tex) ID3D11Texture2D_Release(s_scene_tex);
+            s_scene_tex = NULL;
+            s_scene_srv = NULL;
+            return;
+        }
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_scene_tex,
+                                     (ID3D11Resource *)s_surf[si].tex);
+    s_scene_addr = s_surf[si].addr;
+    s_scene_pitch = s_surf[si].pitch;
+    s_scene_valid = 1;
+    s_scene_fresh = 1;
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host scene end: %08X copied (%ux%u)%c",
+                s_surf[si].addr, d.Width, d.Height, 10);
+}
+
+/* The HDR step, after the overlay: s_hdr_in (the SDR picture) and the
+ * overlay's s_hdr_ui onto the back buffer, the 2D layer told from the 3D
+ * picture by the frame and its scene-end copy. A step that cannot run:
+ * SDR from the next present on. */
+static void hdr_run(int why, ID3D11Texture2D *ftex,
+                    ID3D11ShaderResourceView **fsrv, ID3D11Texture2D *stex,
+                    ID3D11ShaderResourceView *ssrv);
+
+static void hdr_step(void)
+{
+    /* The 2D layer: 0 known, else why not (said whenever it changes): 1 no
+     * scene-end mark this frame (all 2D: a menu, a movie, a loading
+     * screen), 2 the mark's surface is not the one shown, 3 their sizes
+     * differ, 4 nothing shown. */
+    int why = !s_scene_valid ? 1
+        : !s_map_ok || s_shown < 0 || !s_surf[s_shown].tex ? 4
+        : s_surf[s_shown].addr != s_scene_addr
+          || s_surf[s_shown].pitch != s_scene_pitch ? 2 : 0;
+    hdr_run(why, why ? NULL : s_surf[s_shown].tex,
+            why ? NULL : &s_surf[s_shown].srv, s_scene_tex, s_scene_srv);
+}
+
+/* hdr_step with the frame and its scene-end copy given (frame interpolation:
+ * an in-between picture shown by NV_INTERP_SHOW is not in the shown surface,
+ * and has its own copy, pic_scene_keep). */
+static void hdr_run(int why, ID3D11Texture2D *ftex,
+                    ID3D11ShaderResourceView **fsrv, ID3D11Texture2D *stex,
+                    ID3D11ShaderResourceView *ssrv)
+{
+    static int last_why = -1;
+    PostfxHdr h;
+    float paper, peak, stretch;
+    D3D11_TEXTURE2D_DESC fd, sd;
+
+    memset(&h, 0, sizeof h);
+    hdr_levels(&s_hdr_mon, &paper, &peak, &stretch);
+    h.out = s_hdr_out;
+    h.paper = paper;
+    h.peak = peak;
+    h.stretch = s_hdr_out == HDR_OUT_SDR ? 0.0f : stretch;
+    h.mask_view = hdr_mode() == 2;
+    h.sdr = s_hdr_in.srv;
+    h.ui = s_hdr_ui_used ? s_hdr_ui.srv : NULL;
+    if (!why && ftex && fsrv && stex && ssrv
+        && (*fsrv
+            || SUCCEEDED(ID3D11Device_CreateShaderResourceView(s_dev,
+                    (ID3D11Resource *)ftex, NULL, fsrv)))) {
+        ID3D11Texture2D_GetDesc(ftex, &fd);
+        ID3D11Texture2D_GetDesc(stex, &sd);
+        if (fd.Width != sd.Width || fd.Height != sd.Height) {
+            why = 3;
+        } else {
+            /* frame uv = (target pixel - dst corner) * src/dst + src corner,
+             * over the texture's size */
+            float kx = s_map_src[2] / s_map_dst[2];
+            float ky = s_map_src[3] / s_map_dst[3];
+            h.frame = *fsrv;
+            h.scene = ssrv;
+            h.map[0] = kx / (float)fd.Width;
+            h.map[1] = ky / (float)fd.Height;
+            h.map[2] = (s_map_src[0] - s_map_dst[0] * kx) / (float)fd.Width;
+            h.map[3] = (s_map_src[1] - s_map_dst[1] * ky) / (float)fd.Height;
+            h.rect[0] = s_map_dst[0];
+            h.rect[1] = s_map_dst[1];
+            h.rect[2] = s_map_dst[0] + s_map_dst[2];
+            h.rect[3] = s_map_dst[1] + s_map_dst[3];
+        }
+    }
+    if (why != last_why) {
+        static const char *const what[] = {
+            "known (the frame against its scene-end copy)",
+            "unknown: no scene-end mark this frame (all at paper white)",
+            "unknown: the scene-end copy is of another surface",
+            "unknown: the scene-end copy is another size",
+            "unknown: nothing shown",
+        };
+        fprintf(stderr, "[HDR] 2D layer %s", what[why]);
+        if (why == 2)
+            fprintf(stderr, " (copied %08X pitch %u, shown %08X pitch %u)",
+                    s_scene_addr, s_scene_pitch, s_surf[s_shown].addr,
+                    s_surf[s_shown].pitch);
+        fprintf(stderr, "%c", 10);
+        last_why = why;
+    }
+    if (!postfx_hdr(s_dev, s_ctx, &h, s_back_rtv, (float)s_bb_w,
+                    (float)s_bb_h)) {
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[HDR] the HDR step could not run: SDR from now"
+                    " on%c", 10);
+        s_hdr_failed = 1;
+    }
+}
+
+/* RECOMP_BB_DUMP with an HDR back buffer: <prefix>NNNNN.hdr, raw: "HDR1",
+ * width, height, DXGI format (little-endian 32-bit each), then the rows,
+ * 4 bytes a pixel for R10G10B10A2, 8 for R16G16B16A16_FLOAT. */
+static void dump_hdr(int seq)
+{
+    static const char *prefix = (const char *)-1;
+    ID3D11Texture2D *back = NULL, *st = NULL;
+    D3D11_TEXTURE2D_DESC d;
+    D3D11_MAPPED_SUBRESOURCE m;
+    char path[512];
+    uint32_t hdr[4], bpp, y;
+    FILE *f;
+
+    if (prefix == (const char *)-1)
+        prefix = getenv("RECOMP_BB_DUMP");
+    if (!prefix || seq < 0 || !(back = back_tex()))
+        return;
+    ID3D11Texture2D_GetDesc(back, &d);
+    bpp = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : 4u;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    if (SUCCEEDED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &st))) {
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st,
+                                         (ID3D11Resource *)back);
+        if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
+                                              D3D11_MAP_READ, 0, &m))) {
+            snprintf(path, sizeof path, "%s%05d.hdr", prefix, seq);
+            f = fopen(path, "wb");
+            if (f) {
+                memcpy(&hdr[0], "HDR1", 4);
+                hdr[1] = d.Width;
+                hdr[2] = d.Height;
+                hdr[3] = (uint32_t)d.Format;
+                fwrite(hdr, 4, 4, f);
+                for (y = 0; y < d.Height; y++)
+                    fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch,
+                           bpp, d.Width, f);
+                fclose(f);
+                if (seq == 0)
+                    fprintf(stderr, "  [GPU] d3d11 HDR back buffer dump: %s"
+                            " (%ux%u)%c", path, d.Width, d.Height, 10);
+            }
+            ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+        }
+        ID3D11Texture2D_Release(st);
+    }
+    ID3D11Texture2D_Release(back);
+}
+
+/* The shown frame into dst (the back buffer, or with the HDR step on the
+ * float s_hdr_in, which takes no plain copy from the frame), on black. */
+static void shown_to_back(ID3D11RenderTargetView *dst)
 {
     if (s_shown >= 0 && s_scale_on && !s_surf[s_shown].scaled) {
         /* An unscaled surface shown while the frame is scaled: said once. */
@@ -7718,28 +8787,32 @@ static void shown_to_back(void)
     }
     if (s_shown >= 0 && !g_pb_present_black)
         tex_to_back(s_surf[s_shown].tex, surf_sx(s_shown), surf_sy(s_shown),
-                    s_shown_x, s_shown_y, s_shown_w, s_shown_h);
+                    s_shown_x, s_shown_y, s_shown_w, s_shown_h, dst);
     else
-        tex_to_back(NULL, 1.0f, 1.0f, 0, 0, 0, 0);
+        tex_to_back(NULL, 1.0f, 1.0f, 0, 0, 0, 0, dst);
 }
 
 static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
-                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                        ID3D11RenderTargetView *dst)
 {
     static const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
     ID3D11Texture2D *back = NULL;
     float ax, ay, aw, ah;
+    int to_float = dst != s_back_rtv;
 
-    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    s_map_ok = 0;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, dst, black);
     if (tex && (back = back_tex()) && aspect_rect(&ax, &ay, &aw, &ah)) {
         /* At a set shape (NV_HOST_FX_ASPECT): the whole shown rectangle
          * squeezed into the middle, black at the sides. */
         float bl = (float)to_host(x, sx), bt = (float)to_host(y, sy);
         float bw = (float)(to_host(x + w, sx) - to_host(x, sx));
         float bh = (float)(to_host(y + h, sy) - to_host(y, sy));
+        map_note(bl, bt, bw, bh, ax, ay, aw, ah);
         if (!postfx_draw(s_dev, s_ctx, tex, bl, bt, bw, bh,
-                         s_back_rtv, ax, ay, aw, ah))
-            blit_stretch(tex, bl, bt, bw, bh, s_back_rtv,
+                         dst, ax, ay, aw, ah))
+            blit_stretch(tex, bl, bt, bw, bh, dst,
                          ax, ay, aw, ah);
         ID3D11Texture2D_Release(back);
     } else if (tex && (back || (back = back_tex()))) {
@@ -7767,24 +8840,32 @@ static void tex_to_back(ID3D11Texture2D *tex, float sx, float sy,
             uint32_t dh = to_host(h, by);
             float fw = (float)(dw < s_bb_w ? dw : s_bb_w);
             float fh = (float)(dh < s_bb_h ? dh : s_bb_h);
+            map_note((float)box.left, (float)box.top, (float)bw, (float)bh,
+                     0.0f, 0.0f, fw, fh);
             if (!postfx_draw(s_dev, s_ctx, tex,
                              (float)box.left, (float)box.top, (float)bw,
-                             (float)bh, s_back_rtv, 0.0f, 0.0f, fw, fh))
+                             (float)bh, dst, 0.0f, 0.0f, fw, fh))
                 blit_stretch(tex, (float)box.left,
                              (float)box.top, (float)bw, (float)bh,
-                             s_back_rtv, 0.0f, 0.0f, fw, fh);
-        } else if (postfx_active()
-                   && postfx_draw(s_dev, s_ctx, tex,
-                                  (float)box.left, (float)box.top,
-                                  (float)(box.right - box.left),
-                                  (float)(box.bottom - box.top), s_back_rtv,
-                                  0.0f, 0.0f, (float)(box.right - box.left),
-                                  (float)(box.bottom - box.top))) {
-            /* Filtered, pixel for pixel. */
+                             dst, 0.0f, 0.0f, fw, fh);
         } else {
-            ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
-                    (ID3D11Resource *)back, 0, 0, 0, 0,
-                    (ID3D11Resource *)tex, 0, &box);
+            float cw = (float)(box.right - box.left);
+            float ch = (float)(box.bottom - box.top);
+            map_note((float)box.left, (float)box.top, cw, ch, 0.0f, 0.0f,
+                     cw, ch);
+            if ((to_float || postfx_active())
+                && postfx_draw(s_dev, s_ctx, tex,
+                               (float)box.left, (float)box.top, cw, ch, dst,
+                               0.0f, 0.0f, cw, ch)) {
+                /* Filtered, pixel for pixel (into s_hdr_in always). */
+            } else if (to_float) {
+                blit_stretch(tex, (float)box.left,
+                             (float)box.top, cw, ch, dst, 0.0f, 0.0f, cw, ch);
+            } else {
+                ID3D11DeviceContext_CopySubresourceRegion(s_ctx,
+                        (ID3D11Resource *)back, 0, 0, 0, 0,
+                        (ID3D11Resource *)tex, 0, &box);
+            }
         }
         ID3D11Texture2D_Release(back);
     }
@@ -7906,6 +8987,7 @@ static void apply_render_res(void)
                                        s_swap_flags);
     if (FAILED(hr))
         fail("ResizeBuffers", hr);
+    hdr_colour_space();
     if (SUCCEEDED(IDXGISwapChain1_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D,
                                             (void **)&back))) {
         D3D11_TEXTURE2D_DESC d;
@@ -7964,11 +9046,84 @@ static void pace_count(void)
 #define INTERP_PICS 8
 static struct {
     ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;      /* of tex, for the HDR step (lazily) */
     int surf;                           /* s_surf it is a copy of */
     ID3D11Texture2D *src;               /* that surface's texture then */
     float sx, sy;
     uint32_t x, y, w, h;                /* shown rectangle, guest pixels */
+    /* With the HDR step on: the scene-end copy the picture was drawn with
+     * (pic_scene_keep); scene_ok 0 = none (all of it at paper white). */
+    ID3D11Texture2D *scene;
+    ID3D11ShaderResourceView *scene_srv;
+    int scene_ok;
 } s_pic[INTERP_PICS];
+
+/* HDR10 (Conker to-do 239) with frame interpolation: at NV_INTERP_SAVE the
+ * scene-end copy taken since the last save -- the one this picture's frame
+ * or replay drew (each replay runs NV_HOST_FX_SCENE_END again) -- is kept
+ * with the picture, since the next replay overwrites s_scene_tex. */
+static void pic_scene_keep(int slot)
+{
+    D3D11_TEXTURE2D_DESC d, h;
+    int fresh = s_scene_fresh;
+
+    s_scene_fresh = 0;
+    s_pic[slot].scene_ok = 0;
+    if (!s_hdr_step || !fresh || !s_scene_valid || !s_scene_tex || s_shown < 0
+        || s_surf[s_shown].addr != s_scene_addr
+        || s_surf[s_shown].pitch != s_scene_pitch)
+        return;
+    ID3D11Texture2D_GetDesc(s_scene_tex, &d);
+    if (s_pic[slot].scene) {
+        ID3D11Texture2D_GetDesc(s_pic[slot].scene, &h);
+        if (h.Width != d.Width || h.Height != d.Height || h.Format != d.Format) {
+            ID3D11ShaderResourceView_Release(s_pic[slot].scene_srv);
+            ID3D11Texture2D_Release(s_pic[slot].scene);
+            s_pic[slot].scene = NULL;
+            s_pic[slot].scene_srv = NULL;
+        }
+    }
+    if (!s_pic[slot].scene) {
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &d, NULL, &s_pic[slot].scene))) {
+            s_pic[slot].scene = NULL;
+            return;
+        }
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev,
+                (ID3D11Resource *)s_pic[slot].scene, NULL, &s_pic[slot].scene_srv))) {
+            ID3D11Texture2D_Release(s_pic[slot].scene);
+            s_pic[slot].scene = NULL;
+            s_pic[slot].scene_srv = NULL;
+            return;
+        }
+    }
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_pic[slot].scene,
+                                     (ID3D11Resource *)s_scene_tex);
+    s_pic[slot].scene_ok = 1;
+}
+
+/* NV_INTERP_LOAD puts a picture back into its surface for the back end's
+ * own present (the first in-between, in N's place) or for the next frame
+ * (N): its scene-end copy goes back with it, so hdr_step tells that
+ * picture's 2D layer by its own copy. */
+static void pic_scene_load(int slot)
+{
+    D3D11_TEXTURE2D_DESC d, h;
+
+    if (!s_hdr_step)
+        return;
+    s_scene_valid = 0;
+    if (!s_pic[slot].scene_ok || !s_scene_tex)
+        return;
+    ID3D11Texture2D_GetDesc(s_scene_tex, &d);
+    ID3D11Texture2D_GetDesc(s_pic[slot].scene, &h);
+    if (h.Width != d.Width || h.Height != d.Height || h.Format != d.Format)
+        return;
+    ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_scene_tex,
+                                     (ID3D11Resource *)s_pic[slot].scene);
+    s_scene_addr = s_surf[s_pic[slot].surf].addr;
+    s_scene_pitch = s_surf[s_pic[slot].surf].pitch;
+    s_scene_valid = 1;
+}
 
 /* Picture slot's shown rectangle as dump_rect writes a surface's. */
 static int dump_pic_rect(const char *path, int slot)
@@ -8239,6 +9394,9 @@ static int d3d_interp(int op, int slot)
             ID3D11Texture2D_GetDesc(s_pic[slot].tex, &h);
             if (h.Width != d.Width || h.Height != d.Height
                 || h.Format != d.Format || h.MipLevels != d.MipLevels) {
+                if (s_pic[slot].srv)
+                    ID3D11ShaderResourceView_Release(s_pic[slot].srv);
+                s_pic[slot].srv = NULL;
                 ID3D11Texture2D_Release(s_pic[slot].tex);
                 s_pic[slot].tex = NULL;
             }
@@ -8263,6 +9421,7 @@ static int d3d_interp(int op, int slot)
         s_pic[slot].y = s_shown_y;
         s_pic[slot].w = s_shown_w;
         s_pic[slot].h = s_shown_h;
+        pic_scene_keep(slot);
         return 1;
     }
     if (!s_pic[slot].tex || s_pic[slot].surf < 0
@@ -8278,6 +9437,7 @@ static int d3d_interp(int op, int slot)
         s_shown_y = s_pic[slot].y;
         s_shown_w = s_pic[slot].w;
         s_shown_h = s_pic[slot].h;
+        pic_scene_load(slot);
         return 1;
     }
     if (op == NV_INTERP_SHOW) {
@@ -8304,12 +9464,29 @@ static int d3d_interp(int op, int slot)
         }
         if (!s_swap || !ensure_swap_chain())
             return 0;
+        /* With the HDR step on (HDR10, Conker to-do 239), in its order: the
+         * picture into the float s_hdr_in, the overlay into its own layer,
+         * then the step, the 2D layer told by the picture's own scene-end
+         * copy (pic_scene_keep). */
         tex_to_back(s_pic[slot].tex, s_pic[slot].sx, s_pic[slot].sy,
                     s_pic[slot].x, s_pic[slot].y, s_pic[slot].w,
-                    s_pic[slot].h);
-        dump_back(seq);
+                    s_pic[slot].h, s_hdr_step ? s_hdr_in.rtv : s_back_rtv);
+        if (!s_hdr_step)
+            dump_back(seq);
+        s_hdr_ui_used = 0;
         if (overlay)
-            overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h);
+            overlay(s_dev, s_ctx, s_hdr_step ? s_hdr_in.rtv : s_back_rtv,
+                    s_bb_w, s_bb_h);
+        if (s_hdr_step) {
+            int why = !s_pic[slot].scene_ok ? 1 : !s_map_ok ? 4 : 0;
+            hdr_run(why, why ? NULL : s_pic[slot].tex,
+                    why ? NULL : &s_pic[slot].srv, s_pic[slot].scene,
+                    s_pic[slot].scene_srv);
+            if (s_hdr_out == HDR_OUT_SDR)
+                dump_back(seq);
+            else
+                dump_hdr(seq);
+        }
         if (s_excl)
             canvas_to_out();
         vsync_present(s_swap, s_excl_on);
@@ -8492,8 +9669,56 @@ static void exec_stats_tick(void)
     t0 = now;
 }
 
+/* RECOMP_D3D_DEBUG=1: the device made with the D3D11 debug layer (the
+ * Graphics Tools; without them the device is made as usual and a line
+ * says so), and its messages copied into the log at each present as
+ * [D3DDBG] lines: the first three of each kind, then a count at the
+ * report. For checks such as a vertex and pixel shader that do not link
+ * (per-pixel lighting's lit pair, to-do 51 of Conker). */
+static ID3D11InfoQueue *s_dbgq;
+#define DBG_IDS 64
+static struct { D3D11_MESSAGE_ID id; uint32_t n; } s_dbg_ids[DBG_IDS];
+static uint32_t s_dbg_nids, s_dbg_total;
+
+static void d3d_debug_drain(void)
+{
+    static const char *const sev[] = { "corruption", "error", "warning",
+                                       "info", "message" };
+    UINT64 n, i;
+
+    if (!s_dbgq)
+        return;
+    n = ID3D11InfoQueue_GetNumStoredMessages(s_dbgq);
+    for (i = 0; i < n; i++) {
+        SIZE_T len = 0;
+        D3D11_MESSAGE *m;
+        uint32_t j;
+        if (FAILED(ID3D11InfoQueue_GetMessage(s_dbgq, i, NULL, &len))
+            || !(m = (D3D11_MESSAGE *)malloc(len)))
+            continue;
+        if (SUCCEEDED(ID3D11InfoQueue_GetMessage(s_dbgq, i, m, &len))) {
+            for (j = 0; j < s_dbg_nids && s_dbg_ids[j].id != m->ID; j++)
+                ;
+            if (j == s_dbg_nids && j < DBG_IDS) {
+                s_dbg_ids[j].id = m->ID;
+                s_dbg_nids++;
+            }
+            s_dbg_total++;
+            if (j < DBG_IDS && s_dbg_ids[j].n++ < 3)
+                fprintf(stderr, "[D3DDBG] %s %d: %.*s%c",
+                        (unsigned)m->Severity < 5 ? sev[m->Severity] : "?",
+                        (int)m->ID, (int)m->DescriptionByteLength,
+                        m->pDescription, 10);
+        }
+        free(m);
+    }
+    ID3D11InfoQueue_ClearStoredMessages(s_dbgq);
+}
+
 static void d3d_present(void)
 {
+    s_layout_on = 0;
+    d3d_debug_drain();
     heavy_report();
     pace_count();
     gpu_mem_log();
@@ -8521,16 +9746,33 @@ static void d3d_present(void)
             apply_render_res();
             if (!s_swap)
                 break;
+            hdr_update();
+            if (!s_swap)
+                break;
             /* Redone for every present of a held frame: FLIP_DISCARD
              * leaves the back buffer undefined after each Present. */
             gt_frame_begin();
-            shown_to_back();
+            shown_to_back(s_hdr_step ? s_hdr_in.rtv : s_back_rtv);
             gt_mark(GT_POST, GT_KEYS);
-            dump_back(seq);
-            seq = -1;                   /* not again for a held frame */
+            if (!s_hdr_step) {
+                dump_back(seq);
+                seq = -1;               /* not again for a held frame */
+            }
+            s_hdr_ui_used = 0;
             hold = overlay
-                 ? overlay(s_dev, s_ctx, s_back_rtv, s_bb_w, s_bb_h) : 0;
+                 ? overlay(s_dev, s_ctx, s_hdr_step ? s_hdr_in.rtv : s_back_rtv,
+                           s_bb_w, s_bb_h) : 0;
             gt_mark(GT_OVERLAY, GT_KEYS);
+            if (s_hdr_step) {
+                /* The overlay drawn into s_hdr_ui (xbox_GpuOverlayTarget):
+                 * the back buffer's dump has it too. */
+                hdr_step();
+                if (s_hdr_out == HDR_OUT_SDR)
+                    dump_back(seq);
+                else
+                    dump_hdr(seq);
+                seq = -1;
+            }
             gt_frame_end();
             /* The title paces itself on the vblank the kernel emulates;
              * whether the present also waits for the monitor is VSync's
@@ -8548,6 +9790,12 @@ static void d3d_present(void)
         } while (hold);
     }
     s_shown_stale = 1;
+    s_scene_valid = 0;                  /* the next frame marks its own */
+    /* A new pack list (tex_replace_set_packs, e.g. from the overlay above):
+     * listed here, between two frames, on this thread, which is the one
+     * that looks replacements up. */
+    if (tex_replace_reload())
+        tex_drop_all();
 }
 
 /* Visibility reports (d3d_get_report, below): FIFO [head, tail) and counts. */
@@ -8624,9 +9872,28 @@ static void d3d_report(void)
     if (s_stat.tex_smooth)
         fprintf(stderr, "[GPU] d3d11: %u stage reads smoothed"
                 " (xbox_SetTextureSmooth)%c", s_stat.tex_smooth, 10);
+    if (s_stat.lit_draws || s_stat.lit_waits)
+        fprintf(stderr, "[GPU] d3d11: per-pixel lit draws: %u (%u per vertex:"
+                " shader not ready)%c", s_stat.lit_draws, s_stat.lit_waits, 10);
+    if (s_dbgq) {
+        d3d_debug_drain();
+        fprintf(stderr, "[D3DDBG] %u debug layer messages of %u kinds%c",
+                s_dbg_total, s_dbg_nids, 10);
+    }
     if (s_stat.movie_43)
         fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
                 " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
+    if (s_stat.movie_part)
+        fprintf(stderr, "[GPU] d3d11: %u movie batches in part of the frame,"
+                " not squeezed (movie_fills_clip)%c", s_stat.movie_part, 10);
+    if (s_stat.movie_made || s_stat.movie_reused)
+        fprintf(stderr, "[GPU] d3d11: movie upscaling: %u frames made (%u"
+                " with chroma rows in pairs), %u binds of one already made"
+                " (xbox_SetMovieUpscale)%c", s_stat.movie_made,
+                s_stat.movie_paired, s_stat.movie_reused, 10);
+    if (s_stat.layout_draws)
+        fprintf(stderr, "[GPU] d3d11: hud layout: %u batches squeezed to the"
+                " guest's shape (host layout)%c", s_stat.layout_draws, 10);
     {
         static uint32_t last_presents;
         rtt_kind_report(s_stat.presents - last_presents);
@@ -8641,8 +9908,10 @@ static void d3d_report(void)
             s_stat.zeta_reads, s_stat.zeta_unhandled, 10);
     if (cutout_on())
         fprintf(stderr, "[GPU] d3d11: cut-out depth (RECOMP_CUTOUT_DEPTH):"
-                " %u blended batches drawn again into depth%c",
-                s_stat.cutout_draws, 10);
+                " %u blended batches drawn again into depth; %u batches"
+                " left out for a stage-0 texture under %ux%u%c",
+                s_stat.cutout_draws, s_stat.cutout_tiny, CUT_MIN_SIDE,
+                CUT_MIN_SIDE, 10);
     if (s_pss_on > 0)
         fprintf(stderr, "[GPU] d3d11: combiner setups (RECOMP_PS_SPEC): %u"
                 " seen, %ld compiled, %ld from the cache, %ld failed, %.1f s"
@@ -8662,6 +9931,14 @@ static void d3d_report(void)
         fprintf(stderr, "[GPU] d3d11: host depth of field: %u drawn, %u not"
                 " (no surface, depth buffer or shaders)%c", s_stat.dof_drawn,
                 s_stat.dof_skipped, 10);
+    if (s_stat.ao_drawn || s_stat.ao_skipped)
+        fprintf(stderr, "[GPU] d3d11: host ambient occlusion: %u drawn, %u"
+                " not (not the frame, no depth buffer, or no shaders)%c",
+                s_stat.ao_drawn, s_stat.ao_skipped, 10);
+    if (s_stat.mblur_drawn || s_stat.mblur_skipped)
+        fprintf(stderr, "[GPU] d3d11: host motion blur: %u drawn, %u not"
+                " (not the frame, no depth buffer, or no shaders)%c",
+                s_stat.mblur_drawn, s_stat.mblur_skipped, 10);
     fprintf(stderr, "[GPU] d3d11: %u texture reads (once per texture per"
             " flip) from guest memory inside a GPU surface or zeta buffer"
             " (stale); surface binds:"
@@ -8863,6 +10140,90 @@ static float host_float(uint32_t bits)
     return f;
 }
 
+/* NV_HOST_FX_AO: ambient occlusion over the current colour surface's clip
+ * (ao_d3d11.c). Only on a frame-sized surface with a depth buffer: a mark
+ * that lands while a small target is current (a game drawing a light map
+ * mid-scene) is counted and skipped. */
+static void d3d_host_ao(const uint32_t *p)
+{
+    AoParams ap;
+    int si, zi;
+
+    si = surface_current();
+    zi = si >= 0 && s_surf[si].w >= 320 && g_pb.clip_w >= 64
+             && g_pb.clip_h >= 48
+         ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                        s_surf[si].tw, s_surf[si].th) : -1;
+    ap.zn = host_float(p[0]);
+    ap.zf = host_float(p[1]);
+    ap.sx = host_float(p[2]);
+    ap.sy = host_float(p[3]);
+    ap.radius = host_float(p[4]);
+    ap.strength = host_float(p[5]);
+    ap.flags = p[6];
+    ap.fade_end = host_float(p[7]);
+    if (zi < 0 || !ao_draw(s_dev, s_ctx, s_surf[si].tex, s_surf[si].rtv,
+                           s_zeta[zi].srv_z, s_zeta[zi].srv_s,
+                           to_host(g_pb.clip_x, surf_sx(si)),
+                           to_host(g_pb.clip_y, surf_sy(si)),
+                           to_host(g_pb.clip_w, surf_sx(si)),
+                           to_host(g_pb.clip_h, surf_sy(si)), &ap)) {
+        s_stat.ao_skipped++;
+        return;
+    }
+    s_stat.ao_drawn++;
+    gt_mark(GT_AO, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host ambient occlusion on %08X, %ux%u"
+                " (radius %g, strength %g, flags %u)%c", s_surf[si].addr,
+                g_pb.clip_w, g_pb.clip_h, (double)ap.radius,
+                (double)ap.strength, ap.flags, 10);
+}
+
+/* NV_HOST_FX_MBLUR: camera motion blur over the current colour surface's
+ * clip (mblur_d3d11.c); like the ambient occlusion, only on a frame-sized
+ * surface with a depth buffer. */
+static void d3d_host_mblur(const uint32_t *p)
+{
+    MblurParams mp;
+    int si, zi, i;
+
+    si = surface_current();
+    zi = si >= 0 && s_surf[si].w >= 320 && g_pb.clip_w >= 64
+             && g_pb.clip_h >= 48
+         ? zeta_current(0, s_surf[si].scaled, s_surf[si].boost,
+                        s_surf[si].tw, s_surf[si].th) : -1;
+    for (i = 0; i < 4; i++)
+        mp.q[i] = host_float(p[i]);
+    for (i = 0; i < 3; i++)
+        mp.t[i] = host_float(p[4 + i]);
+    mp.zn = host_float(p[7]);
+    mp.zf = host_float(p[8]);
+    mp.sx = host_float(p[9]);
+    mp.sy = host_float(p[10]);
+    mp.amount = host_float(p[11]);
+    mp.max_blur = host_float(p[12]);
+    mp.centre = host_float(p[13]);
+    mp.flags = p[14];
+    if (zi < 0 || !mblur_draw(s_dev, s_ctx, s_surf[si].tex, s_surf[si].rtv,
+                              s_zeta[zi].srv_z,
+                              to_host(g_pb.clip_x, surf_sx(si)),
+                              to_host(g_pb.clip_y, surf_sy(si)),
+                              to_host(g_pb.clip_w, surf_sx(si)),
+                              to_host(g_pb.clip_h, surf_sy(si)),
+                              (float)g_pb.clip_h, &mp)) {
+        s_stat.mblur_skipped++;
+        return;
+    }
+    s_stat.mblur_drawn++;
+    gt_mark(GT_MBLUR, GT_KEYS);
+    if (g_pb_ftrace == 2)
+        fprintf(stderr, "[FTRACE]     host motion blur on %08X, %ux%u (share"
+                " %g, longest %g, middle %g, flags %u)%c", s_surf[si].addr,
+                g_pb.clip_w, g_pb.clip_h, (double)mp.amount,
+                (double)mp.max_blur, (double)mp.centre, mp.flags, 10);
+}
+
 static void d3d_host_effect(uint32_t id, const uint32_t *p)
 {
     DofParams dp;
@@ -8883,6 +10244,25 @@ static void d3d_host_effect(uint32_t id, const uint32_t *p)
             s_aspect_w = w;
             s_aspect_h = h;
         }
+        return;
+    }
+    if (id == NV_HOST_FX_LAYOUT) {
+        s_layout_on = p[0] != 0;
+        s_layout_x = host_float(p[1]);
+        s_layout_abs = (p[2] & NV_HOST_LAYOUT_ABS) != 0;
+        s_layout_box = (p[2] & NV_HOST_LAYOUT_BOX) != 0;
+        return;
+    }
+    if (id == NV_HOST_FX_AO) {
+        d3d_host_ao(p);
+        return;
+    }
+    if (id == NV_HOST_FX_MBLUR) {
+        d3d_host_mblur(p);
+        return;
+    }
+    if (id == NV_HOST_FX_SCENE_END) {
+        scene_copy();
         return;
     }
     if (id != NV_HOST_FX_DOF)
@@ -9044,15 +10424,36 @@ const Nv2aPbBackend *nv2a_pb_backend_d3d11_open(int shadow)
     static const D3D_FEATURE_LEVEL levels[] = {
         D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0
     };
-    D3D_FEATURE_LEVEL got;
+    D3D_FEATURE_LEVEL got = D3D_FEATURE_LEVEL_11_0;
     IDXGIDevice *dxgi_dev = NULL;
     IDXGIAdapter *adapter = NULL;
     HRESULT hr;
 
-    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                           D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                           (UINT)(sizeof levels / sizeof levels[0]),
-                           D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+    {
+        const char *dbg = getenv("RECOMP_D3D_DEBUG");
+        hr = E_FAIL;
+        if (dbg && dbg[0] && dbg[0] != '0') {
+            hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT
+                                   | D3D11_CREATE_DEVICE_DEBUG, levels,
+                                   (UINT)(sizeof levels / sizeof levels[0]),
+                                   D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+            if (SUCCEEDED(hr)
+                && SUCCEEDED(ID3D11Device_QueryInterface(s_dev,
+                             &IID_ID3D11InfoQueue, (void **)&s_dbgq)))
+                fprintf(stderr, "[D3DDBG] D3D11 debug layer on (RECOMP_D3D_"
+                        "DEBUG): its messages in [D3DDBG] lines%c", 10);
+            else
+                fprintf(stderr, "[D3DDBG] no D3D11 debug layer (0x%08lX; the"
+                        " Graphics Tools not installed?): device made as"
+                        " usual%c", (unsigned long)hr, 10);
+        }
+        if (FAILED(hr))
+            hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                                   (UINT)(sizeof levels / sizeof levels[0]),
+                                   D3D11_SDK_VERSION, &s_dev, &got, &s_ctx);
+    }
     if (FAILED(hr)) {
         fail("D3D11CreateDevice", hr);
         return NULL;
@@ -9142,6 +10543,16 @@ int xbox_RenderScaleSize(unsigned *w, unsigned *h)
     *w = 640;
     *h = 480;
     return 100;
+}
+
+void *xbox_GpuOverlayTarget(void)
+{
+    return NULL;
+}
+
+int xbox_HdrStepOn(void)
+{
+    return 0;
 }
 
 #endif

@@ -1,12 +1,18 @@
 /**
- * Replacement textures: the PNG folder and the hash dump (tex_replace.h).
+ * Replacement textures: the PNG folder, the pack folders and the hash dump
+ * (tex_replace.h).
  *
- * The folder is listed once, on first use, and each PNG is decoded (WIC) the
+ * The folders are listed on first use: the packs (each with its
+ * subfolders, named by the title's namer or by hash) and the base folder
+ * (its PNGs right in it, by hash), every hash kept from the highest one
+ * (the first pack; the base folder last). Each PNG is decoded (WIC) the
  * first time its hash comes up, then kept: a texture the title evicts and
- * loads again goes back up without touching the file. Files added while the
- * game runs are not seen until the next start.
- * ponytail: decoded pixels are never freed; a pack bigger than memory would
- * need an LRU here.
+ * loads again goes back up without touching the file. A new pack list
+ * (tex_replace_set_packs after the first texture) is listed again by the
+ * back end between two frames (tex_replace_reload), every decoded picture
+ * freed; files added while the game runs are seen from then.
+ * ponytail: decoded pixels are freed only on a new list; a pack bigger than
+ * memory would need an LRU here.
  */
 #include "tex_replace.h"
 
@@ -22,6 +28,8 @@
 
 typedef struct {
     uint64_t hash;
+    int      prio;                      /* 0 = the first pack; the base folder last */
+    int      seq;                       /* found order: the first wins in one folder */
     WCHAR    path[MAX_PATH];
     uint32_t *px;                       /* decoded on first find */
     uint32_t w, h;
@@ -32,7 +40,19 @@ static int          s_init;
 static int          s_dump;             /* RECOMP_TEX_HASH_DUMP set */
 static WCHAR        s_dump_dir[MAX_PATH];
 static Replacement *s_rep;
-static int          s_nrep;
+static int          s_nrep, s_caprep;
+
+#define MAX_PACKS 64
+static WCHAR          *s_pack[MAX_PACKS];   /* the packs listed, in order */
+static int             s_npack;
+/* tex_replace_set_packs' list, from any thread, until the back end's thread
+ * takes it (take_wanted). */
+static SRWLOCK         s_want_lock = SRWLOCK_INIT;
+static WCHAR          *s_want[MAX_PACKS];
+static int             s_nwant;
+static volatile LONG   s_want_new;          /* s_want not taken yet */
+static TexReplaceNamer s_namer;
+static void           *s_namer_ctx;
 
 #define DUMPED_SLOTS 65536              /* hashes dumped so far (0 = empty) */
 static uint64_t    *s_dumped;
@@ -87,19 +107,44 @@ static uint64_t name_hash(const WCHAR *name)
     return h;
 }
 
+/* By hash, then the highest folder, then found order. */
 static int cmp_rep(const void *a, const void *b)
 {
-    uint64_t x = ((const Replacement *)a)->hash;
-    uint64_t y = ((const Replacement *)b)->hash;
-    return x < y ? -1 : x > y;
+    const Replacement *x = (const Replacement *)a, *y = (const Replacement *)b;
+    if (x->hash != y->hash)
+        return x->hash < y->hash ? -1 : 1;
+    if (x->prio != y->prio)
+        return x->prio < y->prio ? -1 : 1;
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
 }
 
-static void scan(const WCHAR *dir)
+static Replacement *add_rep(uint64_t hash, int prio, const WCHAR *path)
 {
-    WCHAR pat[MAX_PATH];
+    Replacement *r;
+    if (s_nrep == s_caprep) {
+        int cap = s_caprep ? s_caprep * 2 : 64;
+        Replacement *n = (Replacement *)realloc(s_rep, (size_t)cap * sizeof *n);
+        if (!n)
+            return NULL;
+        s_rep = n;
+        s_caprep = cap;
+    }
+    r = &s_rep[s_nrep];
+    memset(r, 0, sizeof *r);
+    r->hash = hash;
+    r->prio = prio;
+    r->seq = s_nrep++;
+    wcscpy_s(r->path, MAX_PATH, path);
+    return r;
+}
+
+/* The base folder: its PNGs right in it, named by hash. */
+static void scan(const WCHAR *dir, int prio)
+{
+    WCHAR pat[MAX_PATH], path[MAX_PATH];
     WIN32_FIND_DATAW fd;
     HANDLE f;
-    int cap = 0;
+    int n = 0;
 
     swprintf_s(pat, MAX_PATH, L"%s\\*.png", dir);
     f = FindFirstFileW(pat, &fd);
@@ -109,25 +154,181 @@ static void scan(const WCHAR *dir)
     }
     do {
         uint64_t h = name_hash(fd.cFileName);
-        Replacement *r;
         if (!h || (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
             continue;
-        if (s_nrep == cap) {
-            Replacement *n;
-            cap = cap ? cap * 2 : 16;
-            n = (Replacement *)realloc(s_rep, (size_t)cap * sizeof *n);
-            if (!n)
-                break;
-            s_rep = n;
-        }
-        r = &s_rep[s_nrep++];
-        memset(r, 0, sizeof *r);
-        r->hash = h;
-        swprintf_s(r->path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+        if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\%s", dir, fd.cFileName) < 0)
+            continue;
+        if (!add_rep(h, prio, path))
+            break;
+        n++;
     } while (FindNextFileW(f, &fd));
     FindClose(f);
+    fprintf(stderr, "[TEXREP] %d replacement texture(s) in %S\n", n, dir);
+}
+
+typedef struct {
+    int   found, unmatched, too_long;
+    WCHAR first_unmatched[MAX_PATH];
+} PackCount;
+
+static int is_png(const WCHAR *name)
+{
+    size_t n = wcslen(name);
+    return n > 4 && !_wcsicmp(name + n - 4, L".png");
+}
+
+/* One pack: every PNG below root (rel = the folder inside it, "" at the
+ * top), by the namer, else by the hash its name starts with. */
+static void scan_pack(const WCHAR *root, const WCHAR *rel, int prio, int depth,
+                      PackCount *c)
+{
+    WCHAR pat[MAX_PATH], sub[MAX_PATH], full[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+
+    if (depth > 16)                     /* a folder link round in a loop */
+        return;
+    if (_snwprintf_s(pat, MAX_PATH, _TRUNCATE, rel[0] ? L"%s\\%s\\*" : L"%s%s\\*",
+                     root, rel) < 0)
+        return;
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        uint64_t h = 0;
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        if (_snwprintf_s(sub, MAX_PATH, _TRUNCATE, rel[0] ? L"%s\\%s" : L"%s%s",
+                         rel, fd.cFileName) < 0
+            || _snwprintf_s(full, MAX_PATH, _TRUNCATE, L"%s\\%s", root, sub) < 0) {
+            c->too_long++;
+            continue;
+        }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            scan_pack(root, sub, prio, depth + 1, c);
+            continue;
+        }
+        if (!is_png(fd.cFileName))
+            continue;
+        if (s_namer) {
+            char u[MAX_PATH * 3];
+            if (WideCharToMultiByte(CP_UTF8, 0, sub, -1, u, (int)sizeof u, NULL, NULL))
+                h = s_namer(u, s_namer_ctx);
+        }
+        if (!h)
+            h = name_hash(fd.cFileName);
+        if (!h) {
+            if (!c->unmatched++)
+                wcscpy_s(c->first_unmatched, MAX_PATH, sub);
+            continue;
+        }
+        if (add_rep(h, prio, full))
+            c->found++;
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+
+/* Sorted for tex_replace_find, each hash once: the highest folder's. */
+static void finish(void)
+{
+    int i, j, hidden = 0;
+    if (!s_nrep)
+        return;
     qsort(s_rep, (size_t)s_nrep, sizeof *s_rep, cmp_rep);
-    fprintf(stderr, "[TEXREP] %d replacement texture(s) in %S\n", s_nrep, dir);
+    for (i = j = 0; i < s_nrep; i++) {
+        if (j && s_rep[j - 1].hash == s_rep[i].hash) {
+            hidden++;
+            continue;
+        }
+        if (i != j)
+            s_rep[j] = s_rep[i];
+        j++;
+    }
+    s_nrep = j;
+    if (s_npack)
+        fprintf(stderr, "[TEXREP] %d texture(s) replaced; %d PNG(s) left out for one "
+                "higher up that replaces the same texture\n", s_nrep, hidden);
+}
+
+void tex_replace_set_namer(TexReplaceNamer namer, void *ctx)
+{
+    s_namer = namer;
+    s_namer_ctx = ctx;
+}
+
+int tex_replace_set_packs(const char *const *dirs, int n)
+{
+    WCHAR *w[MAX_PACKS];
+    int i, k = 0;
+
+    for (i = 0; i < n && k < MAX_PACKS; i++) {
+        if (!(w[k] = (WCHAR *)malloc(MAX_PATH * sizeof(WCHAR)))) {
+            while (k)
+                free(w[--k]);
+            return 0;
+        }
+        to_wide_dir(dirs[i], w[k++]);
+    }
+    AcquireSRWLockExclusive(&s_want_lock);
+    for (i = 0; i < s_nwant; i++)
+        free(s_want[i]);
+    if (k)
+        memcpy(s_want, w, (size_t)k * sizeof *w);
+    s_nwant = k;
+    InterlockedExchange(&s_want_new, 1);
+    ReleaseSRWLockExclusive(&s_want_lock);
+    return 1;
+}
+
+/* The list tex_replace_set_packs left, if there is one, becomes the packs
+ * listed. 1 when it did. */
+static int take_wanted(void)
+{
+    int i;
+    if (!s_want_new)
+        return 0;
+    AcquireSRWLockExclusive(&s_want_lock);
+    for (i = 0; i < s_npack; i++)
+        free(s_pack[i]);
+    if (s_nwant)
+        memcpy(s_pack, s_want, (size_t)s_nwant * sizeof *s_want);
+    s_npack = s_nwant;
+    s_nwant = 0;
+    InterlockedExchange(&s_want_new, 0);
+    ReleaseSRWLockExclusive(&s_want_lock);
+    return 1;
+}
+
+/* Every folder listed into s_rep (empty before): the packs in order, then
+ * the base folder underneath. */
+static void list_all(void)
+{
+    const char *e;
+    int i;
+    for (i = 0; i < s_npack; i++) {
+        DWORD a = GetFileAttributesW(s_pack[i]);
+        PackCount c;
+        if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+            fprintf(stderr, "[TEXREP] pack %S: no such folder\n", s_pack[i]);
+            continue;
+        }
+        memset(&c, 0, sizeof c);
+        scan_pack(s_pack[i], L"", i, 0, &c);
+        fprintf(stderr, "[TEXREP] pack %S: %d replacement texture(s)", s_pack[i], c.found);
+        if (c.unmatched)
+            fprintf(stderr, "; %d PNG(s) named after no texture (the first: %S)",
+                    c.unmatched, c.first_unmatched);
+        if (c.too_long)
+            fprintf(stderr, "; %d path(s) too long", c.too_long);
+        fputc('\n', stderr);
+    }
+    e = getenv("RECOMP_TEX_REPLACE");
+    if (e && *e) {
+        WCHAR dir[MAX_PATH];
+        to_wide_dir(e, dir);
+        scan(dir, s_npack);             /* underneath every pack */
+    }
+    finish();
 }
 
 static void init(void)
@@ -136,12 +337,8 @@ static void init(void)
     if (s_init)
         return;
     s_init = 1;
-    e = getenv("RECOMP_TEX_REPLACE");
-    if (e && *e) {
-        WCHAR dir[MAX_PATH];
-        to_wide_dir(e, dir);
-        scan(dir);
-    }
+    take_wanted();
+    list_all();
     e = getenv("RECOMP_TEX_HASH_DUMP");
     if (e && *e) {
         to_wide_dir(e, s_dump_dir);
@@ -156,6 +353,27 @@ int tex_replace_active(void)
 {
     init();
     return s_nrep > 0 || s_dump;
+}
+
+int tex_replace_reload(void)
+{
+    LARGE_INTEGER t0, t1, f;
+    int i;
+    if (!s_init || !s_want_new)
+        return 0;                       /* not listed yet: init takes the list */
+    QueryPerformanceCounter(&t0);
+    take_wanted();
+    for (i = 0; i < s_nrep; i++)
+        free(s_rep[i].px);
+    s_nrep = 0;
+    fprintf(stderr, "[TEXREP] new pack list (%d pack(s)): listing the folders again\n",
+            s_npack);
+    list_all();
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    fprintf(stderr, "[TEXREP] %d texture(s) replaced now (listed in %.0f ms)\n", s_nrep,
+            (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart);
+    return 1;
 }
 
 /* Decode r's PNG into B8G8R8A8 rows. 1 on success. */
@@ -306,7 +524,17 @@ void tex_replace_dump(uint64_t hash, const uint32_t *px, uint32_t w,
 
 #else
 
+void tex_replace_set_namer(TexReplaceNamer namer, void *ctx)
+{
+    (void)namer; (void)ctx;
+}
+int tex_replace_set_packs(const char *const *dirs, int n)
+{
+    (void)dirs; (void)n;
+    return 1;
+}
 int tex_replace_active(void) { return 0; }
+int tex_replace_reload(void) { return 0; }
 const uint32_t *tex_replace_find(uint64_t hash, uint32_t *w, uint32_t *h)
 {
     (void)hash; (void)w; (void)h;

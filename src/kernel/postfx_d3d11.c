@@ -25,8 +25,10 @@
  *   sharpen   AMD FidelityFX CAS, sharpen-only (RECOMP_SHARPEN, percent;
  *             xbox_SetSharpen), 0 = off; behind FSR's EASU, FSR's own RCAS
  *             instead, at the same setting
- *   picture   gamma, contrast, saturation (RECOMP_GAMMA, RECOMP_CONTRAST,
- *             RECOMP_SATURATION; xbox_SetPicture), each 1.0 = unchanged
+ *   picture   black level, gamma, contrast, saturation, in that order
+ *             (RECOMP_BLACK_LEVEL percent, xbox_SetBlackLevel, 0 =
+ *             unchanged; RECOMP_GAMMA, RECOMP_CONTRAST, RECOMP_SATURATION,
+ *             xbox_SetPicture, each 1.0 = unchanged)
  *   crt       scanlines, or a CRT look: scanlines plus a slight curve,
  *             glow and vignette (RECOMP_CRT=off|scanlines|crt,
  *             RECOMP_CRT_STRENGTH percent; xbox_SetCrt), off by default.
@@ -69,6 +71,7 @@
 
 /* Each as float bits in a LONG, swapped whole. */
 static volatile LONG s_gamma, s_contrast, s_saturation, s_sharpen;
+static volatile LONG s_black;         /* black level, percent */
 static volatile LONG s_aa;            /* AA_*, a plain number */
 static volatile LONG s_upscale;       /* UP_*, a plain number */
 static volatile LONG s_fsr_prepare;   /* xbox_PrepareUpscaler asked */
@@ -134,6 +137,7 @@ static float env_float(const char *name, float lo, float hi, float def)
 #define ADJ_LO   0.0f
 #define ADJ_HI   4.0f
 #define SHARP_HI 100.0f
+#define BLACK_HI 50.0f    /* black level, percent either way */
 #define CRT_HI   100.0f
 #define CRT_DEF  50.0f    /* strength when only RECOMP_CRT is given */
 
@@ -161,6 +165,7 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     float g = env_float("RECOMP_GAMMA", GAMMA_LO, GAMMA_HI, 1.0f);
     float c = env_float("RECOMP_CONTRAST", ADJ_LO, ADJ_HI, 1.0f);
     float s = env_float("RECOMP_SATURATION", ADJ_LO, ADJ_HI, 1.0f);
+    float b = env_float("RECOMP_BLACK_LEVEL", -BLACK_HI, BLACK_HI, 0.0f);
     float sh = env_float("RECOMP_SHARPEN", 0.0f, SHARP_HI, 0.0f);
     int aa = env_choice("RECOMP_AA", s_aa_name, AA_MODES, "off, fxaa or smaa");
     int up = env_choice("RECOMP_UPSCALER", s_up_name, UP_MODES,
@@ -173,15 +178,16 @@ static BOOL CALLBACK params_init(PINIT_ONCE once, PVOID p, PVOID *ctx)
     InterlockedExchange(&s_gamma, fbits(g));
     InterlockedExchange(&s_contrast, fbits(c));
     InterlockedExchange(&s_saturation, fbits(s));
+    InterlockedExchange(&s_black, fbits(b));
     InterlockedExchange(&s_sharpen, fbits(sh));
     InterlockedExchange(&s_aa, aa);
     InterlockedExchange(&s_upscale, up);
     InterlockedExchange(&s_crt, crt);
     InterlockedExchange(&s_crt_strength, fbits(cs));
     s_force = f && !strcmp(f, "1");
-    if (g != 1.0f || c != 1.0f || s != 1.0f)
+    if (g != 1.0f || c != 1.0f || s != 1.0f || b != 0.0f)
         fprintf(stderr, "[GPU] postfx: picture gamma %.2f contrast %.2f"
-                " saturation %.2f%c", g, c, s, 10);
+                " saturation %.2f black level %+.0f %%%c", g, c, s, b, 10);
     if (sh != 0.0f)
         fprintf(stderr, "[GPU] postfx: sharpen %.0f %%%c", sh, 10);
     if (aa != AA_OFF)
@@ -231,6 +237,20 @@ int xbox_SetPicture(float gamma, float contrast, float saturation)
             ok = 0;
     }
     return ok;
+}
+
+/* For a settings menu: the black level in percent, 0 = unchanged. Above 0
+ * lifts the blacks towards grey (+20: black shows as 20 % grey, white stays
+ * white); below 0 deepens them (-20: the darkest fifth goes black, white
+ * stays white). Applied before the gamma. Applies from the next present.
+ * 1 when taken. */
+int xbox_SetBlackLevel(float percent)
+{
+    params();
+    if (!in_range(percent, -BLACK_HI, BLACK_HI))
+        return 0;
+    InterlockedExchange(&s_black, fbits(percent));
+    return 1;
 }
 
 /* For a settings menu: sharpening in percent, 0 = off, 100 = CAS at its
@@ -302,7 +322,7 @@ int xbox_SetCrt(int mode, float strength)
 static int picture_on(void)
 {
     return fval(&s_gamma) != 1.0f || fval(&s_contrast) != 1.0f
-        || fval(&s_saturation) != 1.0f;
+        || fval(&s_saturation) != 1.0f || fval(&s_black) != 0.0f;
 }
 
 /* The crt stage's mode, CRT_OFF at strength 0. */
@@ -325,10 +345,15 @@ int postfx_active(void)
  * po.xy: the viewport's corner in target pixels, po.z nonzero: pixel for
  * pixel, read from pl.xy (the source corner in pixels) on; pl.zw: the
  * source rectangle's far corner in pixels; pa: gamma, contrast,
- * saturation; pc.x: CAS's peak (negative lobe), from the sharpen setting.
+ * saturation, black level (a fraction: 0.2 = +20 %); pc.x: CAS's peak
+ * (negative lobe), from the sharpen setting.
  *
- * pps, the picture stage: a value at 1 is skipped, so a neutral pass gives
- * back exactly what it read. Stretching (po.z zero), it samples
+ * pps, the picture stage, through pic_adjust: black level first (lifted:
+ * v (1 - L) + L, deeper: (v + L) / (1 + L), both keep white at white),
+ * then gamma, contrast and saturation. A value at 1 (black level at 0) is
+ * skipped, so a neutral pass gives back exactly what it read. One function
+ * so that a later output stage can apply the same four. Stretching (po.z
+ * zero), it samples
  * bilinearly, clamped to pc (the source rectangle's outermost pixel
  * centres, in texture units) so nothing beside the rectangle bleeds in.
  *
@@ -373,18 +398,23 @@ static const char s_hlsl[] =
 "  float2 p = float2((id << 1) & 2, id & 2);\n"
 "  return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);\n"
 "}\n"
-"float4 pps(float4 p : SV_Position) : SV_Target {\n"
-"  float2 t = p.xy - po.xy;\n"
-"  float4 c = po.z != 0.0 ? pt.Load(int3(t + pl.xy, 0))\n"
-"                         : pt.Sample(psm, clamp(t * pk.xy + pk.zw, pc.xy,\n"
-"                                               pc.zw));\n"
-"  float3 v = c.rgb;\n"
+"float3 pic_adjust(float3 v) {\n"
+"  [branch] if (pa.w != 0.0)\n"
+"    v = pa.w > 0.0 ? saturate(v) * (1.0 - pa.w) + pa.w\n"
+"                   : saturate((v + pa.w) / (1.0 + pa.w));\n"
 "  [branch] if (pa.x != 1.0) v = pow(saturate(v), 1.0 / pa.x);\n"
 "  [branch] if (pa.y != 1.0) v = saturate((v - 0.5) * pa.y + 0.5);\n"
 "  [branch] if (pa.z != 1.0)\n"
 "    v = saturate(lerp(dot(v, float3(0.2126, 0.7152, 0.0722)).xxx, v,\n"
 "                      pa.z));\n"
-"  return float4(v, c.a);\n"
+"  return v;\n"
+"}\n"
+"float4 pps(float4 p : SV_Position) : SV_Target {\n"
+"  float2 t = p.xy - po.xy;\n"
+"  float4 c = po.z != 0.0 ? pt.Load(int3(t + pl.xy, 0))\n"
+"                         : pt.Sample(psm, clamp(t * pk.xy + pk.zw, pc.xy,\n"
+"                                               pc.zw));\n"
+"  return float4(pic_adjust(c.rgb), c.a);\n"
 "}\n"
 "float3 cl(int2 q) {\n"
 "  float3 c = pt.Load(int3(clamp(q, int2(pl.xy), int2(pl.zw) - 1), 0)).rgb;\n"
@@ -1437,6 +1467,7 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
             k[12] = fval(&s_gamma);
             k[13] = fval(&s_contrast);
             k[14] = fval(&s_saturation);
+            k[15] = fval(&s_black) / 100.0f;
             ok = run_pass(ctx, s_ps, in, rtv, ox, oy, vw, vh, k);
             break;
         }
@@ -1451,11 +1482,246 @@ int postfx_draw(ID3D11Device *dev, ID3D11DeviceContext *ctx,
     return ok;
 }
 
+/* ---- movie frames ----------------------------------------------------------- */
+
+/* Movie upscaling (nv2a_draw_d3d11.c movie_stage): yps turns the raw 4:2:2
+ * words of a movie frame (t0, an R8G8B8A8_UINT texture with one texel per
+ * pixel pair: Y0 U Y1 V, or U Y0 V Y1 when pk.y is set; pk.x the pairs a
+ * line, pk.w the lines) into colour, BT.601 limited range with the
+ * software sampler's numbers (pb_tex_texel case 0x24): an even pixel comes
+ * out exactly as there. An odd one takes the mean of its own pair's chroma
+ * and the next pair's (the chroma is sited with the even pixel), where the
+ * sampler repeats its own pair's: no colour steps two pixels wide. With
+ * pk.z set the frame's chroma comes in row pairs (a 4:2:0 source written
+ * out as 4:2:2: lines 2j and 2j+1 the same), so each line also takes a
+ * quarter of the pair across its nearer edge (the chroma sited between the
+ * two lines): no colour steps two lines tall either. */
+static const char s_yuv_hlsl[] =
+"cbuffer P : register(b0) {\n"
+"  float4 pk; float4 po; float4 pl; float4 pa; float4 pc;\n"
+"};\n"
+"Texture2D<uint4> yt : register(t0);\n"
+"float2 ych(int i, int y, bool odd) {\n"
+"  uint4 g = yt.Load(int3(i, y, 0));\n"
+"  uint4 n = yt.Load(int3(min(i + 1, int(pk.x) - 1), y, 0));\n"
+"  if (pk.y != 0.0) { g = g.yxwz; n = n.yxwz; }\n"
+"  float2 uv = float2(g.yw) - 128.0;\n"
+"  if (odd) uv = 0.5 * (uv + float2(n.yw) - 128.0);\n"
+"  return uv;\n"
+"}\n"
+"float4 yps(float4 p : SV_Position) : SV_Target {\n"
+"  int2 q = int2(p.xy - po.xy);\n"
+"  int i = q.x >> 1;\n"
+"  bool odd = (q.x & 1) != 0;\n"
+"  uint4 g = yt.Load(int3(i, q.y, 0));\n"
+"  if (pk.y != 0.0) g = g.yxwz;\n"
+"  float c = float(odd ? g.z : g.x) - 16.0;\n"
+"  float2 uv = ych(i, q.y, odd);\n"
+"  [branch] if (pk.z != 0.0) {\n"
+"    int ny = clamp((q.y & 1) != 0 ? q.y + 1 : q.y - 1, 0, int(pk.w) - 1);\n"
+"    uv = 0.75 * uv + 0.25 * ych(i, ny, odd);\n"
+"  }\n"
+"  float3 v = floor((298.0 * c + float3(409.0 * uv.y,\n"
+"                    -100.0 * uv.x - 208.0 * uv.y, 516.0 * uv.x) + 128.0)\n"
+"                   / 256.0);\n"
+"  return float4(saturate(v / 255.0), 1.0);\n"
+"}\n";
+
+static ID3D11PixelShader *s_yuv;        /* yps, made on first use */
+static int                s_yuv_broken; /* not made, said once */
+static Surf               s_mv_rgb;     /* a movie frame in colour */
+static Surf               s_mv_mid;     /* EASU's output when RCAS follows */
+
+int postfx_movie(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                 ID3D11ShaderResourceView *yuv, unsigned flags, UINT w,
+                 UINT h, ID3D11RenderTargetView *dst, UINT ow, UINT oh,
+                 float sharpen)
+{
+    float k[20];
+    int rcas;
+
+    if (!yuv || !dst || w < 2 || !h || ow < w || oh < h || s_yuv_broken
+        || !setup(dev))
+        return 0;
+    if (!s_yuv && FAILED(make_ps_from(dev, s_yuv_hlsl, sizeof s_yuv_hlsl - 1,
+                                      "yps", "ps_4_0", &s_yuv))) {
+        fprintf(stderr, "[GPU] postfx: the movie colour shader could not be"
+                " made; movies decoded as before%c", 10);
+        s_yuv_broken = 1;
+        return 0;
+    }
+    memset(k, 0, sizeof k);
+    k[0] = (float)(w / 2);
+    k[1] = (flags & POSTFX_MOVIE_UYVY) ? 1.0f : 0.0f;
+    k[2] = (flags & POSTFX_MOVIE_ROW_PAIRS) ? 1.0f : 0.0f;
+    k[3] = (float)h;
+    if (ow == w && oh == h)             /* the colour alone */
+        return run_pass(ctx, s_yuv, yuv, dst, 0.0f, 0.0f, (float)w,
+                        (float)h, k);
+    if (!fsr_setup(dev)
+        || !surf_fit(dev, &s_mv_rgb, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, 1)
+        || !run_pass(ctx, s_yuv, yuv, s_mv_rgb.rtv, 0.0f, 0.0f, (float)w,
+                     (float)h, k))
+        return 0;
+    rcas = sharpen > 0.0f
+           && surf_fit(dev, &s_mv_mid, ow, oh, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+    /* FsrEasuCon(con0..con3, w, h, w, h, ow, oh): the input is its whole
+     * texture, as in postfx_draw's scale stage. */
+    memset(k, 0, sizeof k);
+    k[0] = (float)w / (float)ow;
+    k[1] = (float)h / (float)oh;
+    k[2] = 0.5f * (float)w / (float)ow - 0.5f;
+    k[3] = 0.5f * (float)h / (float)oh - 0.5f;
+    k[8] = 1.0f / (float)w;
+    k[9] = 1.0f / (float)h;
+    k[10] = 1.0f / (float)w;
+    k[11] = -1.0f / (float)h;
+    k[12] = -1.0f / (float)w;
+    k[13] = 2.0f / (float)h;
+    k[14] = 1.0f / (float)w;
+    k[15] = 2.0f / (float)h;
+    k[17] = 4.0f / (float)h;
+    if (!run_pass(ctx, s_easu, s_mv_rgb.srv, rcas ? s_mv_mid.rtv : dst, 0.0f,
+                  0.0f, (float)ow, (float)oh, k))
+        return 0;
+    if (!rcas)
+        return 1;
+    /* RCAS over the whole output, at the chain's own scale: 100 % = 0
+     * stops, each 50 % less one stop less sharp. */
+    memset(k, 0, sizeof k);
+    k[10] = (float)ow;
+    k[11] = (float)oh;
+    k[16] = exp2f(-2.0f * (1.0f - sharpen / 100.0f));
+    return run_pass(ctx, s_rcas, s_mv_mid.srv, dst, 0.0f, 0.0f, (float)ow,
+                    (float)oh, k);
+}
+
+/* ---- HDR output ------------------------------------------------------------ */
+
+/* hps, the HDR step (postfx_hdr; hdr_d3d11.c): t0 the SDR picture, t1 the
+ * overlay (premultiplied: drawn with straight alpha over transparent black),
+ * t2 / t3 the shown frame and its copy at the scene end (unbound: no 2D
+ * layer known, all of it 2D). hm: the frame's uv = pixel * hm.xy + hm.zw;
+ * hr: the frame's rectangle on the target (x0 y0 x1 y1); hl: paper white
+ * (nits), peak / paper white (>= 1), stretch (0..1), the knee (linear, of
+ * SDR white); ho: output (0 SDR, 1 PQ, 2 scRGB), frame and copy bound, mask
+ * view; ht: the difference that starts / completes "2D" (0..1).
+ *
+ * The picture is made linear with a plain 2.2 gamma, as an SDR monitor
+ * shows it (Windows' own SDR-in-HDR uses the sRGB curve, which lifts the
+ * darkest greys). The stretch works on the brightest channel v (so a
+ * saturated light stretches as much as a white one) and scales all three by
+ * f(v) / v, hue and saturation kept: f(v) = v below the knee, above it
+ * v + s (P - 1) t^2 with t going 0..1 from the knee to white, so SDR white
+ * lands at 1 + s (P - 1) times the paper white (P at 100 %) and the curve
+ * leaves the knee smoothly. The 2D share m (0..1, from how much the frame
+ * differs from its copy, the larger of the three channels) takes the
+ * stretch away. The overlay goes over it in gamma 2.2 terms relative to the
+ * paper white, so it blends exactly as it did over the SDR picture.
+ * PQ: SMPTE ST 2084's constants, 10000 nits = 1. */
+static const char s_hdr_hlsl[] =
+"cbuffer P : register(b0) {\n"
+"  float4 hm; float4 hr; float4 hl; float4 ho; float4 ht;\n"
+"};\n"
+"Texture2D hs : register(t0); Texture2D hu : register(t1);\n"
+"Texture2D hf : register(t2); Texture2D hc : register(t3);\n"
+"SamplerState hsm : register(s0);\n"
+"static const float3x3 to2020 = {\n"
+"  0.6274040, 0.3292820, 0.0433136,\n"
+"  0.0690970, 0.9195400, 0.0113612,\n"
+"  0.0163916, 0.0880132, 0.8955950 };\n"
+"float3 pq(float3 n) {\n"
+"  float3 y = pow(saturate(n / 10000.0), 0.1593017578125);\n"
+"  return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y),\n"
+"             78.84375);\n"
+"}\n"
+"float4 hps(float4 p : SV_Position) : SV_Target {\n"
+"  int2 q = int2(p.xy);\n"
+"  float3 x = pow(saturate(hs.Load(int3(q, 0)).rgb), 2.2);\n"
+"  float4 u = hu.Load(int3(q, 0));\n"
+"  float m = 1.0;\n"
+"  [branch] if (ho.y != 0.0 && all(p.xy >= hr.xy) && all(p.xy < hr.zw)) {\n"
+"    float2 t = p.xy * hm.xy + hm.zw;\n"
+"    float3 d = abs(hf.SampleLevel(hsm, t, 0).rgb\n"
+"                   - hc.SampleLevel(hsm, t, 0).rgb);\n"
+"    m = smoothstep(ht.x, ht.y, max(max(d.r, d.g), d.b));\n"
+"  }\n"
+"  float v = max(max(x.r, x.g), x.b);\n"
+"  float k = saturate((v - hl.w) / (1.0 - hl.w));\n"
+"  x *= 1.0 + (1.0 - m) * hl.z * (hl.y - 1.0) * k * k / max(v, 1e-4);\n"
+"  [branch] if (u.a > 0.0 || any(u.rgb > 0.0))\n"
+"    x = pow(max(u.rgb + pow(x, 1.0 / 2.2) * (1.0 - u.a), 0.0), 2.2);\n"
+"  [branch] if (ho.z != 0.0)\n"
+"    x = lerp(x, float3(0.25 + 0.75 * dot(saturate(x),\n"
+"                       float3(0.2126, 0.7152, 0.0722)), 0.0, 0.0),\n"
+"             0.6 * m);\n"
+"  [branch] if (ho.x == 0.0)\n"
+"    return float4(pow(saturate(x), 1.0 / 2.2), 1.0);\n"
+"  float3 n = x * hl.x;\n"
+"  [branch] if (ho.x == 2.0)\n"
+"    return float4(n / 80.0, 1.0);\n"
+"  return float4(pq(mul(to2020, n)), 1.0);\n"
+"}\n";
+
+#define HDR_KNEE      0.6121f     /* 0.8 ^ 2.2: from 80 % of SDR white */
+#define HDR_DIFF_LO   (0.5f / 255.0f)
+#define HDR_DIFF_HI   (6.0f / 255.0f)
+
+static ID3D11PixelShader *s_hdrps;      /* hps, made on first use */
+static int                s_hdr_broken;
+
+int postfx_hdr(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+               const PostfxHdr *h, ID3D11RenderTargetView *dst, float w,
+               float hgt)
+{
+    ID3D11ShaderResourceView *t[4];
+    float k[20], ratio;
+    int mask;
+
+    if (!h || !h->sdr || !dst || w < 1.0f || hgt < 1.0f || s_hdr_broken
+        || !setup(dev))
+        return 0;
+    if (!s_hdrps && FAILED(make_ps_from(dev, s_hdr_hlsl, sizeof s_hdr_hlsl - 1,
+                                        "hps", "ps_4_0", &s_hdrps))) {
+        fprintf(stderr, "[GPU] postfx: the HDR step's shader could not be"
+                " made%c", 10);
+        s_hdr_broken = 1;
+        return 0;
+    }
+    mask = h->frame && h->scene;
+    ratio = h->paper > 0.0f ? h->peak / h->paper : 1.0f;
+    memset(k, 0, sizeof k);
+    if (mask) {
+        memcpy(&k[0], h->map, 4 * sizeof *k);
+        memcpy(&k[4], h->rect, 4 * sizeof *k);
+    }
+    k[8] = h->paper;
+    k[9] = ratio > 1.0f ? ratio : 1.0f;
+    k[10] = h->stretch < 0.0f ? 0.0f : h->stretch > 1.0f ? 1.0f : h->stretch;
+    k[11] = HDR_KNEE;
+    k[12] = (float)h->out;
+    k[13] = mask ? 1.0f : 0.0f;
+    k[14] = h->mask_view ? 1.0f : 0.0f;
+    k[16] = HDR_DIFF_LO;
+    k[17] = HDR_DIFF_HI;
+    t[0] = h->sdr;
+    t[1] = h->ui;
+    t[2] = mask ? h->frame : NULL;
+    t[3] = mask ? h->scene : NULL;
+    return run_draw(ctx, NULL, s_hdrps, t, 4, dst, 0.0f, 0.0f, w, hgt, k);
+}
+
 #else
 
 int xbox_SetPicture(float gamma, float contrast, float saturation)
 {
     (void)gamma; (void)contrast; (void)saturation;
+    return 0;
+}
+
+int xbox_SetBlackLevel(float percent)
+{
+    (void)percent;
     return 0;
 }
 
