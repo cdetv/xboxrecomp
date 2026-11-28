@@ -465,6 +465,8 @@ static struct {
     uint32_t rtt_filled;                /* RTT_FILL stage binds */
     uint32_t tex_smooth;                /* stages read smoothly */
     uint32_t movie_43;                  /* movie batches drawn in 4:3 */
+    uint32_t movie_part;                /* movie batches in part of the frame,
+                                         * left as the title draws them */
     uint32_t movie_made, movie_reused;  /* upscaled movie frames (movie_stage) */
     uint32_t movie_paired;              /*   of them with chroma rows in pairs */
     uint32_t layout_draws;              /* NV_HOST_FX_LAYOUT squeezes */
@@ -4905,6 +4907,50 @@ static int movie_rows_paired(const Texture *t, const uint8_t *p)
 
 static int movie_stretch(void);
 
+/* Whether this movie batch fills its clip (a full-screen movie): its
+ * vertices' screen box covers at least 90 % of the clip both ways. Only
+ * such a movie is squeezed to 4:3 with bars (movie_stretch); one drawn in
+ * a panel of a menu (Conker's multiplayer Mission Brief) is drawn as the
+ * menu round it is, or the bars would blank the menu at both sides. The
+ * vertices: the CPU's (s_rtt_verts), or for a batch on the GPU the
+ * program run on the CPU for its few vertices (pb_transform_batch, once
+ * per batch, as rtt_read_rect does). Not known: full, as before. The
+ * first box of each kind is logged once. */
+static int movie_fills_clip(void)
+{
+    static int said[2];
+    const Nv2aVshOutput *v = s_rtt_verts;
+    uint32_t i, n = s_rtt_n;
+    float x0 = 3e38f, x1 = -3e38f, y0 = 3e38f, y1 = -3e38f;
+    int full;
+
+    if (!v && s_rtt_vk == 'G' && n && n <= RTT_RECT_VERTS)
+        v = s_rtt_verts = pb_transform_batch();
+    if (!v || !n || !g_pb.clip_w || !g_pb.clip_h)
+        return 1;
+    for (i = 0; i < n; i++) {
+        float x = v[i].pos[0], y = v[i].pos[1];
+        if (!(x == x) || !(y == y))
+            continue;                   /* NaN */
+        if (x < x0) x0 = x;
+        if (x > x1) x1 = x;
+        if (y < y0) y0 = y;
+        if (y > y1) y1 = y;
+    }
+    if (x1 < x0 || y1 < y0)
+        return 1;
+    full = x1 - x0 >= 0.9f * (float)g_pb.clip_w
+           && y1 - y0 >= 0.9f * (float)g_pb.clip_h;
+    if (!said[full]++)
+        fprintf(stderr, "[GPU] d3d11: a movie drawn %s: box x %.0f..%.0f y"
+                " %.0f..%.0f of clip %ux%u%s%c", full ? "full screen"
+                : "in part of the frame", (double)x0, (double)x1,
+                (double)y0, (double)y1, g_pb.clip_w, g_pb.clip_h,
+                full ? "" : " (kept with the menu round it: no 4:3 squeeze)",
+                10);
+    return full;
+}
+
 /* m's texture for stage st: its levels and shift for sampler_stage. */
 static ID3D11ShaderResourceView *movie_bind(int st, MovieTex *m)
 {
@@ -4933,7 +4979,8 @@ static ID3D11ShaderResourceView *movie_stage(int st, const Texture *t,
         return NULL;
     sx = surf_sx(si);
     sy = surf_sy(si);
-    xs = sy < sx * 0.999f && !movie_stretch() ? sy : sx;
+    xs = sy < sx * 0.999f && !movie_stretch() && movie_fills_clip() ? sy
+                                                                    : sx;
     ow = (uint32_t)((float)t->width * xs + 0.5f);
     oh = (uint32_t)((float)t->height * sy + 0.5f);
     if (ow < t->width)
@@ -5500,7 +5547,9 @@ void xbox_SetTextureSmooth(xbox_TextureSmoothFn fn)
  * movie's size (320 wide and up). On a surface scaled wider than tall (a
  * wide window: x scale above the y scale), its batch is drawn squeezed to
  * the guest frame's own shape round the clip's middle, and the clip's two
- * side strips are cleared to black first. 1 = stretched to the window as
+ * side strips are cleared to black first; only a movie that fills the clip
+ * (movie_fills_clip): one in a menu's panel is drawn as the menu round it
+ * is (the bars would blank the menu). 1 = stretched to the window as
  * the surface is (the old look); RECOMP_STRETCH_FMV=1 the same from the
  * start. Executor thread; a change applies at the next movie batch. */
 static volatile int s_movie_stretch = -1;
@@ -7465,6 +7514,10 @@ static void d3d_draw(void)
         const int wide = surf_sy(si) < surf_sx(si) * 0.999f;
 
         movie43 = bound && wide && batch_is_movie(bound) && !movie_stretch();
+        if (movie43 && !movie_fills_clip()) {
+            movie43 = 0;                /* in a menu's panel: as the menu */
+            s_stat.movie_part++;
+        }
         layout = !movie43 && s_layout_on && wide;
     }
     if (layout) {
@@ -8631,6 +8684,9 @@ static void d3d_report(void)
     if (s_stat.movie_43)
         fprintf(stderr, "[GPU] d3d11: %u movie batches drawn in 4:3"
                 " (xbox_SetMovieStretch)%c", s_stat.movie_43, 10);
+    if (s_stat.movie_part)
+        fprintf(stderr, "[GPU] d3d11: %u movie batches in part of the frame,"
+                " not squeezed (movie_fills_clip)%c", s_stat.movie_part, 10);
     if (s_stat.movie_made || s_stat.movie_reused)
         fprintf(stderr, "[GPU] d3d11: movie upscaling: %u frames made (%u"
                 " with chroma rows in pairs), %u binds of one already made"
